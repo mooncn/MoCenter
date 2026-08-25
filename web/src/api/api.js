@@ -36,6 +36,26 @@ export const Api = {
     const { data } = await api.get('/audits')
     return data
   },
+  // 批量命令
+  async batchCommand(req) {
+    const { data } = await api.post('/command/batch', req)
+    return data
+  },
+  // 端口映射规则
+  async portmapRules() {
+    const { data } = await api.get('/portmap/rules')
+    return data
+  },
+  // 端口映射操作
+  async portmapOp(op) {
+    const { data } = await api.post('/portmap/op', op)
+    return data
+  },
+  // 远程升级
+  async upgrade(req) {
+    const { data } = await api.post('/upgrade', req)
+    return data
+  },
   // 健康检查
   async health() {
     const { data } = await api.get('/health')
@@ -45,12 +65,12 @@ export const Api = {
 
 // WebSocket 客户端：用于接收服务端实时推送（主机状态、命令输出等）。
 export class MCSocket {
-  constructor({ onAgentList, onCommandResp, onInteractive, onPortMap, token }) {
+  constructor({ onAgentList, onCommandResp, onInteractive, onPortMap, onFileTransfer, onUpgrade, token }) {
     this.url = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws'
       return `${proto}://${location.host}/ws?token=${encodeURIComponent(token || '')}`
     }
-    this.handlers = { onAgentList, onCommandResp, onInteractive, onPortMap }
+    this.handlers = { onAgentList, onCommandResp, onInteractive, onPortMap, onFileTransfer, onUpgrade }
     this.reconnectDelay = 1000
     this.ws = null
     this.alive = true
@@ -71,6 +91,8 @@ export class MCSocket {
         case 'CommandResp': this.handlers.onCommandResp?.(payload); break
         case 'InteractiveOutput': this.handlers.onInteractive?.(payload); break
         case 'PortMapState': this.handlers.onPortMap?.(payload); break
+        case 'FileTransferState': this.handlers.onFileTransfer?.(payload); break
+        case 'UpgradeResp': this.handlers.onUpgrade?.(payload); break
         default: break
       }
     }

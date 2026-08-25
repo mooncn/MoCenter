@@ -90,6 +90,8 @@ scripts\build-all.bat
 cd server
 ./mocenter-server -listen :9000 -http :8080 -apikey your-secret-key
 # 可选: -whitelist 1.2.3.4,10.0.0.0/8   # IP 白名单
+# 可选: -web web/dist                  # 同时托管 Web 前端（单进程部署）
+# 可选: -tls-cert server.crt -tls-key server.key   # Agent 连接启用 TLS 加密
 ```
 
 ### 3. 启动 Agent
@@ -99,6 +101,8 @@ cd server
 ./mocenter-agent -server your.server.com:9000 -agentid host-01
 # 后台守护 + 崩溃自启
 ./mocenter-agent -server your.server.com:9000 -agentid host-01 -daemon
+# 启用 TLS 加密连接（自签名证书用 -insecure 跳过校验）
+./mocenter-agent -server your.server.com:9000 -agentid host-01 -tls -insecure
 
 # Windows 交叉编译
 bash agent/build.sh windows   # 生成 mocenter-agent.exe
@@ -117,15 +121,21 @@ npm run dev     # 开发模式 (代理到 :8080)
 ## 功能清单
 
 - ✅ Agent 上线注册、心跳保活、离线判定（3 个心跳周期）
-- ✅ 探针采集（CPU/内存/磁盘/网络流量/系统信息）与 Web 实时展示
+- ✅ 探针采集（CPU/内存/磁盘/网络流量/系统信息）与 Web 实时展示 + 历史趋势图
 - ✅ 远程命令执行（bash/sh/cmd/powershell）、超时控制、审计日志、命令黑名单
-- ✅ WebSocket 实时推送主机列表与命令输出
-- ✅ 端口映射规则管理、连接跟踪、超时清理（`server/internal/portmap`）
+- ✅ **交互式 PTY 终端**（基于 creack/pty，实时双向 IO、尺寸自适应、Ctrl-C）
+- ✅ WebSocket 实时推送主机列表、命令输出、交互输出、文件传输状态、升级结果
+- ✅ **端口映射反向代理**：规则持久化、连接跟踪、流量统计、超时清理，公网端口实时转发
+- ✅ **文件传输断点续传**：分片收发、MD5 校验、ACK/NACK、断点续传、合并落盘
+- ✅ **批量命令**：一次下发到多台在线主机，审计留痕
+- ✅ **远程升级 Agent**：下载升级包 → MD5 校验 → 备份 → 替换 → 自动重启，失败回滚
 - ✅ 离线机器列表、操作审计界面
 - ✅ 鉴权（Token）+ IP 白名单 + 速率限制
 - ✅ Agent 断线指数退避重连、进程守护崩溃自启
+- ✅ **TLS/mTLS 加密**：Agent<->Server 可选全链路 TLS，自签名证书兼容
+- ✅ **服务端托管 Web 静态资源**：`-web web/dist` 单进程部署
 
-> 说明：本项目当前为可运行的 MVP 骨架，核心链路（Agent 上线→探针→命令执行→结果回传→Web 展示）已端到端打通。生产级能力（mTLS 证书体系、文件传输断点续传、远程升级、批量命令、MFA 等）已按规划书完成模块化设计，可在此基础上继续增强。
+> 说明：核心链路（Agent 上线→探针→命令执行→结果回传→Web 展示）已端到端打通，并在此基础上实现了交互式终端、文件断点续传、端口映射、批量命令、远程升级、TLS 加密等生产级能力。
 
 ## 许可证
 

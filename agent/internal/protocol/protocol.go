@@ -14,6 +14,8 @@ const (
 	TypeInteractiveIn  = "InteractiveInputReq"
 	TypeInteractiveOut = "InteractiveOutput"
 	TypeOnline         = "AgentOnline"
+	TypeUpgradeReq     = "UpgradeReq"
+	TypeUpgradeResp    = "UpgradeResp"
 )
 
 // Envelope 通用消息信封。
@@ -86,6 +88,10 @@ type ProbeDataResp struct {
 }
 
 // FileUploadReq Agent -> Server
+const (
+	DefaultChunkSize = 64 * 1024 // 默认分片 64KB
+)
+
 type FileUploadReq struct {
 	AgentID   string `json:"agent_id"`
 	FilePath  string `json:"file_path"`
@@ -120,4 +126,21 @@ type InteractiveOutput struct {
 	Data      string `json:"data"`
 	Type      string `json:"type"`
 	ExitCode  int    `json:"exit_code"`
+}
+
+// UpgradeReq Server -> Agent
+type UpgradeReq struct {
+	UpgradeID string `json:"upgrade_id"`
+	Version   string `json:"version"`
+	URL       string `json:"url"`
+	MD5       string `json:"md5"`
+	Force     bool   `json:"force"`
+}
+
+// UpgradeResp Agent -> Server
+type UpgradeResp struct {
+	UpgradeID string `json:"upgrade_id"`
+	OK        bool   `json:"ok"`
+	Message   string `json:"message"`
+	Version   string `json:"version"`
 }

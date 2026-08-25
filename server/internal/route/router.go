@@ -83,6 +83,25 @@ func (r *Router) Dispatch(req *protocol.CommandReq, operator, operatorIP string)
 	return true, ""
 }
 
+// BatchResult 批量命令单台结果。
+type BatchResult struct {
+	AgentID string `json:"agent_id"`
+	OK      bool   `json:"ok"`
+	Msg     string `json:"msg"`
+}
+
+// DispatchBatch 将同一命令批量下发到多台在线 Agent。
+func (r *Router) DispatchBatch(req *protocol.CommandReq, agentIDs []string, operator, operatorIP string) []*BatchResult {
+	results := make([]*BatchResult, 0, len(agentIDs))
+	for _, id := range agentIDs {
+		clone := *req
+		clone.AgentID = id
+		ok, msg := r.Dispatch(&clone, operator, operatorIP)
+		results = append(results, &BatchResult{AgentID: id, OK: ok, Msg: msg})
+	}
+	return results
+}
+
 // Audit 记录审计日志。
 func (r *Router) Audit(l *AuditLog) {
 	r.auditMu.Lock()
