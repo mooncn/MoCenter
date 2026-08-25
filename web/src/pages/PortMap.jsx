@@ -2,40 +2,72 @@ import React, { useState, useEffect } from 'react'
 import { Api } from '../api/api.js'
 
 // 端口映射管理界面：配置/查看/管理内网主机端口映射规则
+// 通过服务端 REST API 持久化管理规则，公网端口由服务端反向代理转发到内网
 export default function PortMap({ agents }) {
-  const [rules, setRules] = useState([
-    // MVP 演示数据；实际由服务端持久化并通过 API 返回
-  ])
+  const [rules, setRules] = useState([])
   const [agent, setAgent] = useState('')
   const [pubPort, setPubPort] = useState('')
   const [localPort, setLocalPort] = useState('')
   const [sourceIp, setSourceIp] = useState('')
   const [notice, setNotice] = useState('')
+  const [loading, setLoading] = useState(true)
 
-  const addRule = (e) => {
+  // 加载服务端已持久化的映射规则
+  const loadRules = () => {
+    Api.portmapRules()
+      .then((data) => setRules(Array.isArray(data) ? data : []))
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }
+
+  useEffect(() => {
+    loadRules()
+  }, [])
+
+  const addRule = async (e) => {
     e.preventDefault()
+    setNotice('')
     if (!agent || !pubPort || !localPort) {
       setNotice('请填写目标主机、公网端口与本地端口')
       return
     }
-    setRules([...rules, {
-      id: 'rule-' + Date.now(),
-      agent_id: agent,
-      public_port: Number(pubPort),
-      local_port: Number(localPort),
-      source_ip: sourceIp,
-      enabled: true,
-      created_at: Math.floor(Date.now() / 1000),
-    }])
-    setNotice('映射规则已添加（演示模式，未持久化）')
+    const p = Number(pubPort)
+    const l = Number(localPort)
+    if (p < 1 || p > 65535 || l < 1 || l > 65535) {
+      setNotice('端口范围应为 1-65535')
+      return
+    }
+    try {
+      await Api.portmapOp({
+        action: 'create',
+        agent_id: agent,
+        public_port: p,
+        local_port: l,
+        source_ip: sourceIp || '',
+      })
+      setNotice(`映射规则已创建：公网 :${p} -> ${agent}:${l}`)
+      setPubPort('')
+      setLocalPort('')
+      setSourceIp('')
+      loadRules()
+    } catch (ex) {
+      setNotice('创建失败：' + (ex.response?.data?.msg || ex.message))
+    }
   }
 
-  const toggleRule = (id) => {
-    setRules(rules.map((r) => r.id === id ? { ...r, enabled: !r.enabled } : r))
+  const toggleRule = async (r) => {
+    await Api.portmapOp({
+      action: r.enabled ? 'disable' : 'enable',
+      agent_id: r.agent_id,
+      public_port: r.public_port,
+      local_port: r.local_port,
+    })
+    loadRules()
   }
 
-  const removeRule = (id) => {
-    setRules(rules.filter((r) => r.id !== id))
+  const removeRule = async (r) => {
+    await Api.portmapOp({ action: 'delete', public_port: r.public_port })
+    loadRules()
   }
 
   return (
@@ -75,7 +107,7 @@ export default function PortMap({ agents }) {
           </div>
           <button type="submit">添加规则</button>
         </form>
-        {notice && <div className="notice ok" style={{ marginTop: 12 }}>{notice}</div>}
+        {notice && <div className={`notice ${notice.includes('失败') ? 'err' : 'ok'}`} style={{ marginTop: 12 }}>{notice}</div>}
       </div>
 
       <div className="card">
@@ -94,26 +126,26 @@ export default function PortMap({ agents }) {
           </thead>
           <tbody>
             {rules.map((r) => (
-              <tr key={r.id}>
-                <td>{r.id}</td>
+              <tr key={r.public_port || r.id}>
+                <td>{r.id || `rule-${r.public_port}`}</td>
                 <td>{r.agent_id}</td>
                 <td>{r.public_port}</td>
                 <td>{r.local_port}</td>
-                <td>{r.source_ip || '不限'}</td>
+                <td>{r.source_ip_whitelist || r.source_ip || '不限'}</td>
                 <td>
                   <span className={`badge ${r.enabled ? 'online' : 'offline'}`}>
                     {r.enabled ? '已启用' : '已禁用'}
                   </span>
                 </td>
                 <td>
-                  <button className="secondary" onClick={() => toggleRule(r.id)} style={{ marginRight: 8 }}>
+                  <button className="secondary" onClick={() => toggleRule(r)} style={{ marginRight: 8 }}>
                     {r.enabled ? '禁用' : '启用'}
                   </button>
-                  <button className="secondary" onClick={() => removeRule(r.id)}>删除</button>
+                  <button className="secondary" onClick={() => removeRule(r)}>删除</button>
                 </td>
               </tr>
             ))}
-            {rules.length === 0 && (
+            {!loading && rules.length === 0 && (
               <tr><td colSpan="7" style={{ textAlign: 'center', color: '#8b98a5' }}>暂无映射规则</td></tr>
             )}
           </tbody>

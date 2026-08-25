@@ -1,11 +1,28 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
+import { Api } from '../api/api.js'
 
-// 主机探针信息面板：展示各主机 CPU/内存/磁盘/流量等实时状态
+// 主机探针信息面板：展示各主机 CPU/内存/磁盘/流量等实时状态与历史趋势
 export default function Dashboard({ agents }) {
   const [since, setSince] = useState('24h')
+  const [selectedAgent, setSelectedAgent] = useState('')
+  const [history, setHistory] = useState(null)
 
   const online = agents.filter((a) => a.online).length
   const offline = agents.filter((a) => !a.online).length
+
+  const sinceMap = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800 }
+
+  // 加载选中主机的历史探针趋势
+  useEffect(() => {
+    if (!selectedAgent) {
+      setHistory(null)
+      return
+    }
+    const sinceTs = new Date(Date.now() - sinceMap[since] * 1000).toISOString()
+    Api.history(selectedAgent, sinceTs)
+      .then((data) => setHistory(data))
+      .catch(() => setHistory([]))
+  }, [selectedAgent, since])
 
   return (
     <div>
@@ -61,6 +78,7 @@ export default function Dashboard({ agents }) {
               <th>磁盘</th>
               <th>网络 ↓ / ↑</th>
               <th>最后在线</th>
+              <th>趋势</th>
             </tr>
           </thead>
           <tbody>
@@ -82,15 +100,78 @@ export default function Dashboard({ agents }) {
                 <td><Bar v={a.disk_usage} /></td>
                 <td>{fmtBytes(a.net_in_bytes)} / {fmtBytes(a.net_out_bytes)}</td>
                 <td>{a.online ? fmtTime(a.last_seen) : `离线 ${fmtOffline(a)}`}</td>
+                <td>
+                  <button className="secondary" onClick={() => setSelectedAgent(selectedAgent === a.agent_id ? '' : a.agent_id)}>
+                    {selectedAgent === a.agent_id ? '收起' : '查看'}
+                  </button>
+                </td>
               </tr>
             ))}
             {agents.length === 0 && (
-              <tr><td colSpan="9" style={{ textAlign: 'center', color: '#8b98a5' }}>暂无主机接入</td></tr>
+              <tr><td colSpan="10" style={{ textAlign: 'center', color: '#8b98a5' }}>暂无主机接入</td></tr>
             )}
           </tbody>
         </table>
       </div>
+
+      {/* 历史趋势图 */}
+      {selectedAgent && (
+        <div className="card" style={{ marginTop: 20 }}>
+          <h3>探针历史趋势 · {agents.find((a) => a.agent_id === selectedAgent)?.hostname}</h3>
+          <TrendChart history={history || []} />
+        </div>
+      )}
     </div>
+  )
+}
+
+// 轻量 SVG 趋势折线图（无外部依赖）
+function TrendChart({ history }) {
+  const W = 900, H = 240, PAD = 30
+  if (!history || history.length === 0) {
+    return <div style={{ color: '#8b98a5', textAlign: 'center', padding: 30 }}>该时间段暂无历史采样数据</div>
+  }
+
+  const series = history.slice(-200) // 最多展示 200 个点
+  const draw = (key, color) => {
+    const vals = series.map((p) => p[key] || 0)
+    const max = Math.max(100, ...vals)
+    const pts = vals.map((v, i) => {
+      const x = PAD + (i / (series.length - 1)) * (W - PAD * 2)
+      const y = H - PAD - (v / max) * (H - PAD * 2)
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    }).join(' ')
+    const last = vals[vals.length - 1]
+    return (
+      <g key={key}>
+        <polyline points={pts} fill="none" stroke={color} strokeWidth="2" />
+        <text x={W - PAD - 8} y={H - PAD - (last / max) * (H - PAD * 2) + 4} fill={color} fontSize="11" textAnchor="end">{Math.round(last)}%</text>
+      </g>
+    )
+  }
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto' }}>
+      {/* 网格线 */}
+      {[0, 25, 50, 75, 100].map((g) => {
+        const y = H - PAD - (g / 100) * (H - PAD * 2)
+        return <g key={g}>
+          <line x1={PAD} y1={y} x2={W - PAD} y2={y} stroke="#2a3340" strokeDasharray="4 4" />
+          <text x={PAD - 6} y={y + 4} fill="#8b98a5" fontSize="10" textAnchor="end">{g}%</text>
+        </g>
+      })}
+      {draw('cpu_usage', '#4da3ff')}
+      {draw('mem_usage', '#52c41a')}
+      {draw('disk_usage', '#fa8c16')}
+      <g>
+        <rect x={PAD} y={4} width={10} height={10} fill="#4da3ff" />
+        <text x={PAD + 14} y={13} fill="#8b98a5" fontSize="11">CPU</text>
+        <rect x={PAD + 60} y={4} width={10} height={10} fill="#52c41a" />
+        <text x={PAD + 74} y={13} fill="#8b98a5" fontSize="11">内存</text>
+        <rect x={PAD + 120} y={4} width={10} height={10} fill="#fa8c16" />
+        <text x={PAD + 134} y={13} fill="#8b98a5" fontSize="11">磁盘</text>
+      </g>
+    </svg>
   )
 }
 

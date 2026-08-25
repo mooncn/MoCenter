@@ -23,6 +23,8 @@ func main() {
 	hb := flag.Int("hb", 30, "心跳间隔(秒)")
 	probe := flag.Int("probe", 10, "探针采集周期(秒)")
 	daemonize := flag.Bool("daemon", false, "以守护进程方式运行（后台运行并崩溃自启）")
+	tlsEnabled := flag.Bool("tls", false, "启用 TLS 加密连接")
+	insecure := flag.Bool("insecure", false, "跳过 TLS 证书校验（自签名测试）")
 	flag.Parse()
 
 	if *server == "" {
@@ -37,20 +39,22 @@ func main() {
 	// 进程守护：崩溃自动重启
 	if *daemonize {
 		daemon.Supervise(func() {
-			runClient(*server, *agentID, *hb, *probe)
+			runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure)
 		})
 		return
 	}
 
-	runClient(*server, *agentID, *hb, *probe)
+	runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure)
 }
 
-func runClient(server, agentID string, hb, probe int) {
+func runClient(server, agentID string, hb, probe int, tlsEnabled, insecure bool) {
 	c := client.New(client.Config{
 		ServerAddr: server,
 		AgentID:    agentID,
 		Heartbeat:  seconds(hb),
 		ProbeEvery: seconds(probe),
+		TLS:        tlsEnabled,
+		Insecure:   insecure,
 	})
 	log.Printf("[agent] 启动 Agent %s，目标服务端 %s", agentID, server)
 	c.Run()

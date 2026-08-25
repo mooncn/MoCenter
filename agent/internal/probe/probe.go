@@ -140,7 +140,7 @@ func memUsage() float64 {
 }
 
 func diskUsage() float64 {
-	return diskUsageProc()
+	return diskUsageImpl()
 }
 
 // cpuTimes 结构用于存储 /proc/stat 数值
@@ -215,8 +215,4 @@ func windowsCPU() float64 {
 		}
 	}
 	return 0
-}
-
-func diskUsageProc() float64 {
-	return 0 // 简化：跨平台磁盘使用率在 agent 启动时通过 du 命令探测
 }

@@ -111,9 +111,4 @@ func Execute(req *protocol.CommandReq) *Result {
 	return res
 }
 
-// ExecuteInteractive 启动交互式命令（简化实现：非 PTY 场景退化为非交互执行）。
-// 完整 PTY 交互涉及 ioctl/winsize，在 main 中通过 stdin/stdout 管道桥接。
-func ExecuteInteractive(req *protocol.CommandReq, onOutput func(*protocol.InteractiveOutput)) *Result {
-	// MVP：交互式命令暂按普通命令执行，实时输出通过管道回传
-	return Execute(req)
-}
+
