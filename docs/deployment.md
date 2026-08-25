@@ -22,13 +22,14 @@ docker run -d -p 9000:9000 -p 8080:8080 \
   mocenter-server
 ```
 
-### 方式二：物理机直接部署
+### 方式二：物理机直接部署（单进程托管 Web）
 
 ```bash
-# 1. 准备公网服务器，编译服务端二进制
-cd server && bash build.sh
-# 2. 启动（配置端口与防火墙规则）
-./mocenter-server -listen :9000 -http :8080 -apikey your-secret-key
+# 1. 构建前端并交由服务端托管
+cd web && bash build.sh   # 生成 dist/
+cd ../server && bash build.sh
+# 2. 启动（同时托管 Web 静态资源，单进程部署）
+./mocenter-server -listen :9000 -http :8080 -apikey your-secret-key -web ../web/dist
 ```
 
 ## 三、Agent 部署
@@ -110,16 +111,44 @@ server {
 
 1. **修改 API Key**：服务端启动时通过 `-apikey` 设置强随机密钥，Web 登录时使用该 Key。
 2. **IP 白名单**：通过 `-whitelist 1.2.3.4,10.0.0.0/8` 限制可访问服务端的源 IP。
-3. **TLS/mTLS**：生产环境为 Agent<->Server 配置全链路 TLS 1.2+ 与 mTLS 双向认证；Web 端启用 WSS。证书采用自签名 CA 体系，最长有效期 90 天，到期前自动续期。
+3. **TLS/mTLS**：Agent<->Server 支持全链路 TLS 加密。生成自签名证书：
+
+   ```bash
+   bash scripts/gen-cert.sh certs
+   # 服务端
+   ./mocenter-server -listen :9000 -http :8080 -apikey xxx -tls-cert certs/server.crt -tls-key certs/server.key
+   # Agent
+   ./mocenter-agent -server host:9000 -agentid host-01 -tls -insecure
+   ```
+
+   生产环境建议使用受信任 CA 签发的证书，并将 Agent 端的 `-insecure` 替换为 CA 校验，实现 mTLS 双向认证。Web 端启用 HTTPS/WSS。
+
 4. **命令黑名单**：高危命令（`rm -rf /`、`mkfs`、`sudo` 等）由服务端拦截并记录审计。
 
-## 六、备份与恢复
+## 六、高级运维能力
+
+### 1. 交互式 PTY 终端
+Web「远程终端」页面选择在线主机并执行交互式命令（如 `bash`、`top`、`vim`），支持实时双向 IO、终端尺寸自适应、Ctrl-C 中断。
+
+### 2. 批量命令
+Web「运维操作」页面勾选多台在线主机，批量下发同一命令；服务端逐一审计留痕。REST 接口：`POST /api/command/batch`。
+
+### 3. 远程升级 Agent
+Web「运维操作」页面填写升级包 URL 与 MD5 校验和，下发升级指令。Agent 依次执行：下载升级包 → MD5 校验 → 备份旧版本 → 替换二进制 → 自动重启；失败自动回滚。REST 接口：`POST /api/upgrade`。
+
+### 4. 端口映射
+Web「端口映射」页面创建规则（公网端口 → 内网服务端口），服务端反向代理实时转发到目标 Agent，支持源 IP 白名单、连接跟踪与流量统计。REST 接口：`GET/POST /api/portmap/rules`、`POST /api/portmap/op`。
+
+### 5. 文件传输
+支持 Agent 文件上传/下载，分片传输 + MD5 校验 + ACK/NACK + 断点续传，接收目录默认为服务端 `/tmp/mocenter_uploads`。
+
+## 七、备份与恢复
 
 - **审计日志**：默认保留 180 天，建议定期导出归档（`/api/audits`）。
 - **探针趋势**：服务端聚合存储默认 90 天。
 - **配置备份**：备份服务端启动参数、证书文件、映射规则配置。
 
-## 七、常见故障处理
+## 八、常见故障处理
 
 | 现象 | 排查方法 |
 |------|----------|
@@ -129,6 +158,6 @@ server {
 | Web 连接断开 | 确认 Token 有效、WebSocket 代理配置正确（Upgrade 头） |
 | 端口映射不通 | 确认映射规则已启用、Agent 在线、目标内网服务可达 |
 
-## 八、远程升级 Agent
+## 九、远程升级 Agent
 
 服务端发布新版本 → Agent 检测到新版本 → 下载升级包 → 校验签名 → 停止旧进程 → 替换二进制 → 重启新进程 → 上报版本信息。支持差分升级、失败自动回滚、灰度升级（规划书 12.4）。

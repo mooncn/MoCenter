@@ -29,11 +29,24 @@ type Track struct {
 	Status        string    `json:"status"` // Active/Closed/Timeout
 }
 
+// Rule 一条端口映射规则。
+type Rule struct {
+	ID         string `json:"id"`
+	PublicPort int    `json:"public_port"`
+	AgentID    string `json:"agent_id"`
+	LocalHost  string `json:"local_host"`
+	LocalPort  int    `json:"local_port"`
+	Enabled    bool   `json:"enabled"`
+	SourceIP   string `json:"source_ip_whitelist"`
+	CreatedAt  int64  `json:"created_at"`
+}
+
 // Manager 端口映射管理器，负责连接跟踪与转发。
 type Manager struct {
 	mu          sync.RWMutex
 	tracks      map[string]*Track            // key: public port(string)
 	byAgent     map[string]map[string]*Track // 二级索引：agentID -> publicPort -> track
+	rules       map[int]*Rule                // 规则：publicPort -> Rule
 	listeners   map[int]net.Listener
 	sessions    *session.Manager
 	agentForPort func(int) string // 由 Server 注入：根据公网端口找到目标 AgentID
@@ -45,6 +58,7 @@ func NewManager(sess *session.Manager) *Manager {
 	m := &Manager{
 		tracks:    make(map[string]*Track),
 		byAgent:   make(map[string]map[string]*Track),
+		rules:     make(map[int]*Rule),
 		listeners: make(map[int]net.Listener),
 		sessions:  sess,
 		idleTimeout: 300 * time.Second,
@@ -126,11 +140,50 @@ func (m *Manager) Tracks() []*Track {
 	return out
 }
 
-// ServeRule 为一条映射规则启动公网监听端口，将入站连接转发至目标 Agent。
-func (m *Manager) ServeRule(publicPort int, agentID string) error {
-	if m.agentForPort == nil {
-		return fmt.Errorf("agent resolver not set")
+// Rules 返回全部映射规则。
+func (m *Manager) Rules() []*Rule {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Rule, 0, len(m.rules))
+	for _, r := range m.rules {
+		out = append(out, r)
 	}
+	return out
+}
+
+// GetRule 返回指定公网端口规则。
+func (m *Manager) GetRule(publicPort int) *Rule {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.rules[publicPort]
+}
+
+// CreateRule 创建并启动一条端口映射规则。
+func (m *Manager) CreateRule(r *Rule) error {
+	if r.PublicPort <= 0 || r.LocalPort <= 0 {
+		return fmt.Errorf("invalid public/local port")
+	}
+	if r.LocalHost == "" {
+		r.LocalHost = "127.0.0.1"
+	}
+	r.Enabled = true
+	m.mu.Lock()
+	m.rules[r.PublicPort] = r
+	m.mu.Unlock()
+	return m.ServeRule(r)
+}
+
+// DeleteRule 删除规则并停止监听。
+func (m *Manager) DeleteRule(publicPort int) {
+	m.StopRule(publicPort)
+	m.mu.Lock()
+	delete(m.rules, publicPort)
+	m.mu.Unlock()
+}
+
+// ServeRule 为一条映射规则启动公网监听端口，将入站连接转发至目标 Agent。
+func (m *Manager) ServeRule(r *Rule) error {
+	publicPort := r.PublicPort
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", publicPort))
 	if err != nil {
 		return err
@@ -145,7 +198,7 @@ func (m *Manager) ServeRule(publicPort int, agentID string) error {
 			if err != nil {
 				return
 			}
-			go m.handleConnection(clientConn, publicPort, agentID)
+			go m.handleConnection(clientConn, publicPort, r)
 		}
 	}()
 	return nil
@@ -162,16 +215,16 @@ func (m *Manager) StopRule(publicPort int) {
 }
 
 // handleConnection 转发一条公网入站连接到目标 Agent 的映射端口。
-func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, agentID string) {
+func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, r *Rule) {
 	defer clientConn.Close()
 	defer m.CloseTrack(publicPort)
 
-	// 目标 Agent 需在线，并通过其连接发起端口映射隧道（此处简化为直接转发到本地端口）。
-	// 实际项目中，此处应通过 Agent 长连接建立隧道通道；这里使用 Agent 映射的本机端口。
-	localHost := "127.0.0.1"
-	// 从 agentForPort 无法拿到本地端口，故端口映射规则中的 local 信息由 Server 维护。
-	localPort := m.localPortFor(agentID)
-	if localPort == 0 {
+	localHost := r.LocalHost
+	if localHost == "" {
+		localHost = "127.0.0.1"
+	}
+	localPort := r.LocalPort
+	if localPort <= 0 {
 		return
 	}
 	upstream, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", localHost, localPort), 5*time.Second)
@@ -183,7 +236,7 @@ func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, agentID 
 
 	t := &Track{
 		PublicPort:   publicPort,
-		AgentID:      agentID,
+		AgentID:      r.AgentID,
 		CreatedAt:    time.Now(),
 		LastActiveAt: time.Now(),
 		Status:       "Active",
@@ -203,10 +256,4 @@ func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, agentID 
 		done <- struct{}{}
 	}()
 	<-done
-}
-
-// localPortFor 为简化的默认本地端口；实际由端口映射规则提供。
-func (m *Manager) localPortFor(agentID string) int {
-	_ = agentID
-	return 0
 }

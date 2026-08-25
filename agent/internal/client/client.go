@@ -3,16 +3,20 @@ package client
 
 import (
 	"bufio"
+	"crypto/md5"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
 	"mocenter/agent/internal/command"
 	"mocenter/agent/internal/probe"
 	"mocenter/agent/internal/protocol"
+	"mocenter/agent/internal/upgrade"
 )
 
 // Config Agent 配置。
@@ -21,6 +25,8 @@ type Config struct {
 	AgentID    string
 	Heartbeat  time.Duration // 默认 30s
 	ProbeEvery time.Duration // 探针采集周期，默认 10s
+	TLS        bool          // 是否启用 TLS 加密连接
+	Insecure   bool          // 是否跳过证书校验（自签名测试）
 }
 
 // Client Agent 客户端。
@@ -32,14 +38,8 @@ type Client struct {
 	sc      *bufio.Scanner
 	mu      sync.Mutex
 	hb      time.Duration
-	// 交互会话映射 commandID -> writer
-	interactive map[string]*interactiveSession
-}
-
-type interactiveSession struct {
-	cmdID  string
-	input  chan string
-	cancel chan struct{}
+	// 交互会话映射 commandID -> session
+	interactive map[string]*command.InteractiveSession
 }
 
 // New 创建 Agent 客户端。
@@ -54,7 +54,7 @@ func New(cfg Config) *Client {
 		cfg:         cfg,
 		collect:     probe.NewCollector(cfg.AgentID),
 		hb:          cfg.Heartbeat,
-		interactive: make(map[string]*interactiveSession),
+		interactive: make(map[string]*command.InteractiveSession),
 	}
 	return c
 }
@@ -78,7 +78,14 @@ func (c *Client) Run() {
 
 // connectAndServe 建立连接并进入消息循环，返回时连接已断开。
 func (c *Client) connectAndServe() error {
-	conn, err := net.Dial("tcp", c.cfg.ServerAddr)
+	var conn net.Conn
+	var err error
+	if c.cfg.TLS {
+		tlsCfg := &tls.Config{InsecureSkipVerify: c.cfg.Insecure}
+		conn, err = tls.Dial("tcp", c.cfg.ServerAddr, tlsCfg)
+	} else {
+		conn, err = net.Dial("tcp", c.cfg.ServerAddr)
+	}
 	if err != nil {
 		return err
 	}
@@ -196,29 +203,78 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 			return
 		}
 		if s, ok := c.interactive[inp.CommandID]; ok {
-			select {
-			case s.input <- inp.InputData:
-			case <-s.cancel:
+			if inp.Control != "" {
+				_ = s.SendControl(inp.Control)
+			}
+			if inp.Rows > 0 && inp.Cols > 0 {
+				_ = s.Resize(inp.Rows, inp.Cols)
+			}
+			if inp.InputData != "" {
+				_ = s.Write([]byte(inp.InputData))
 			}
 		}
 	case protocol.TypeFileDownloadReq:
-		// MVP：文件下载暂按提示处理
+		// 文件下载：将文件分片回传给服务端
 		var fd protocol.FileDownloadReq
-		_ = json.Unmarshal(env.Data, &fd)
+		if json.Unmarshal(env.Data, &fd) == nil && fd.FilePath != "" {
+			c.sendFileChunks(fd)
+		}
+	case protocol.TypeUpgradeReq:
+		var up protocol.UpgradeReq
+		if json.Unmarshal(env.Data, &up) != nil {
+			return
+		}
+		go upgrade.Perform(&up, func(resp *protocol.UpgradeResp) {
+			_ = c.write(protocol.TypeUpgradeResp, resp)
+		})
 	}
 }
 
-// runCommand 执行命令并回传结果。
+// sendFileChunks 将本地文件分片回传给服务端（文件下载）。
+func (c *Client) sendFileChunks(req protocol.FileDownloadReq) {
+	log.Printf("[agent] 收到文件下载请求: %s", req.FilePath)
+	f, err := os.Open(req.FilePath)
+	if err != nil {
+		// 上报失败
+		_ = c.write(protocol.TypeFileUploadReq, protocol.FileUploadReq{
+			AgentID: c.cfg.AgentID, FilePath: req.FilePath, FileSize: -1,
+		})
+		return
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return
+	}
+	size := st.Size()
+	buf := make([]byte, protocol.DefaultChunkSize)
+	seq := 0
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			md5 := md5Chunk(buf[:n])
+			_ = c.write(protocol.TypeFileUploadReq, protocol.FileUploadReq{
+				AgentID: c.cfg.AgentID, FilePath: req.FilePath, FileSize: size,
+				ChunkSeq: seq, ChunkData: append([]byte(nil), buf[:n]...), ChunkMD5: md5,
+			})
+			seq++
+		}
+		if rerr != nil {
+			break
+		}
+	}
+}
+
+// md5Chunk 计算分片 MD5 校验和。
+func md5Chunk(data []byte) string {
+	h := md5.Sum(data)
+	return fmt.Sprintf("%x", h)
+}
+
 func (c *Client) runCommand(req protocol.CommandReq) {
 	if req.Interactive {
-		// 启动交互会话
-		sess := &interactiveSession{cmdID: req.CommandID, input: make(chan string, 128), cancel: make(chan struct{})}
-		c.interactive[req.CommandID] = sess
-		defer func() {
-			delete(c.interactive, req.CommandID)
-			close(sess.cancel)
-		}()
-		go c.interactiveReadLoop(sess, req.CommandID)
+		c.runInteractive(req)
+		return
 	}
 
 	res := command.Execute(&req)
@@ -232,16 +288,25 @@ func (c *Client) runCommand(req protocol.CommandReq) {
 	})
 }
 
-// interactiveReadLoop 交互模式下读取 stdin 输入。
-func (c *Client) interactiveReadLoop(sess *interactiveSession, cmdID string) {
-	for {
-		select {
-		case <-sess.cancel:
-			return
-		case data := <-sess.input:
-			_ = c.write(protocol.TypeInteractiveOut, protocol.InteractiveOutput{
-				CommandID: cmdID, Data: data, Type: "input",
-			})
-		}
+// runInteractive 启动真实 PTY 交互会话。
+func (c *Client) runInteractive(req protocol.CommandReq) {
+	sess, err := command.StartInteractive(&req, func(out *protocol.InteractiveOutput) {
+		_ = c.write(protocol.TypeInteractiveOut, out)
+	})
+	if err != nil {
+		_ = c.write(protocol.TypeInteractiveOut, &protocol.InteractiveOutput{
+			CommandID: req.CommandID, Type: "exit", ExitCode: -1, Data: "启动交互终端失败: " + err.Error(),
+		})
+		return
 	}
+	c.mu.Lock()
+	c.interactive[req.CommandID] = sess
+	c.mu.Unlock()
+
+	// 等待进程结束，清理会话
+	<-sess.Done()
+	c.mu.Lock()
+	delete(c.interactive, req.CommandID)
+	c.mu.Unlock()
+	sess.Close()
 }

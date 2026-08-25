@@ -12,6 +12,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,11 +20,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"mocenter/server/internal/auth"
+	"mocenter/server/internal/filetransfer"
 	"mocenter/server/internal/portmap"
 	"mocenter/server/internal/probe"
 	"mocenter/server/internal/protocol"
@@ -37,6 +39,10 @@ func main() {
 	httpAddr := flag.String("http", ":8080", "REST API / WebSocket 监听地址")
 	apiKey := flag.String("apikey", os.Getenv("MOCENTER_API_KEY"), "全局 API Key")
 	whitelist := flag.String("whitelist", os.Getenv("MOCENTER_WHITELIST"), "IP 白名单，逗号分隔")
+	webDir := flag.String("web", os.Getenv("MOCENTER_WEB_DIR"), "Web 静态资源目录，留空则不托管前端")
+	tlsCert := flag.String("tls-cert", "", "Agent TCP 连接 TLS 证书文件路径")
+	tlsKey := flag.String("tls-key", "", "Agent TCP 连接 TLS 私钥文件路径")
+	insecure := flag.Bool("insecure", false, "允许非 TLS 的 Agent 连接（未提供证书时自动启用）")
 	flag.Parse()
 
 	if *apiKey == "" {
@@ -55,12 +61,13 @@ func main() {
 	authz := auth.NewAuth(*apiKey, wl)
 	router := route.NewRouter(sess)
 	pm := portmap.NewManager(sess)
+	ft := filetransfer.NewManager("/tmp/mocenter_uploads")
 
 	hub := ws.NewHub()
 
 	// WebSocket 收到 Web 消息后的统一处理入口
 	hub.SetMessageHandler(func(data []byte) {
-		handleWebMessage(data, sess, store, router, hub)
+		handleWebMessage(data, sess, store, router, hub, ft, pm)
 	})
 
 	// 服务端启动后台任务
@@ -75,10 +82,20 @@ func main() {
 	mux.HandleFunc("/api/agents", agentsHandler(store, authz))
 	mux.HandleFunc("/api/agents/history", historyHandler(store, authz))
 	mux.HandleFunc("/api/command", commandHandler(router, authz))
+	mux.HandleFunc("/api/command/batch", batchCommandHandler(router, authz))
 	mux.HandleFunc("/api/audits", auditsHandler(router, authz))
+	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
+	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz))
+	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
+
+	// 可选：托管 Web 前端静态资源（SPA 回退到 index.html）
+	if *webDir != "" {
+		serveSPA(mux, *webDir)
+		log.Printf("[server] 托管 Web 静态资源: %s", *webDir)
+	}
 
 	go func() {
 		log.Printf("[server] REST API 监听 %s", *httpAddr)
@@ -86,25 +103,40 @@ func main() {
 			log.Fatalf("[server] http error: %v", err)
 		}
 	}()
-
-	// 启动 Agent TCP 服务
 	log.Printf("[server] Agent TCP 监听 %s (apikey=%s)", *addr, auth.HashToken(*apiKey))
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("[server] listen error: %v", err)
 	}
+
+	// 若提供证书则启用 TLS（全链路加密）
+	var tlsLn net.Listener
+	if *tlsCert != "" && *tlsKey != "" {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			log.Fatalf("[server] 加载 TLS 证书失败: %v", err)
+		}
+		tlsLn = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+		log.Printf("[server] Agent TCP 已启用 TLS 加密")
+	} else {
+		tlsLn = ln
+		if !*insecure {
+			log.Printf("[server] 警告: 未提供 TLS 证书，Agent 连接为明文传输；生产环境请配置证书")
+		}
+	}
+
 	for {
-		conn, err := ln.Accept()
+		conn, err := tlsLn.Accept()
 		if err != nil {
 			log.Printf("[server] accept error: %v", err)
 			continue
 		}
-		go handleAgentConn(conn, sess, store, hub, router)
+		go handleAgentConn(conn, sess, store, hub, router, ft)
 	}
 }
 
 // handleAgentConn 处理单个 Agent 的 TCP 长连接。
-func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router) {
+func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -193,8 +225,20 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		case protocol.TypeFileUploadReq:
 			var fu protocol.FileUploadReq
 			_ = json.Unmarshal(env.Data, &fu)
-			// 分片保存/合并（MVP 中先落盘）
-			saveUploadChunk(&fu)
+			// 分片接收：MD5 校验 + 断点续传 + ACK/NACK
+			ack := ft.HandleUploadChunk(&fu)
+			_ = sessConn.Write(protocol.TypeFileAck, ack)
+			// 推送状态给 Web
+			hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+				AgentID: fu.AgentID, FilePath: fu.FilePath, Action: "upload",
+				TotalBytes: fu.FileSize, DoneBytes: int64(fu.ChunkSeq+1) * int64(len(fu.ChunkData)),
+				ChunkSeq: fu.ChunkSeq, Status: "transferring",
+			})
+		case protocol.TypeUpgradeResp:
+			var ur protocol.UpgradeResp
+			_ = json.Unmarshal(env.Data, &ur)
+			hub.Broadcast(protocol.TypeUpgradeResp, ur)
+			log.Printf("[server] Agent %s 升级结果: %v %s", sessConn.AgentID, ur.OK, ur.Message)
 		}
 	}
 
@@ -230,19 +274,6 @@ func cleanupSweeper(pm *portmap.Manager, hub *ws.Hub) {
 			hub.Broadcast(protocol.TypePortMapState, pm.Tracks())
 		}
 	}
-}
-
-// saveUploadChunk 保存文件上传分片（MVP：合并到 /tmp/mocenter_uploads）。
-func saveUploadChunk(fu *protocol.FileUploadReq) {
-	dir := "/tmp/mocenter_uploads"
-	_ = os.MkdirAll(dir, 0755)
-	path := fmt.Sprintf("%s/%s", dir, strings.ReplaceAll(fu.FilePath, "/", "_"))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.Write(fu.ChunkData)
 }
 
 // --- REST 处理器 ---
@@ -291,12 +322,124 @@ func commandHandler(router *route.Router, authz *auth.Auth) http.HandlerFunc {
 	}
 }
 
+func batchCommandHandler(router *route.Router, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			AgentIDs  []string            `json:"agent_ids"`
+			CommandID string              `json:"command_id"`
+			Command   string              `json:"command"`
+			ShellType string              `json:"shell_type"`
+			Timeout   int                 `json:"timeout"`
+			Env       map[string]string   `json:"env"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if len(body.AgentIDs) == 0 {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+			return
+		}
+		req := &protocol.CommandReq{
+			CommandID: body.CommandID,
+			Command:   body.Command,
+			ShellType: body.ShellType,
+			Timeout:   body.Timeout,
+			Env:       body.Env,
+		}
+		if req.CommandID == "" {
+			req.CommandID = fmt.Sprintf("batch-%d", time.Now().UnixNano())
+		}
+		results := router.DispatchBatch(req, body.AgentIDs, "web-admin", r.RemoteAddr)
+		writeJSON(w, map[string]interface{}{"ok": true, "results": results})
+	}
+}
+
 func auditsHandler(router *route.Router, authz *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
 		}
 		writeJSON(w, router.Audits())
+	}
+}
+
+func portmapRulesHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		writeJSON(w, pm.Rules())
+	}
+}
+
+func portmapOpHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var op protocol.PortMapOp
+		if err := json.NewDecoder(r.Body).Decode(&op); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		handlePortMapOp(pm, nil, &op)
+		writeJSON(w, pm.Rules())
+	}
+}
+
+func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			AgentID string `json:"agent_id"`
+			Version string `json:"version"`
+			URL     string `json:"url"`
+			MD5     string `json:"md5"`
+			Force   bool   `json:"force"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if body.AgentID == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+			return
+		}
+		conn := sess.Get(body.AgentID)
+		if conn == nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "目标主机离线"})
+			return
+		}
+		req := &protocol.UpgradeReq{
+			UpgradeID: fmt.Sprintf("up-%d", time.Now().UnixNano()),
+			Version:   body.Version,
+			URL:       body.URL,
+			MD5:       body.MD5,
+			Force:     body.Force,
+		}
+		if err := conn.Write(protocol.TypeUpgradeReq, req); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]interface{}{"ok": true, "upgrade_id": req.UpgradeID})
 	}
 }
 
@@ -323,14 +466,43 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// serveSPA 托管 SPA 静态资源，并对非 API/WS 路径回退到 index.html。
+func serveSPA(mux *http.ServeMux, webDir string) {
+	fs := http.FileServer(http.Dir(webDir))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// API 与 WS 已有独立路由，这里只处理静态资源
+		p := r.URL.Path
+		if p == "/" || strings.HasPrefix(p, "/api") || strings.HasPrefix(p, "/ws") {
+			if p != "/" && (strings.HasPrefix(p, "/api") || strings.HasPrefix(p, "/ws")) {
+				// 交由其他处理器
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+		}
+		// SPA 路由回退：若请求路径不是实际文件，返回 index.html
+		filePath := filepath.Join(webDir, filepath.Clean("/"+r.URL.Path))
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			http.ServeFile(w, r, filepath.Join(webDir, "index.html"))
+			return
+		}
+		fs.ServeHTTP(w, r)
+	})
+}
+
 // handleWebMessage 处理 Web 前端通过 WebSocket 发来的消息。
 // 支持：命令下发、交互输入、端口映射操作。
-func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub) {
-	var env protocol.Envelope
-	if err := json.Unmarshal(data, &env); err != nil {
+func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager) {
+	// WebSocket 消息中 data 为 JSON 对象，需用 RawMessage 解码（不同于 TCP 的 base64 []byte）
+	var raw struct {
+		Type string          `json:"type"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
 		log.Printf("[server] web message decode error: %v", err)
 		return
 	}
+	// 统一转成 Envelope 供 switch 复用
+	env := protocol.Envelope{Type: raw.Type, Data: raw.Data}
 	switch env.Type {
 	case protocol.TypeCommandReq:
 		var req protocol.CommandReq
@@ -357,10 +529,66 @@ func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, ro
 		if err := json.Unmarshal(env.Data, &op); err != nil {
 			return
 		}
-		hub.Broadcast(protocol.TypePortMapState, map[string]string{"op": op.Action, "agent": op.AgentID})
+		handlePortMapOp(pm, sess, &op)
+		hub.Broadcast(protocol.TypePortMapState, pm.Tracks())
 		log.Printf("[server] 端口映射操作: %+v", op)
+	case protocol.TypeFileTransferOp:
+		var op protocol.FileTransferOp
+		if err := json.Unmarshal(env.Data, &op); err != nil {
+			return
+		}
+		handleFileTransferOp(ft, sess, hub, &op)
 	}
 }
 
-// --- 供 portmap 依赖的类型适配（避免循环依赖） ---
-var _ = sync.RWMutex{}
+// handleFileTransferOp 处理文件传输操作。
+func handleFileTransferOp(ft *filetransfer.Manager, sess *session.Manager, hub *ws.Hub, op *protocol.FileTransferOp) {
+	switch op.Action {
+	case "download":
+		// 向目标 Agent 下发文件下载请求，Agent 回传分片
+		if c := sess.Get(op.AgentID); c != nil {
+			_ = c.Write(protocol.TypeFileDownloadReq, &protocol.FileDownloadReq{
+				CommandID: "dl-" + op.AgentID + "-" + fmt.Sprint(time.Now().UnixNano()),
+				FilePath:  op.FilePath,
+			})
+			hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+				AgentID: op.AgentID, FilePath: op.FilePath, Action: "download", Status: "transferring",
+			})
+		} else {
+			hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+				AgentID: op.AgentID, FilePath: op.FilePath, Action: "download", Status: "failed", Message: "目标主机离线",
+			})
+		}
+	case "list":
+		// 列出该 Agent 已接收的文件
+		hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+			AgentID: op.AgentID, FilePath: op.FilePath, Action: "list", Status: "done",
+		})
+	}
+}
+
+// handlePortMapOp 处理端口映射操作（转发给服务端端口映射管理器）。
+func handlePortMapOp(pm *portmap.Manager, sess *session.Manager, op *protocol.PortMapOp) {
+	switch op.Action {
+	case "create", "enable":
+		if op.PublicPort <= 0 || op.LocalPort <= 0 {
+			return
+		}
+		r := &portmap.Rule{
+			ID:         fmt.Sprintf("rule-%d-%s", op.PublicPort, op.AgentID),
+			PublicPort: op.PublicPort,
+			AgentID:    op.AgentID,
+			LocalHost:  "127.0.0.1",
+			LocalPort:  op.LocalPort,
+			SourceIP:   op.SourceIP,
+			CreatedAt:  time.Now().Unix(),
+		}
+		if err := pm.CreateRule(r); err != nil {
+			log.Printf("[portmap] 创建映射 %d 失败: %v", op.PublicPort, err)
+		}
+	case "delete", "disable":
+		if op.PublicPort > 0 {
+			pm.DeleteRule(op.PublicPort)
+		}
+	}
+}

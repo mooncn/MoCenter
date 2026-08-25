@@ -17,6 +17,9 @@ const (
 	TypeProbeDataResp  = "ProbeDataResp"
 	TypeFileUploadReq  = "FileUploadReq"
 	TypeFileDownloadReq = "FileDownloadReq"
+	TypeFileAck        = "FileAck"       // Server<->Agent 分片确认
+	TypeFileTransferOp = "FileTransferOp" // Web->Server 文件传输操作
+	TypeFileTransferState = "FileTransferState" // Server->Web 文件传输状态
 	TypeInteractiveIn  = "InteractiveInputReq"
 	TypeInteractiveOut = "InteractiveOutput"
 	TypeOnline         = "AgentOnline"   // Agent 上线通知（Agent->Server）
@@ -25,6 +28,9 @@ const (
 	TypePortMapState   = "PortMapState"  // Server->Web 端口映射状态
 	TypeAuth           = "AuthReq"       // Web->Server 登录/鉴权
 	TypeAuthResp       = "AuthResp"
+	TypeUpgradeReq     = "UpgradeReq"    // Server->Agent 远程升级
+	TypeUpgradeResp    = "UpgradeResp"   // Agent->Server 升级结果
+	TypeBatchCommand   = "BatchCommand"  // Server->Agent 批量命令（预留）
 )
 
 // Envelope 是所有消息的通用信封：Type 用于路由，Data 为具体负载。
@@ -177,4 +183,48 @@ type InteractiveOutput struct {
 	Data      string `json:"data"`
 	Type      string `json:"type"` // stdout/stderr/exit
 	ExitCode  int    `json:"exit_code"`
+}
+
+// ChunkAck 分片确认（ACK/NACK），用于断点续传。
+type ChunkAck struct {
+	FilePath string `json:"file_path"`
+	ChunkSeq int    `json:"chunk_seq"`
+	Ack      bool   `json:"ack"` // true=ACK, false=NACK
+}
+
+// FileTransferOp Web -> Server 文件传输操作。
+type FileTransferOp struct {
+	Action    string `json:"action"` // upload/download/list/status
+	AgentID   string `json:"agent_id"`
+	FilePath  string `json:"file_path"`
+	LocalPath string `json:"local_path"` // 服务端本地路径（上传目的地/下载源）
+}
+
+// FileTransferState Server -> Web 文件传输状态。
+type FileTransferState struct {
+	AgentID    string `json:"agent_id"`
+	FilePath   string `json:"file_path"`
+	Action     string `json:"action"`
+	TotalBytes int64  `json:"total_bytes"`
+	DoneBytes  int64  `json:"done_bytes"`
+	ChunkSeq   int    `json:"chunk_seq"`
+	Status     string `json:"status"` // transferring/done/failed
+	Message    string `json:"message"`
+}
+
+// UpgradeReq Server -> Agent 远程升级请求。
+type UpgradeReq struct {
+	UpgradeID string `json:"upgrade_id"`
+	Version   string `json:"version"`
+	URL       string `json:"url"`        // 升级包下载地址
+	MD5       string `json:"md5"`        // 升级包 MD5 校验和
+	Force     bool   `json:"force"`      // 是否强制升级
+}
+
+// UpgradeResp Agent -> Server 升级结果。
+type UpgradeResp struct {
+	UpgradeID string `json:"upgrade_id"`
+	OK        bool   `json:"ok"`
+	Message   string `json:"message"`
+	Version   string `json:"version"`
 }

@@ -5,6 +5,7 @@ import Terminal from './pages/Terminal.jsx'
 import PortMap from './pages/PortMap.jsx'
 import Offline from './pages/Offline.jsx'
 import Audit from './pages/Audit.jsx'
+import Ops from './pages/Ops.jsx'
 import Login from './pages/Login.jsx'
 import { Api, MCSocket } from './api/api.js'
 
@@ -44,6 +45,7 @@ function Layout() {
             <NavLink to="/" end>仪表盘</NavLink>
             <NavLink to="/terminal">远程终端</NavLink>
             <NavLink to="/portmap">端口映射</NavLink>
+            <NavLink to="/ops">运维操作</NavLink>
             <NavLink to="/offline">离线机器</NavLink>
             <NavLink to="/audit">操作审计</NavLink>
           </nav>
@@ -57,6 +59,7 @@ function Layout() {
             <Route path="/" element={<Dashboard agents={agents} />} />
             <Route path="/terminal" element={<Terminal agents={agents} />} />
             <Route path="/portmap" element={<PortMap agents={agents} />} />
+            <Route path="/ops" element={<Ops agents={agents} />} />
             <Route path="/offline" element={<Offline agents={agents} />} />
             <Route path="/audit" element={<Audit />} />
           </Routes>
