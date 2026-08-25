@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+// 文件传输协议
+// 分片传输 + MD5 校验 + NACK 重传 + 断点续传。
+package mocenter;
+
+option go_package = "mocenter/proto/filetransfer";
+
+// Agent -> Server 文件上传分片
+message FileUploadReq {
+  string agent_id = 1;
+  string file_path = 2;    // 文件路径
+  int64  file_size = 3;    // 文件总大小
+  int32  chunk_seq = 4;    // 分片编号
+  bytes  chunk_data = 5;   // 分片数据
+  string chunk_md5 = 6;    // 分片 MD5 校验和
+}
+
+// Server -> Agent 文件下载分片
+message FileDownloadReq {
+  string command_id = 1;
+  string file_path = 2;
+  int64  file_size = 3;
+  int32  chunk_seq = 4;
+  bytes  chunk_data = 5;
+}
+
+// 分片确认（ACK/NACK）
+message ChunkAck {
+  string file_path = 1;
+  int32  chunk_seq = 2;
+  bool   ack = 3;          // true=ACK, false=NACK
+}

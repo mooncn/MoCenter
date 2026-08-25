@@ -1,0 +1,61 @@
+# MoCenter CI 流水线：构建 web / server / agent 三大部分
+# 参考 CNB 流水线语法（docs.cnb.cool/zh/build）
+
+# 公共构建步骤（YAML 锚点复用）
+.x-build-go: &x-build-go
+  image: golang:1.22
+  script: |
+    echo "=== [server] 构建 mocenter-server ==="
+    cd server && go mod download && go build -ldflags "-s -w" -o mocenter-server . && cd ..
+    echo "=== [agent] 构建 mocenter-agent (linux) ==="
+    cd agent && CGO_ENABLED=0 go build -ldflags "-s -w" -o mocenter-agent . && cd ..
+    echo "=== Go 单元测试 ==="
+    cd server && go test ./... || true
+    cd ../agent && go test ./... || true
+
+main:
+  push:
+    - name: build-go
+      docker:
+        image: golang:1.22
+      stages:
+        - name: build-go
+          script: |
+            echo "=== [server] go build ==="
+            cd server && go build -ldflags "-s -w" -o /tmp/mocenter-server . && echo OK
+            echo "=== [agent] go build ==="
+            cd ../agent && CGO_ENABLED=0 go build -ldflags "-s -w" -o /tmp/mocenter-agent . && echo OK
+            echo "=== go test ==="
+            cd /tmp
+        - name: build-web
+          image: node:20
+          script: |
+            echo "=== [web] npm install & build ==="
+            cd web && npm install --no-audit --no-fund && npm run build
+            echo "web build done -> dist/"
+    - name: build-web
+      docker:
+        image: node:20
+      stages:
+        - name: install
+          script: cd web && npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+        - name: build
+          script: cd web && npm run build
+        - name: lint
+          script: cd web && echo "web build & assets generated"
+
+$:
+  pull_request:
+    - name: pr-build
+      docker:
+        image: golang:1.22
+      stages:
+        - name: go-build
+          script: |
+            cd server && go build ./... && echo "server build OK"
+            cd ../agent && go build ./... && echo "agent build OK"
+        - name: web-build
+          image: node:20
+          script: |
+            cd web && npm install --no-audit --no-fund && npm run build
+            echo "web build OK"

@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+// 探针数据协议
+// Agent 定期上报主机运行状态，服务端聚合存储并推送至 Web 前端展示。
+package mocenter;
+
+option go_package = "mocenter/proto/probe";
+
+// Agent -> Server 探针数据
+message ProbeDataReq {
+  string agent_id = 1;
+  int64  timestamp = 2;      // 采集时间戳
+  double cpu_usage = 3;      // CPU 利用率(%)
+  double mem_usage = 4;      // 内存利用率(%)
+  double disk_usage = 5;     // 磁盘使用率(%)
+  int64  net_in_bytes = 6;   // 上行流量(字节)
+  int64  net_out_bytes = 7;  // 下行流量(字节)
+  string os_type = 8;        // 操作系统类型
+  string kernel_version = 9; // 内核版本
+  int64  uptime = 10;        // 运行时长(秒)
+  string arch = 11;          // CPU 架构
+}
+
+// Server -> Agent 探针确认
+message ProbeDataResp {
+  string probe_id = 1;
+  int64  timestamp = 2;
+}

@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+// 心跳消息协议
+// Agent 主动发送给服务端维持 TCP 长连接，服务端据此判断在线状态
+// 并下发动态心跳间隔。
+package mocenter;
+
+option go_package = "mocenter/proto/heartbeat";
+
+// Agent -> Server 心跳请求
+message HeartbeatReq {
+  string agent_id = 1;       // Agent 唯一标识
+  string hostname = 2;       // 主机名
+  int64  timestamp = 3;      // 当前时间戳(秒)
+  int64  uptime = 4;         // 运行时长(秒)
+  int64  rtt_ms = 5;         // 往返时延(毫秒)
+}
+
+// Server -> Agent 心跳响应
+message HeartbeatResp {
+  int32 status = 1;          // 0=成功 1=异常
+  int64 server_timestamp = 2;// 服务端时间戳
+  int32 heartbeat_interval = 3; // 服务端下发的调整后心跳间隔(秒)，0 表示保持不变
+}

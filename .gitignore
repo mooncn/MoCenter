@@ -1,0 +1,24 @@
+# 构建产物
+build/
+dist/
+*.exe
+mocenter-server
+mocenter-agent
+mocenter-server.exe
+mocenter-agent.exe
+
+# Go
+*.test
+*.out
+vendor/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

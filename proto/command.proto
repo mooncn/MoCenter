@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+// 命令消息协议
+// 服务端下发给 Agent 的远程命令执行，以及 Agent 回传执行结果。
+package mocenter;
+
+option go_package = "mocenter/proto/command";
+
+// Server -> Agent 命令请求
+message CommandReq {
+  string command_id = 1;      // 命令 ID（全局唯一）
+  string agent_id = 2;        // 目标 Agent
+  string command = 3;         // 命令内容
+  string shell_type = 4;      // bash/sh/cmd/powershell，空则按 os_type 推断
+  int32  timeout = 5;         // 超时(秒)，默认 30；交互式可设 0 表示无超时
+  bool   async = 6;           // 是否异步执行
+  bool   interactive = 7;     // 是否为交互式命令
+  string work_dir = 8;        // 工作目录
+  map<string, string> env = 9;// 覆盖/追加环境变量
+  int32  rows = 10;           // 交互终端行数
+  int32  cols = 11;           // 交互终端列数
+  string user = 12;           // 执行用户上下文（降权）
+}
+
+// Agent -> Server 命令响应
+message CommandResp {
+  string command_id = 1;      // 对应命令 ID
+  int32  status = 2;          // 0=成功 1=失败 2=超时
+  int32  exit_code = 3;       // 退出码
+  string stdout = 4;          // 标准输出
+  string stderr = 5;          // 标准错误
+  int64  duration_ms = 6;     // 执行耗时(毫秒)
+}
