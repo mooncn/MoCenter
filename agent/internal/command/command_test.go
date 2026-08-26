@@ -9,8 +9,10 @@ import (
 
 func TestBuildCmd(t *testing.T) {
 	wantDefault := "/bin/bash"
+	wantPowershell := "pwsh"
 	if runtime.GOOS == "windows" {
 		wantDefault = "cmd.exe"
+		wantPowershell = "powershell.exe"
 	}
 	cases := []struct {
 		shell string
@@ -20,7 +22,7 @@ func TestBuildCmd(t *testing.T) {
 		{"bash", "ls", "/bin/bash"},
 		{"sh", "ls", "/bin/sh"},
 		{"cmd", "dir", "cmd.exe"},
-		{"powershell", "Get-Date", "powershell.exe"},
+		{"powershell", "Get-Date", wantPowershell},
 		{"", "ls", wantDefault}, // 默认按目标平台推断
 	}
 	for _, c := range cases {

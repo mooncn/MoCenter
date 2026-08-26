@@ -24,7 +24,10 @@ type Collector struct {
 	lastNetIn  int64
 	lastNetOut int64
 	lastTime   time.Time
-	start      time.Time
+	// 累计网络流量（自 Agent 启动以来的总收发字节）
+	totalIn  int64
+	totalOut int64
+	start    time.Time
 }
 
 type cpuTimes struct {
@@ -74,13 +77,13 @@ func (c *Collector) Sample() *protocol.ProbeDataReq {
 		}
 		c.lastCPU = cpu
 		in, out := netTraffic()
-		if c.lastTime.IsZero() {
-			p.NetInBytes = 0
-			p.NetOutBytes = 0
-		} else {
-			p.NetInBytes = in - c.lastNetIn
-			p.NetOutBytes = out - c.lastNetOut
+		if !c.lastTime.IsZero() {
+			// 累加采样间隔内的增量，得到自启动以来的累计流量
+			c.totalIn += in - c.lastNetIn
+			c.totalOut += out - c.lastNetOut
 		}
+		p.NetInBytes = c.totalIn
+		p.NetOutBytes = c.totalOut
 		c.lastNetIn, c.lastNetOut = in, out
 	} else {
 		p.CPUUsage = windowsCPU()

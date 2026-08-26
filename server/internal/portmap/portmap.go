@@ -218,6 +218,37 @@ func (m *Manager) DeleteRule(publicPort int) {
 	m.mu.Unlock()
 }
 
+// DisableRule 停用规则：停止公网监听，但保留规则供后续重新启用。
+func (m *Manager) DisableRule(publicPort int) {
+	m.StopRule(publicPort)
+	m.mu.Lock()
+	if r, ok := m.rules[publicPort]; ok {
+		r.Enabled = false
+	}
+	m.mu.Unlock()
+}
+
+// EnableRule 重新启用规则：若规则仍存在且已停用，则恢复公网监听。
+// 返回错误信息（如端口被占用或规则不存在）。
+func (m *Manager) EnableRule(publicPort int) error {
+	m.mu.Lock()
+	r, ok := m.rules[publicPort]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("规则 %d 不存在", publicPort)
+	}
+	if r.Enabled {
+		return nil
+	}
+	if err := m.ServeRule(r); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	r.Enabled = true
+	m.mu.Unlock()
+	return nil
+}
+
 // ServeRule 为一条映射规则启动公网监听端口，将入站连接转发至目标 Agent。
 func (m *Manager) ServeRule(r *Rule) error {
 	publicPort := r.PublicPort

@@ -48,24 +48,29 @@ func Perform(req *protocol.UpgradeReq, report func(*protocol.UpgradeResp)) {
 	tmpPath := filepath.Join(dir, ".mocenter-upgrade-"+fmt.Sprint(time.Now().UnixNano()))
 	_ = os.Remove(tmpPath)
 
-	if req.URL != "" {
-		if err := download(req.URL, tmpPath); err != nil {
-			resp.Message = "下载升级包失败: " + err.Error()
+	if req.URL == "" {
+		// 未提供下载地址：无新二进制可替换。
+		// 若指定了新版本但无包，无法完成替换，直接报错。
+		resp.Message = "未提供升级包下载地址（url）"
+		return
+	}
+
+	if err := download(req.URL, tmpPath); err != nil {
+		resp.Message = "下载升级包失败: " + err.Error()
+		return
+	}
+	// 校验 MD5
+	if req.MD5 != "" {
+		sum, err := fileMD5(tmpPath)
+		if err != nil || sum != req.MD5 {
+			_ = os.Remove(tmpPath)
+			resp.Message = "升级包 MD5 校验失败"
 			return
 		}
-		// 校验 MD5
-		if req.MD5 != "" {
-			sum, err := fileMD5(tmpPath)
-			if err != nil || sum != req.MD5 {
-				_ = os.Remove(tmpPath)
-				resp.Message = "升级包 MD5 校验失败"
-				return
-			}
-		}
-		// 授予执行权限
-		if runtime.GOOS != "windows" {
-			_ = os.Chmod(tmpPath, 0755)
-		}
+	}
+	// 授予执行权限
+	if runtime.GOOS != "windows" {
+		_ = os.Chmod(tmpPath, 0755)
 	}
 
 	// 3. 备份旧二进制

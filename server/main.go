@@ -321,6 +321,8 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			} else if hb.RTTMs > 50 {
 				interval = 60
 			}
+			// 记录动态心跳间隔，供超时清扫按实际心跳频率判定离线
+			sessConn.SetHeartbeatInterval(interval)
 			resp := protocol.HeartbeatResp{Status: 0, ServerTimestamp: time.Now().Unix(), HeartbeatInterval: interval}
 			_ = sessConn.Write(protocol.TypeHeartbeatResp, resp)
 		case protocol.TypeProbeDataReq:
@@ -901,7 +903,7 @@ func handleFileTransferOp(ft *filetransfer.Manager, sess *session.Manager, hub *
 // handlePortMapOp 处理端口映射操作（转发给服务端端口映射管理器）。
 func handlePortMapOp(pm *portmap.Manager, sess *session.Manager, op *protocol.PortMapOp) {
 	switch op.Action {
-	case "create", "enable":
+	case "create":
 		if op.PublicPort <= 0 || op.LocalPort <= 0 {
 			return
 		}
@@ -917,7 +919,19 @@ func handlePortMapOp(pm *portmap.Manager, sess *session.Manager, op *protocol.Po
 		if err := pm.CreateRule(r); err != nil {
 			log.Printf("[portmap] 创建映射 %d 失败: %v", op.PublicPort, err)
 		}
-	case "delete", "disable":
+	case "enable":
+		if op.PublicPort <= 0 {
+			return
+		}
+		// 规则已存在则恢复监听；否则（规则曾被删除或不存在）按新建处理
+		if err := pm.EnableRule(op.PublicPort); err != nil {
+			log.Printf("[portmap] 启用映射 %d 失败: %v", op.PublicPort, err)
+		}
+	case "disable":
+		if op.PublicPort > 0 {
+			pm.DisableRule(op.PublicPort)
+		}
+	case "delete":
 		if op.PublicPort > 0 {
 			pm.DeleteRule(op.PublicPort)
 		}

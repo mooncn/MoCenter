@@ -22,6 +22,34 @@ type Conn struct {
 	LastSeen   time.Time
 	RemoteAddr string
 	enc        *json.Encoder
+	// HeartbeatInterval 该 Agent 当前被服务端动态下发的心跳间隔（秒）。
+	// 用于在 Tick 中按每个 Agent 的实际心跳频率判定超时，
+	// 避免弱网下心跳间隔被拉长后仍按固定阈值误判离线。
+	HeartbeatInterval int
+}
+
+// SetHeartbeatInterval 记录服务端下发给该 Agent 的动态心跳间隔（秒）。
+func (c *Conn) SetHeartbeatInterval(sec int) {
+	if sec <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.HeartbeatInterval = sec
+	c.mu.Unlock()
+}
+
+// heartbeatTimeout 返回该连接基于动态心跳间隔的超时阈值：
+// 仅当服务端已下发超过默认心跳（30s）的间隔时才启用动态阈值，
+// 否则返回 0（表示由调用方按 offlineAfter 判定）。
+func (c *Conn) heartbeatTimeout() time.Duration {
+	c.mu.Lock()
+	iv := c.HeartbeatInterval
+	c.mu.Unlock()
+	if iv <= 30 {
+		// 默认或更短心跳：不启用动态阈值，交由 offlineAfter 兜底
+		return 0
+	}
+	return time.Duration(iv) * 3 * time.Second
 }
 
 // NewConn 创建基于给定网络连接的长连接会话。
@@ -107,12 +135,20 @@ func (m *Manager) Broadcast(typ string, payload interface{}) {
 }
 
 // Tick 扫描心跳超时（超过 3 个心跳周期视为离线），返回离线的 AgentID 列表。
+// 每个 Agent 按其动态心跳间隔计算超时阈值（offlineAfter 作为下限兜底）。
 func (m *Manager) Tick(offlineAfter time.Duration) []string {
 	m.mu.RLock()
 	var offline []string
 	now := time.Now()
 	for id, c := range m.conns {
-		if c.Online && now.Sub(c.LastSeen) > offlineAfter {
+		if !c.Online {
+			continue
+		}
+		threshold := c.heartbeatTimeout()
+		if threshold < offlineAfter {
+			threshold = offlineAfter
+		}
+		if now.Sub(c.LastSeen) > threshold {
 			offline = append(offline, id)
 		}
 	}
