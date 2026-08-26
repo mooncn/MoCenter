@@ -87,7 +87,7 @@ export default function PortMap({ agents }) {
               <label>目标主机</label>
               <select value={agent} onChange={(e) => setAgent(e.target.value)}>
                 <option value="">选择主机...</option>
-                {agents.filter((a) => a.online).map((a) => (
+                {(agents || []).filter((a) => a.online).map((a) => (
                   <option key={a.agent_id} value={a.agent_id}>{a.hostname}</option>
                 ))}
               </select>

@@ -7,8 +7,8 @@ export default function Dashboard({ agents }) {
   const [selectedAgent, setSelectedAgent] = useState('')
   const [history, setHistory] = useState(null)
 
-  const online = agents.filter((a) => a.online).length
-  const offline = agents.filter((a) => !a.online).length
+  const online = (agents || []).filter((a) => a.online).length
+  const offline = (agents || []).filter((a) => !a.online).length
 
   const sinceMap = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800 }
 
@@ -54,11 +54,11 @@ export default function Dashboard({ agents }) {
           <div className="label">注册主机</div>
         </div>
         <div className="metric">
-          <div className="value">{agents.length ? Math.round(agents.reduce((s, a) => s + a.cpu_usage, 0) / agents.length) : 0}%</div>
+          <div className="value">{(agents || []).length > 0 ? Math.round((agents || []).reduce((s, a) => s + a.cpu_usage, 0) / agents.length) : 0}%</div>
           <div className="label">平均 CPU</div>
         </div>
         <div className="metric">
-          <div className="value">{agents.length ? Math.round(agents.reduce((s, a) => s + a.mem_usage, 0) / agents.length) : 0}%</div>
+          <div className="value">{(agents || []).length > 0 ? Math.round((agents || []).reduce((s, a) => s + a.mem_usage, 0) / agents.length) : 0}%</div>
           <div className="label">平均内存</div>
         </div>
       </div>
@@ -82,7 +82,7 @@ export default function Dashboard({ agents }) {
             </tr>
           </thead>
           <tbody>
-            {agents.map((a) => (
+            {(agents || []).map((a) => (
               <tr key={a.agent_id}>
                 <td>
                   <b>{a.hostname}</b>

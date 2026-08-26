@@ -1,32 +1,40 @@
-// Package portmap 实现内网端口到公网服务端的端口映射（反向代理）。
+// Package portmap 实现内网端口到公网服务端的端口映射（反向隧道）。
 //
-// 每个映射规则绑定服务端一个公网端口，通过连接跟踪表维护
-// 公网端口到内网 Agent 的映射关系，实现多路复用。采用 Go 原生
-// net/http + TCP 转发，不依赖外部 Nginx。
+// 整体流程：
+//   - 公网连接到达服务端的映射监听端口后，服务端通过已建立的 Agent 长连接
+//     下发 TunnelOpenReq，指示 Agent 在本机 Dial 目标内网服务端口；
+//   - 隧道建立后，公网侧数据经服务端封装为 TunnelData 转发给 Agent，
+//     Agent 写回内网服务；内网服务返回数据经 Agent 封装为 TunnelData 回传，
+//     服务端写回公网连接，实现跨公网/内网的双向反向转发。
+//
+// 连接跟踪表以 TunnelID（公网连接唯一标识，等同规划书中的 PublicConnID）为键，
+// 并维护按 AgentID 的二级索引，支持同一公网端口的并发连接。
 package portmap
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"mocenter/server/internal/protocol"
 	"mocenter/server/internal/session"
 )
 
 // Track 单条连接跟踪记录。
 type Track struct {
-	PublicPort    int       `json:"public_port"`
-	PublicConnID  string    `json:"public_conn_id"`
-	AgentID       string    `json:"agent_id"`
-	AgentConnID   string    `json:"agent_conn_id"`
-	CreatedAt     time.Time `json:"created_at"`
-	LastActiveAt  time.Time `json:"last_active_at"`
-	BytesSent     int64     `json:"bytes_sent"`
-	BytesReceived int64     `json:"bytes_received"`
-	Status        string    `json:"status"` // Active/Closed/Timeout
+	TunnelID   string    `json:"tunnel_id"`
+	PublicPort int       `json:"public_port"`
+	PublicConnID string  `json:"public_conn_id"`
+	AgentID    string    `json:"agent_id"`
+	AgentConnID string   `json:"agent_conn_id"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastActiveAt time.Time `json:"last_active_at"`
+	BytesSent  int64     `json:"bytes_sent"`
+	BytesReceived int64  `json:"bytes_received"`
+	Status     string    `json:"status"` // Active/Closed/Timeout
 }
 
 // Rule 一条端口映射规则。
@@ -41,29 +49,39 @@ type Rule struct {
 	CreatedAt  int64  `json:"created_at"`
 }
 
-// Manager 端口映射管理器，负责连接跟踪与转发。
+// publicTrack 保存公网侧连接，用于隧道数据回写。
+type publicTrack struct {
+	pconn      net.Conn
+	publicPort int
+	agentID    string
+	wmu        sync.Mutex // 保护 pconn 写入
+}
+
+// Manager 端口映射管理器，负责隧道建立、连接跟踪与双向转发。
 type Manager struct {
 	mu          sync.RWMutex
-	tracks      map[string]*Track            // key: public port(string)
-	byAgent     map[string]map[string]*Track // 二级索引：agentID -> publicPort -> track
-	rules       map[int]*Rule                // 规则：publicPort -> Rule
+	tracks      map[string]*Track            // key: TunnelID
+	byAgent     map[string]map[string]*Track // 二级索引：agentID -> TunnelID -> Track
+	pub         map[string]*publicTrack      // key: TunnelID -> 公网连接
+	rules       map[int]*Rule
 	listeners   map[int]net.Listener
 	sessions    *session.Manager
 	agentForPort func(int) string // 由 Server 注入：根据公网端口找到目标 AgentID
 	idleTimeout time.Duration
+	seq         uint64
 }
 
 // NewManager 创建端口映射管理器。
 func NewManager(sess *session.Manager) *Manager {
-	m := &Manager{
-		tracks:    make(map[string]*Track),
-		byAgent:   make(map[string]map[string]*Track),
-		rules:     make(map[int]*Rule),
-		listeners: make(map[int]net.Listener),
-		sessions:  sess,
+	return &Manager{
+		tracks:      make(map[string]*Track),
+		byAgent:     make(map[string]map[string]*Track),
+		pub:         make(map[string]*publicTrack),
+		rules:       make(map[int]*Rule),
+		listeners:   make(map[int]net.Listener),
+		sessions:    sess,
 		idleTimeout: 300 * time.Second,
 	}
-	return m
 }
 
 // SetAgentResolver 设置公网端口 -> AgentID 的解析函数。
@@ -73,60 +91,79 @@ func (m *Manager) SetAgentResolver(fn func(int) string) { m.agentForPort = fn }
 func (m *Manager) TrackConn(t *Track) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.tracks[fmt.Sprint(t.PublicPort)] = t
+	m.tracks[t.TunnelID] = t
 	if m.byAgent[t.AgentID] == nil {
 		m.byAgent[t.AgentID] = make(map[string]*Track)
 	}
-	m.byAgent[t.AgentID][fmt.Sprint(t.PublicPort)] = t
+	m.byAgent[t.AgentID][t.TunnelID] = t
 }
 
-// UpdateTraffic 更新连接流量统计（读锁复制快照后更新）。
-func (m *Manager) UpdateTraffic(publicPort int, sent, received int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if t, ok := m.tracks[fmt.Sprint(publicPort)]; ok {
-		t.BytesSent += sent
-		t.BytesReceived += received
-		t.LastActiveAt = time.Now()
+// UpdateTraffic 更新连接流量统计。
+func (m *Manager) UpdateTraffic(tunnelID string, sent, received int64) {
+	m.mu.RLock()
+	t, ok := m.tracks[tunnelID]
+	m.mu.RUnlock()
+	if !ok {
+		return
 	}
+	t.BytesSent += sent
+	t.BytesReceived += received
+	t.LastActiveAt = time.Now()
 }
 
-// CloseTrack 关闭并移除连接跟踪记录。
-func (m *Manager) CloseTrack(publicPort int) {
+// CloseTrack 关闭并移除连接跟踪记录（并清理公网连接）。
+func (m *Manager) CloseTrack(tunnelID string) {
+	m.removePublic(tunnelID)
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := fmt.Sprint(publicPort)
-	if t, ok := m.tracks[key]; ok {
+	if t, ok := m.tracks[tunnelID]; ok {
 		if m.byAgent[t.AgentID] != nil {
-			delete(m.byAgent[t.AgentID], key)
+			delete(m.byAgent[t.AgentID], tunnelID)
 		}
 		t.Status = "Closed"
-		delete(m.tracks, key)
+		delete(m.tracks, tunnelID)
 	}
+	m.mu.Unlock()
 }
 
-// CleanupExpired 周期性清理超时连接（分批，单次最多 100 条）。
+// CleanupExpired 周期性清理超时连接（分批，单次最多 max 条）。
 func (m *Manager) CleanupExpired(max int) []*Track {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var keys []string
 	now := time.Now()
-	var expired []*Track
-	count := 0
-	for key, t := range m.tracks {
-		if count >= max {
+	for id, t := range m.tracks {
+		if len(keys) >= max {
 			break
 		}
 		if now.Sub(t.LastActiveAt) > m.idleTimeout {
+			keys = append(keys, id)
+		}
+	}
+	m.mu.Unlock()
+
+	var expired []*Track
+	for _, id := range keys {
+		if t := m.GetTrack(id); t != nil {
+			// 通知 Agent 关闭隧道
+			m.sendTunnelClose(id, t.AgentID, "idle-timeout")
+			m.removePublic(id)
 			t.Status = "Timeout"
 			expired = append(expired, t)
+			m.mu.Lock()
 			if m.byAgent[t.AgentID] != nil {
-				delete(m.byAgent[t.AgentID], key)
+				delete(m.byAgent[t.AgentID], id)
 			}
-			delete(m.tracks, key)
-			count++
+			delete(m.tracks, id)
+			m.mu.Unlock()
 		}
 	}
 	return expired
+}
+
+// GetTrack 返回指定隧道跟踪记录。
+func (m *Manager) GetTrack(tunnelID string) *Track {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.tracks[tunnelID]
 }
 
 // Tracks 返回全部活跃连接跟踪。
@@ -214,46 +251,111 @@ func (m *Manager) StopRule(publicPort int) {
 	m.mu.Unlock()
 }
 
-// handleConnection 转发一条公网入站连接到目标 Agent 的映射端口。
+// handleConnection 处理一条公网入站连接：建立隧道并双向转发。
 func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, r *Rule) {
 	defer clientConn.Close()
-	defer m.CloseTrack(publicPort)
 
-	localHost := r.LocalHost
-	if localHost == "" {
-		localHost = "127.0.0.1"
+	var agent *session.Conn
+	if m.sessions != nil {
+		agent = m.sessions.Get(r.AgentID)
 	}
-	localPort := r.LocalPort
-	if localPort <= 0 {
+	if agent == nil {
+		log.Printf("[portmap] 目标 Agent %s 离线，拒绝公网端口 %d", r.AgentID, publicPort)
 		return
 	}
-	upstream, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", localHost, localPort), 5*time.Second)
-	if err != nil {
-		log.Printf("[portmap] dial upstream %s:%d error: %v", localHost, localPort, err)
-		return
-	}
-	defer upstream.Close()
 
-	t := &Track{
-		PublicPort:   publicPort,
-		AgentID:      r.AgentID,
-		CreatedAt:    time.Now(),
+	tunnelID := fmt.Sprintf("t-%d-%d-%d", publicPort, time.Now().UnixNano(), atomic.AddUint64(&m.seq, 1))
+	pt := &publicTrack{pconn: clientConn, publicPort: publicPort, agentID: r.AgentID}
+
+	m.mu.Lock()
+	m.pub[tunnelID] = pt
+	m.mu.Unlock()
+
+	m.TrackConn(&Track{
+		TunnelID:    tunnelID,
+		PublicConnID: tunnelID,
+		PublicPort:  publicPort,
+		AgentID:     r.AgentID,
+		CreatedAt:   time.Now(),
 		LastActiveAt: time.Now(),
-		Status:       "Active",
-	}
-	m.TrackConn(t)
+		Status:      "Active",
+	})
 
-	// 双向复制流量
-	done := make(chan struct{}, 2)
-	go func() {
-		n, _ := io.Copy(upstream, clientConn)
-		m.UpdateTraffic(publicPort, 0, n)
-		done <- struct{}{}
-	}()
-	go func() {
-		n, _ := io.Copy(clientConn, upstream)
-		m.UpdateTraffic(publicPort, n, 0)
-		done <- struct{}{}
-	}()
-	<-done
+	// 通知 Agent 建立到内网服务的隧道
+	open := &protocol.TunnelOpenReq{
+		TunnelID:  tunnelID,
+		AgentID:   r.AgentID,
+		LocalHost: r.LocalHost,
+		LocalPort: r.LocalPort,
+	}
+	if err := agent.Write(protocol.TypeTunnelOpen, open); err != nil {
+		m.removePublic(tunnelID)
+		m.CloseTrack(tunnelID)
+		log.Printf("[portmap] 发送隧道建立请求失败: %v", err)
+		return
+	}
+
+	// 正向：读公网连接 -> 封装 TunnelData 发给 Agent -> 记录流量
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := clientConn.Read(buf)
+		if n > 0 {
+			if werr := agent.Write(protocol.TypeTunnelData, &protocol.TunnelData{TunnelID: tunnelID, Data: buf[:n]}); werr != nil {
+				break
+			}
+			m.UpdateTraffic(tunnelID, int64(n), 0)
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	// 公网侧断开：关闭并向 Agent 发送关闭通知
+	m.removePublic(tunnelID)
+	_ = agent.Write(protocol.TypeTunnelClose, &protocol.TunnelClose{TunnelID: tunnelID, Reason: "public-closed"})
+	m.CloseTrack(tunnelID)
+}
+
+// DeliverTunnelData 将 Agent 回传的隧道数据写回公网连接。
+func (m *Manager) DeliverTunnelData(tunnelID string, data []byte) {
+	m.mu.RLock()
+	pt, ok := m.pub[tunnelID]
+	m.mu.RUnlock()
+	if !ok || pt == nil {
+		return
+	}
+	pt.wmu.Lock()
+	defer pt.wmu.Unlock()
+	if _, err := pt.pconn.Write(data); err != nil {
+		// 公网连接已断开
+		m.removePublic(tunnelID)
+		m.CloseTrack(tunnelID)
+	}
+	m.UpdateTraffic(tunnelID, 0, int64(len(data)))
+}
+
+// NotifyTunnelClosed 处理 Agent 本地隧道关闭的通知。
+func (m *Manager) NotifyTunnelClosed(tunnelID string, _ string) {
+	m.removePublic(tunnelID)
+	m.CloseTrack(tunnelID)
+}
+
+// sendTunnelClose 通过 Agent 长连接下发隧道关闭通知。
+func (m *Manager) sendTunnelClose(tunnelID, agentID, reason string) {
+	if m.sessions == nil {
+		return
+	}
+	if agent := m.sessions.Get(agentID); agent != nil {
+		_ = agent.Write(protocol.TypeTunnelClose, &protocol.TunnelClose{TunnelID: tunnelID, Reason: reason})
+	}
+}
+
+// removePublic 移除并关闭公网连接（幂等）。
+func (m *Manager) removePublic(tunnelID string) {
+	m.mu.Lock()
+	if pt, ok := m.pub[tunnelID]; ok {
+		delete(m.pub, tunnelID)
+		_ = pt.pconn.Close()
+	}
+	m.mu.Unlock()
 }

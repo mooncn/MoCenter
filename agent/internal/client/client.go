@@ -45,6 +45,9 @@ type Client struct {
 	hb      time.Duration
 	// 交互会话映射 commandID -> session
 	interactive map[string]*command.InteractiveSession
+	// 隧道映射 tunnelID -> 内网服务连接（端口映射反向隧道）
+	tunnels   map[string]net.Conn
+	tunnelsMu sync.Mutex
 	// 文件分发写入句柄 filePath -> *os.File
 	pushFiles map[string]*os.File
 	pushMu    sync.Mutex
@@ -63,6 +66,7 @@ func New(cfg Config) *Client {
 		collect:     probe.NewCollector(cfg.AgentID),
 		hb:          cfg.Heartbeat,
 		interactive: make(map[string]*command.InteractiveSession),
+		tunnels:     make(map[string]net.Conn),
 		pushFiles:   make(map[string]*os.File),
 	}
 	return c
@@ -145,6 +149,7 @@ func (c *Client) connectAndServe() error {
 	}
 	close(hbStop)
 	close(probeStop)
+	c.closeAllTunnels()
 	return c.sc.Err()
 }
 
@@ -255,6 +260,26 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 		if json.Unmarshal(env.Data, &fp) == nil && fp.FilePath != "" {
 			c.handleFilePush(fp)
 		}
+	case protocol.TypeTunnelOpen:
+		var to protocol.TunnelOpenReq
+		if json.Unmarshal(env.Data, &to) != nil {
+			return
+		}
+		c.openTunnel(to)
+	case protocol.TypeTunnelData:
+		var td protocol.TunnelData
+		if json.Unmarshal(env.Data, &td) != nil {
+			return
+		}
+		if conn := c.getTunnel(td.TunnelID); conn != nil {
+			_, _ = conn.Write(td.Data)
+		}
+	case protocol.TypeTunnelClose:
+		var tc protocol.TunnelClose
+		if json.Unmarshal(env.Data, &tc) != nil {
+			return
+		}
+		c.closeTunnel(tc.TunnelID)
 	case protocol.TypeUpgradeReq:
 		var up protocol.UpgradeReq
 		if json.Unmarshal(env.Data, &up) != nil {
@@ -418,4 +443,75 @@ func (c *Client) runInteractive(req protocol.CommandReq) {
 	delete(c.interactive, req.CommandID)
 	c.mu.Unlock()
 	sess.Close()
+}
+
+// openTunnel 建立到内网服务的隧道连接并桥接双向数据。
+func (c *Client) openTunnel(req protocol.TunnelOpenReq) {
+	localHost := req.LocalHost
+	if localHost == "" {
+		localHost = "127.0.0.1"
+	}
+	lconn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", localHost, req.LocalPort), 10*time.Second)
+	resp := protocol.TunnelOpenResp{TunnelID: req.TunnelID}
+	if err != nil {
+		resp.Message = "dial internal service failed: " + err.Error()
+		_ = c.write(protocol.TypeTunnelOpenResp, resp)
+		log.Printf("[agent] 隧道建立失败 %s: %v", req.TunnelID, err)
+		return
+	}
+	c.tunnelsMu.Lock()
+	if old, ok := c.tunnels[req.TunnelID]; ok {
+		_ = old.Close()
+	}
+	c.tunnels[req.TunnelID] = lconn
+	c.tunnelsMu.Unlock()
+	resp.OK = true
+	_ = c.write(protocol.TypeTunnelOpenResp, resp)
+	log.Printf("[agent] 隧道建立成功 %s -> %s:%d", req.TunnelID, localHost, req.LocalPort)
+	go c.readTunnel(req.TunnelID, lconn)
+}
+
+// readTunnel 读取内网服务的回包，封装为 TunnelData 回传服务端。
+func (c *Client) readTunnel(tunnelID string, conn net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			if c.write(protocol.TypeTunnelData, &protocol.TunnelData{TunnelID: tunnelID, Data: buf[:n]}) != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	// 内网服务关闭 -> 通知服务端关闭隧道
+	_ = c.write(protocol.TypeTunnelClose, &protocol.TunnelClose{TunnelID: tunnelID, Reason: "local-closed"})
+	c.closeTunnel(tunnelID)
+}
+
+func (c *Client) getTunnel(tunnelID string) net.Conn {
+	c.tunnelsMu.Lock()
+	defer c.tunnelsMu.Unlock()
+	return c.tunnels[tunnelID]
+}
+
+// closeTunnel 关闭指定隧道。
+func (c *Client) closeTunnel(tunnelID string) {
+	c.tunnelsMu.Lock()
+	defer c.tunnelsMu.Unlock()
+	if conn, ok := c.tunnels[tunnelID]; ok {
+		delete(c.tunnels, tunnelID)
+		_ = conn.Close()
+	}
+}
+
+// closeAllTunnels 关闭全部隧道（断线时调用）。
+func (c *Client) closeAllTunnels() {
+	c.tunnelsMu.Lock()
+	defer c.tunnelsMu.Unlock()
+	for id, conn := range c.tunnels {
+		_ = conn.Close()
+		delete(c.tunnels, id)
+	}
 }

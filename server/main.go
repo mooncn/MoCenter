@@ -13,8 +13,11 @@ package main
 import (
 	"bufio"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -23,10 +26,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"mocenter/server/internal/auth"
+	"mocenter/server/internal/config"
 	"mocenter/server/internal/filetransfer"
 	"mocenter/server/internal/portmap"
 	"mocenter/server/internal/probe"
@@ -46,7 +51,98 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "Agent TCP 连接 TLS 私钥文件路径")
 	caCert := flag.String("ca-cert", "", "mTLS 客户端 CA 证书文件路径（提供后启用双向认证，Agent 需携带客户端证书）")
 	insecure := flag.Bool("insecure", false, "允许非 TLS 的 Agent 连接（未提供证书时自动启用）")
+	dataDir := flag.String("data", ".", "数据目录（审计日志持久化等）")
+	user := flag.String("user", "", "登录用户名（设置后启用用户名+密码登录）")
+	password := flag.String("password", "", "登录密码")
+	totpSecret := flag.String("totp-secret", "", "TOTP 密钥（base32，设置后登录需提供一次性验证码，兼容 Google Authenticator）")
+	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
 	flag.Parse()
+
+	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("加载配置失败: %v", err)
+	}
+	if cfg == nil {
+		cfg = &config.Config{
+			Listen:     *addr,
+			HTTP:       *httpAddr,
+			APIKey:     *apiKey,
+			Whitelist:  *whitelist,
+			WebDir:     *webDir,
+			TLSCert:    *tlsCert,
+			TLSKey:     *tlsKey,
+			CACert:     *caCert,
+			Insecure:   *insecure,
+			DataDir:    *dataDir,
+			User:       *user,
+			// 不落盘明文密码与 TOTP 密钥：账号以哈希持久化到 users.json
+			Password:   "",
+			TOTPSecret: "",
+		}
+		if err := config.Save(*configPath, cfg); err != nil {
+			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
+		} else {
+			log.Printf("已生成配置文件: %s（后续可直接运行 %s）", *configPath, os.Args[0])
+		}
+	} else {
+		// 已有配置：命令行显式参数（非默认值）覆盖配置文件
+		if cfg.Listen != "" && *addr == ":9000" {
+			*addr = cfg.Listen
+		}
+		if cfg.HTTP != "" && *httpAddr == ":8080" {
+			*httpAddr = cfg.HTTP
+		}
+		if cfg.APIKey != "" && *apiKey == os.Getenv("MOCENTER_API_KEY") {
+			*apiKey = cfg.APIKey
+		}
+		if cfg.Whitelist != "" && *whitelist == os.Getenv("MOCENTER_WHITELIST") {
+			*whitelist = cfg.Whitelist
+		}
+		if cfg.WebDir != "" && *webDir == os.Getenv("MOCENTER_WEB_DIR") {
+			*webDir = cfg.WebDir
+		}
+		if cfg.TLSCert != "" && *tlsCert == "" {
+			*tlsCert = cfg.TLSCert
+		}
+		if cfg.TLSKey != "" && *tlsKey == "" {
+			*tlsKey = cfg.TLSKey
+		}
+		if cfg.CACert != "" && *caCert == "" {
+			*caCert = cfg.CACert
+		}
+		if cfg.Insecure && !*insecure {
+			*insecure = true
+		}
+		if cfg.DataDir != "" && *dataDir == "." {
+			*dataDir = cfg.DataDir
+		}
+		if cfg.User != "" && *user == "" {
+			*user = cfg.User
+		}
+		if cfg.Password != "" && *password == "" {
+			*password = cfg.Password
+		}
+		if cfg.TOTPSecret != "" && *totpSecret == "" {
+			*totpSecret = cfg.TOTPSecret
+		}
+	}
+
+	// 未显式指定 Web 目录时，自动探测可执行文件旁或当前目录下的 web 前端，
+	// 便于单文件部署：把 server 与 web/ 放在同目录即可直接托管前端。
+	if *webDir == "" {
+		candidates := []string{
+			filepath.Join(filepath.Dir(os.Args[0]), "web"),
+			filepath.Join(".", "web"),
+		}
+		for _, c := range candidates {
+			if _, err := os.Stat(filepath.Join(c, "index.html")); err == nil {
+				*webDir = c
+				log.Printf("[server] 自动探测到 Web 前端目录: %s", c)
+				break
+			}
+		}
+	}
 
 	if *apiKey == "" {
 		*apiKey = "change-me-api-key"
@@ -62,7 +158,11 @@ func main() {
 	sess := session.NewManager()
 	store := probe.NewStore()
 	authz := auth.NewAuth(*apiKey, wl)
-	router := route.NewRouter(sess)
+	userMgr := auth.NewUserManager(filepath.Join(*dataDir, "users.json"))
+	if err := userMgr.InitFromFlags(*user, *password, *totpSecret); err != nil {
+		log.Printf("警告: 初始化用户失败: %v", err)
+	}
+	router := route.NewRouter(sess, filepath.Join(*dataDir, "audits.jsonl"))
 	pm := portmap.NewManager(sess)
 	ft := filetransfer.NewManager("/tmp/mocenter_uploads")
 	pushMgr := filetransfer.NewPushManager()
@@ -91,6 +191,8 @@ func main() {
 	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
 	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz))
 	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz))
+	mux.HandleFunc("/api/login", loginHandler(userMgr, authz))
+	mux.HandleFunc("/api/password", changePasswordHandler(userMgr, authz))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
@@ -153,12 +255,12 @@ func main() {
 			log.Printf("[server] accept error: %v", err)
 			continue
 		}
-		go handleAgentConn(conn, sess, store, hub, router, ft, pushMgr)
+		go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr)
 	}
 }
 
 // handleAgentConn 处理单个 Agent 的 TCP 长连接。
-func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pushMgr *filetransfer.PushManager) {
+func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -271,6 +373,23 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			_ = json.Unmarshal(env.Data, &ur)
 			hub.Broadcast(protocol.TypeUpgradeResp, ur)
 			log.Printf("[server] Agent %s 升级结果: %v %s", sessConn.AgentID, ur.OK, ur.Message)
+		case protocol.TypeTunnelOpenResp:
+			var tr protocol.TunnelOpenResp
+			if json.Unmarshal(env.Data, &tr) == nil && !tr.OK {
+				// 隧道建立失败：关闭对应的公网侧连接
+				log.Printf("[server] 隧道建立失败 %s: %s", tr.TunnelID, tr.Message)
+				pm.NotifyTunnelClosed(tr.TunnelID, tr.Message)
+			}
+		case protocol.TypeTunnelData:
+			var td protocol.TunnelData
+			if json.Unmarshal(env.Data, &td) == nil {
+				pm.DeliverTunnelData(td.TunnelID, td.Data)
+			}
+		case protocol.TypeTunnelClose:
+			var tc protocol.TunnelClose
+			if json.Unmarshal(env.Data, &tc) == nil {
+				pm.NotifyTunnelClosed(tc.TunnelID, tc.Reason)
+			}
 		}
 	}
 
@@ -399,8 +518,53 @@ func auditsHandler(router *route.Router, authz *auth.Auth) http.HandlerFunc {
 		if !guard(w, r, authz) {
 			return
 		}
-		writeJSON(w, router.Audits())
+		q := r.URL.Query()
+		var since, until int64
+		if v, err := strconv.ParseInt(q.Get("since"), 10, 64); err == nil {
+			since = v
+		}
+		if v, err := strconv.ParseInt(q.Get("until"), 10, 64); err == nil {
+			until = v
+		}
+		offset, _ := strconv.Atoi(q.Get("offset"))
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		logs := router.SearchAudits(route.AuditQuery{
+			Agent:    q.Get("agent"),
+			Operator: q.Get("operator"),
+			Command:  q.Get("cmd"),
+			Since:    since,
+			Until:    until,
+			Offset:   offset,
+			Limit:    limit,
+		})
+		// 脱敏：命令中的敏感字段掩码后返回
+		for _, l := range logs {
+			l.Command = route.MaskCommand(l.Command)
+		}
+		if q.Get("format") == "csv" {
+			writeAuditCSV(w, logs)
+			return
+		}
+		writeJSON(w, logs)
 	}
+}
+
+// writeAuditCSV 将审计日志导出为 CSV。
+func writeAuditCSV(w http.ResponseWriter, logs []*route.AuditLog) {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="audits.csv"`)
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{"time", "operator", "agent_id", "command", "result", "exit_code", "blocked", "block_reason", "duration_ms"})
+	for _, l := range logs {
+		_ = cw.Write([]string{
+			strconv.FormatInt(l.Time, 10),
+			l.Operator, l.AgentID, l.Command, l.Result,
+			strconv.Itoa(l.ExitCode),
+			strconv.FormatBool(l.Blocked), l.BlockReason,
+			strconv.FormatInt(l.Duration, 10),
+		})
+	}
+	cw.Flush()
 }
 
 func portmapRulesHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc {
@@ -473,6 +637,77 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 		}
 		writeJSON(w, map[string]interface{}{"ok": true, "upgrade_id": req.UpgradeID})
 	}
+}
+
+// loginHandler 处理用户名+密码（+OTP 可选）登录，成功后颁发访问 Token。
+func loginHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			OTP      string `json:"otp"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if !um.HasUsers() {
+			http.Error(w, "未配置可登录用户", http.StatusNotImplemented)
+			return
+		}
+		if err := um.Authenticate(body.Username, body.Password, body.OTP); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+			return
+		}
+		tok := randHex(32)
+		authz.RegisterToken(tok)
+		log.Printf("[auth] 用户 %s 登录成功", body.Username)
+		writeJSON(w, map[string]interface{}{"ok": true, "token": tok})
+	}
+}
+
+// changePasswordHandler 修改用户密码（需鉴权；校验当前密码，若启用 OTP 还需验证码）。
+func changePasswordHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !um.HasUsers() {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未启用账号登录，无需修改密码"})
+			return
+		}
+		var body struct {
+			Username    string `json:"username"`
+			OldPassword string `json:"old_password"`
+			NewPassword string `json:"new_password"`
+			OTP         string `json:"otp"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := um.ChangePassword(body.Username, body.OldPassword, body.NewPassword, body.OTP); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+			return
+		}
+		log.Printf("[auth] 用户 %s 修改密码成功", body.Username)
+		writeJSON(w, map[string]interface{}{"ok": true, "msg": "密码修改成功"})
+	}
+}
+
+// randHex 生成随机十六进制字符串（用于 Token）。
+func randHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // guard 统一鉴权中间件。

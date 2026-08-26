@@ -10,8 +10,8 @@
     echo "=== [agent] 构建 mocenter-agent (linux) ==="
     cd agent && CGO_ENABLED=0 go build -ldflags "-s -w" -o mocenter-agent . && cd ..
     echo "=== Go 单元测试 ==="
-    cd server && go test ./... || true
-    cd ../agent && go test ./... || true
+    cd server && go test ./...
+    cd ../agent && go test ./...
 
 main:
   push:

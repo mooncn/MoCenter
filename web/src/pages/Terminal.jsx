@@ -18,7 +18,7 @@ export default function TerminalPage({ agents }) {
   const [status, setStatus] = useState('idle') // idle/connecting/executing
   const [notice, setNotice] = useState('')
 
-  const onlineHosts = agents.filter((a) => a.online)
+  const onlineHosts = (agents || []).filter((a) => a.online)
 
   // 初始化 xterm
   useEffect(() => {
@@ -59,6 +59,7 @@ export default function TerminalPage({ agents }) {
 
     return () => {
       window.removeEventListener('resize', onResize)
+      term.dispose()
     }
   }, [socket])
 
@@ -101,7 +102,8 @@ export default function TerminalPage({ agents }) {
       line += data
       term.write(data)
     }
-    term.onData(onData)
+    // xterm.js v5: onData 返回 disposable，清理时调用 dispose()
+    const disposable = term.onData(onData)
 
     async function execute(cmd) {
       if (!hostRef.current) {
@@ -125,7 +127,7 @@ export default function TerminalPage({ agents }) {
         setStatus('idle')
       }
     }
-    return () => term.off('data', onData)
+    return () => disposable.dispose()
   }, [shell])
 
   return (

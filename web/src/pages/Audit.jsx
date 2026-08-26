@@ -14,7 +14,7 @@ export default function Audit() {
       .finally(() => setLoading(false))
   }, [])
 
-  const filtered = logs.filter((l) => {
+  const filtered = (Array.isArray(logs) ? logs : []).filter((l) => {
     if (!keyword) return true
     return (l.command || '').includes(keyword) || (l.agent_id || '').includes(keyword)
   })

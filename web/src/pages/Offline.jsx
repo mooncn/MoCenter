@@ -2,7 +2,7 @@ import React from 'react'
 
 // 离线机器列表：记录历史注册过的主机，展示最后上线时间与离线时长
 export default function Offline({ agents }) {
-  const offline = agents.filter((a) => !a.online)
+  const offline = (agents || []).filter((a) => !a.online)
 
   return (
     <div>
@@ -25,7 +25,7 @@ export default function Offline({ agents }) {
             </tr>
           </thead>
           <tbody>
-            {offline.map((a) => (
+            {(offline || []).map((a) => (
               <tr key={a.agent_id}>
                 <td>
                   <b>{a.hostname}</b>

@@ -128,6 +128,43 @@ npm run dev     # 开发模式 (代理到 :8080)
 
 浏览器打开后，使用服务端启动时的 `-apikey` 作为登录 Token。
 
+## 登录认证
+
+系统**默认没有内置的账号密码**。登录后台有两种方式：
+
+### 方式一：使用 API Key（默认，推荐）
+- 在登录页顶部的 **「访问 Token / API Key」** 输入框中，填写服务端启动时的 `-apikey` 值。
+- 服务端未通过 `-apikey` 指定时，默认值为 `change-me-api-key`。
+- 在后端程序目录的 `mocenter-server.json` 配置文件中，字段 `apikey` 也即该值。
+
+> 例如：启动服务端执行了 `mocenter-server -apikey MySecretKey`，登录时在输入框填 `MySecretKey` 即可。
+
+### 方式二：用户名 + 密码（可选，需服务端启用）
+服务端可通过启动参数（或写入配置）启用账号登录，并可选启用 OTP 二次校验：
+
+```bash
+# 仅账号（用户名+密码）
+mocenter-server -user admin -password your-password
+
+# 账号 + OTP（需提供 base32 密钥，可用任意 TOTP 生成器生成，兼容 Google Authenticator）
+mocenter-server -user admin -password your-password -totp-secret JBSWY3DPEHPK3PXP
+```
+
+启用后，登录页填写 **用户名、密码**（及 OTP 动态验证码，若启用了）即可登录；此时“访问 Token”可留空。
+对应配置字段：`user` / `password` / `totp_secret`（`mocenter-server.json`）。
+
+> ⚠️ 安全说明：**密码不会明文落盘**。首次通过 `-user/-password` 创建账号时，密码会以 SHA-256 哈希持久化到服务端数据目录的 **`users.json`**；`mocenter-server.json` 配置文件**不保存**明文密码与 TOTP 密钥。
+> 创建完成后，即可在 Web 端侧边栏 **「账号设置」** 页面修改密码（无需再在命令行用明文参数），修改同样只写哈希到 `users.json`。
+
+### 修改密码
+1. 登录后点击左侧 **「账号设置」**。
+2. 填写 用户名、当前密码、两次新密码（至少 6 位；若该账号启用了 OTP，需一并填写动态验证码）。
+3. 提交成功后，下次登录使用新密码。
+
+### 说明
+- 未配置 `-user` 时后端 `/api/login` 返回 501，登录页仅需填写 API Key（Token）。
+- Token 为空时才走账号登录；两种方式互不冲突。
+
 ## 功能清单
 
 - ✅ Agent 上线注册、心跳保活、离线判定（3 个心跳周期）

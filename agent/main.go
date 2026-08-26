@@ -4,7 +4,9 @@
 // 上报探针数据、接收并执行远程命令。
 //
 // 用法：
-//   ./agent -server host:port -agentid <id> [-hb 30] [-probe 10]
+//   首次：./agent -server host:port -agentid <id> [-hb 30] [-probe 10]
+//         （首次运行会自动把参数写入配置文件 mocenter-agent.json）
+//   后续：./agent（自动读取配置文件；命令行显式参数优先级更高）
 package main
 
 import (
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"mocenter/agent/internal/client"
+	"mocenter/agent/internal/config"
 	"mocenter/agent/internal/daemon"
 )
 
@@ -28,10 +31,69 @@ func main() {
 	clientCert := flag.String("client-cert", "", "mTLS 客户端证书文件路径（服务端启用双向认证时必填）")
 	clientKey := flag.String("client-key", "", "mTLS 客户端私钥文件路径")
 	caCert := flag.String("ca-cert", "", "用于校验服务端证书的 CA 证书路径（不指定则用 -insecure 跳过校验）")
+	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
 	flag.Parse()
 
+	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("加载配置失败: %v", err)
+	}
+	if cfg == nil {
+		// 首次启动：用当前参数生成配置
+		cfg = &config.Config{
+			Server:     *server,
+			AgentID:    *agentID,
+			Heartbeat:  *hb,
+			ProbeEvery: *probe,
+			TLS:        *tlsEnabled,
+			Insecure:   *insecure,
+			Daemon:     *daemonize,
+			ClientCert: *clientCert,
+			ClientKey:  *clientKey,
+			CACert:     *caCert,
+		}
+		if err := config.Save(*configPath, cfg); err != nil {
+			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
+		} else {
+			log.Printf("已生成配置文件: %s（后续可直接运行 %s 或 %s 读取）", *configPath, os.Args[0], *configPath)
+		}
+	} else {
+		// 已有配置：命令行显式参数（非默认值）覆盖配置文件
+		if cfg.Server != "" && *server == os.Getenv("MOCENTER_SERVER") {
+			*server = cfg.Server
+		}
+		if cfg.AgentID != "" && *agentID == os.Getenv("MOCENTER_AGENT_ID") {
+			*agentID = cfg.AgentID
+		}
+		if cfg.Heartbeat > 0 && *hb == 30 {
+			*hb = cfg.Heartbeat
+		}
+		if cfg.ProbeEvery > 0 && *probe == 10 {
+			*probe = cfg.ProbeEvery
+		}
+		if cfg.TLS && !*tlsEnabled {
+			*tlsEnabled = true
+		}
+		if cfg.Insecure && !*insecure {
+			*insecure = true
+		}
+		if cfg.Daemon && !*daemonize {
+			*daemonize = true
+		}
+		if cfg.ClientCert != "" && *clientCert == "" {
+			*clientCert = cfg.ClientCert
+		}
+		if cfg.ClientKey != "" && *clientKey == "" {
+			*clientKey = cfg.ClientKey
+		}
+		if cfg.CACert != "" && *caCert == "" {
+			*caCert = cfg.CACert
+		}
+	}
+
 	if *server == "" {
-		log.Fatal("请通过 -server 或环境变量 MOCENTER_SERVER 指定服务端地址")
+		log.Fatal("请通过 -server、环境变量 MOCENTER_SERVER 或配置文件指定服务端地址")
 	}
 	if *agentID == "" {
 		host, _ := os.Hostname()

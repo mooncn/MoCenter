@@ -6,6 +6,7 @@ import PortMap from './pages/PortMap.jsx'
 import Offline from './pages/Offline.jsx'
 import Audit from './pages/Audit.jsx'
 import Ops from './pages/Ops.jsx'
+import Account from './pages/Account.jsx'
 import Login from './pages/Login.jsx'
 import { Api, MCSocket } from './api/api.js'
 
@@ -18,13 +19,13 @@ function Layout() {
 
   useEffect(() => {
     // 拉取主机列表
-    Api.agents().then(setAgents).catch(() => {})
+    Api.agents().then((d) => setAgents(Array.isArray(d) ? d : [])).catch(() => {})
 
     // 建立 WebSocket，接收实时推送
     const token = localStorage.getItem('mc_token')
     const socket = new MCSocket({
       token,
-      onAgentList: (list) => setAgents(list),
+      onAgentList: (list) => setAgents(Array.isArray(list) ? list : []),
     })
     socket.connect()
     socketRef.current = socket
@@ -48,6 +49,7 @@ function Layout() {
             <NavLink to="/ops">运维操作</NavLink>
             <NavLink to="/offline">离线机器</NavLink>
             <NavLink to="/audit">操作审计</NavLink>
+            <NavLink to="/account">账号设置</NavLink>
           </nav>
           <div className="spacer" />
           <nav>
@@ -62,6 +64,7 @@ function Layout() {
             <Route path="/ops" element={<Ops agents={agents} />} />
             <Route path="/offline" element={<Offline agents={agents} />} />
             <Route path="/audit" element={<Audit />} />
+            <Route path="/account" element={<Account />} />
           </Routes>
         </div>
       </div>

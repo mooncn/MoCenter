@@ -70,6 +70,12 @@ func Execute(req *protocol.CommandReq) *Result {
 
 	name, args := buildCmd(req)
 	cmd := exec.CommandContext(ctx, name, args...)
+	// 降权执行：以指定用户身份运行（非 Windows）
+	if req.User != "" {
+		if err := applyRunAs(cmd, req.User); err != nil {
+			return &Result{Status: 1, Stderr: "降权执行失败: " + err.Error(), Duration: time.Since(start).Milliseconds()}
+		}
+	}
 
 	// 工作目录
 	if req.WorkDir != "" {
@@ -81,9 +87,6 @@ func Execute(req *protocol.CommandReq) *Result {
 		env = append(env, k+"="+v)
 	}
 	cmd.Env = env
-
-	// 降权执行（可选）：此处通过设置环境变量简化，完整实现需以指定用户身份运行
-	_ = req.User
 
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout

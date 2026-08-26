@@ -61,6 +61,16 @@ export const Api = {
     const { data } = await api.get('/health')
     return data
   },
+  // 用户名+密码（+OTP 可选）登录，成功返回 { token }
+  async login({ username, password, otp }) {
+    const { data } = await api.post('/login', { username, password, otp })
+    return data
+  },
+  // 修改用户密码
+  async changePassword(payload) {
+    const { data } = await api.post('/password', payload)
+    return data
+  },
 }
 
 // WebSocket 客户端：用于接收服务端实时推送（主机状态、命令输出等）。
@@ -97,7 +107,16 @@ export class MCSocket {
     this.ws.onmessage = (ev) => {
       let msg
       try { msg = JSON.parse(ev.data) } catch { return }
-      const payload = msg.data ? (typeof msg.data === 'string' ? JSON.parse(msg.data) : msg.data) : msg
+      // 服务端 Envelope.Data 为 []byte，json 序列化后是 base64 字符串；
+      // 这里先解析为对象，若是 base64 则解码后再解析。
+      let payload = msg.data
+      if (typeof payload === 'string') {
+        try {
+          payload = JSON.parse(payload)
+        } catch {
+          try { payload = JSON.parse(atob(payload)) } catch { payload = msg.data }
+        }
+      }
       switch (msg.type) {
         case 'AgentList': this.handlers.onAgentList?.(payload); break
         case 'CommandResp': this.handlers.onCommandResp?.(payload); break

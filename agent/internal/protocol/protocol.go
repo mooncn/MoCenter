@@ -18,6 +18,10 @@ const (
 	TypeOnline         = "AgentOnline"
 	TypeUpgradeReq     = "UpgradeReq"
 	TypeUpgradeResp    = "UpgradeResp"
+	TypeTunnelOpen     = "TunnelOpenReq"  // Server->Agent 端口映射隧道建立请求
+	TypeTunnelOpenResp = "TunnelOpenResp" // Agent->Server 隧道建立响应
+	TypeTunnelData     = "TunnelData"     // Server<->Agent 隧道双向数据
+	TypeTunnelClose    = "TunnelClose"    // Server<->Agent 隧道关闭
 )
 
 // Envelope 通用消息信封。
@@ -167,4 +171,31 @@ type UpgradeResp struct {
 	OK        bool   `json:"ok"`
 	Message   string `json:"message"`
 	Version   string `json:"version"`
+}
+
+// TunnelOpenReq Server -> Agent：请求 Agent 在本机建立到内网服务的隧道连接。
+type TunnelOpenReq struct {
+	TunnelID  string `json:"tunnel_id"`
+	AgentID   string `json:"agent_id"`
+	LocalHost string `json:"local_host"` // 默认 127.0.0.1
+	LocalPort int    `json:"local_port"`
+}
+
+// TunnelOpenResp Agent -> Server
+type TunnelOpenResp struct {
+	TunnelID string `json:"tunnel_id"`
+	OK       bool   `json:"ok"`
+	Message  string `json:"message"`
+}
+
+// TunnelData Server <-> Agent 隧道载荷
+type TunnelData struct {
+	TunnelID string `json:"tunnel_id"`
+	Data     []byte `json:"data"`
+}
+
+// TunnelClose Server <-> Agent 隧道关闭
+type TunnelClose struct {
+	TunnelID string `json:"tunnel_id"`
+	Reason   string `json:"reason"`
 }

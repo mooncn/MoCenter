@@ -27,6 +27,11 @@ type InteractiveSession struct {
 	onOutput func(*protocol.InteractiveOutput)
 	stop     chan struct{}
 	done     chan struct{}
+
+	// Windows ConPTY 会话（非零时优先于普通管道）
+	conptyResize func(int, int) error
+	conptyClose  func()
+	conptyDone   <-chan struct{}
 }
 
 // StartInteractive 启动一个交互式命令，onOutput 用于回传输出。
@@ -58,8 +63,33 @@ func StartInteractive(req *protocol.CommandReq, onOutput func(*protocol.Interact
 		s.ptmx = ptmx
 		go s.readLoop(ptmx)
 		go s.waitLoop()
+	} else if runtime.GOOS == "windows" {
+		// Windows：优先使用真伪终端 ConPTY，失败则退化为普通管道
+		if cs, cerr := startConPTYSession(name, args, req.Rows, req.Cols); cerr == nil {
+			s.conptyResize = cs.Resize
+			s.conptyClose = cs.Close
+			s.conptyDone = cs.Done()
+			go s.readPipeLoop(cs.Stdout())
+			go s.waitConPTY()
+		} else {
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				return nil, err
+			}
+			stdout, err := cmd.StdoutPipe()
+			if err != nil {
+				return nil, err
+			}
+			cmd.Stderr = os.Stderr
+			if err := cmd.Start(); err != nil {
+				return nil, err
+			}
+			s.stdin = stdin
+			go s.readPipeLoop(stdout)
+			go s.waitLoop()
+		}
 	} else {
-		// Windows 等平台退化：使用管道
+		// 其他平台退化：使用管道
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
 			return nil, err
@@ -102,7 +132,13 @@ func (s *InteractiveSession) Write(data []byte) error {
 func (s *InteractiveSession) Resize(rows, cols int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ptmx == nil || rows <= 0 || cols <= 0 {
+	if rows <= 0 || cols <= 0 {
+		return nil
+	}
+	if s.conptyResize != nil {
+		return s.conptyResize(rows, cols)
+	}
+	if s.ptmx == nil {
 		return nil
 	}
 	return resizePTY(s.ptmx, rows, cols)
@@ -141,9 +177,23 @@ func (s *InteractiveSession) Close() {
 	}
 	close(s.stop)
 	s.mu.Unlock()
+	if s.conptyClose != nil {
+		s.conptyClose()
+	}
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
+}
+
+// waitConPTY 等待 ConPTY 子进程退出并发送退出事件。
+func (s *InteractiveSession) waitConPTY() {
+	<-s.conptyDone
+	s.emit(&protocol.InteractiveOutput{
+		CommandID: s.cmdID,
+		Type:      "exit",
+		ExitCode:  0,
+	})
+	close(s.done)
 }
 
 // readLoop 从 PTY 主端读取输出并回传。

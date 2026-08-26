@@ -5,7 +5,7 @@ import { SocketContext } from '../App.jsx'
 // 运维操作页面：批量命令、远程升级、文件传输
 export default function Ops({ agents }) {
   const socket = useContext(SocketContext)
-  const online = agents.filter((a) => a.online)
+  const online = (agents || []).filter((a) => a.online)
 
   // 批量命令
   const [selected, setSelected] = useState([])
