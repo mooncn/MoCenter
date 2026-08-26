@@ -288,7 +288,65 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 		go upgrade.Perform(&up, func(resp *protocol.UpgradeResp) {
 			_ = c.write(protocol.TypeUpgradeResp, resp)
 		})
+	case protocol.TypeInteractiveClose:
+		var req protocol.InteractiveCloseReq
+		if json.Unmarshal(env.Data, &req) != nil {
+			return
+		}
+		c.closeSession(req)
+	case protocol.TypeVncInstallReq:
+		var req protocol.VncInstallReq
+		if json.Unmarshal(env.Data, &req) != nil {
+			return
+		}
+		go c.handleVncInstall(req)
 	}
+}
+
+// closeSession 断开终端连接：结束指定会话/命令及其相关进程。
+func (c *Client) closeSession(req protocol.InteractiveCloseReq) {
+	// 1) 交互会话
+	if req.CommandID != "" {
+		c.mu.Lock()
+		if s, ok := c.interactive[req.CommandID]; ok {
+			delete(c.interactive, req.CommandID)
+			s.Close()
+			c.mu.Unlock()
+			log.Printf("[agent] 断开会话 %s 并结束相关进程", req.CommandID)
+			return
+		}
+		c.mu.Unlock()
+	}
+	// 2) 非交互登记中的命令
+	closed := 0
+	if req.CommandID != "" {
+		if command.Kill(req.CommandID) {
+			closed++
+		}
+	} else if req.KillAll {
+		closed = command.KillAll()
+	}
+	// 3) 若无指定且未 kill_all，则结束全部活跃会话/命令
+	if req.CommandID == "" && !req.KillAll {
+		c.mu.Lock()
+		for id, s := range c.interactive {
+			delete(c.interactive, id)
+			s.Close()
+			closed++
+		}
+		c.mu.Unlock()
+		closed += command.KillAll()
+	}
+	log.Printf("[agent] 断开终端连接，已结束 %d 个会话/命令", closed)
+}
+
+// handleVncInstall 处理 VNC 安装/启动指令并回传结果。
+func (c *Client) handleVncInstall(req protocol.VncInstallReq) {
+	resp := command.VncInstall(req.Port)
+	log.Printf("[agent] VNC 安装/启动结果: ok=%v msg=%s", resp.OK, resp.Message)
+	_ = c.write(protocol.TypeVncInstallResp, protocol.VncInstallResp{
+		OK: resp.OK, Message: resp.Message, Port: resp.Port,
+	})
 }
 
 // handleFilePush 接收服务端下发的文件分片，写入本地目标文件并回传 ACK/NACK。
@@ -411,14 +469,16 @@ func (c *Client) runCommand(req protocol.CommandReq) {
 		return
 	}
 
-	res := command.Execute(&req)
-	_ = c.write(protocol.TypeCommandResp, protocol.CommandResp{
-		CommandID: req.CommandID,
-		Status:    res.Status,
-		ExitCode:  res.ExitCode,
-		Stdout:    res.Stdout,
-		Stderr:    res.Stderr,
-		Duration:  res.Duration,
+	// 非交互命令异步执行，避免阻塞消息循环，并支持「断开连接」时结束相关进程
+	command.RunAsync(&req, func(res *command.Result) {
+		_ = c.write(protocol.TypeCommandResp, protocol.CommandResp{
+			CommandID: req.CommandID,
+			Status:    res.Status,
+			ExitCode:  res.ExitCode,
+			Stdout:    res.Stdout,
+			Stderr:    res.Stderr,
+			Duration:  res.Duration,
+		})
 	})
 }
 

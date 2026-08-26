@@ -130,6 +130,30 @@ export default function TerminalPage({ agents }) {
     return () => disposable.dispose()
   }, [shell])
 
+  // 断开终端连接：向目标主机下发断开指令并结束相关进程
+  const disconnect = async () => {
+    if (!hostRef.current) {
+      setNotice('请先选择目标主机')
+      return
+    }
+    setStatus('disconnecting')
+    try {
+      await Api.commandClose({
+        agent_id: hostRef.current,
+        command_id: cmdIdRef.current || '',
+        kill_all: false,
+      })
+      const term = terminalRef.current
+      if (term) term.write('\r\n\x1b[1;33m[已发送断开指令，相关进程将被结束]\x1b[0m\r\n')
+      setNotice('')
+    } catch (ex) {
+      setNotice('断开失败: ' + (ex.response?.data?.msg || ex.message))
+    } finally {
+      setStatus('idle')
+      setCmdId('')
+    }
+  }
+
   return (
     <div>
       <div className="page-head">
@@ -167,6 +191,10 @@ export default function TerminalPage({ agents }) {
           </span>
           <span className="host-label">{host ? onlineHosts.find((h) => h.agent_id === host)?.hostname : '未选择主机'}</span>
           <button className="secondary" onClick={() => terminalRef.current && terminalRef.current.clear()}>清屏</button>
+          <button className="secondary danger" onClick={disconnect} disabled={!host || (status !== 'executing' && status !== 'idle')}
+            title="断开与目标主机的终端连接，并结束相关进程">
+            断开连接
+          </button>
         </div>
         <div className="terminal-wrap">
           <div ref={termRef} style={{ height: 420 }} />

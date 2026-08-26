@@ -23,6 +23,7 @@ type InteractiveSession struct {
 	ptmx     *os.File // PTY 主端（linux/macOS）
 	cmd      *exec.Cmd
 	stdin    io.WriteCloser
+	in       io.Writer // 实际输入句柄（含平台编码转换）
 	closed   bool
 	onOutput func(*protocol.InteractiveOutput)
 	stop     chan struct{}
@@ -61,6 +62,7 @@ func StartInteractive(req *protocol.CommandReq, onOutput func(*protocol.Interact
 			return nil, err
 		}
 		s.ptmx = ptmx
+		s.in = ptmx
 		go s.readLoop(ptmx)
 		go s.waitLoop()
 	} else if runtime.GOOS == "windows" {
@@ -69,6 +71,7 @@ func StartInteractive(req *protocol.CommandReq, onOutput func(*protocol.Interact
 			s.conptyResize = cs.Resize
 			s.conptyClose = cs.Close
 			s.conptyDone = cs.Done()
+			s.in = cs.Stdin()
 			go s.readPipeLoop(cs.Stdout())
 			go s.waitConPTY()
 		} else {
@@ -85,6 +88,7 @@ func StartInteractive(req *protocol.CommandReq, onOutput func(*protocol.Interact
 				return nil, err
 			}
 			s.stdin = stdin
+			s.in = stdin
 			go s.readPipeLoop(stdout)
 			go s.waitLoop()
 		}
@@ -103,6 +107,7 @@ func StartInteractive(req *protocol.CommandReq, onOutput func(*protocol.Interact
 			return nil, err
 		}
 		s.stdin = stdin
+		s.in = stdin
 		go s.readPipeLoop(stdout)
 		go s.waitLoop()
 	}
@@ -116,6 +121,10 @@ func (s *InteractiveSession) Write(data []byte) error {
 	defer s.mu.Unlock()
 	if s.closed {
 		return io.EOF
+	}
+	if s.in != nil {
+		_, err := s.in.Write(data)
+		return err
 	}
 	if s.ptmx != nil {
 		_, err := s.ptmx.Write(data)

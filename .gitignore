@@ -12,6 +12,16 @@ mocenter-agent.exe
 *.out
 vendor/
 
+# 安全：私钥/证书（测试生成）
+certs/
+*.key
+*.pem
+*.crt
+
+# 临时诊断目录
+_diag/
+_diag*/
+
 # Node
 node_modules/
 npm-debug.log*

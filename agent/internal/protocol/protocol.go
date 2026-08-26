@@ -22,6 +22,9 @@ const (
 	TypeTunnelOpenResp = "TunnelOpenResp" // Agent->Server 隧道建立响应
 	TypeTunnelData     = "TunnelData"     // Server<->Agent 隧道双向数据
 	TypeTunnelClose    = "TunnelClose"    // Server<->Agent 隧道关闭
+	TypeInteractiveClose = "InteractiveClose" // Web->Server->Agent 断开交互终端并结束相关进程
+	TypeVncInstallReq    = "VncInstallReq"   // Server->Agent 下发 VNC 安装/启动指令
+	TypeVncInstallResp   = "VncInstallResp"  // Agent->Server VNC 安装/启动结果
 )
 
 // Envelope 通用消息信封。
@@ -198,4 +201,24 @@ type TunnelData struct {
 type TunnelClose struct {
 	TunnelID string `json:"tunnel_id"`
 	Reason   string `json:"reason"`
+}
+
+// InteractiveCloseReq Web->Server->Agent：断开交互终端，并结束该会话相关进程。
+type InteractiveCloseReq struct {
+	AgentID   string `json:"agent_id"`
+	CommandID string `json:"command_id"` // 为空表示结束当前 Agent 上全部活跃命令/会话
+	KillAll   bool   `json:"kill_all"`
+}
+
+// VncInstallReq Server->Agent：下发 VNC 安装/启动指令。
+type VncInstallReq struct {
+	AgentID string `json:"agent_id"`
+	Port    int    `json:"port"` // VNC 端口，默认 5900
+}
+
+// VncInstallResp Agent->Server：VNC 安装/启动结果。
+type VncInstallResp struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+	Port    int    `json:"port"`
 }

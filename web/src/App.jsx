@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import { Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom'
 import Dashboard from './pages/Dashboard.jsx'
 import Terminal from './pages/Terminal.jsx'
+import Vnc from './pages/Vnc.jsx'
 import PortMap from './pages/PortMap.jsx'
 import Offline from './pages/Offline.jsx'
 import Audit from './pages/Audit.jsx'
@@ -45,6 +46,7 @@ function Layout() {
           <nav>
             <NavLink to="/" end>仪表盘</NavLink>
             <NavLink to="/terminal">远程终端</NavLink>
+            <NavLink to="/vnc">远程桌面</NavLink>
             <NavLink to="/portmap">端口映射</NavLink>
             <NavLink to="/ops">运维操作</NavLink>
             <NavLink to="/offline">离线机器</NavLink>
@@ -60,6 +62,7 @@ function Layout() {
           <Routes>
             <Route path="/" element={<Dashboard agents={agents} />} />
             <Route path="/terminal" element={<Terminal agents={agents} />} />
+            <Route path="/vnc" element={<Vnc agents={agents} />} />
             <Route path="/portmap" element={<PortMap agents={agents} />} />
             <Route path="/ops" element={<Ops agents={agents} />} />
             <Route path="/offline" element={<Offline agents={agents} />} />

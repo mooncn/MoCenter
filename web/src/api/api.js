@@ -71,6 +71,21 @@ export const Api = {
     const { data } = await api.post('/password', payload)
     return data
   },
+  // 断开远程终端连接，结束相关进程
+  async commandClose(payload) {
+    const { data } = await api.post('/command/close', payload)
+    return data
+  },
+  // 探测目标主机 VNC 是否可连
+  async vncProbe(agent, port) {
+    const { data } = await api.get('/vnc/probe', { params: { agent, port } })
+    return data
+  },
+  // 一键下发 VNC 安装/启动指令
+  async vncInstall(payload) {
+    const { data } = await api.post('/vnc/install', payload)
+    return data
+  },
 }
 
 // WebSocket 客户端：用于接收服务端实时推送（主机状态、命令输出等）。
@@ -108,13 +123,17 @@ export class MCSocket {
       let msg
       try { msg = JSON.parse(ev.data) } catch { return }
       // 服务端 Envelope.Data 为 []byte，json 序列化后是 base64 字符串；
-      // 这里先解析为对象，若是 base64 则解码后再解析。
+      // 用 TextDecoder 按 UTF-8 还原字节，避免中文等非 ASCII 出现乱码。
       let payload = msg.data
       if (typeof payload === 'string') {
         try {
           payload = JSON.parse(payload)
         } catch {
-          try { payload = JSON.parse(atob(payload)) } catch { payload = msg.data }
+          try {
+            const bin = atob(payload)
+            const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0))
+            payload = JSON.parse(new TextDecoder('utf-8').decode(bytes))
+          } catch { payload = msg.data }
         }
       }
       switch (msg.type) {

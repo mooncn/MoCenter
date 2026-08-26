@@ -6,11 +6,25 @@ export default function Dashboard({ agents }) {
   const [since, setSince] = useState('24h')
   const [selectedAgent, setSelectedAgent] = useState('')
   const [history, setHistory] = useState(null)
+  // 服务端存活状态：null=检测中 true=在线 false=离线
+  const [serverAlive, setServerAlive] = useState(null)
 
   const online = (agents || []).filter((a) => a.online).length
   const offline = (agents || []).filter((a) => !a.online).length
 
   const sinceMap = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800 }
+
+  // 每 5 秒探测服务端存活状态（/api/health 无需鉴权）
+  useEffect(() => {
+    let alive = true
+    const check = async () => {
+      try { await Api.health(); alive && setServerAlive(true) }
+      catch { alive && setServerAlive(false) }
+    }
+    check()
+    const t = setInterval(check, 5000)
+    return () => { alive = false; clearInterval(t) }
+  }, [])
 
   // 加载选中主机的历史探针趋势
   useEffect(() => {
@@ -31,6 +45,10 @@ export default function Dashboard({ agents }) {
           <h2>仪表盘</h2>
           <div className="sub">主机探针信息总览 · 在线 {online} / 离线 {offline} / 共 {agents.length}</div>
         </div>
+        <span className={`badge ${serverAlive === false ? 'offline' : serverAlive ? 'online' : ''}`} style={{ marginRight: 12 }}>
+          <span className={`dot ${serverAlive === false ? 'offline' : serverAlive ? 'online' : ''}`} />{' '}
+          {serverAlive === null ? '服务端检测中…' : serverAlive ? '服务端在线' : '服务端离线'}
+        </span>
         <select value={since} onChange={(e) => setSince(e.target.value)} style={{ width: 150 }}>
           <option value="1h">最近 1 小时</option>
           <option value="6h">最近 6 小时</option>

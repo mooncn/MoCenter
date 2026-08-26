@@ -61,6 +61,10 @@ tr:hover td { background: var(--panel-2); }
 .badge.online { background: rgba(34,197,94,.15); color: var(--green); }
 .badge.offline { background: rgba(239,68,68,.15); color: var(--red); }
 .badge.idle { background: rgba(234,179,8,.15); color: var(--yellow); }
+/* 状态指示点 */
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; background: var(--yellow); }
+.dot.online { background: var(--green); }
+.dot.offline { background: var(--red); }
 
 /* 按钮 */
 button {

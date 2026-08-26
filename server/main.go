@@ -38,6 +38,7 @@ import (
 	"mocenter/server/internal/protocol"
 	"mocenter/server/internal/route"
 	"mocenter/server/internal/session"
+	"mocenter/server/internal/vnc"
 	"mocenter/server/internal/ws"
 )
 
@@ -166,12 +167,13 @@ func main() {
 	pm := portmap.NewManager(sess)
 	ft := filetransfer.NewManager("/tmp/mocenter_uploads")
 	pushMgr := filetransfer.NewPushManager()
+	vncMgr := vnc.NewMgr(sess)
 
 	hub := ws.NewHub()
 
 	// WebSocket 收到 Web 消息后的统一处理入口
 	hub.SetMessageHandler(func(data []byte) {
-		handleWebMessage(data, sess, store, router, hub, ft, pm, pushMgr)
+		handleWebMessage(data, sess, store, router, hub, ft, pm, pushMgr, vncMgr)
 	})
 
 	// 服务端启动后台任务
@@ -183,10 +185,16 @@ func main() {
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		hub.HandleUpgrade(w, r, authz.ValidateToken)
 	})
-	mux.HandleFunc("/api/agents", agentsHandler(store, authz))
-	mux.HandleFunc("/api/agents/history", historyHandler(store, authz))
+	mux.HandleFunc("/vnc-ws", func(w http.ResponseWriter, r *http.Request) {
+		vncMgr.HandleViewer(w, r, authz.ValidateToken)
+	})
 	mux.HandleFunc("/api/command", commandHandler(router, authz))
 	mux.HandleFunc("/api/command/batch", batchCommandHandler(router, authz))
+	mux.HandleFunc("/api/command/close", commandCloseHandler(sess, authz))
+	mux.HandleFunc("/api/vnc/probe", vncProbeHandler(vncMgr, authz))
+	mux.HandleFunc("/api/vnc/install", vncInstallHandler(vncMgr, authz))
+	mux.HandleFunc("/api/agents", agentsHandler(store, authz))
+	mux.HandleFunc("/api/agents/history", historyHandler(store, authz))
 	mux.HandleFunc("/api/audits", auditsHandler(router, authz))
 	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
 	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz))
@@ -255,12 +263,12 @@ func main() {
 			log.Printf("[server] accept error: %v", err)
 			continue
 		}
-		go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr)
+		go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr)
 	}
 }
 
 // handleAgentConn 处理单个 Agent 的 TCP 长连接。
-func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager) {
+func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -377,20 +385,41 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			log.Printf("[server] Agent %s 升级结果: %v %s", sessConn.AgentID, ur.OK, ur.Message)
 		case protocol.TypeTunnelOpenResp:
 			var tr protocol.TunnelOpenResp
-			if json.Unmarshal(env.Data, &tr) == nil && !tr.OK {
-				// 隧道建立失败：关闭对应的公网侧连接
+			if json.Unmarshal(env.Data, &tr) != nil {
+				continue
+			}
+			if isVNCTunnel(tr.TunnelID) {
+				vncMgr.DeliverOpenResp(tr.TunnelID, tr.OK, tr.Message)
+				if !tr.OK {
+					log.Printf("[server] VNC 隧道建立失败 %s: %s", tr.TunnelID, tr.Message)
+				}
+			} else if !tr.OK {
+				// 端口映射隧道建立失败：关闭对应的公网侧连接
 				log.Printf("[server] 隧道建立失败 %s: %s", tr.TunnelID, tr.Message)
 				pm.NotifyTunnelClosed(tr.TunnelID, tr.Message)
 			}
 		case protocol.TypeTunnelData:
 			var td protocol.TunnelData
 			if json.Unmarshal(env.Data, &td) == nil {
-				pm.DeliverTunnelData(td.TunnelID, td.Data)
+				if isVNCTunnel(td.TunnelID) {
+					vncMgr.DeliverTunnelData(td.TunnelID, td.Data)
+				} else {
+					pm.DeliverTunnelData(td.TunnelID, td.Data)
+				}
 			}
 		case protocol.TypeTunnelClose:
 			var tc protocol.TunnelClose
 			if json.Unmarshal(env.Data, &tc) == nil {
-				pm.NotifyTunnelClosed(tc.TunnelID, tc.Reason)
+				if isVNCTunnel(tc.TunnelID) {
+					vncMgr.NotifyTunnelClosed(tc.TunnelID)
+				} else {
+					pm.NotifyTunnelClosed(tc.TunnelID, tc.Reason)
+				}
+			}
+		case protocol.TypeVncInstallResp:
+			var vr protocol.VncInstallResp
+			if json.Unmarshal(env.Data, &vr) == nil {
+				vncMgr.NotifyInstall(sessConn.AgentID, &vr)
 			}
 		}
 	}
@@ -513,6 +542,89 @@ func batchCommandHandler(router *route.Router, authz *auth.Auth) http.HandlerFun
 		results := router.DispatchBatch(req, body.AgentIDs, "web-admin", r.RemoteAddr)
 		writeJSON(w, map[string]interface{}{"ok": true, "results": results})
 	}
+}
+
+// commandCloseHandler 断开远程终端连接：向目标 Agent 下发 InteractiveClose，结束相关进程。
+func commandCloseHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req protocol.InteractiveCloseReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if req.AgentID == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+			return
+		}
+		conn := sess.Get(req.AgentID)
+		if conn == nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "目标主机离线"})
+			return
+		}
+		if err := conn.Write(protocol.TypeInteractiveClose, req); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "下发失败: " + err.Error()})
+			return
+		}
+		log.Printf("[server] 终端断开请求 agent=%s command_id=%q kill_all=%v", req.AgentID, req.CommandID, req.KillAll)
+		writeJSON(w, map[string]interface{}{"ok": true, "msg": "已下发断开/结束指令"})
+	}
+}
+
+// vncProbeHandler 探测目标主机 VNC 是否可连。
+func vncProbeHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		agentID := r.URL.Query().Get("agent")
+		port := 5900
+		if s := r.URL.Query().Get("port"); s != "" {
+			if p, err := strconv.Atoi(s); err == nil && p > 0 {
+				port = p
+			}
+		}
+		ok, msg := mgr.Probe(agentID, port)
+		writeJSON(w, map[string]interface{}{"ok": ok, "msg": msg, "port": port, "agent_id": agentID})
+	}
+}
+
+// vncInstallHandler 一键下发 VNC 安装/启动指令并返回结果。
+func vncInstallHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			AgentID string `json:"agent_id"`
+			Port    int    `json:"port"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if body.AgentID == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+			return
+		}
+		resp := mgr.Install(body.AgentID, body.Port)
+		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port})
+	}
+}
+
+// isVNCTunnel 判断隧道 ID 是否属于 VNC（查看器 v- / 探测 vp-）。
+func isVNCTunnel(tunnelID string) bool {
+	return strings.HasPrefix(tunnelID, "v-") || strings.HasPrefix(tunnelID, "vp-")
 }
 
 func auditsHandler(router *route.Router, authz *auth.Auth) http.HandlerFunc {
@@ -760,7 +872,7 @@ func serveSPA(mux *http.ServeMux, webDir string) {
 
 // handleWebMessage 处理 Web 前端通过 WebSocket 发来的消息。
 // 支持：命令下发、交互输入、端口映射操作。
-func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager) {
+func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr) {
 	// WebSocket 消息中 data 为 JSON 对象，需用 RawMessage 解码（不同于 TCP 的 base64 []byte）
 	var raw struct {
 		Type string          `json:"type"`
