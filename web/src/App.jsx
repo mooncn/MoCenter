@@ -22,6 +22,10 @@ function Layout() {
     // 拉取主机列表
     Api.agents().then((d) => setAgents(Array.isArray(d) ? d : [])).catch(() => {})
 
+    // 备注保存后刷新主机列表，使备注在仪表盘即时生效
+    const onRemarkSaved = () => Api.agents().then((d) => setAgents(Array.isArray(d) ? d : [])).catch(() => {})
+    window.addEventListener('mc-remark-saved', onRemarkSaved)
+
     // 建立 WebSocket，接收实时推送
     const token = localStorage.getItem('mc_token')
     const socket = new MCSocket({
@@ -30,7 +34,7 @@ function Layout() {
     })
     socket.connect()
     socketRef.current = socket
-    return () => socket.close()
+    return () => { socket.close(); window.removeEventListener('mc-remark-saved', onRemarkSaved) }
   }, [])
 
   const logout = () => {

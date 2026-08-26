@@ -24,6 +24,7 @@ type Config struct {
 	ClientCert string `json:"client_cert,omitempty"` // mTLS 客户端证书
 	ClientKey  string `json:"client_key,omitempty"`  // mTLS 客户端私钥
 	CACert     string `json:"ca_cert,omitempty"`     // 校验服务端证书的 CA
+	ProxyIP    string `json:"proxy_ip,omitempty"`    // 国内加速代理前缀
 }
 
 func DefaultPath() string { return "mocenter-agent.json" }

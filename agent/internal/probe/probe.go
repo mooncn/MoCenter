@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"mocenter/agent/internal/ip"
 	"mocenter/agent/internal/protocol"
 )
 
@@ -28,6 +29,8 @@ type Collector struct {
 	totalIn  int64
 	totalOut int64
 	start    time.Time
+	// 公网出口 IP 探测器
+	ipDetector *ip.Detector
 }
 
 type cpuTimes struct {
@@ -36,14 +39,26 @@ type cpuTimes struct {
 
 // NewCollector 创建采集器。
 func NewCollector(agentID string) *Collector {
+	return NewCollectorWithProxy(agentID, "")
+}
+
+// NewCollectorWithProxy 创建采集器，proxy 为可选的国内加速代理前缀。
+func NewCollectorWithProxy(agentID, proxy string) *Collector {
 	return &Collector{
-		AgentID: agentID,
-		host:    hostname(),
-		osType:  runtime.GOOS,
-		arch:    runtime.GOARCH,
-		start:   time.Now(),
+		AgentID:    agentID,
+		host:       hostname(),
+		osType:     runtime.GOOS,
+		arch:       runtime.GOARCH,
+		start:      time.Now(),
+		ipDetector: ip.NewDetector(proxy),
 	}
 }
+
+// PublicIPs 返回公网出口 IP（IPv4/IPv6）。
+func (c *Collector) PublicIPs() ip.Result { return c.ipDetector.Resolve() }
+
+// PublicIPv4 返回公网 IPv4。
+func (c *Collector) PublicIPv4() string { return c.ipDetector.Resolve().IPv4 }
 
 // Host 返回主机名。
 func (c *Collector) Host() string { return c.host }
@@ -57,6 +72,7 @@ func (c *Collector) Arch() string { return c.arch }
 // Sample 采集一次探针数据。
 func (c *Collector) Sample() *protocol.ProbeDataReq {
 	now := time.Now()
+	ips := c.PublicIPs()
 	p := &protocol.ProbeDataReq{
 		AgentID:       c.AgentID,
 		Timestamp:     now.Unix(),
@@ -66,6 +82,8 @@ func (c *Collector) Sample() *protocol.ProbeDataReq {
 		Uptime:        int64(now.Sub(c.start).Seconds()),
 		MemUsage:      memUsage(),
 		DiskUsage:     diskUsage(),
+		PublicIP:      ips.IPv4,
+		PublicIPv6:    ips.IPv6,
 	}
 	if c.osType == "linux" {
 		cpu := readCPUTimes()

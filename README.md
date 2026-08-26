@@ -169,6 +169,8 @@ mocenter-server -user admin -password your-password -totp-secret JBSWY3DPEHPK3PX
 
 - ✅ Agent 上线注册、心跳保活、离线判定（3 个心跳周期）
 - ✅ 探针采集（CPU/内存/磁盘/网络流量/系统信息）与 Web 实时展示 + 历史趋势图
+- ✅ **主机备注**：仪表盘可为主机设置自定义备注，有备注时优先显示备注、小字显示主机名
+- ✅ **公网 IP 展示**：仪表盘展示主机公网出口 IPv4/IPv6，并按 IP 解析地理位置与国家图标
 - ✅ 远程命令执行（bash/sh/cmd/powershell）、超时控制、审计日志、命令黑名单
 - ✅ **交互式 PTY 终端**（基于 creack/pty，实时双向 IO、尺寸自适应、Ctrl-C）
 - ✅ WebSocket 实时推送主机列表、命令输出、交互输出、文件传输状态、升级结果
@@ -182,8 +184,61 @@ mocenter-server -user admin -password your-password -totp-secret JBSWY3DPEHPK3PX
 - ✅ Agent 断线指数退避重连、进程守护崩溃自启
 - ✅ **TLS/mTLS 加密**：Agent<->Server 可选全链路 TLS 单向加密，或 mTLS 双向认证（客户端证书 + CA 校验）
 - ✅ **服务端托管 Web 静态资源**：`-web web/dist` 单进程部署
+- ✅ **远程桌面 (VNC)**：服务端隧道 + noVNC 浏览器渲染，一键安装/启动（Windows TightVNC、Linux x11vnc，支持国内加速代理）
+- ✅ **多架构打包**：Windows x86/x86_64/ARM/ARM64、Linux amd64/arm64/arm/386 二进制，及 .deb/.rpm 安装包
+- ✅ **系统服务注册**：Agent 一键注册为 Windows 服务 / Linux systemd 服务，开机自启
 
 > 说明：核心链路（Agent 上线→探针→命令执行→结果回传→Web 展示）已端到端打通，并在此基础上实现了交互式终端、文件断点续传、端口映射、批量命令、远程升级、TLS 加密等生产级能力。
+
+## Agent 安装包与系统服务
+
+### 多架构二进制构建
+
+```bash
+# Linux 多架构（amd64/arm64/arm/386）
+bash scripts/packaging/build-linux-all.sh
+
+# Windows 多架构（x86_64/x86/arm64/arm）
+# 在 Windows 上执行:
+scripts\packaging\build-win-all.bat
+```
+
+### Linux .deb/.rpm 安装包（含 systemd 服务）
+
+```bash
+# 一键生成 .deb 与 .rpm（默认 amd64）
+bash scripts/packaging/build-linux-pkg.sh all amd64
+
+# 单独生成 .deb / .rpm
+bash scripts/packaging/build-linux-pkg.sh deb arm64
+bash scripts/packaging/build-linux-pkg.sh rpm amd64
+```
+
+安装包内置 systemd 服务单元，安装后自动：
+- 注册 `mocenter-agent.service` 服务
+- 设置开机自启并启动
+- 配置文件位于 `/etc/mocenter/mocenter-agent.conf`（请修改服务端地址）
+
+> 依赖 `dpkg-deb`（Debian/Ubuntu）或 `fpm`；也可直接使用一键脚本：
+> `sudo bash scripts/packaging/install-linux.sh install <server>`
+
+### Windows 系统服务（开机自启）
+
+将对应架构的 `mocenter-agent-*.exe` 命名为 `mocenter-agent.exe` 与 `install-windows.bat` 放在同目录，然后以**管理员**运行：
+
+```bat
+install-windows.bat install your.server.com:9000 [agentid] [proxy]
+```
+
+脚本会：
+- 复制二进制到 `%ProgramFiles%\MoCenter`
+- 注册 Windows 服务 `MoCenterAgent`（`sc create`）
+- 设置开机自启并启动
+
+### 国内加速代理
+
+Agent 支持 `-proxy-ip http://fa.mooncn.win/?url=` 参数（或配置文件 `MOCENTER_PROXY_IP`），
+用于国内网络环境下加速：公网 IP 探测、VNC 安装包下载等境外服务。
 
 ## 许可证
 

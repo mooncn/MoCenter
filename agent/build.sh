@@ -1,18 +1,45 @@
 #!/usr/bin/env bash
 # MoCenter Agent 构建脚本 (Linux/macOS)
-# 用法: bash build.sh [linux|windows|darwin]
+# 用法: bash build.sh [linux|windows|darwin] [amd64|386|arm64|arm]
 #       默认构建当前平台；构建 windows 时输出 .exe
 set -e
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 PLATFORM="${1:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
+ARCH="${2:-amd64}"
 OUT="mocenter-agent"
-GOOS="linux"; GOARCH="amd64"
+GOOS="linux"; GOARCH="${ARCH}"
 
 case "${PLATFORM}" in
-  linux)   GOOS=linux GOARCH=amd64 ;;
-  windows) GOOS=windows GOARCH=amd64; OUT="mocenter-agent.exe" ;;
-  darwin)  GOOS=darwin GOARCH=amd64 ;;
+  linux)
+    GOOS=linux
+    case "${ARCH}" in
+      amd64|x86_64) GOARCH=amd64 ;;
+      arm64|aarch64) GOARCH=arm64 ;;
+      arm) GOARCH=arm; export GOARM=7 ;;
+      386) GOARCH=386 ;;
+      *) GOARCH=amd64 ;;
+    esac
+    ;;
+  windows)
+    GOOS=windows
+    OUT="mocenter-agent.exe"
+    case "${ARCH}" in
+      amd64|x86_64) GOARCH=amd64 ;;
+      arm64|aarch64) GOARCH=arm64 ;;
+      arm) GOARCH=arm; export GOARM=7 ;;
+      386) GOARCH=386 ;;
+      *) GOARCH=amd64 ;;
+    esac
+    ;;
+  darwin)
+    GOOS=darwin
+    case "${ARCH}" in
+      arm64) GOARCH=arm64 ;;
+      amd64) GOARCH=amd64 ;;
+      *) GOARCH=amd64 ;;
+    esac
+    ;;
   *) GOOS=linux GOARCH=amd64 ;;
 esac
 

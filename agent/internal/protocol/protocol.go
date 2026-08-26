@@ -88,6 +88,8 @@ type ProbeDataReq struct {
 	KernelVersion string  `json:"kernel_version"`
 	Uptime        int64   `json:"uptime"`
 	Arch          string  `json:"arch"`
+	PublicIP      string  `json:"public_ip"`
+	PublicIPv6    string  `json:"public_ipv6"`
 }
 
 // ProbeDataResp Server -> Agent
