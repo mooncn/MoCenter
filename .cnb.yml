@@ -33,6 +33,16 @@ main:
             echo "=== [web] npm install & build ==="
             cd web && npm install --no-audit --no-fund && npm run build
             echo "web build done -> dist/"
+    - name: package-linux
+      docker:
+        image: golang:1.22
+      stages:
+        - name: package-agent
+          script: |
+            echo "=== [package] 构建 Linux amd64 二进制 ==="
+            cd agent && CGO_ENABLED=0 go build -ldflags "-s -w" -o mocenter-agent .
+            echo "=== [package] 生成 .deb 安装包（含 systemd 服务） ==="
+            bash scripts/packaging/build-linux-pkg.sh deb amd64 || echo "deb 打包需在构建机安装 dpkg-deb"
     - name: build-web
       docker:
         image: node:20

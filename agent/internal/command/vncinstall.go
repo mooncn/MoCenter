@@ -19,8 +19,21 @@ type VncInstallResult struct {
 	Port    int
 }
 
+// VncConfig VNC 安装/启动配置。
+type VncConfig struct {
+	// Proxy 国内加速代理前缀（如 http://fa.mooncn.win/?url= ），为空则不使用。
+	Proxy string
+	// DownloadBase 下载地址前缀（如官方或镜像），为空使用默认地址。
+	DownloadBase string
+}
+
 // VncInstall 安装并按需启动 VNC 服务，返回结果。port<=0 时默认 5900。
 func VncInstall(port int) VncInstallResult {
+	return VncInstallCfg(port, VncConfig{})
+}
+
+// VncInstallCfg 带配置安装 VNC，支持国内加速代理与自定义下载地址。
+func VncInstallCfg(port int, cfg VncConfig) VncInstallResult {
 	if port <= 0 {
 		port = 5900
 	}
@@ -33,9 +46,9 @@ func VncInstall(port int) VncInstallResult {
 	}
 	switch runtime.GOOS {
 	case "windows":
-		return vncInstallWindows(port)
+		return vncInstallWindows(port, cfg)
 	case "linux":
-		return vncInstallLinux(port)
+		return vncInstallLinux(port, cfg)
 	default:
 		res.Message = "当前平台暂不支持一键安装，请手动安装 VNC 服务端。"
 		return res

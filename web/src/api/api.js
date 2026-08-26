@@ -86,6 +86,11 @@ export const Api = {
     const { data } = await api.post('/vnc/install', payload)
     return data
   },
+  // 设置/更新主机备注
+  async setRemark(agentId, remark) {
+    const { data } = await api.post('/agents/remark', { agent_id: agentId, remark })
+    return data
+  },
 }
 
 // WebSocket 客户端：用于接收服务端实时推送（主机状态、命令输出等）。

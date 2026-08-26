@@ -32,6 +32,7 @@ func main() {
 	clientKey := flag.String("client-key", "", "mTLS 客户端私钥文件路径")
 	caCert := flag.String("ca-cert", "", "用于校验服务端证书的 CA 证书路径（不指定则用 -insecure 跳过校验）")
 	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
+	proxyIP := flag.String("proxy-ip", os.Getenv("MOCENTER_PROXY_IP"), "国内加速代理前缀（用于公网 IP 探测等境外服务，如 http://fa.mooncn.win/?url= ）")
 	flag.Parse()
 
 	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
@@ -52,6 +53,7 @@ func main() {
 			ClientCert: *clientCert,
 			ClientKey:  *clientKey,
 			CACert:     *caCert,
+			ProxyIP:    *proxyIP,
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
 			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
@@ -90,6 +92,9 @@ func main() {
 		if cfg.CACert != "" && *caCert == "" {
 			*caCert = cfg.CACert
 		}
+		if cfg.ProxyIP != "" && *proxyIP == os.Getenv("MOCENTER_PROXY_IP") {
+			*proxyIP = cfg.ProxyIP
+		}
 	}
 
 	if *server == "" {
@@ -104,15 +109,15 @@ func main() {
 	// 进程守护：崩溃自动重启
 	if *daemonize {
 		daemon.Supervise(func() {
-			runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert)
+			runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert, *proxyIP)
 		})
 		return
 	}
 
-	runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert)
+	runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert, *proxyIP)
 }
 
-func runClient(server, agentID string, hb, probe int, tlsEnabled, insecure bool, clientCert, clientKey, caCert string) {
+func runClient(server, agentID string, hb, probe int, tlsEnabled, insecure bool, clientCert, clientKey, caCert, proxyIP string) {
 	c := client.New(client.Config{
 		ServerAddr: server,
 		AgentID:    agentID,
@@ -123,6 +128,7 @@ func runClient(server, agentID string, hb, probe int, tlsEnabled, insecure bool,
 		ClientCert: clientCert,
 		ClientKey:  clientKey,
 		CACert:     caCert,
+		ProxyIP:    proxyIP,
 	})
 	log.Printf("[agent] 启动 Agent %s，目标服务端 %s", agentID, server)
 	c.Run()
