@@ -12,7 +12,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/md5"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -42,6 +44,7 @@ func main() {
 	webDir := flag.String("web", os.Getenv("MOCENTER_WEB_DIR"), "Web 静态资源目录，留空则不托管前端")
 	tlsCert := flag.String("tls-cert", "", "Agent TCP 连接 TLS 证书文件路径")
 	tlsKey := flag.String("tls-key", "", "Agent TCP 连接 TLS 私钥文件路径")
+	caCert := flag.String("ca-cert", "", "mTLS 客户端 CA 证书文件路径（提供后启用双向认证，Agent 需携带客户端证书）")
 	insecure := flag.Bool("insecure", false, "允许非 TLS 的 Agent 连接（未提供证书时自动启用）")
 	flag.Parse()
 
@@ -62,12 +65,13 @@ func main() {
 	router := route.NewRouter(sess)
 	pm := portmap.NewManager(sess)
 	ft := filetransfer.NewManager("/tmp/mocenter_uploads")
+	pushMgr := filetransfer.NewPushManager()
 
 	hub := ws.NewHub()
 
 	// WebSocket 收到 Web 消息后的统一处理入口
 	hub.SetMessageHandler(func(data []byte) {
-		handleWebMessage(data, sess, store, router, hub, ft, pm)
+		handleWebMessage(data, sess, store, router, hub, ft, pm, pushMgr)
 	})
 
 	// 服务端启动后台任务
@@ -109,15 +113,33 @@ func main() {
 		log.Fatalf("[server] listen error: %v", err)
 	}
 
-	// 若提供证书则启用 TLS（全链路加密）
+	// 若提供证书则启用 TLS（全链路加密）。提供 CA 时启用 mTLS 双向认证。
 	var tlsLn net.Listener
 	if *tlsCert != "" && *tlsKey != "" {
 		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 		if err != nil {
 			log.Fatalf("[server] 加载 TLS 证书失败: %v", err)
 		}
-		tlsLn = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
-		log.Printf("[server] Agent TCP 已启用 TLS 加密")
+		tlsCfg := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		if *caCert != "" {
+			caPEM, err := os.ReadFile(*caCert)
+			if err != nil {
+				log.Fatalf("[server] 读取 CA 证书失败: %v", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(caPEM) {
+				log.Fatalf("[server] 解析 CA 证书失败")
+			}
+			tlsCfg.ClientCAs = pool
+			tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+			log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（校验客户端 CA 证书）")
+		} else {
+			log.Printf("[server] Agent TCP 已启用 TLS 加密（单向）")
+		}
+		tlsLn = tls.NewListener(ln, tlsCfg)
 	} else {
 		tlsLn = ln
 		if !*insecure {
@@ -131,12 +153,12 @@ func main() {
 			log.Printf("[server] accept error: %v", err)
 			continue
 		}
-		go handleAgentConn(conn, sess, store, hub, router, ft)
+		go handleAgentConn(conn, sess, store, hub, router, ft, pushMgr)
 	}
 }
 
 // handleAgentConn 处理单个 Agent 的 TCP 长连接。
-func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager) {
+func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pushMgr *filetransfer.PushManager) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -234,6 +256,16 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 				TotalBytes: fu.FileSize, DoneBytes: int64(fu.ChunkSeq+1) * int64(len(fu.ChunkData)),
 				ChunkSeq: fu.ChunkSeq, Status: "transferring",
 			})
+		case protocol.TypeFilePushAck:
+			var fa protocol.FilePushAck
+			_ = json.Unmarshal(env.Data, &fa)
+			hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+				AgentID: sessConn.AgentID, FilePath: fa.FilePath, Action: "push",
+				Status: fa.Status, Message: fa.Message, ChunkSeq: fa.ChunkSeq,
+			})
+			if fa.Status == "done" || fa.Status == "failed" {
+				pushMgr.Remove(fa.CommandID)
+			}
 		case protocol.TypeUpgradeResp:
 			var ur protocol.UpgradeResp
 			_ = json.Unmarshal(env.Data, &ur)
@@ -491,7 +523,7 @@ func serveSPA(mux *http.ServeMux, webDir string) {
 
 // handleWebMessage 处理 Web 前端通过 WebSocket 发来的消息。
 // 支持：命令下发、交互输入、端口映射操作。
-func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager) {
+func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager) {
 	// WebSocket 消息中 data 为 JSON 对象，需用 RawMessage 解码（不同于 TCP 的 base64 []byte）
 	var raw struct {
 		Type string          `json:"type"`
@@ -538,6 +570,70 @@ func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, ro
 			return
 		}
 		handleFileTransferOp(ft, sess, hub, &op)
+	case protocol.TypeFilePushReq:
+		// Web 上传文件分发分片：缓存到服务端，全部到齐后推送给 Agent
+		handleWebPushChunk(pushMgr, sess, hub, env.Data)
+	}
+}
+
+// handleWebPushChunk 处理 Web 端上传的文件分发分片。
+func handleWebPushChunk(pushMgr *filetransfer.PushManager, sess *session.Manager, hub *ws.Hub, data []byte) {
+	var req protocol.FilePushReq
+	if err := json.Unmarshal(data, &req); err != nil {
+		return
+	}
+	task, complete := pushMgr.UploadChunk(&req)
+	if task == nil {
+		// 分发失败/取消
+		hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+			AgentID: req.AgentID, FilePath: req.FilePath, Action: "push",
+			Status: "failed", Message: "文件分发被取消或目标主机离线",
+		})
+		return
+	}
+	// 推送进度给 Web
+	hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+		AgentID: req.AgentID, FilePath: req.FilePath, Action: "push",
+		TotalBytes: task.Size(), DoneBytes: task.TotalBytes(), ChunkSeq: req.ChunkSeq,
+		Status: "transferring",
+	})
+
+	if !complete {
+		return
+	}
+
+	// 全部到齐，向目标 Agent 依次推送分片
+	conn := sess.Get(req.AgentID)
+	if conn == nil {
+		hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+			AgentID: req.AgentID, FilePath: req.FilePath, Action: "push",
+			Status: "failed", Message: "目标主机离线",
+		})
+		pushMgr.Remove(req.CommandID)
+		return
+	}
+
+	chunks := task.OrderedChunks()
+	total := len(chunks)
+	for i, chunk := range chunks {
+		last := i == total-1
+		push := protocol.FilePushReq{
+			CommandID: req.CommandID,
+			FilePath:  task.FilePath,
+			FileSize:  task.FileSize,
+			ChunkSeq:  i,
+			ChunkData: chunk,
+			ChunkMD5:  fmt.Sprintf("%x", md5.Sum(chunk)),
+			Done:      last,
+		}
+		if err := conn.Write(protocol.TypeFilePushReq, push); err != nil {
+			hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+				AgentID: req.AgentID, FilePath: task.FilePath, Action: "push",
+				Status: "failed", Message: "推送失败: " + err.Error(),
+			})
+			pushMgr.Remove(req.CommandID)
+			return
+		}
 	}
 }
 

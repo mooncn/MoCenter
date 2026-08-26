@@ -71,6 +71,18 @@ export class MCSocket {
       return `${proto}://${location.host}/ws?token=${encodeURIComponent(token || '')}`
     }
     this.handlers = { onAgentList, onCommandResp, onInteractive, onPortMap, onFileTransfer, onUpgrade }
+    // 文件传输状态缓存 key=agentId:path:action -> {total, done}
+    this.transferState = new Map()
+    this.onFileTransfer = (st) => {
+      const key = `${st.agent_id}:${st.file_path}:${st.action}`
+      if (st.status === 'transferring') {
+        this.transferState.set(key, { total: st.total_bytes || 0, done: st.done_bytes || 0, status: 'transferring' })
+      } else {
+        this.transferState.set(key, { total: st.total_bytes || 0, done: st.done_bytes || 0, status: st.status, message: st.message })
+      }
+      onFileTransfer?.(st)
+    }
+    this.onUpgrade = onUpgrade
     this.reconnectDelay = 1000
     this.ws = null
     this.alive = true
@@ -110,6 +122,52 @@ export class MCSocket {
   // 发送交互输入到指定 Agent
   sendInteractive(agentId, commandId, data) {
     this.send({ type: 'InteractiveInputReq', data: { agent_id: agentId, command_id: commandId, input_data: data } })
+  }
+
+  // 文件分发：将本地文件分片上传到服务端，服务端转发给目标 Agent
+  async sendFilePush({ agentId, commandId, filePath, file, onProgress }) {
+    const CHUNK = 64 * 1024
+    const total = file.size
+    let seq = 0
+    const totalChunks = Math.ceil(total / CHUNK)
+    for (let offset = 0; offset < total; offset += CHUNK) {
+      const slice = file.slice(offset, offset + CHUNK)
+      const buf = new Uint8Array(await slice.arrayBuffer())
+      // 将二进制转为 base64 便于 JSON 传输
+      const b64 = this.bytesToBase64(buf)
+      const done = offset + CHUNK >= total
+      this.send({
+        type: 'FilePushReq',
+        data: {
+          command_id: commandId,
+          agent_id: agentId,
+          file_path: filePath,
+          file_size: total,
+          chunk_seq: seq,
+          chunk_data: b64,
+          done,
+        },
+      })
+      seq++
+      onProgress?.({ done: offset + buf.length, total, percent: Math.round(((offset + buf.length) / total) * 100), chunks: `${seq}/${totalChunks}` })
+      // 轻微限速，避免一次性塞满队列
+      await new Promise((r) => setTimeout(r, 5))
+    }
+  }
+
+  bytesToBase64(bytes) {
+    let binary = ''
+    const len = bytes.length
+    for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i])
+    return btoa(binary)
+  }
+
+  base64ToBytes(b64) {
+    const binary = atob(b64)
+    const len = binary.length
+    const bytes = new Uint8Array(len)
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i)
+    return bytes
   }
 
   send(obj) {

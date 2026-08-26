@@ -92,6 +92,7 @@ cd server
 # 可选: -whitelist 1.2.3.4,10.0.0.0/8   # IP 白名单
 # 可选: -web web/dist                  # 同时托管 Web 前端（单进程部署）
 # 可选: -tls-cert server.crt -tls-key server.key   # Agent 连接启用 TLS 加密
+# 可选: -ca-cert ca.crt                            # 启用 mTLS 双向认证（Agent 须携带客户端证书）
 ```
 
 ### 3. 启动 Agent
@@ -103,12 +104,21 @@ cd server
 ./mocenter-agent -server your.server.com:9000 -agentid host-01 -daemon
 # 启用 TLS 加密连接（自签名证书用 -insecure 跳过校验）
 ./mocenter-agent -server your.server.com:9000 -agentid host-01 -tls -insecure
+# 启用 mTLS 双向认证：携带客户端证书，并用 CA 校验服务端证书
+./mocenter-agent -server your.server.com:9000 -agentid host-01 -tls \
+  -client-cert client.crt -client-key client.key -ca-cert ca.crt
 
 # Windows 交叉编译
 bash agent/build.sh windows   # 生成 mocenter-agent.exe
 ```
 
-### 4. 访问 Web
+### 4. 生成 TLS/mTLS 证书（可选）
+
+```bash
+bash scripts/gen-cert.sh ./certs   # 生成 ca / server / client 三套证书
+```
+
+### 5. 访问 Web
 
 ```bash
 cd web
@@ -127,12 +137,13 @@ npm run dev     # 开发模式 (代理到 :8080)
 - ✅ WebSocket 实时推送主机列表、命令输出、交互输出、文件传输状态、升级结果
 - ✅ **端口映射反向代理**：规则持久化、连接跟踪、流量统计、超时清理，公网端口实时转发
 - ✅ **文件传输断点续传**：分片收发、MD5 校验、ACK/NACK、断点续传、合并落盘
+- ✅ **文件分发到主机**：Web 上传文件 → 服务端中转 → Agent 指定路径落盘（分片 + MD5 校验）
 - ✅ **批量命令**：一次下发到多台在线主机，审计留痕
 - ✅ **远程升级 Agent**：下载升级包 → MD5 校验 → 备份 → 替换 → 自动重启，失败回滚
 - ✅ 离线机器列表、操作审计界面
 - ✅ 鉴权（Token）+ IP 白名单 + 速率限制
 - ✅ Agent 断线指数退避重连、进程守护崩溃自启
-- ✅ **TLS/mTLS 加密**：Agent<->Server 可选全链路 TLS，自签名证书兼容
+- ✅ **TLS/mTLS 加密**：Agent<->Server 可选全链路 TLS 单向加密，或 mTLS 双向认证（客户端证书 + CA 校验）
 - ✅ **服务端托管 Web 静态资源**：`-web web/dist` 单进程部署
 
 > 说明：核心链路（Agent 上线→探针→命令执行→结果回传→Web 展示）已端到端打通，并在此基础上实现了交互式终端、文件断点续传、端口映射、批量命令、远程升级、TLS 加密等生产级能力。

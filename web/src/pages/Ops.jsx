@@ -1,8 +1,10 @@
-import React, { useState } from 'react'
+import React, { useState, useContext } from 'react'
 import { Api } from '../api/api.js'
+import { SocketContext } from '../App.jsx'
 
 // 运维操作页面：批量命令、远程升级、文件传输
 export default function Ops({ agents }) {
+  const socket = useContext(SocketContext)
   const online = agents.filter((a) => a.online)
 
   // 批量命令
@@ -66,6 +68,48 @@ export default function Ops({ agents }) {
       setUpNotice(res.ok ? '升级指令已下发，等待 Agent 执行...' : res.msg)
     } catch (ex) {
       setUpNotice('下发失败：' + (ex.response?.data?.msg || ex.message))
+    }
+  }
+
+  // 文件分发
+  const [pushAgent, setPushAgent] = useState('')
+  const [pushPath, setPushPath] = useState('')
+  const [pushFile, setPushFile] = useState(null)
+  const [pushNotice, setPushNotice] = useState('')
+  const [pushProgress, setPushProgress] = useState(null)
+
+  const runPush = async (e) => {
+    e.preventDefault()
+    setPushNotice('')
+    setPushProgress(null)
+    if (!pushAgent) {
+      setPushNotice('请选择目标主机')
+      return
+    }
+    if (!pushPath.trim()) {
+      setPushNotice('请输入 Agent 端目标路径')
+      return
+    }
+    if (!pushFile) {
+      setPushNotice('请选择要分发的文件')
+      return
+    }
+    if (!socket) {
+      setPushNotice('WebSocket 未连接，无法分发文件')
+      return
+    }
+    const commandId = 'push-' + Date.now()
+    try {
+      await socket.sendFilePush({
+        agentId: pushAgent,
+        commandId,
+        filePath: pushPath.trim(),
+        file: pushFile,
+        onProgress: (p) => setPushProgress(p),
+      })
+      setPushNotice('分片已全部上传至服务端，等待 Agent 写入确认...')
+    } catch (ex) {
+      setPushNotice('文件分发失败：' + (ex.message || ex))
     }
   }
 
@@ -174,6 +218,54 @@ export default function Ops({ agents }) {
           升级流程：Agent 下载升级包 → 校验 MD5 → 备份旧版本 → 替换二进制 → 自动重启（失败自动回滚）。
         </div>
       </div>
+
+      {/* 文件分发 */}
+      <div className="card" style={{ marginTop: 20 }}>
+        <h3>文件分发到主机</h3>
+        <form onSubmit={runPush}>
+          <div className="form-grid">
+            <div className="form-row">
+              <label>目标主机</label>
+              <select value={pushAgent} onChange={(e) => setPushAgent(e.target.value)}>
+                <option value="">选择主机...</option>
+                {online.map((a) => (
+                  <option key={a.agent_id} value={a.agent_id}>{a.hostname} ({a.agent_id})</option>
+                ))}
+              </select>
+            </div>
+            <div className="form-row">
+              <label>Agent 端目标路径</label>
+              <input value={pushPath} onChange={(e) => setPushPath(e.target.value)} placeholder="如 /tmp/deploy.tar.gz 或 C:\\temp\\app.zip" />
+            </div>
+            <div className="form-row" style={{ gridColumn: '1 / -1' }}>
+              <label>选择要分发的文件</label>
+              <input type="file" onChange={(e) => setPushFile(e.target.files[0] || null)} />
+            </div>
+          </div>
+          <button type="submit" disabled={pushProgress && pushProgress.percent < 100}>分发文件</button>
+        </form>
+        {pushProgress && (
+          <div style={{ marginTop: 12 }}>
+            <div className="sub">已上传 {formatBytes(pushProgress.done)} / {formatBytes(pushProgress.total)}（分片 {pushProgress.chunks}，{pushProgress.percent}%）</div>
+            <div style={{ background: '#1e2a38', borderRadius: 4, height: 8, marginTop: 6 }}>
+              <div style={{ width: `${pushProgress.percent}%`, background: '#2f81f7', height: 8, borderRadius: 4 }} />
+            </div>
+          </div>
+        )}
+        {pushNotice && <div className={`notice ${pushNotice.includes('失败') ? 'err' : 'ok'}`} style={{ marginTop: 12 }}>{pushNotice}</div>}
+        <div className="sub" style={{ marginTop: 12 }}>
+          文件通过服务端中转，分片 + MD5 校验传输至目标主机指定路径，完成写入后回传确认。
+        </div>
+      </div>
     </div>
   )
+}
+
+function formatBytes(b) {
+  if (!b) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let i = 0
+  let v = b
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
+  return v.toFixed(v >= 10 || i === 0 ? 0 : 1) + ' ' + units[i]
 }

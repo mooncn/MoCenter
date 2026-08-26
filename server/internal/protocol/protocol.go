@@ -17,6 +17,8 @@ const (
 	TypeProbeDataResp  = "ProbeDataResp"
 	TypeFileUploadReq  = "FileUploadReq"
 	TypeFileDownloadReq = "FileDownloadReq"
+	TypeFilePushReq   = "FilePushReq"     // Server->Agent 文件分发分片
+	TypeFilePushAck   = "FilePushAck"     // Agent->Server 文件分发分片确认
 	TypeFileAck        = "FileAck"       // Server<->Agent 分片确认
 	TypeFileTransferOp = "FileTransferOp" // Web->Server 文件传输操作
 	TypeFileTransferState = "FileTransferState" // Server->Web 文件传输状态
@@ -175,6 +177,29 @@ type FileDownloadReq struct {
 	FileSize  int64  `json:"file_size"`
 	ChunkSeq  int    `json:"chunk_seq"`
 	ChunkData []byte `json:"chunk_data"`
+}
+
+// FilePushReq Server -> Agent 文件分发（Web 上传分发到 Agent）分片。
+// FileSize<0 表示分发失败通知；Done=true 表示最后一个分片。
+type FilePushReq struct {
+	CommandID string `json:"command_id"`
+	AgentID   string `json:"agent_id"`   // 目标 Agent
+	FilePath  string `json:"file_path"` // Agent 端目标路径
+	FileSize  int64  `json:"file_size"`
+	ChunkSeq  int    `json:"chunk_seq"`
+	ChunkData []byte `json:"chunk_data"`
+	ChunkMD5  string `json:"chunk_md5"`
+	Done      bool   `json:"done"`
+}
+
+// FilePushAck Agent -> Server 文件分发分片确认。
+type FilePushAck struct {
+	CommandID string `json:"command_id"`
+	FilePath  string `json:"file_path"`
+	ChunkSeq  int    `json:"chunk_seq"`
+	Ack       bool   `json:"ack"` // true=ACK false=NACK
+	Status    string `json:"status"` // transferring/done/failed
+	Message   string `json:"message"`
 }
 
 // InteractiveOutput Agent -> Server -> Web 交互输出

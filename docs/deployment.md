@@ -111,17 +111,29 @@ server {
 
 1. **修改 API Key**：服务端启动时通过 `-apikey` 设置强随机密钥，Web 登录时使用该 Key。
 2. **IP 白名单**：通过 `-whitelist 1.2.3.4,10.0.0.0/8` 限制可访问服务端的源 IP。
-3. **TLS/mTLS**：Agent<->Server 支持全链路 TLS 加密。生成自签名证书：
+3. **TLS/mTLS**：Agent<->Server 支持全链路 TLS 加密，可升级为 mTLS 双向认证。生成自签名证书：
 
    ```bash
-   bash scripts/gen-cert.sh certs
+   bash scripts/gen-cert.sh certs   # 生成 ca.crt / server.crt / client.crt
+   ```
+
+   **单向 TLS**（加密传输）：
+   ```bash
    # 服务端
    ./mocenter-server -listen :9000 -http :8080 -apikey xxx -tls-cert certs/server.crt -tls-key certs/server.key
-   # Agent
+   # Agent（自签名跳过校验）
    ./mocenter-agent -server host:9000 -agentid host-01 -tls -insecure
    ```
 
-   生产环境建议使用受信任 CA 签发的证书，并将 Agent 端的 `-insecure` 替换为 CA 校验，实现 mTLS 双向认证。Web 端启用 HTTPS/WSS。
+   **mTLS 双向认证**（服务端校验 Agent 客户端证书）：
+   ```bash
+   # 服务端（额外提供 -ca-cert，要求 Agent 携带有效客户端证书）
+   ./mocenter-server -listen :9000 -http :8080 -apikey xxx -tls-cert certs/server.crt -tls-key certs/server.key -ca-cert certs/ca.crt
+   # Agent（携带客户端证书，并用 CA 校验服务端证书）
+   ./mocenter-agent -server host:9000 -agentid host-01 -tls -client-cert certs/client.crt -client-key certs/client.key -ca-cert certs/ca.crt
+   ```
+
+   生产环境建议使用受信任 CA 签发的证书，实现 mTLS 双向认证。Web 端启用 HTTPS/WSS。
 
 4. **命令黑名单**：高危命令（`rm -rf /`、`mkfs`、`sudo` 等）由服务端拦截并记录审计。
 
@@ -141,6 +153,9 @@ Web「端口映射」页面创建规则（公网端口 → 内网服务端口）
 
 ### 5. 文件传输
 支持 Agent 文件上传/下载，分片传输 + MD5 校验 + ACK/NACK + 断点续传，接收目录默认为服务端 `/tmp/mocenter_uploads`。
+
+### 6. 文件分发到主机
+Web「运维操作」页面选择目标在线主机与 Agent 端目标路径，上传本地文件分片经服务端中转、MD5 校验后写入 Agent 指定路径。适用于批量下发部署包、配置文件、脚本等场景。
 
 ## 七、备份与恢复
 

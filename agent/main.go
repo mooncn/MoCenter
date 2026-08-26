@@ -25,6 +25,9 @@ func main() {
 	daemonize := flag.Bool("daemon", false, "以守护进程方式运行（后台运行并崩溃自启）")
 	tlsEnabled := flag.Bool("tls", false, "启用 TLS 加密连接")
 	insecure := flag.Bool("insecure", false, "跳过 TLS 证书校验（自签名测试）")
+	clientCert := flag.String("client-cert", "", "mTLS 客户端证书文件路径（服务端启用双向认证时必填）")
+	clientKey := flag.String("client-key", "", "mTLS 客户端私钥文件路径")
+	caCert := flag.String("ca-cert", "", "用于校验服务端证书的 CA 证书路径（不指定则用 -insecure 跳过校验）")
 	flag.Parse()
 
 	if *server == "" {
@@ -39,15 +42,15 @@ func main() {
 	// 进程守护：崩溃自动重启
 	if *daemonize {
 		daemon.Supervise(func() {
-			runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure)
+			runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert)
 		})
 		return
 	}
 
-	runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure)
+	runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert)
 }
 
-func runClient(server, agentID string, hb, probe int, tlsEnabled, insecure bool) {
+func runClient(server, agentID string, hb, probe int, tlsEnabled, insecure bool, clientCert, clientKey, caCert string) {
 	c := client.New(client.Config{
 		ServerAddr: server,
 		AgentID:    agentID,
@@ -55,6 +58,9 @@ func runClient(server, agentID string, hb, probe int, tlsEnabled, insecure bool)
 		ProbeEvery: seconds(probe),
 		TLS:        tlsEnabled,
 		Insecure:   insecure,
+		ClientCert: clientCert,
+		ClientKey:  clientKey,
+		CACert:     caCert,
 	})
 	log.Printf("[agent] 启动 Agent %s，目标服务端 %s", agentID, server)
 	c.Run()
