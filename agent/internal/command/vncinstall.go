@@ -14,9 +14,10 @@ import (
 
 // VncInstallResult VNC 安装/启动结果。
 type VncInstallResult struct {
-	OK      bool
-	Message string
-	Port    int
+	OK       bool
+	Message  string
+	Port     int
+	Password string // 生成的 VNC 口令（供 Web 端本次会话连接使用）
 }
 
 // VncConfig VNC 安装/启动配置。
@@ -38,12 +39,8 @@ func VncInstallCfg(port int, cfg VncConfig) VncInstallResult {
 		port = 5900
 	}
 	res := VncInstallResult{Port: port}
-	// 目标端口已在监听，认为 VNC 已就绪
-	if portOpen(port) {
-		res.OK = true
-		res.Message = fmt.Sprintf("VNC 已在端口 %d 上监听，可直接连接。", port)
-		return res
-	}
+	// 注意：不在此处因“端口已监听”短路返回——即使 VNC 已在运行，仍会重新生成
+	// 并回写口令，从而始终能给前端提供有效的本次口令（实现口令兜底与轮换）。
 	switch runtime.GOOS {
 	case "windows":
 		return vncInstallWindows(port, cfg)

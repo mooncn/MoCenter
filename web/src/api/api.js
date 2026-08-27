@@ -86,6 +86,11 @@ export const Api = {
     const { data } = await api.post('/vnc/install', payload)
     return data
   },
+  // 查询最近一次 VNC 安装/启动结果（含口令，供超时后补取）
+  async vncStatus(agent) {
+    const { data } = await api.get('/vnc/status', { params: { agent } })
+    return data
+  },
   // 设置/更新主机备注
   async setRemark(agentId, remark) {
     const { data } = await api.post('/agents/remark', { agent_id: agentId, remark })

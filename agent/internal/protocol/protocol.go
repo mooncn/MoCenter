@@ -220,7 +220,8 @@ type VncInstallReq struct {
 
 // VncInstallResp Agent->Server：VNC 安装/启动结果。
 type VncInstallResp struct {
-	OK      bool   `json:"ok"`
-	Message string `json:"message"`
-	Port    int    `json:"port"`
+	OK       bool   `json:"ok"`
+	Message  string `json:"message"`
+	Port     int    `json:"port"`
+	Password string `json:"password,omitempty"` // 安装时生成的随机口令（仅服务端按需交付给前端）
 }

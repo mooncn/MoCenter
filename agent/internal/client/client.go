@@ -351,7 +351,7 @@ func (c *Client) handleVncInstall(req protocol.VncInstallReq) {
 	resp := command.VncInstallCfg(req.Port, command.VncConfig{Proxy: c.cfg.ProxyIP})
 	log.Printf("[agent] VNC 安装/启动结果: ok=%v msg=%s", resp.OK, resp.Message)
 	_ = c.write(protocol.TypeVncInstallResp, protocol.VncInstallResp{
-		OK: resp.OK, Message: resp.Message, Port: resp.Port,
+		OK: resp.OK, Message: resp.Message, Port: resp.Port, Password: resp.Password,
 	})
 }
 

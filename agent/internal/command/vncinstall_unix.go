@@ -6,35 +6,45 @@
 package command
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 )
 
 // x11vncBinURL 默认 x11vnc 二进制下载地址（可用 DownloadBase 覆盖）。
 const x11vncBinURL = "https://github.com/LibVNC/x11vnc/releases/download/0.9.16/x11vnc-0.9.16-x86_64"
 
-// vncInstallLinux 安装并启动 x11vnc。
+// vncInstallLinux 安装并启动 x11vnc，并写入随机口令、仅允许回环访问。
 func vncInstallLinux(port int, cfg VncConfig) VncInstallResult {
 	res := VncInstallResult{Port: port}
 
-	start := `DISPLAY="${DISPLAY:-:0}" x11vnc -forever -shared -noxdamage -nopw -rfbport ` +
-		itoa(port) + ` </dev/null >/tmp/mocenter_x11vnc.log 2>&1 &`
+	// 生成口令并写入口令文件（自行写文件，免依赖 vncpasswd）
+	pw := generateRandomPassword()
+	res.Password = pw
+	passFile := filepath.Join(homeDir(), ".mocenter", "vncpasswd")
+	if err := writeVncPasswdFile(passFile, pw); err != nil {
+		res.Message = "创建 VNC 口令文件失败: " + err.Error()
+		return res
+	}
+
+	// 使用 -rfbauth（口令）与 -localhost（仅回环），配合隧道回连；先结束旧实例以生效新口令
+	start := `pkill -f '[x]11vnc' 2>/dev/null; sleep 1; DISPLAY="${DISPLAY:-:0}" x11vnc -forever -shared -noxdamage -rfbauth '` +
+		passFile + `' -localhost -rfbport ` + itoa(port) + ` </dev/null >/tmp/mocenter_x11vnc.log 2>&1 &`
 
 	// 已安装则直接启动
 	if hasBin("x11vnc") {
 		_ = exec.Command("bash", "-c", start).Run()
-		res.Message = "已启动 x11vnc（无密码，端口 " + itoa(port) + "）。若提示无图形会话，请确保主机存在 DISPLAY。"
+		res.Message = "已启动 x11vnc（口令见本次下发值，仅回环；端口 " + itoa(port) + "）。若提示无图形会话，请确保存在 DISPLAY。"
 		res.OK = portOpen(port)
 		return res
 	}
 
 	// 尝试包管理器安装
 	if installByPkgMgr(start) {
-		res.Message = "VNC(x11vnc) 已安装并尝试启动，端口 " + itoa(port) + "。"
+		res.Message = "VNC(x11vnc) 已安装并尝试启动（已启用口令，仅回环），端口 " + itoa(port) + "。"
 		if portOpen(port) {
 			res.OK = true
 		} else {
@@ -105,20 +115,22 @@ func installByCurl(cfg VncConfig, start string, port int) (string, bool) {
 	dst := filepath.Join(homeDir(), ".local", "bin", "x11vnc")
 	_ = exec.Command("bash", "-c", "mkdir -p "+filepath.Dir(dst)).Run()
 
-	var cmd *exec.Cmd
-	if hasBin("curl") {
-		cmd = exec.Command("curl", "-fSL", "-o", dst, url)
+	// 选择下载器并以慢速检测包装，速率过低时切换备选源
+	var errm string
+	if err := downloadSlowAware(dst, minVNCBps, func(ctx context.Context) error {
+		if hasBin("curl") {
+			return exec.CommandContext(ctx, "curl", "-fSL", "--max-time", "90", "-o", dst, url).Run()
+		}
+		return exec.CommandContext(ctx, "wget", "-q", "-O", dst, url).Run()
+	}); err != nil {
+		errm = err.Error()
 	} else {
-		cmd = exec.Command("wget", "-q", "-O", dst, url)
+		_ = exec.Command("bash", "-c", "chmod +x "+dst).Run()
+		envStart := "export PATH=\"$HOME/.local/bin:$PATH\"\n" + start
+		_ = exec.Command("bash", "-c", envStart).Run()
+		return "已通过 curl 下载并尝试启动 x11vnc（端口 " + itoa(port) + "）。", true
 	}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Sprintf("x11vnc 自动安装失败：下载失败（%v）。可手动安装：%s\n%s", err, url, strings.TrimSpace(string(out))), false
-	}
-	_ = exec.Command("bash", "-c", "chmod +x "+dst).Run()
-	// 将 x11vnc 加入 PATH 并启动
-	envStart := "export PATH=\"$HOME/.local/bin:$PATH\"\n" + start
-	_ = exec.Command("bash", "-c", envStart).Run()
-	return "已通过 curl 下载并尝试启动 x11vnc（端口 " + itoa(port) + "）。", true
+	return fmt.Sprintf("x11vnc 自动安装失败：下载失败（%v）。可手动安装：%s", errm, url), false
 }
 
 func homeDir() string {

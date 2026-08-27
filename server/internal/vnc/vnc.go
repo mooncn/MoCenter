@@ -42,12 +42,13 @@ type probeResult struct {
 
 // Mgr VNC 远程桌面管理器。
 type Mgr struct {
-	mu         sync.Mutex
-	sess       *session.Manager
-	viewer     map[string]*viewerConn        // tunnelID -> 查看器连接
-	probeWait  map[string]chan probeResult   // tunnelID("vp-") -> 探测结果
-	installWait map[string]chan *protocol.VncInstallResp // agentID -> 安装结果
-	seq        uint64
+	mu          sync.Mutex
+	sess        *session.Manager
+	viewer      map[string]*viewerConn                      // tunnelID -> 查看器连接
+	probeWait   map[string]chan probeResult                 // tunnelID("vp-") -> 探测结果
+	installWait map[string]chan *protocol.VncInstallResp    // agentID -> 安装结果
+	last        map[string]*protocol.VncInstallResp         // agentID -> 最近一次安装/启动结果（口令）
+	seq         uint64
 }
 
 // NewMgr 创建 VNC 管理器。
@@ -57,7 +58,15 @@ func NewMgr(sess *session.Manager) *Mgr {
 		viewer:      make(map[string]*viewerConn),
 		probeWait:   make(map[string]chan probeResult),
 		installWait: make(map[string]chan *protocol.VncInstallResp),
+		last:        make(map[string]*protocol.VncInstallResp),
 	}
+}
+
+// LastResult 返回该主机最近一次 VNC 安装/启动结果（含口令），无则返回 nil。
+func (m *Mgr) LastResult(agentID string) *protocol.VncInstallResp {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.last[agentID]
 }
 
 func (m *Mgr) nextTunnel(prefix string) string {
@@ -166,8 +175,8 @@ func (m *Mgr) Install(agentID string, port int) *protocol.VncInstallResp {
 	select {
 	case r := <-ch:
 		return r
-	case <-time.After(120 * time.Second):
-		return nf("安装超时（可能需更高权限或已占用）")
+	case <-time.After(240 * time.Second):
+		return &protocol.VncInstallResp{OK: false, Message: "安装超时（下载较慢或需更高权限）", Port: port}
 	}
 }
 
@@ -214,9 +223,12 @@ func (m *Mgr) NotifyTunnelClosed(tunnelID string) {
 	}
 }
 
-// NotifyInstall 接收 Agent 回传的 VNC 安装/启动结果。
+// NotifyInstall 接收 Agent 回传的 VNC 安装/启动结果（始终缓存最近结果，便于口令补发）。
 func (m *Mgr) NotifyInstall(agentID string, resp *protocol.VncInstallResp) {
 	m.mu.Lock()
+	if resp != nil {
+		m.last[agentID] = resp
+	}
 	ch, ok := m.installWait[agentID]
 	m.mu.Unlock()
 	if ok {

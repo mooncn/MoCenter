@@ -200,6 +200,7 @@ func main() {
 	mux.HandleFunc("/api/command/close", commandCloseHandler(sess, authz))
 	mux.HandleFunc("/api/vnc/probe", vncProbeHandler(vncMgr, authz))
 	mux.HandleFunc("/api/vnc/install", vncInstallHandler(vncMgr, authz))
+	mux.HandleFunc("/api/vnc/status", vncStatusHandler(vncMgr, authz))
 	mux.HandleFunc("/api/agents", agentsHandler(store, authz))
 	mux.HandleFunc("/api/agents/history", historyHandler(store, authz))
 	mux.HandleFunc("/api/agents/remark", setRemarkHandler(remarks, authz))
@@ -656,7 +657,23 @@ func vncInstallHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
 			return
 		}
 		resp := mgr.Install(body.AgentID, body.Port)
-		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port})
+		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port, "password": resp.Password})
+	}
+}
+
+// vncStatusHandler 返回该主机最近一次 VNC 安装/启动结果（含口令，供超时后补取）。
+func vncStatusHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		agentID := r.URL.Query().Get("agent")
+		resp := mgr.LastResult(agentID)
+		if resp == nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "尚未执行安装/启动"})
+			return
+		}
+		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port, "password": resp.Password})
 	}
 }
 
