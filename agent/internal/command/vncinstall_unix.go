@@ -30,9 +30,21 @@ func vncInstallLinux(port int, cfg VncConfig) VncInstallResult {
 		return res
 	}
 
-	// 使用 -rfbauth（口令）与 -localhost（仅回环），配合隧道回连；先结束旧实例以生效新口令
-	start := `pkill -f '[x]11vnc' 2>/dev/null; sleep 1; DISPLAY="${DISPLAY:-:0}" x11vnc -forever -shared -noxdamage -rfbauth '` +
-		passFile + `' -localhost -rfbport ` + itoa(port) + ` </dev/null >/tmp/mocenter_x11vnc.log 2>&1 &`
+	// 使用 -rfbauth（口令）与 -localhost（仅回环），配合隧道回连；先结束旧实例以生效新口令。
+	// 自动检测 XAUTHORITY，若当前用户为 root 且存在图形会话的 auth 文件则显式指定。
+	start := `pkill -f '[x]11vnc' 2>/dev/null; sleep 1;
+AUTH="";
+# 优先使用当前会话 XAUTHORITY
+if [ -n "$XAUTHORITY" ] && [ -f "$XAUTHORITY" ]; then
+  AUTH="-auth $XAUTHORITY";
+# 自动探测 GDM/GDM3 的 Xauthority 文件
+elif [ -z "$XAUTHORITY" ]; then
+  for f in /run/gdm/auth-for-DM-*/database /run/gdm3/auth-for-DM-*/database /home/*/.Xauthority /root/.Xauthority; do
+    if [ -f "$f" ]; then AUTH="-auth $f"; break; fi;
+  done;
+fi;
+DISPLAY="${DISPLAY:-:0}" x11vnc -forever -shared -noxdamage -rfbauth '` +
+		passFile + `' -localhost $AUTH -rfbport ` + itoa(port) + ` </dev/null >/tmp/mocenter_x11vnc.log 2>&1 &`
 
 	// 已安装则直接启动
 	if hasBin("x11vnc") {
@@ -73,15 +85,21 @@ func hasBin(name string) bool {
 }
 
 // installByPkgMgr 通过系统包管理器安装 x11vnc。
+// 对 RHEL 系（Rocky/CentOS/Fedora）先启用 EPEL 仓库再安装，
+// 因为 x11vnc 不在基础仓库中（Rocky Linux 8 必须启用 EPEL）。
 func installByPkgMgr(start string) bool {
 	script := `
 if ! command -v x11vnc >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     (sudo apt-get update -qq && sudo apt-get install -y -qq x11vnc) || (apt-get update -qq && apt-get install -y -qq x11vnc)
-  elif command -v yum >/dev/null 2>&1; then
-    (sudo yum install -y x11vnc) || yum install -y x11vnc
   elif command -v dnf >/dev/null 2>&1; then
-    (sudo dnf install -y x11vnc) || (dnf install -y -q x11vnc)
+    # 先启用 EPEL（x11vnc 在 EPEL 仓库），不强制成功
+    (sudo dnf install -y epel-release) || (dnf install -y epel-release) || true
+    (sudo dnf install -y -q x11vnc) || (dnf install -y -q x11vnc)
+  elif command -v yum >/dev/null 2>&1; then
+    # 先启用 EPEL
+    (sudo yum install -y epel-release) || (yum install -y epel-release) || true
+    (sudo yum install -y x11vnc) || yum install -y x11vnc
   fi
 fi
 if command -v x11vnc >/dev/null 2>&1; then
