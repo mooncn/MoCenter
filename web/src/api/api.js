@@ -15,6 +15,22 @@ api.interceptors.request.use((config) => {
   return config
 })
 
+// 响应拦截器：401 时自动清除 Token 并跳转登录页
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem('mc_token')
+      // 不在登录页时跳转；登录页自身的 401 由页面逻辑处理
+      if (!window.location.pathname.startsWith('/login')) {
+        const current = window.location.pathname + window.location.search
+        window.location.href = `/login?redirect=${encodeURIComponent(current)}`
+      }
+    }
+    return Promise.reject(error)
+  }
+)
+
 export const Api = {
   // 获取全部主机（含离线）
   async agents() {

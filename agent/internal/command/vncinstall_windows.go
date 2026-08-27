@@ -104,7 +104,8 @@ var vncRegistryKeys = []string{
 //   1) 全部设置写入所有 hive（含 AllowLoopback 允许回环隧道回连）；
 //   2) 使用指定口令（禁止免密）；
 //   3) 设置监听端口（PortNumber）；
-//   4) 启动顺序：先用服务 → 未监听则以独立 GUI 进程启动 → 最后用计划任务在用户会话启动。
+//   4) 启动顺序：优先在交互式用户会话中启动（避免 Session 0 隔离导致黑屏），
+//      先尝试独立进程启动 → 计划任务用户会话 → 服务模式兜底。
 func configureAndStartTightVNC(port int, password string) {
 	dword := []struct{ name, val string }{
 		// Authentication=1 启用口令认证；同时写 ControlPassword
@@ -145,30 +146,44 @@ func configureAndStartTightVNC(port int, password string) {
 	}
 
 	exe := findTvnserverExe()
+	if exe == "" {
+		log.Printf("[vnc-install] 未找到 tvnserver.exe，跳过启动")
+		return
+	}
 
-	// 1) 尝试以服务方式启动
-	// 先检查服务是否存在，存在则重启以应用新配置
+	// 先停止 TightVNC 服务并杀掉所有已运行的 tvnserver 实例，
+	// 确保使用最新配置在交互式用户会话中重新启动
 	if serviceExists("tvnserver") {
+		_ = exec.Command("sc.exe", "stop", "tvnserver").Run()
+	}
+	_ = exec.Command("taskkill.exe", "/IM", "tvnserver.exe", "/F").Run()
+	time.Sleep(1 * time.Second)
+
+	// 1) 优先以独立进程启动：若 Agent 运行在交互式用户会话中，直接启动即可捕获桌面。
+	//    若 Agent 作为服务运行（Session 0），独立进程也会落在 Session 0，仍需走第2步。
+	startTvnserverDirect(exe)
+
+	// 2) 若未监听，通过计划任务在交互式用户会话中启动，解决 Session 0 黑屏问题
+	if !waitPortOpen(port, 5*time.Second) {
+		_ = exec.Command("taskkill.exe", "/IM", "tvnserver.exe", "/F").Run()
+		startInUserSession(exe)
+	}
+
+	// 3) 兜底：使用服务方式启动（此时可能受 Session 0 限制，但至少端口可达）
+	if !waitPortOpen(port, 5*time.Second) && serviceExists("tvnserver") {
 		_ = exec.Command("sc.exe", "stop", "tvnserver").Run()
 		time.Sleep(2 * time.Second)
 		_ = exec.Command("sc.exe", "config", "tvnserver", "start=", "auto").Run()
 		_ = exec.Command("sc.exe", "start", "tvnserver").Run()
 	}
 
-	// 2) 若服务方式未保持监听，则以独立 GUI 进程启动
-	if !waitPortOpen(port, 5*time.Second) && exe != "" {
-		_ = exec.Command("taskkill.exe", "/IM", "tvnserver.exe", "/F").Run()
-		psCmd := fmt.Sprintf("Start-Process -FilePath '%s'", strings.ReplaceAll(exe, "'", "''"))
-		_ = exec.Command("powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", psCmd).Run()
-	}
-
-	// 3) 若仍未就绪，尝试通过计划任务在用户交互会话中启动
-	if !waitPortOpen(port, 5*time.Second) && exe != "" {
-		_ = exec.Command("taskkill.exe", "/IM", "tvnserver.exe", "/F").Run()
-		startInUserSession(exe)
-	}
-
 	_ = waitPortOpen(port, 8*time.Second)
+}
+
+// startTvnserverDirect 以独立进程方式启动 TightVNC（继承 Agent 当前会话）。
+func startTvnserverDirect(exe string) {
+	psCmd := fmt.Sprintf("Start-Process -FilePath '%s'", strings.ReplaceAll(exe, "'", "''"))
+	_ = exec.Command("powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", psCmd).Run()
 }
 
 // serviceExists 检查 Windows 服务是否存在。
@@ -183,6 +198,7 @@ func serviceExists(name string) bool {
 
 // startInUserSession 通过 Windows 计划任务在当前登录用户的交互会话中启动程序。
 // 这解决了 agent 以服务方式运行时无法访问用户桌面（Session 0 隔离）的问题。
+// 关键点：schtasks /it 让任务在登录用户的交互会话中运行，从而能捕获桌面内容。
 func startInUserSession(exe string) {
 	taskName := "MoCenter-VNC-Starter"
 	// 在 /tr 参数中对可执行文件路径加引号，以支持带空格路径（如 C:\Program Files\...）
@@ -191,7 +207,9 @@ func startInUserSession(exe string) {
 		"schtasks /create /tn \"%s\" /tr %s /sc once /st 00:00 /it /f && schtasks /run /tn \"%s\" && timeout /t 5 /nobreak >nul && schtasks /delete /tn \"%s\" /f",
 		taskName, quotedExe, taskName, taskName,
 	)
-	_ = exec.Command("cmd.exe", "/c", cmdStr).Run()
+	if err := exec.Command("cmd.exe", "/c", cmdStr).Run(); err != nil {
+		log.Printf("[vnc-install] schtasks 用户会话启动失败: %v", err)
+	}
 }
 
 // findTvnserverExe 定位已安装的 tvnserver 可执行文件。
@@ -439,6 +457,7 @@ func probeTigerVNC() bool {
 }
 
 // configureAndStartTigerVNC 配置并启动 TigerVNC。
+// 优先在当前会话直接启动；若端口未就绪则通过计划任务在用户交互会话启动。
 func configureAndStartTigerVNC(port int, password string) {
 	// 写入 TigerVNC 口令（格式与 TightVNC 相同：DES 混淆的 8 字节）
 	passFile := filepath.Join(os.TempDir(), "mocenter_vnc_passwd")
@@ -452,12 +471,30 @@ func configureAndStartTigerVNC(port int, password string) {
 		return
 	}
 
-	// 启动 TigerVNC server（-rfbport 指定端口，-rfbauth 指定口令文件）
+	// 先杀掉已有 vncserver 进程
+	_ = exec.Command("taskkill.exe", "/IM", "vncserver.exe", "/F").Run()
+	time.Sleep(1 * time.Second)
+
+	// 1) 直接启动 TigerVNC server（-rfbport 指定端口，-rfbauth 指定口令文件）
 	psCmd := fmt.Sprintf(
 		"Start-Process -FilePath '%s' -ArgumentList '-rfbport', '%d', '-rfbauth', '%s' -WindowStyle Hidden",
 		strings.ReplaceAll(exe, "'", "''"), port, strings.ReplaceAll(passFile, "'", "''"),
 	)
 	_ = exec.Command("powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", psCmd).Run()
+
+	// 2) 未就绪则通过计划任务在用户交互会话启动（避免 Session 0 黑屏）
+	if !waitPortOpen(port, 5*time.Second) {
+		_ = exec.Command("taskkill.exe", "/IM", "vncserver.exe", "/F").Run()
+		taskName := "MoCenter-TigerVNC-Starter"
+		// 在 /tr 参数中对可执行文件路径加引号，支持带空格路径
+		quotedExe := "\"" + strings.ReplaceAll(exe, "\"", "\"\"") + "\""
+		cmdStr := fmt.Sprintf(
+			"schtasks /create /tn \"%s\" /tr %s -rfbport %d -rfbauth \"%s\" /sc once /st 00:00 /it /f && schtasks /run /tn \"%s\" && timeout /t 5 /nobreak >nul && schtasks /delete /tn \"%s\" /f",
+			taskName, quotedExe, port, strings.ReplaceAll(passFile, "\"", "\\\""), taskName, taskName,
+		)
+		_ = exec.Command("cmd.exe", "/c", cmdStr).Run()
+	}
+
 	_ = waitPortOpen(port, 8*time.Second)
 }
 
