@@ -33,9 +33,11 @@ import (
 	"mocenter/server/internal/auth"
 	"mocenter/server/internal/config"
 	"mocenter/server/internal/filetransfer"
+	"mocenter/server/internal/geo"
 	"mocenter/server/internal/portmap"
 	"mocenter/server/internal/probe"
 	"mocenter/server/internal/protocol"
+	"mocenter/server/internal/remark"
 	"mocenter/server/internal/route"
 	"mocenter/server/internal/session"
 	"mocenter/server/internal/vnc"
@@ -158,6 +160,11 @@ func main() {
 
 	sess := session.NewManager()
 	store := probe.NewStore()
+	geoResolver := geo.NewResolver()
+	store.SetGeoResolver(geoResolver)
+	remarks := remark.NewStore(*dataDir)
+	remarks.Load()
+	store.SetRemarkFn(remarks.Get)
 	authz := auth.NewAuth(*apiKey, wl)
 	userMgr := auth.NewUserManager(filepath.Join(*dataDir, "users.json"))
 	if err := userMgr.InitFromFlags(*user, *password, *totpSecret); err != nil {
@@ -195,6 +202,7 @@ func main() {
 	mux.HandleFunc("/api/vnc/install", vncInstallHandler(vncMgr, authz))
 	mux.HandleFunc("/api/agents", agentsHandler(store, authz))
 	mux.HandleFunc("/api/agents/history", historyHandler(store, authz))
+	mux.HandleFunc("/api/agents/remark", setRemarkHandler(remarks, authz))
 	mux.HandleFunc("/api/audits", auditsHandler(router, authz))
 	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
 	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz))
@@ -482,6 +490,36 @@ func historyHandler(store *probe.Store, authz *auth.Auth) http.HandlerFunc {
 			}
 		}
 		writeJSON(w, store.History(agentID, since))
+	}
+}
+
+// setRemarkHandler 设置/更新指定主机的备注（POST 或 PUT）。
+func setRemarkHandler(remarks *remark.Store, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			AgentID string `json:"agent_id"`
+			Remark  string `json:"remark"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if body.AgentID == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+			return
+		}
+		if err := remarks.Set(body.AgentID, body.Remark); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "保存备注失败: " + err.Error()})
+			return
+		}
+		writeJSON(w, map[string]interface{}{"ok": true, "msg": "备注已保存"})
 	}
 }
 

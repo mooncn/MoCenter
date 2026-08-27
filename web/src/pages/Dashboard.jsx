@@ -89,6 +89,7 @@ export default function Dashboard({ agents }) {
             <tr>
               <th>主机</th>
               <th>状态</th>
+              <th>公网 IP / 地理位置</th>
               <th>系统</th>
               <th>架构</th>
               <th>CPU</th>
@@ -103,13 +104,20 @@ export default function Dashboard({ agents }) {
             {(agents || []).map((a) => (
               <tr key={a.agent_id}>
                 <td>
-                  <b>{a.hostname}</b>
-                  <div style={{ color: '#8b98a5', fontSize: 12 }}>{a.agent_id}</div>
+                  <b>{a.remark || a.hostname}</b>
+                  <div style={{ color: '#8b98a5', fontSize: 12 }}>
+                    {a.hostname}
+                    {a.remark ? ' · ' + a.agent_id : ''}
+                  </div>
+                  <RemarkEditor agent={a} onSaved={() => window.dispatchEvent(new Event('mc-remark-saved'))} />
                 </td>
                 <td>
                   <span className={`badge ${a.online ? 'online' : 'offline'}`}>
                     {a.online ? '在线' : '离线'}
                   </span>
+                </td>
+                <td>
+                  <PublicIPCell agent={a} />
                 </td>
                 <td>{a.os_type}</td>
                 <td>{a.arch}</td>
@@ -126,7 +134,7 @@ export default function Dashboard({ agents }) {
               </tr>
             ))}
             {agents.length === 0 && (
-              <tr><td colSpan="10" style={{ textAlign: 'center', color: '#8b98a5' }}>暂无主机接入</td></tr>
+              <tr><td colSpan="11" style={{ textAlign: 'center', color: '#8b98a5' }}>暂无主机接入</td></tr>
             )}
           </tbody>
         </table>
@@ -227,4 +235,88 @@ function fmtOffline(a) {
   if (s < 3600) return `${Math.floor(s / 60)}分`
   if (s < 86400) return `${Math.floor(s / 3600)}时`
   return `${Math.floor(s / 86400)}天`
+}
+
+// 根据 ISO 国家代码返回国旗 emoji（零依赖，基于区域指示符字符）。
+function countryFlag(code) {
+  if (!code || code.length !== 2) return ''
+  const base = 0x1F1E6
+  const a = 'A'.charCodeAt(0)
+  const upper = code.toUpperCase()
+  return String.fromCodePoint(base + (upper.charCodeAt(0) - a), base + (upper.charCodeAt(1) - a))
+}
+
+// 公网 IP 与地理位置展示单元格。
+function PublicIPCell({ agent }) {
+  const ips = [agent.public_ip, agent.public_ipv6].filter(Boolean)
+  const geo = agent.geo
+  return (
+    <div>
+      {ips.length === 0 ? (
+        <span style={{ color: '#8b98a5', fontSize: 12 }}>未获取到公网 IP</span>
+      ) : (
+        ips.map((ip, i) => (
+          <div key={i} style={{ fontSize: 12 }} title={ip.includes(':') ? 'IPv6' : 'IPv4'}>
+            <span style={{ color: '#8b98a5' }}>{ip.includes(':') ? 'v6' : 'v4'}</span>{' '}
+            {ip}
+          </div>
+        ))
+      )}
+      {geo && geo.country_code && (
+        <div style={{ fontSize: 12, color: '#4da3ff', marginTop: 2 }}>
+          <span style={{ marginRight: 4 }}>{countryFlag(geo.country_code)}</span>
+          {[geo.country, geo.region, geo.city].filter(Boolean).join(' · ')}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// 备注编辑器：点击主机的备注图标可编辑。
+function RemarkEditor({ agent, onSaved }) {
+  const [editing, setEditing] = React.useState(false)
+  const [value, setValue] = React.useState(agent.remark || '')
+  const [saving, setSaving] = React.useState(false)
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      await Api.setRemark(agent.agent_id, value.trim())
+      onSaved && onSaved()
+      setEditing(false)
+    } catch (e) {
+      alert('保存备注失败：' + (e.response?.data?.msg || e.message))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!editing) {
+    return (
+      <div style={{ marginTop: 2 }}>
+        <button
+          className="secondary"
+          style={{ fontSize: 11, padding: '1px 6px' }}
+          onClick={() => { setValue(agent.remark || ''); setEditing(true) }}
+          title="编辑备注"
+        >✎ 备注</button>
+      </div>
+    )
+  }
+  return (
+    <div style={{ marginTop: 4, display: 'flex', gap: 4, alignItems: 'center' }}>
+      <input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder="输入备注…"
+        autoFocus
+        style={{ fontSize: 12, padding: '2px 6px', width: 120 }}
+        onKeyDown={(e) => { if (e.key === 'Enter') save(); if (e.key === 'Escape') setEditing(false) }}
+      />
+      <button className="primary" style={{ fontSize: 11, padding: '2px 8px' }} onClick={save} disabled={saving}>
+        {saving ? '保存中…' : '保存'}
+      </button>
+      <button className="secondary" style={{ fontSize: 11, padding: '2px 8px' }} onClick={() => setEditing(false)}>取消</button>
+    </div>
+  )
 }

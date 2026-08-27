@@ -103,6 +103,8 @@ type ProbeDataReq struct {
 	KernelVersion  string  `json:"kernel_version"`
 	Uptime         int64   `json:"uptime"`
 	Arch           string  `json:"arch"`
+	PublicIP       string  `json:"public_ip"`
+	PublicIPv6     string  `json:"public_ipv6"`
 }
 
 // ProbeDataResp Server -> Agent 探针确认
@@ -129,6 +131,20 @@ type AgentInfo struct {
 	NetOutBytes    int64   `json:"net_out_bytes"`
 	RemoteAddr     string  `json:"remote_addr"`
 	Tags           []string `json:"tags"`
+	PublicIP       string  `json:"public_ip"`
+	PublicIPv6     string  `json:"public_ipv6"`
+	Remark         string  `json:"remark"`
+	Geo            *GeoInfo `json:"geo,omitempty"`
+}
+
+// GeoInfo IP 地理位置信息。
+type GeoInfo struct {
+	Country     string  `json:"country"`
+	CountryCode string  `json:"country_code"`
+	Region      string  `json:"region"`
+	City        string  `json:"city"`
+	Latitude    float64 `json:"lat"`
+	Longitude   float64 `json:"lon"`
 }
 
 // PortMapRule 端口映射规则

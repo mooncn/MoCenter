@@ -32,6 +32,8 @@ type Config struct {
 	ClientCert string        // mTLS 客户端证书路径
 	ClientKey  string        // mTLS 客户端私钥路径
 	CACert     string        // 校验服务端证书的 CA 证书路径
+	// ProxyIP 国内加速代理前缀（用于公网 IP 探测等境外服务，如 http://fa.mooncn.win/?url= ）
+	ProxyIP string
 }
 
 // Client Agent 客户端。
@@ -63,7 +65,7 @@ func New(cfg Config) *Client {
 	}
 	c := &Client{
 		cfg:         cfg,
-		collect:     probe.NewCollector(cfg.AgentID),
+		collect:     probe.NewCollectorWithProxy(cfg.AgentID, cfg.ProxyIP),
 		hb:          cfg.Heartbeat,
 		interactive: make(map[string]*command.InteractiveSession),
 		tunnels:     make(map[string]net.Conn),
@@ -155,12 +157,15 @@ func (c *Client) connectAndServe() error {
 
 // register 发送上线消息。
 func (c *Client) register() {
+	ips := c.collect.PublicIPs()
 	info := map[string]interface{}{
-		"agent_id":   c.cfg.AgentID,
-		"hostname":   c.collect.Host(),
-		"os_type":    c.collect.OSType(),
-		"arch":       c.collect.Arch(),
+		"agent_id":    c.cfg.AgentID,
+		"hostname":    c.collect.Host(),
+		"os_type":     c.collect.OSType(),
+		"arch":        c.collect.Arch(),
 		"remote_addr": "",
+		"public_ip":   ips.IPv4,
+		"public_ipv6": ips.IPv6,
 	}
 	_ = c.write(protocol.TypeOnline, info)
 }
@@ -342,7 +347,8 @@ func (c *Client) closeSession(req protocol.InteractiveCloseReq) {
 
 // handleVncInstall 处理 VNC 安装/启动指令并回传结果。
 func (c *Client) handleVncInstall(req protocol.VncInstallReq) {
-	resp := command.VncInstall(req.Port)
+	// 默认：若配置了公网 IP 探测代理，则同样用于 VNC 安装包的国内加速
+	resp := command.VncInstallCfg(req.Port, command.VncConfig{Proxy: c.cfg.ProxyIP})
 	log.Printf("[agent] VNC 安装/启动结果: ok=%v msg=%s", resp.OK, resp.Message)
 	_ = c.write(protocol.TypeVncInstallResp, protocol.VncInstallResp{
 		OK: resp.OK, Message: resp.Message, Port: resp.Port,
