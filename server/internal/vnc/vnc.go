@@ -28,6 +28,10 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
+// tunnelEstablishTimeout 隧道建立超时：超过该时间未收到 Agent 的 TunnelOpenResp
+// 视为隧道建立失败，关闭查看器避免浏览器一直等待。
+const tunnelEstablishTimeout = 15 * time.Second
+
 // viewerConn 浏览器查看器连接。包含 pending 缓冲，用于解决
 // 「浏览器 RFB 数据先于隧道建立到达」导致的 RFB 握手数据丢失（黑屏）问题。
 type viewerConn struct {
@@ -306,6 +310,26 @@ func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken
 		m.closeViewer(tunnelID)
 		return
 	}
+
+	// 隧道建立超时：若 Agent 在指定时间内未回传 TunnelOpenResp，
+	// 关闭查看器并向浏览器发送错误消息。
+	go func(tid string) {
+		time.Sleep(tunnelEstablishTimeout)
+		m.mu.Lock()
+		v, ok := m.viewer[tid]
+		m.mu.Unlock()
+		if !ok || v == nil {
+			return
+		}
+		v.wmu.Lock()
+		ready := v.ready
+		v.wmu.Unlock()
+		if !ready {
+			log.Printf("[vnc] 隧道建立超时 %s，关闭查看器", tid)
+			m.closeViewer(tid)
+		}
+	}(tunnelID)
+
 	// 浏览器 -> Agent：读取浏览器 RFB 帧。
 	// 若隧道尚未就绪（DeliverOpenResp 未收到），先存入 pending 缓冲；
 	// 待隧道建立后由 DeliverOpenResp 统一转发。
