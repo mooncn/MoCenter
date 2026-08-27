@@ -28,11 +28,17 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
+// viewerConn 浏览器查看器连接。包含 pending 缓冲，用于解决
+// 「浏览器 RFB 数据先于隧道建立到达」导致的 RFB 握手数据丢失（黑屏）问题。
 type viewerConn struct {
-	ws   *websocket.Conn
-	agentID string
+	ws       *websocket.Conn
+	agentID  string
 	tunnelID string
-	wmu  sync.Mutex
+	wmu      sync.Mutex
+	// ready 隧道已就绪（Agent 回传 TunnelOpenResp OK=true）。
+	// ready==false 时浏览器数据暂存入 pending，待就绪后统一转发。
+	ready   bool
+	pending [][]byte
 }
 
 type probeResult struct {
@@ -90,6 +96,7 @@ func (m *Mgr) sendTunnelClose(tunnelID, agentID, reason string) {
 	}
 }
 
+// closeViewer 关闭查看器连接并清理。注意：调用方不应持有 vw.wmu 锁。
 func (m *Mgr) closeViewer(tunnelID string) {
 	m.mu.Lock()
 	vw, ok := m.viewer[tunnelID]
@@ -189,13 +196,16 @@ func (m *Mgr) DeliverTunnelData(tunnelID string, data []byte) {
 		return
 	}
 	vw.wmu.Lock()
-	defer vw.wmu.Unlock()
 	if err := vw.ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
+		vw.wmu.Unlock()
 		m.closeViewer(tunnelID)
+		return
 	}
+	vw.wmu.Unlock()
 }
 
 // DeliverOpenResp 处理 VNC 隧道的建立响应。
+// 隧道建立成功后，flush 缓冲的浏览器 RFB 数据。
 func (m *Mgr) DeliverOpenResp(tunnelID string, ok bool, msg string) {
 	m.mu.Lock()
 	ch, isProbe := m.probeWait[tunnelID]
@@ -210,6 +220,28 @@ func (m *Mgr) DeliverOpenResp(tunnelID string, ok bool, msg string) {
 		_ = vw.ws.WriteMessage(websocket.TextMessage, []byte("{\"type\":\"vnc_unavailable\",\"message\":\""+msg+"\"}"))
 		vw.wmu.Unlock()
 		m.closeViewer(tunnelID)
+		return
+	}
+	if isViewer && ok {
+		// 隧道就绪：标记 ready 并 flush 缓冲的浏览器数据
+		var pending [][]byte
+		vw.wmu.Lock()
+		vw.ready = true
+		pending = vw.pending
+		vw.pending = nil
+		vw.wmu.Unlock()
+
+		agent := m.sess.Get(vw.agentID)
+		if agent == nil {
+			m.closeViewer(tunnelID)
+			return
+		}
+		for _, d := range pending {
+			if err := agent.Write(protocol.TypeTunnelData, &protocol.TunnelData{TunnelID: tunnelID, Data: d}); err != nil {
+				m.closeViewer(tunnelID)
+				return
+			}
+		}
 	}
 }
 
@@ -238,6 +270,8 @@ func (m *Mgr) NotifyInstall(agentID string, resp *protocol.VncInstallResp) {
 
 // HandleViewer 处理浏览器查看器 WebSocket：升级为 WS，建立到 Agent 内网 VNC 的隧道，
 // 双向中继 RFB 字节流。
+// 关键修复：浏览器 RFB 数据可能在隧道建立前到达，此时先缓冲，等 TunnelOpenResp
+// 确认隧道就绪后再转发，避免 RFB 握手数据丢失导致黑屏。
 func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken func(string) bool) {
 	if !validateToken(r.URL.Query().Get("token")) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -261,8 +295,9 @@ func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken
 		return
 	}
 	tunnelID := m.nextTunnel("v")
+	vw := &viewerConn{ws: conn, agentID: agentID, tunnelID: tunnelID}
 	m.mu.Lock()
-	m.viewer[tunnelID] = &viewerConn{ws: conn, agentID: agentID, tunnelID: tunnelID}
+	m.viewer[tunnelID] = vw
 	m.mu.Unlock()
 
 	if err := a.Write(protocol.TypeTunnelOpen, &protocol.TunnelOpenReq{
@@ -271,18 +306,29 @@ func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken
 		m.closeViewer(tunnelID)
 		return
 	}
-	// 浏览器 -> Agent：读取浏览器 RFB 帧并封装转发
+	// 浏览器 -> Agent：读取浏览器 RFB 帧。
+	// 若隧道尚未就绪（DeliverOpenResp 未收到），先存入 pending 缓冲；
+	// 待隧道建立后由 DeliverOpenResp 统一转发。
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
-		if a := m.sess.Get(agentID); a != nil {
-			if werr := a.Write(protocol.TypeTunnelData, &protocol.TunnelData{TunnelID: tunnelID, Data: data}); werr != nil {
+		// 判断隧道是否已就绪
+		vw.wmu.Lock()
+		ready := vw.ready
+		if ready {
+			vw.wmu.Unlock()
+			if cur := m.sess.Get(agentID); cur != nil {
+				if werr := cur.Write(protocol.TypeTunnelData, &protocol.TunnelData{TunnelID: tunnelID, Data: data}); werr != nil {
+					break
+				}
+			} else {
 				break
 			}
 		} else {
-			break
+			vw.pending = append(vw.pending, data)
+			vw.wmu.Unlock()
 		}
 	}
 	m.closeViewer(tunnelID)
