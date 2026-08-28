@@ -105,6 +105,14 @@ type ProbeDataReq struct {
 	Arch           string  `json:"arch"`
 	PublicIP       string  `json:"public_ip"`
 	PublicIPv6     string  `json:"public_ipv6"`
+	// 扩展指标：系统版本 / CPU 型号与主频 / 内存与磁盘 已用+总量
+	OSVersion      string  `json:"os_version,omitempty"`
+	CPUModel       string  `json:"cpu_model,omitempty"`
+	CPUMHz         float64 `json:"cpu_mhz,omitempty"`
+	MemTotalBytes  int64   `json:"mem_total_bytes,omitempty"`
+	MemUsedBytes   int64   `json:"mem_used_bytes,omitempty"`
+	DiskTotalBytes int64   `json:"disk_total_bytes,omitempty"`
+	DiskUsedBytes  int64   `json:"disk_used_bytes,omitempty"`
 }
 
 // ProbeDataResp Server -> Agent 探针确认
@@ -135,6 +143,14 @@ type AgentInfo struct {
 	PublicIPv6     string  `json:"public_ipv6"`
 	Remark         string  `json:"remark"`
 	Geo            *GeoInfo `json:"geo,omitempty"`
+	// 扩展指标：系统版本 / CPU 型号与主频 / 内存与磁盘 已用+总量
+	OSVersion      string  `json:"os_version,omitempty"`
+	CPUModel       string  `json:"cpu_model,omitempty"`
+	CPUMHz         float64 `json:"cpu_mhz,omitempty"`
+	MemTotalBytes  int64   `json:"mem_total_bytes,omitempty"`
+	MemUsedBytes   int64   `json:"mem_used_bytes,omitempty"`
+	DiskTotalBytes int64   `json:"disk_total_bytes,omitempty"`
+	DiskUsedBytes  int64   `json:"disk_used_bytes,omitempty"`
 }
 
 // GeoInfo IP 地理位置信息。

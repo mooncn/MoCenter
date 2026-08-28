@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 
 	"mocenter/agent/internal/protocol"
@@ -52,6 +53,19 @@ func StartInteractive(req *protocol.CommandReq, onOutput func(*protocol.Interact
 	env := os.Environ()
 	for k, v := range req.Env {
 		env = append(env, k+"="+v)
+	}
+	// PTY 终端类型：让 bash/ls 等输出彩色与正确光标控制
+	if runtime.GOOS != "windows" {
+		hasTerm := false
+		for _, e := range env {
+			if strings.HasPrefix(e, "TERM=") {
+				hasTerm = true
+				break
+			}
+		}
+		if !hasTerm {
+			env = append(env, "TERM=xterm-256color")
+		}
 	}
 	cmd.Env = env
 	s.cmd = cmd

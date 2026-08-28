@@ -65,6 +65,18 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 		a.LastSeen = p.Timestamp
 		a.PublicIP = firstNonEmpty(p.PublicIP, a.PublicIP)
 		a.PublicIPv6 = firstNonEmpty(p.PublicIPv6, a.PublicIPv6)
+		// 扩展指标（旧版 Agent 未上报时保留原值）
+		a.OSVersion = firstNonEmpty(p.OSVersion, a.OSVersion)
+		a.CPUModel = firstNonEmpty(p.CPUModel, a.CPUModel)
+		if p.CPUMHz > 0 {
+			a.CPUMHz = p.CPUMHz
+		}
+		if p.MemTotalBytes > 0 {
+			a.MemTotalBytes, a.MemUsedBytes = p.MemTotalBytes, p.MemUsedBytes
+		}
+		if p.DiskTotalBytes > 0 {
+			a.DiskTotalBytes, a.DiskUsedBytes = p.DiskTotalBytes, p.DiskUsedBytes
+		}
 	}
 	h := s.history[p.AgentID]
 	h = append(h, p)

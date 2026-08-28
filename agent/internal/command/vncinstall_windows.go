@@ -230,18 +230,6 @@ func findTvnserverExe() string {
 	return ""
 }
 
-// waitPortOpen 轮询等待端口监听，成功返回 true。
-func waitPortOpen(port int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if portOpen(port) {
-			return true
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return false
-}
-
 // installTightVNCByCurl 下载 TightVNC MSI 并静默安装。
 func installTightVNCByCurl(cfg VncConfig) (string, bool) {
 	base := cfg.DownloadBase

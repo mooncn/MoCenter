@@ -20,14 +20,14 @@ type Collector struct {
 	host    string
 	osType  string
 	arch    string
+	// 静态信息（首次采集后缓存）
+	osVersion string
+	cpuModel  string
+	cpuMHz    float64
+	staticGot bool
 	// 上次采样用于计算速率
-	lastCPU    cpuTimes
-	lastNetIn  int64
-	lastNetOut int64
-	lastTime   time.Time
-	// 累计网络流量（自 Agent 启动以来的总收发字节）
-	totalIn  int64
-	totalOut int64
+	lastCPU  cpuTimes
+	lastTime time.Time
 	start    time.Time
 	// 公网出口 IP 探测器
 	ipDetector *ip.Detector
@@ -73,6 +73,9 @@ func (c *Collector) Arch() string { return c.arch }
 func (c *Collector) Sample() *protocol.ProbeDataReq {
 	now := time.Now()
 	ips := c.PublicIPs()
+	c.ensureStatic()
+	memTotal, memUsed := memDetails()
+	diskTotal, diskUsed := diskDetails()
 	p := &protocol.ProbeDataReq{
 		AgentID:       c.AgentID,
 		Timestamp:     now.Unix(),
@@ -80,10 +83,21 @@ func (c *Collector) Sample() *protocol.ProbeDataReq {
 		Arch:          c.arch,
 		KernelVersion: kernelVersion(),
 		Uptime:        int64(now.Sub(c.start).Seconds()),
-		MemUsage:      memUsage(),
 		DiskUsage:     diskUsage(),
 		PublicIP:      ips.IPv4,
 		PublicIPv6:    ips.IPv6,
+		// 扩展指标
+		OSVersion:      c.osVersion,
+		CPUModel:       c.cpuModel,
+		CPUMHz:         c.cpuMHz,
+		MemTotalBytes:  memTotal,
+		MemUsedBytes:   memUsed,
+		DiskTotalBytes: diskTotal,
+		DiskUsedBytes:  diskUsed,
+	}
+	// 内存使用率统一由明细计算（Linux /proc 与 Windows wmic 均适用）
+	if memTotal > 0 {
+		p.MemUsage = float64(memUsed) / float64(memTotal) * 100
 	}
 	if c.osType == "linux" {
 		cpu := readCPUTimes()
@@ -94,20 +108,29 @@ func (c *Collector) Sample() *protocol.ProbeDataReq {
 			}
 		}
 		c.lastCPU = cpu
-		in, out := netTraffic()
-		if !c.lastTime.IsZero() {
-			// 累加采样间隔内的增量，得到自启动以来的累计流量
-			c.totalIn += in - c.lastNetIn
-			c.totalOut += out - c.lastNetOut
-		}
-		p.NetInBytes = c.totalIn
-		p.NetOutBytes = c.totalOut
-		c.lastNetIn, c.lastNetOut = in, out
+		// 网卡自系统启动以来的累计收发字节
+		p.NetInBytes, p.NetOutBytes = netTraffic()
 	} else {
 		p.CPUUsage = windowsCPU()
+		p.NetInBytes, p.NetOutBytes = windowsNetTraffic()
 	}
 	c.lastTime = now
 	return p
+}
+
+// OSVersion 返回操作系统版本描述（如 "Rocky Linux 8.10"/"Windows 10 Pro 22H2"）。
+func (c *Collector) OSVersion() string {
+	c.ensureStatic()
+	return c.osVersion
+}
+
+// ensureStatic 首次调用时采集静态信息并缓存。
+func (c *Collector) ensureStatic() {
+	if c.staticGot {
+		return
+	}
+	c.staticGot = true
+	c.osVersion, c.cpuModel, c.cpuMHz = staticSysInfo()
 }
 
 func hostname() string {
@@ -127,37 +150,6 @@ func kernelVersion() string {
 	}
 	out, _ := exec.Command("uname", "-a").Output()
 	return strings.TrimSpace(string(out))
-}
-
-func memUsage() float64 {
-	data, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0
-	}
-	lines := strings.Split(string(data), "\n")
-	parse := func(k string) float64 {
-		for _, l := range lines {
-			if strings.HasPrefix(l, k) {
-				f := strings.Fields(l)
-				if len(f) >= 2 {
-					v, _ := strconv.ParseFloat(f[1], 64)
-					return v
-				}
-			}
-		}
-		return 0
-	}
-	total := parse("MemTotal:")
-	free := parse("MemFree:")
-	avail := parse("MemAvailable:")
-	used := total - free
-	if avail > 0 {
-		used = total - avail
-	}
-	if total <= 0 {
-		return 0
-	}
-	return used / total * 100
 }
 
 func diskUsage() float64 {

@@ -21,6 +21,11 @@ certs/
 # 临时诊断目录
 _diag/
 _diag*/
+_obf/
+
+# 运行时数据（敏感，不纳入版本控制）
+server/audits.jsonl
+server/users.json
 
 # Node
 node_modules/

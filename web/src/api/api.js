@@ -183,9 +183,14 @@ export class MCSocket {
     this.ws.onerror = () => this.ws && this.ws.close()
   }
 
-  // 发送交互输入到指定 Agent
-  sendInteractive(agentId, commandId, data) {
-    this.send({ type: 'InteractiveInputReq', data: { agent_id: agentId, command_id: commandId, input_data: data } })
+  // 发送交互输入到指定 Agent；opts 可携带 { rows, cols } 同步终端尺寸
+  sendInteractive(agentId, commandId, data, opts) {
+    const payload = { agent_id: agentId, command_id: commandId, input_data: data }
+    if (opts && opts.rows > 0 && opts.cols > 0) {
+      payload.rows = opts.rows
+      payload.cols = opts.cols
+    }
+    this.send({ type: 'InteractiveInputReq', data: payload })
   }
 
   // 文件分发：将本地文件分片上传到服务端，服务端转发给目标 Agent

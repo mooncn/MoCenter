@@ -131,6 +131,41 @@ func main() {
 		}
 	}
 
+	// 命令行显式传入的参数（flag.Visit）优先级最高，并自动保存回配置文件，
+	// 这样下次可直接按最新参数启动，无需重复传参。密码/TOTP 不落盘。
+	{
+		explicit := map[string]bool{}
+		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+		// flag 名 -> (配置字段指针, 命令行变量值)
+		field := map[string]func(){
+			"listen":    func() { cfg.Listen = *addr },
+			"http":      func() { cfg.HTTP = *httpAddr },
+			"apikey":    func() { cfg.APIKey = *apiKey },
+			"whitelist": func() { cfg.Whitelist = *whitelist },
+			"web":       func() { cfg.WebDir = *webDir },
+			"tls-cert":  func() { cfg.TLSCert = *tlsCert },
+			"tls-key":   func() { cfg.TLSKey = *tlsKey },
+			"ca-cert":   func() { cfg.CACert = *caCert },
+			"insecure":  func() { cfg.Insecure = *insecure },
+			"data":      func() { cfg.DataDir = *dataDir },
+			"user":      func() { cfg.User = *user },
+		}
+		dirty := false
+		for _, name := range []string{"listen", "http", "apikey", "whitelist", "web", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user"} {
+			if explicit[name] {
+				field[name]()
+				dirty = true
+			}
+		}
+		if dirty {
+			if err := config.Save(*configPath, cfg); err != nil {
+				log.Printf("警告: 更新配置文件 %s 失败: %v", *configPath, err)
+			} else {
+				log.Printf("已把命令行参数保存到配置文件: %s", *configPath)
+			}
+		}
+	}
+
 	// 未显式指定 Web 目录时，自动探测可执行文件旁或当前目录下的 web 前端，
 	// 便于单文件部署：把 server 与 web/ 放在同目录即可直接托管前端。
 	if *webDir == "" {

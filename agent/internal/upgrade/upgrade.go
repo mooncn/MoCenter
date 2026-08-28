@@ -73,31 +73,72 @@ func Perform(req *protocol.UpgradeReq, report func(*protocol.UpgradeResp)) {
 		_ = os.Chmod(tmpPath, 0755)
 	}
 
-	// 3. 备份旧二进制
+	// 3. 备份旧二进制：先移走运行中的 exe（Windows 允许重命名运行中的文件，
+	//    但不允许直接覆盖），再让新文件落位；失败时回滚。
 	backupPath := exe + ".bak"
-	if err := copyFile(exe, backupPath); err != nil {
+	_ = os.Remove(backupPath)
+	if err := os.Rename(exe, backupPath); err != nil {
 		_ = os.Remove(tmpPath)
 		resp.Message = "备份旧版本失败: " + err.Error()
 		return
 	}
 
-	// 4. 替换二进制
-	if err := os.Rename(tmpPath, exe); err != nil {
+	// 4. 新二进制落位（重试以避开杀软扫描瞬时锁定；仍失败则回退内容复制）
+	if err := renameWithRetry(tmpPath, exe, 5, 2*time.Second); err != nil {
+		if cerr := copyFile(tmpPath, exe); cerr != nil {
+			_ = os.Remove(tmpPath)
+			// 回滚备份
+			_ = os.Rename(backupPath, exe)
+			resp.Message = "替换二进制失败: " + err.Error()
+			return
+		}
 		_ = os.Remove(tmpPath)
-		// 回滚备份
-		_ = os.Rename(backupPath, exe)
-		resp.Message = "替换二进制失败: " + err.Error()
-		return
+	}
+	// Windows 下旧备份可能仍被占用，延迟清理交给系统；Linux 直接清理
+	if runtime.GOOS != "windows" {
+		_ = os.Remove(backupPath)
 	}
 
-	// 5. 立即重启以加载新版本（通过服务端或 daemon 重新拉起）
+	// 5. 以分离进程重新拉起新版本（保持原工作目录与参数），随后退出旧进程
 	resp.OK = true
 	resp.Message = "升级成功，正在重启"
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		// 触发守护进程自启：直接退出当前进程
-		os.Exit(0)
+		restartSelf(dir)
 	}()
+}
+
+// renameWithRetry 带重试的 rename：新下载的二进制可能被杀软瞬时锁定，
+// 稍候重试通常即可成功。
+func renameWithRetry(from, to string, attempts int, wait time.Duration) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(wait)
+		}
+		if err = os.Rename(from, to); err == nil {
+			return nil
+		}
+		log.Printf("[upgrade] rename 重试 %d/%d: %v", i+1, attempts, err)
+	}
+	return err
+}
+
+// restartSelf 以分离方式重新启动自身（升级后调用），然后退出当前进程。
+func restartSelf(dir string) {
+	defer os.Exit(0)
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := platformSpawnSelf(exe)
+	cmd.Dir = dir
+	if f, err := os.OpenFile(filepath.Join(dir, "mocenter-agent.out"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		cmd.Stdout = f
+		cmd.Stderr = f
+	}
+	_ = cmd.Start()
 }
 
 // download 下载文件到指定路径。

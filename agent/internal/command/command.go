@@ -32,6 +32,8 @@ type Result struct {
 }
 
 // buildCmd 根据 shell_type 构造命令行参数。
+// 交互模式（req.Interactive）下返回登录式 shell（不带 -c），
+// 使会话可连续执行多条命令，而非“一命令一进程一退出”。
 func buildCmd(req *protocol.CommandReq) (name string, args []string) {
 	shell := req.ShellType
 	if shell == "" {
@@ -39,6 +41,26 @@ func buildCmd(req *protocol.CommandReq) (name string, args []string) {
 			shell = "cmd"
 		} else {
 			shell = "bash"
+		}
+	}
+	if req.Interactive {
+		switch shell {
+		case "bash":
+			return "/bin/bash", []string{"-i"}
+		case "sh":
+			return "/bin/sh", []string{"-i"}
+		case "powershell":
+			if runtime.GOOS == "windows" {
+				return "powershell.exe", []string{"-NoProfile"}
+			}
+			return "pwsh", []string{"-NoProfile"}
+		case "cmd":
+			return "cmd.exe", nil
+		default:
+			if runtime.GOOS == "windows" {
+				return "cmd.exe", nil
+			}
+			return "/bin/bash", []string{"-i"}
 		}
 	}
 	switch shell {

@@ -1,0 +1,89 @@
+//go:build linux || darwin
+
+// Linux/macOS 静态系统信息与内存/磁盘明细采集（零外部依赖，直接读 /proc 等）。
+package probe
+
+import (
+	"os"
+	"strconv"
+	"strings"
+	"syscall"
+)
+
+// staticSysInfo 返回操作系统版本描述、CPU 型号与主频。
+func staticSysInfo() (osVer, cpuModel string, cpuMHz float64) {
+	// 系统版本：/etc/os-release 的 PRETTY_NAME（如 "Rocky Linux 8.10 (Green Obsidian)"）
+	if b, err := os.ReadFile("/etc/os-release"); err == nil {
+		for _, l := range strings.Split(string(b), "\n") {
+			if v, ok := strings.CutPrefix(l, "PRETTY_NAME="); ok {
+				osVer = strings.Trim(strings.TrimSpace(v), `"`)
+				break
+			}
+		}
+	}
+	if osVer == "" {
+		osVer = "Linux"
+	}
+	// CPU 型号与主频：/proc/cpuinfo
+	if b, err := os.ReadFile("/proc/cpuinfo"); err == nil {
+		for _, l := range strings.Split(string(b), "\n") {
+			if cpuModel == "" {
+				if v, ok := strings.CutPrefix(l, "model name"); ok {
+					cpuModel = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(v), ":"))
+					continue
+				}
+			}
+			if cpuMHz == 0 {
+				if v, ok := strings.CutPrefix(l, "cpu MHz"); ok {
+					f, _ := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(v), ":")), 64)
+					cpuMHz = f
+				}
+			}
+		}
+	}
+	return osVer, cpuModel, cpuMHz
+}
+
+// memDetails 返回内存总量与已用量（字节）。已用 = Total - Available。
+func memDetails() (total, used int64) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0
+	}
+	var t, avail, free float64
+	for _, l := range strings.Split(string(b), "\n") {
+		f := strings.Fields(l)
+		if len(f) < 2 {
+			continue
+		}
+		v, _ := strconv.ParseFloat(f[1], 64) // 单位 kB
+		switch {
+		case strings.HasPrefix(l, "MemTotal:"):
+			t = v
+		case strings.HasPrefix(l, "MemAvailable:"):
+			avail = v
+		case strings.HasPrefix(l, "MemFree:"):
+			free = v
+		}
+	}
+	if avail <= 0 {
+		avail = free
+	}
+	total = int64(t * 1024)
+	used = int64((t - avail) * 1024)
+	return total, used
+}
+
+// diskDetails 返回根分区总量与已用量（字节）。
+func diskDetails() (total, used int64) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs("/", &st); err != nil {
+		return 0, 0
+	}
+	total = int64(st.Blocks) * int64(st.Bsize)
+	used = total - int64(st.Bavail)*int64(st.Bsize)
+	return total, used
+}
+
+// windowsNetTraffic Unix 平台占位（不会被执行）。
+func windowsNetTraffic() (recv, sent int64) { return 0, 0 }

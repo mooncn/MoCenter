@@ -119,12 +119,28 @@ export default function Dashboard({ agents }) {
                 <td>
                   <PublicIPCell agent={a} />
                 </td>
-                <td>{a.os_type}</td>
+                <td>
+                  <div style={{ fontWeight: 600, fontSize: 12 }}>{a.os_version || a.os_type}</div>
+                  <div style={{ color: '#8b98a5', fontSize: 11 }}>{a.os_type} · {a.arch}</div>
+                </td>
                 <td>{a.arch}</td>
-                <td><CpuBar v={a.cpu_usage} /></td>
-                <td><MemBar v={a.mem_usage} /></td>
-                <td><Bar v={a.disk_usage} /></td>
-                <td>{fmtBytes(a.net_in_bytes)} / {fmtBytes(a.net_out_bytes)}</td>
+                <td>
+                  <div style={{ fontSize: 11, maxWidth: 210, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={(a.cpu_model || '') + (a.cpu_mhz ? ` @ ${(a.cpu_mhz / 1000).toFixed(2)}GHz` : '')}>
+                    {a.cpu_model || '-'}{a.cpu_mhz ? ` @ ${(a.cpu_mhz / 1000).toFixed(2)}GHz` : ''}
+                  </div>
+                  <CpuBar v={a.cpu_usage} />
+                </td>
+                <td>
+                  <div style={{ fontSize: 11 }}>{fmtGBytes(a.mem_used_bytes)}/{fmtGBytes(a.mem_total_bytes)}</div>
+                  <MemBar v={a.mem_usage} />
+                </td>
+                <td>
+                  <div style={{ fontSize: 11 }}>{fmtGBytes(a.disk_used_bytes)}/{fmtGBytes(a.disk_total_bytes)}</div>
+                  <Bar v={a.disk_usage} />
+                </td>
+                <td style={{ fontSize: 11, whiteSpace: 'nowrap' }}>
+                  ↑{fmtGB(a.net_out_bytes)}<br />↓{fmtGB(a.net_in_bytes)}
+                </td>
                 <td>{a.online ? fmtTime(a.last_seen) : `离线 ${fmtOffline(a)}`}</td>
                 <td>
                   <button className="secondary" onClick={() => setSelectedAgent(selectedAgent === a.agent_id ? '' : a.agent_id)}>
@@ -220,6 +236,18 @@ function fmtBytes(b) {
   if (b > 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + 'M'
   if (b > 1024) return (b / 1024).toFixed(1) + 'K'
   return b + 'B'
+}
+
+// 字节数 -> xx.xxG（内存/磁盘 已用/总量展示）
+function fmtGBytes(b) {
+  if (!b || b <= 0) return '0.00G'
+  return (b / 1024 / 1024 / 1024).toFixed(2) + 'G'
+}
+
+// 字节数 -> xx.xxGB（网络累计上行/下行展示，统一 GB）
+function fmtGB(b) {
+  if (!b || b <= 0) return '0.00GB'
+  return (b / 1024 / 1024 / 1024).toFixed(2) + 'GB'
 }
 
 function fmtTime(ts) {

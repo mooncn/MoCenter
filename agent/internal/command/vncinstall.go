@@ -62,4 +62,16 @@ func portOpen(port int) bool {
 	return false
 }
 
+// waitPortOpen 轮询等待端口监听，成功返回 true（各平台共用）。
+func waitPortOpen(port int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if portOpen(port) {
+			return true
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
+}
+
 func itoa(n int) string { return strconv.Itoa(n) }

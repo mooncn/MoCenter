@@ -97,6 +97,40 @@ func main() {
 		}
 	}
 
+	// 命令行显式传入的参数（flag.Visit）优先级最高，并自动保存回配置文件，
+	// 这样下次可直接按最新参数启动，无需重复传参。
+	{
+		explicit := map[string]bool{}
+		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+		field := map[string]func(){
+			"server":      func() { cfg.Server = *server },
+			"agentid":     func() { cfg.AgentID = *agentID },
+			"hb":          func() { cfg.Heartbeat = *hb },
+			"probe":       func() { cfg.ProbeEvery = *probe },
+			"tls":         func() { cfg.TLS = *tlsEnabled },
+			"insecure":    func() { cfg.Insecure = *insecure },
+			"daemon":      func() { cfg.Daemon = *daemonize },
+			"client-cert": func() { cfg.ClientCert = *clientCert },
+			"client-key":  func() { cfg.ClientKey = *clientKey },
+			"ca-cert":     func() { cfg.CACert = *caCert },
+			"proxy-ip":    func() { cfg.ProxyIP = *proxyIP },
+		}
+		dirty := false
+		for _, name := range []string{"server", "agentid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip"} {
+			if explicit[name] {
+				field[name]()
+				dirty = true
+			}
+		}
+		if dirty {
+			if err := config.Save(*configPath, cfg); err != nil {
+				log.Printf("警告: 更新配置文件 %s 失败: %v", *configPath, err)
+			} else {
+				log.Printf("已把命令行参数保存到配置文件: %s", *configPath)
+			}
+		}
+	}
+
 	if *server == "" {
 		log.Fatal("请通过 -server、环境变量 MOCENTER_SERVER 或配置文件指定服务端地址")
 	}

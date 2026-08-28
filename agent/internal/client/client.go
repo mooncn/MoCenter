@@ -163,6 +163,7 @@ func (c *Client) register() {
 		"hostname":    c.collect.Host(),
 		"os_type":     c.collect.OSType(),
 		"arch":        c.collect.Arch(),
+		"os_version":  c.collect.OSVersion(),
 		"remote_addr": "",
 		"public_ip":   ips.IPv4,
 		"public_ipv6": ips.IPv6,

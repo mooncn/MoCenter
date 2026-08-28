@@ -16,6 +16,8 @@ import (
 var vncStoreKey, _ = hex.DecodeString("e84ad660c4721ae0")
 
 // vncObfuscatePassword 生成与 VNC 服务器存储一致的口令字节（8 字节）。
+// VNC 口令最长 8 字节：超长必须截断，否则存储侧（TightVNC/TigerVNC）与
+// 客户端各自截断后可能不一致，导致 Authentication failed。
 func vncObfuscatePassword(pw string) []byte {
 	key := vncStoreKey
 	block, err := des.NewCipher(key)
@@ -23,18 +25,18 @@ func vncObfuscatePassword(pw string) []byte {
 		return make([]byte, 8)
 	}
 	in := make([]byte, 8)
-	copy(in, []byte(pw)) // 不足 8 字节以 0 补齐；超长截断
+	copy(in, []byte(pw)) // 不足 8 字节以 0 补齐；超长截断为前 8 字节
 	out := make([]byte, 8)
 	block.Encrypt(out, in)
 	return out
 }
 
-// generateRandomPassword 生成用于 VNC 的随机口令（去易混淆字符，长度 12）。
+// generateRandomPassword 生成用于 VNC 的随机口令（去易混淆字符，长度 8=VNC 上限）。
 func generateRandomPassword() string {
 	const charset = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789"
-	b := make([]byte, 12)
+	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
-		return "mocenter-vnc-2026"
+		return "mocenter"[:8]
 	}
 	for i := range b {
 		b[i] = charset[int(b[i])%len(charset)]

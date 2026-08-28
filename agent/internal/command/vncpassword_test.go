@@ -19,7 +19,16 @@ func TestVncObfuscateKnownVector(t *testing.T) {
 func TestGenerateRandomPassword(t *testing.T) {
 	a := generateRandomPassword()
 	b := generateRandomPassword()
-	if len(a) != 12 || a == b {
+	if len(a) != 8 || a == b {
 		t.Fatalf("unexpected random passwords: %q %q", a, b)
+	}
+}
+
+// 超长口令必须截断为前 8 字节再混淆（VNC 协议上限）。
+func TestVncObfuscateTruncates(t *testing.T) {
+	short := vncObfuscatePassword("12345678")
+	long := vncObfuscatePassword("12345678xyz")
+	if string(short) != string(long) {
+		t.Fatal("passwords longer than 8 bytes must be truncated to 8")
 	}
 }
