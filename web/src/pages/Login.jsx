@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Api } from '../api/api.js'
 
 export default function Login() {
@@ -9,6 +9,8 @@ export default function Login() {
   const [token, setToken] = useState('')
   const [err, setErr] = useState('')
   const nav = useNavigate()
+  const [searchParams] = useSearchParams()
+  const redirectTo = searchParams.get('redirect') || '/'
 
   const doLogin = async (e) => {
     e.preventDefault()
@@ -18,7 +20,7 @@ export default function Login() {
       try {
         localStorage.setItem('mc_token', token.trim())
         await Api.agents()
-        nav('/')
+        nav(redirectTo)
         return
       } catch {
         localStorage.removeItem('mc_token')
@@ -32,7 +34,7 @@ export default function Login() {
         const res = await Api.login({ username: username.trim(), password, otp: otp.trim() })
         if (res && res.ok && res.token) {
           localStorage.setItem('mc_token', res.token)
-          nav('/')
+          nav(redirectTo)
           return
         }
         setErr((res && res.msg) || '登录失败')

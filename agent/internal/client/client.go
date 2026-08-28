@@ -539,7 +539,7 @@ func (c *Client) openTunnel(req protocol.TunnelOpenReq) {
 
 // readTunnel 读取内网服务的回包，封装为 TunnelData 回传服务端。
 func (c *Client) readTunnel(tunnelID string, conn net.Conn) {
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, 64*1024)
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
