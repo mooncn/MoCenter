@@ -227,7 +227,7 @@ func (s *InteractiveSession) readLoop(pr io.Reader) {
 		if n > 0 {
 			s.emit(&protocol.InteractiveOutput{
 				CommandID: s.cmdID,
-				Data:      string(buf[:n]),
+				Data:      normalizePTYOutput(string(buf[:n])),
 				Type:      "stdout",
 			})
 		}
@@ -245,7 +245,7 @@ func (s *InteractiveSession) readPipeLoop(pr io.Reader) {
 		if n > 0 {
 			s.emit(&protocol.InteractiveOutput{
 				CommandID: s.cmdID,
-				Data:      string(buf[:n]),
+				Data:      normalizePTYOutput(string(buf[:n])),
 				Type:      "stdout",
 			})
 		}
@@ -286,4 +286,28 @@ func (s *InteractiveSession) emit(out *protocol.InteractiveOutput) {
 	if s.onOutput != nil {
 		s.onOutput(out)
 	}
+}
+
+// normalizePTYOutput 规范化 PTY 输出中的换行符：
+// 将独立的 LF(\n) 转换为 CRLF(\r\n)，确保 Web 端 xterm 正确回到行首，
+// 避免"每行比上一行前留空格更多"的递进缩进问题。
+// 已存在的 CRLF 保持不变。
+func normalizePTYOutput(data string) string {
+	// 快速路径：不含 \n 则直接返回
+	if !strings.Contains(data, "\n") {
+		return data
+	}
+	// 将独立的 \n（前面不是 \r 的）替换为 \r\n
+	var sb strings.Builder
+	sb.Grow(len(data) + 8)
+	prev := byte(0)
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if c == '\n' && prev != '\r' {
+			sb.WriteByte('\r')
+		}
+		sb.WriteByte(c)
+		prev = c
+	}
+	return sb.String()
 }

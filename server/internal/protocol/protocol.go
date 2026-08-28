@@ -151,6 +151,9 @@ type AgentInfo struct {
 	MemUsedBytes   int64   `json:"mem_used_bytes,omitempty"`
 	DiskTotalBytes int64   `json:"disk_total_bytes,omitempty"`
 	DiskUsedBytes  int64   `json:"disk_used_bytes,omitempty"`
+	// 网络速率（字节/秒），由服务端根据相邻探针累计值差计算
+	NetRateIn      int64   `json:"net_rate_in,omitempty"`
+	NetRateOut     int64   `json:"net_rate_out,omitempty"`
 }
 
 // GeoInfo IP 地理位置信息。

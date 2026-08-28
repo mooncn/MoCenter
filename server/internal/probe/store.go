@@ -57,6 +57,23 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 		a.CPUUsage = p.CPUUsage
 		a.MemUsage = p.MemUsage
 		a.DiskUsage = p.DiskUsage
+		// 计算网络速率（字节/秒）：相邻探针累计值差 / 时间间隔
+		if a.NetInBytes > 0 && p.NetInBytes >= a.NetInBytes && a.LastSeen > 0 {
+			dt := p.Timestamp - a.LastSeen
+			if dt > 0 {
+				a.NetRateIn = (p.NetInBytes - a.NetInBytes) / dt
+			}
+		} else {
+			a.NetRateIn = 0
+		}
+		if a.NetOutBytes > 0 && p.NetOutBytes >= a.NetOutBytes && a.LastSeen > 0 {
+			dt := p.Timestamp - a.LastSeen
+			if dt > 0 {
+				a.NetRateOut = (p.NetOutBytes - a.NetOutBytes) / dt
+			}
+		} else {
+			a.NetRateOut = 0
+		}
 		a.NetInBytes = p.NetInBytes
 		a.NetOutBytes = p.NetOutBytes
 		a.KernelVersion = p.KernelVersion

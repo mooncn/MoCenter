@@ -32,7 +32,7 @@ export default function TerminalPage({ agents }) {
       fontFamily: 'Menlo, Consolas, "Courier New", monospace',
       scrollback: 10000,
       theme: { background: '#000000', foreground: '#d4d4d4' },
-      convertEol: false,
+      convertEol: true,
     })
     const fit = new FitAddon()
     term.loadAddon(fit)

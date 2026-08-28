@@ -95,7 +95,7 @@ export default function Dashboard({ agents }) {
               <th>CPU</th>
               <th>内存</th>
               <th>磁盘</th>
-              <th>网络 ↓ / ↑</th>
+              <th>网络(累计↓↑ / 速率↓↑)</th>
               <th>最后在线</th>
               <th>趋势</th>
             </tr>
@@ -139,7 +139,11 @@ export default function Dashboard({ agents }) {
                   <Bar v={a.disk_usage} />
                 </td>
                 <td style={{ fontSize: 11, whiteSpace: 'nowrap' }}>
-                  ↑{fmtGB(a.net_out_bytes)}<br />↓{fmtGB(a.net_in_bytes)}
+                  <div style={{ color: '#4da3ff' }} title="网卡累计下行">↓ {fmtGB(a.net_in_bytes)}</div>
+                  <div style={{ color: '#fa8c16' }} title="网卡累计上行">↑ {fmtGB(a.net_out_bytes)}</div>
+                  <div style={{ color: '#52c41a', fontSize: 10 }}>
+                    {fmtSpeed(a.net_rate_in)} / {fmtSpeed(a.net_rate_out)}
+                  </div>
                 </td>
                 <td>{a.online ? fmtTime(a.last_seen) : `离线 ${fmtOffline(a)}`}</td>
                 <td>
@@ -248,6 +252,14 @@ function fmtGBytes(b) {
 function fmtGB(b) {
   if (!b || b <= 0) return '0.00GB'
   return (b / 1024 / 1024 / 1024).toFixed(2) + 'GB'
+}
+
+// 字节/秒 -> 可读速率（KB/s / MB/s）
+function fmtSpeed(bps) {
+  if (!bps || bps <= 0) return '-'
+  if (bps >= 1024 * 1024) return (bps / 1024 / 1024).toFixed(2) + 'MB/s'
+  if (bps >= 1024) return (bps / 1024).toFixed(1) + 'KB/s'
+  return bps + 'B/s'
 }
 
 function fmtTime(ts) {
