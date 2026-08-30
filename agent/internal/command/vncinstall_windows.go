@@ -1,9 +1,9 @@
 //go:build windows
 
 // Windows VNC 一键安装/启动：
-//   1. 优先 winget / choco 安装 TightVNC；
-//   2. 否则通过 curl 下载 TightVNC MSI 静默安装（支持国内加速代理前缀）；
-//   3. 若 TightVNC 不可用，回退尝试 TigerVNC。
+//  1. 优先 winget / choco 安装 TightVNC；
+//  2. 否则通过 curl 下载 TightVNC MSI 静默安装（支持国内加速代理前缀）；
+//  3. 若 TightVNC 不可用，回退尝试 TigerVNC。
 package command
 
 import (
@@ -36,7 +36,6 @@ func vncInstallWindows(port int, cfg VncConfig) VncInstallResult {
 	if installAndStartTightVNC(port, cfg, &res) {
 		if portOpen(port) {
 			res.OK = true
-			res.Message = "VNC(TightVNC) 已就绪，端口 " + itoa(port) + "。"
 			return res
 		}
 	}
@@ -86,9 +85,12 @@ func installAndStartTightVNC(port int, cfg VncConfig, res *VncInstallResult) boo
 
 	// 生成随机口令并写入注册表（DES 混淆），强制回环，禁止免密
 	res.Password = generateRandomPassword()
-	configureAndStartTightVNC(port, res.Password)
+	vddMsg := configureAndStartTightVNC(port, res.Password, cfg)
 	if res.Message == "" {
 		res.Message = "TightVNC 已安装并启动（端口 " + itoa(port) + "）。口令请使用本次下发值。"
+	}
+	if vddMsg != "" {
+		res.Message += " " + vddMsg
 	}
 	return portOpen(port)
 }
@@ -101,12 +103,12 @@ var vncRegistryKeys = []string{
 }
 
 // configureAndStartTightVNC 写入 TightVNC 配置并启动：
-//   1) 全部设置写入所有 hive（含 AllowLoopback 允许回环隧道回连）；
-//   2) 使用指定口令（禁止免密）；
-//   3) 设置监听端口（PortNumber）；
-//   4) 启动顺序：优先在交互式用户会话中启动（避免 Session 0 隔离导致黑屏），
-//      先尝试独立进程启动 → 计划任务用户会话 → 服务模式兜底。
-func configureAndStartTightVNC(port int, password string) {
+//  1. 全部设置写入所有 hive（含 AllowLoopback 允许回环隧道回连）；
+//  2. 使用指定口令（禁止免密）；
+//  3. 设置监听端口（PortNumber）；
+//  4. 启动顺序：优先在交互式用户会话中启动（避免 Session 0 隔离导致黑屏），
+//     先尝试独立进程启动 → 计划任务用户会话 → 服务模式兜底。
+func configureAndStartTightVNC(port int, password string, cfg VncConfig) string {
 	dword := []struct{ name, val string }{
 		// Authentication=1 启用口令认证；同时写 ControlPassword
 		{"Authentication", "1"},
@@ -148,7 +150,15 @@ func configureAndStartTightVNC(port int, password string) {
 	exe := findTvnserverExe()
 	if exe == "" {
 		log.Printf("[vnc-install] 未找到 tvnserver.exe，跳过启动")
-		return
+		return ""
+	}
+
+	// 无头检测：确保系统有可用的显示设备（物理显示器或虚拟显示器）。
+	// 若系统无显示器，TightVNC 即使在交互会话中启动也捕获不到画面（黑屏）。
+	vddMsg := ""
+	if vddOK, msg := ensureVirtualDisplay(cfg); !vddOK {
+		log.Printf("[vnc-install] 警告: %s", msg)
+		vddMsg = msg
 	}
 
 	// 停止并禁用 TightVNC 服务：MSI 默认以 AUTO_START 安装该服务，若不禁用，
@@ -173,6 +183,11 @@ func configureAndStartTightVNC(port int, password string) {
 	}
 
 	_ = waitPortOpen(port, 8*time.Second)
+
+	// 创建登录自启任务：系统重启后自动在交互会话中启动 VNC
+	ensureVncLogonTask(exe)
+
+	return vddMsg
 }
 
 // startTvnserverDirect 以独立进程方式启动 TightVNC（继承 Agent 当前会话）。
@@ -205,6 +220,39 @@ func startInUserSession(exe string) {
 	if err := exec.Command("cmd.exe", "/c", cmdStr).Run(); err != nil {
 		log.Printf("[vnc-install] schtasks 用户会话启动失败: %v", err)
 	}
+}
+
+// ensureVncLogonTask 创建（或更新）持久化的「用户登录后自动启动 VNC」计划任务。
+// 该任务在用户登录交互式会话时自动运行 VNC server，确保系统重启后
+// VNC 仍能正常工作（捕获交互式桌面），且不会落入 Session 0。
+// extraArgs 为附加的命令行参数（TigerVNC 需要 -rfbport 等参数时使用）。
+func ensureVncLogonTask(exe string, extraArgs ...string) {
+	taskName := "MoCenter-VNC-Logon"
+	quotedExe := "\"" + strings.ReplaceAll(exe, "\"", "\"\"") + "\""
+
+	// 拼接附加参数（含空格或路径参数需加引号）
+	for _, a := range extraArgs {
+		if strings.ContainsAny(a, " \t") {
+			quotedExe += " \"" + strings.ReplaceAll(a, "\"", "\"\"") + "\""
+		} else {
+			quotedExe += " " + a
+		}
+	}
+
+	// 先删除旧任务（避免重复）
+	_ = exec.Command("cmd.exe", "/c", fmt.Sprintf("schtasks /delete /tn \"%s\" /f", taskName)).Run()
+
+	// 创建用户登录时触发的交互式任务
+	// /it 确保在交互式用户会话中运行（可捕获桌面）
+	cmdStr := fmt.Sprintf(
+		"schtasks /create /tn \"%s\" /tr %s /sc onlogon /it /f",
+		taskName, quotedExe,
+	)
+	if err := exec.Command("cmd.exe", "/c", cmdStr).Run(); err != nil {
+		log.Printf("[vnc-install] 创建登录自启任务失败: %v", err)
+		return
+	}
+	log.Printf("[vnc-install] 已创建登录自启任务 %s", taskName)
 }
 
 // findTvnserverExe 定位已安装的 tvnserver 可执行文件。
@@ -418,7 +466,10 @@ func installAndStartTigerVNC(port int, cfg VncConfig, res *VncInstallResult) boo
 
 	// 生成口令并写入配置
 	res.Password = generateRandomPassword()
-	configureAndStartTigerVNC(port, res.Password)
+	vddMsg := configureAndStartTigerVNC(port, res.Password, cfg)
+	if vddMsg != "" && res.Message == "" {
+		res.Message = vddMsg
+	}
 	return portOpen(port)
 }
 
@@ -441,17 +492,24 @@ func probeTigerVNC() bool {
 
 // configureAndStartTigerVNC 配置并启动 TigerVNC。
 // 优先在当前会话直接启动；若端口未就绪则通过计划任务在用户交互会话启动。
-func configureAndStartTigerVNC(port int, password string) {
+func configureAndStartTigerVNC(port int, password string, cfg VncConfig) string {
 	// 写入 TigerVNC 口令（格式与 TightVNC 相同：DES 混淆的 8 字节）
 	passFile := filepath.Join(os.TempDir(), "mocenter_vnc_passwd")
 	if err := writeVncPasswdFile(passFile, password); err != nil {
 		log.Printf("[vnc-install] TigerVNC 口令文件写入失败: %v", err)
-		return
+		return ""
 	}
 
 	exe := findTigerVNCExe()
 	if exe == "" {
-		return
+		return ""
+	}
+
+	// 无头检测：确保系统有可用的显示设备
+	vddMsg := ""
+	if vddOK, msg := ensureVirtualDisplay(cfg); !vddOK {
+		log.Printf("[vnc-install] TigerVNC 警告: %s", msg)
+		vddMsg = msg
 	}
 
 	// 先杀掉已有 vncserver 进程
@@ -479,6 +537,11 @@ func configureAndStartTigerVNC(port int, password string) {
 	}
 
 	_ = waitPortOpen(port, 8*time.Second)
+
+	// 创建登录自启任务：系统重启后自动在交互会话中启动 VNC
+	ensureVncLogonTask(exe, "-rfbport", itoa(port), "-rfbauth", passFile)
+
+	return vddMsg
 }
 
 // findTigerVNCExe 定位已安装的 TigerVNC 可执行文件。

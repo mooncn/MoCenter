@@ -1,4 +1,4 @@
-# Windows 无头 VNC 测试报告
+# Windows 无头 VNC 测试报告与实现总结
 
 ## 背景
 MoCenter Agent 在 Windows 虚拟机上部署后，VNC 远程桌面显示黑屏。目标是实现**无头（无人连接控制台）Windows 虚拟机的 VNC 远程桌面**。
@@ -33,42 +33,56 @@ MoCenter Agent 在 Windows 虚拟机上部署后，VNC 远程桌面显示黑屏�
 
 **产品启示**：Agent 的 VNC 抓取组件必须设计为在**交互会话中运行**（如通过 schtasks /it 拉起），不能直接在 Session 0 中抓取。
 
+**实现**：`vncinstall_windows.go` 的 `startInUserSession()` 通过 `schtasks /it` 在交互会话中启动 TightVNC server。
+
 ---
 
 ### 3. IddSampleDriver（IDD 驱动）无法被 DXGI Desktop Duplication 捕获
 **现象**：在交互会话中安装了 IddSampleDriver 并创建了虚拟显示设备（`ROOT\IDDSAMPLEDRIVER\0000`），`EnumOutputs` 能枚举到虚拟屏 `\\.\DISPLAY9 1280x800 attached=1`，但调用 `IDXGIOutputDuplication::AcquireNextFrame` 时发生**访问越界崩溃（AV, 0xc0000005）**。
 
-**尝试的调试**：
-- 确认 D3D11 设备创建成功且指针有效；
-- 确认 DuplicateOutput 返回成功；
-- 更换帧信息缓冲区（堆分配/栈分配、不同大小）——均无效；
-- 跳过离线的主屏（DISPLAY1），只抓虚拟屏（DISPLAY9）——仍然在 AcquireNextFrame 崩溃。
-
-**结论**：**IDD（间接显示驱动）类型的虚拟屏，不支持标准的 DXGI Desktop Duplication 抓取流程**。IDD 的帧是通过驱动内部的"间接"通道交付给接收端的，不暴露为可被 Desktop Duplication 直接读取的桌面表面。这与之前 GDI 轮询也抓不到 IDD 屏的现象一致。
-
-**对比 RustDesk**：RustDesk 的无头方案使用的是**显示器仿真型（display-only/monitor-emulation）驱动**，而非纯 IDD。这类驱动让系统把虚拟屏当作一块真正的物理显示器，DXGI/GDI 都能正常捕获。
+**结论**：**IDD（间接显示驱动）类型的虚拟屏，不支持标准的 DXGI Desktop Duplication 抓取流程**。IDD 的帧是通过驱动内部的"间接"通道交付给接收端的，不暴露为可被 Desktop Duplication 直接读取的桌面表面。
 
 ---
 
-### 4. 虚拟显示驱动选型
+### 4. 虚拟显示驱动选型与实现
 | 驱动 | 类型 | 签名 | 授权 | 评估 |
 |---|---|---|---|---|
 | **IddSampleDriver** | IDD（间接显示） | 自签 | MIT | ❌ DXGI 抓取崩溃，不适用 |
 | **Parsec VDD** | 显示器仿真 | ✅ WHQL | 闭源商业 | ⚠️ 可用但二次分发有授权风险 |
 | **VirtualDrivers/Virtual-Display-Driver** | 显示器仿真 | 需测试签名 | 开源 | ✅ 推荐，无授权风险，可集成 |
 
-**推荐方案**：使用 **VirtualDrivers/Virtual-Display-Driver**（开源、可商用），配合 Go DXGI Desktop Duplication 抓取。这是最干净、无法律风险的路径。
+**实现**（`agent/internal/command/vdd_windows.go`，新增）：
+- `hasActiveDisplay()` — 无头检测：通过注册表/PnP 枚举判断系统是否有活动显示器
+- `installVirtualDisplayDriver(cfg)` — 下载并安装 VirtualDrivers/Virtual-Display-Driver（`pnputil /add-driver`）
+- `createVirtualDisplay()` — 创建/激活虚拟显示器（扫描硬件更改 + PnP 设备启用）
+- `ensureVirtualDisplay(cfg)` — 完整流程：检测 → 安装 → 创建
+
+**集成点**（`vncinstall_windows.go`）：
+- `configureAndStartTightVNC()` 与 `configureAndStartTigerVNC()` 在启动 VNC 前调用 `ensureVirtualDisplay()`
+- 无头系统且 VDD 安装失败时给出明确错误提示，提示用户连接显示器或配置虚拟显示器
+
+---
+
+### 5. 终端交互在 Windows 下的管道桥接
+**背景**：ConPTY 在实测中不可用（Win10 19044 上 CreatePseudoConsole 返回 S_OK 但不产生输出）。
+
+**修复**（`agent/internal/command/interactive.go`）：
+- Windows 移除 ConPTY 实现，改用管道桥接 cmd/powershell
+- 新增 `normalizeInput()`：将 xterm 的 CR 规范为 CRLF、DEL 规范为 BS
+- 新增 `normalizePTYOutput()`：将独立的 LF 规范为 CRLF，解决递进缩进问题
+- cmd 启动时附加 `/K chcp 65001` 切换 UTF-8 代码页解决中文乱码
 
 ---
 
 ## 当前状态
 - ✅ TightVNC 服务模式 bug 已修复（产品代码已改）
-- ✅ 确认了 Agent 抓取必须在交互会话运行的架构约束
-- ✅ 验证了 IddSampleDriver 不适用于 DXGI 抓取（技术结论）
-- ⏳ 待验证：VirtualDrivers/Virtual-Display-Driver + Go DXGI 抓取链路
+- ✅ Agent 抓取必须在交互会话运行的架构约束已实现（schtasks /it）
+- ✅ IddSampleDriver 不适用于 DXGI 抓取（技术结论已记录）
+- ✅ VirtualDrivers/Virtual-Display-Driver 集成代码已编写（`vdd_windows.go`）
+- ✅ Windows 终端管道桥接（`interactive.go`）已完善
+- ✅ CI 构建 golang 1.25 适配已完成
 
-## 后续工作
-1. 在 Win10 VM 上安装 VirtualDrivers/Virtual-Display-Driver；
-2. 用现有 Go DXGI 抓取程序验证能否抓到虚拟屏的画面；
-3. 将"装驱动→建设备→DXGI 抓取"固化进 Agent 的 Windows VNC 安装流程；
-4. 清理测试脚本和临时文件，提交最终代码。
+## 后续验证工作（需真实 Windows 环境）
+1. 在 Win10 VM 上安装 VirtualDrivers/Virtual-Display-Driver，验证 DXGI 抓取链路
+2. 验证 VDD 安装后 TightVNC 能否捕获虚拟屏画面
+3. 验证 headless + VDD + TightVNC 全链路端到端可用性
