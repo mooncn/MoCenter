@@ -138,7 +138,9 @@ func restartSelf(dir string) {
 		cmd.Stdout = f
 		cmd.Stderr = f
 	}
-	_ = cmd.Start()
+	if err := cmd.Start(); err != nil {
+		log.Printf("[upgrade] 拉起新进程失败: %v", err)
+	}
 }
 
 // download 下载文件到指定路径。

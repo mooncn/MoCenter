@@ -55,7 +55,9 @@ func buildCmd(req *protocol.CommandReq) (name string, args []string) {
 			}
 			return "pwsh", []string{"-NoProfile"}
 		case "cmd":
-			return "cmd.exe", nil
+			// /K 先切 UTF-8 代码页：cmd 默认按系统 GBK 输出，透传到按 UTF-8
+			// 解码的 Web 终端会乱码；随后保持交互 shell 常驻。
+			return "cmd.exe", []string{"/K", "chcp 65001>nul"}
 		default:
 			if runtime.GOOS == "windows" {
 				return "cmd.exe", nil

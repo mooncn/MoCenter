@@ -69,6 +69,8 @@ export default defineConfig(async () => {
         // 开发环境将 API 与 WebSocket 代理到服务端
         '/api': { target: apiTarget, changeOrigin: true },
         '/ws': { target: apiTarget.replace('http', 'ws'), ws: true },
+        // VNC 查看器 WebSocket（noVNC）也需代理到服务端
+        '/vnc-ws': { target: apiTarget.replace('http', 'ws'), ws: true },
       },
     },
     build: {

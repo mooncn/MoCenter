@@ -151,10 +151,12 @@ func configureAndStartTightVNC(port int, password string) {
 		return
 	}
 
-	// 先停止 TightVNC 服务并杀掉所有已运行的 tvnserver 实例，
-	// 确保使用最新配置在交互式用户会话中重新启动
+	// 停止并禁用 TightVNC 服务：MSI 默认以 AUTO_START 安装该服务，若不禁用，
+	// 重启后它会在 Session 0 抢占端口、抓到空桌面（整屏黑），且盖掉交互式实例。
+	// 因此必须禁用服务、只保留交互式用户会话中的应用模式实例。
 	if serviceExists("tvnserver") {
 		_ = exec.Command("sc.exe", "stop", "tvnserver").Run()
+		_ = exec.Command("sc.exe", "config", "tvnserver", "start=", "disabled").Run()
 	}
 	_ = exec.Command("taskkill.exe", "/IM", "tvnserver.exe", "/F").Run()
 	time.Sleep(1 * time.Second)
@@ -163,18 +165,11 @@ func configureAndStartTightVNC(port int, password string) {
 	//    若 Agent 作为服务运行（Session 0），独立进程也会落在 Session 0，仍需走第2步。
 	startTvnserverDirect(exe)
 
-	// 2) 若未监听，通过计划任务在交互式用户会话中启动，解决 Session 0 黑屏问题
+	// 2) 若未监听，通过计划任务在交互式用户会话中启动，解决 Session 0 黑屏问题。
+	//    不再回退到服务模式：无镜像驱动时服务运行在 Session 0，只会抓到黑屏。
 	if !waitPortOpen(port, 5*time.Second) {
 		_ = exec.Command("taskkill.exe", "/IM", "tvnserver.exe", "/F").Run()
 		startInUserSession(exe)
-	}
-
-	// 3) 兜底：使用服务方式启动（此时可能受 Session 0 限制，但至少端口可达）
-	if !waitPortOpen(port, 5*time.Second) && serviceExists("tvnserver") {
-		_ = exec.Command("sc.exe", "stop", "tvnserver").Run()
-		time.Sleep(2 * time.Second)
-		_ = exec.Command("sc.exe", "config", "tvnserver", "start=", "auto").Run()
-		_ = exec.Command("sc.exe", "start", "tvnserver").Run()
 	}
 
 	_ = waitPortOpen(port, 8*time.Second)

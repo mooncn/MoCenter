@@ -243,15 +243,20 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 		if json.Unmarshal(env.Data, &inp) != nil {
 			return
 		}
-		if s, ok := c.interactive[inp.CommandID]; ok {
+		// 先在锁内取指针：map 由 runInteractive goroutine 写入，无锁读取会触发
+		// Go runtime 的 concurrent map access 崩溃。
+		c.mu.Lock()
+		sess := c.interactive[inp.CommandID]
+		c.mu.Unlock()
+		if sess != nil {
 			if inp.Control != "" {
-				_ = s.SendControl(inp.Control)
+				_ = sess.SendControl(inp.Control)
 			}
 			if inp.Rows > 0 && inp.Cols > 0 {
-				_ = s.Resize(inp.Rows, inp.Cols)
+				_ = sess.Resize(inp.Rows, inp.Cols)
 			}
 			if inp.InputData != "" {
-				_ = s.Write([]byte(inp.InputData))
+				_ = sess.Write([]byte(inp.InputData))
 			}
 		}
 	case protocol.TypeFileDownloadReq:
@@ -472,7 +477,10 @@ func md5Chunk(data []byte) string {
 
 func (c *Client) runCommand(req protocol.CommandReq) {
 	if req.Interactive {
-		c.runInteractive(req)
+		// 交互会话会阻塞等待 PTY 进程结束，必须在独立 goroutine 运行，
+		// 否则会阻塞主消息循环，导致后续的 InteractiveInputReq（打字输入）
+		// 永远无法被处理，表现为「有光标但无法输入」。
+		go c.runInteractive(req)
 		return
 	}
 

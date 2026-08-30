@@ -49,6 +49,7 @@ export default function VncPage({ agents }) {
     rfbRef.current = rfb
 
     setStatus('connecting')
+    setNotice('正在连接 VNC 桌面，等待 RFB 握手/口令认证...')
     rfb.addEventListener('connect', () => { setStatus('connected'); setNotice('') })
     rfb.addEventListener('disconnect', (e) => {
       setStatus('disconnected')

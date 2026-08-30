@@ -22,6 +22,7 @@ certs/
 _diag/
 _diag*/
 _obf/
+.testtools/
 
 # 运行时数据（敏感，不纳入版本控制）
 server/audits.jsonl

@@ -39,11 +39,17 @@ export default function TerminalPage({ agents }) {
     terminalRef.current = term
     fitAddonRef.current = fit
 
+    let fitTimer = 0
     if (termRef.current) {
       term.open(termRef.current)
-      fit.fit()
-      term.writeln('\x1b[1;32mMoCenter 远程终端\x1b[0m')
-      term.writeln('选择主机后点击「连接」，即进入持久交互会话（支持连续执行命令、Ctrl+C）。\r\n')
+      // xterm 渲染器需在 DOM 完成布局后才能读取容器尺寸；
+      // 若立即 fit，容器尚未就绪时会抛 Viewport dimensions 异常并导致整页崩溃，
+      // 故延迟到下一帧执行 fit 与横幅写入。
+      fitTimer = window.setTimeout(() => {
+        try { fit.fit() } catch { /* 布局时序，忽略 */ }
+        term.write('\r\n\x1b[1;32mMoCenter 远程终端\x1b[0m\r\n')
+        term.write('选择主机后点击「连接」，即进入持久交互会话（支持连续执行命令、Ctrl+C）。\r\n')
+      }, 0)
     }
 
     const onResize = () => fit.fit()
@@ -67,6 +73,7 @@ export default function TerminalPage({ agents }) {
     }
 
     return () => {
+      window.clearTimeout(fitTimer)
       window.removeEventListener('resize', onResize)
       term.dispose()
     }
