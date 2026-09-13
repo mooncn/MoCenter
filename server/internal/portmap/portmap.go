@@ -21,6 +21,7 @@ import (
 
 	"mocenter/server/internal/protocol"
 	"mocenter/server/internal/session"
+	"mocenter/server/internal/storage"
 )
 
 // Track 单条连接跟踪记录。
@@ -66,21 +67,58 @@ type Manager struct {
 	rules       map[int]*Rule
 	listeners   map[int]net.Listener
 	sessions    *session.Manager
+	db          *storage.DB                  // SQLite 持久化
 	agentForPort func(int) string // 由 Server 注入：根据公网端口找到目标 AgentID
 	idleTimeout time.Duration
 	seq         uint64
 }
 
-// NewManager 创建端口映射管理器。
-func NewManager(sess *session.Manager) *Manager {
-	return &Manager{
+// NewManager 创建端口映射管理器。可选传入 SQLite DB 启用持久化。
+func NewManager(sess *session.Manager, db *storage.DB) *Manager {
+	m := &Manager{
 		tracks:      make(map[string]*Track),
 		byAgent:     make(map[string]map[string]*Track),
 		pub:         make(map[string]*publicTrack),
 		rules:       make(map[int]*Rule),
 		listeners:   make(map[int]net.Listener),
 		sessions:    sess,
+		db:          db,
 		idleTimeout: 300 * time.Second,
+	}
+	// 从数据库加载已持久化的规则
+	if db != nil {
+		m.loadRulesFromDB()
+	}
+	return m
+}
+
+// loadRulesFromDB 从数据库加载全部规则到内存，并自动恢复启用的规则监听。
+func (m *Manager) loadRulesFromDB() {
+	rows, err := m.db.LoadPortmapRules()
+	if err != nil {
+		log.Printf("[portmap] 从数据库加载规则失败: %v", err)
+		return
+	}
+	for _, row := range rows {
+		r := &Rule{
+			ID:         row.ID,
+			PublicPort: row.PublicPort,
+			AgentID:    row.AgentID,
+			LocalHost:  row.LocalHost,
+			LocalPort:  row.LocalPort,
+			Enabled:    row.Enabled,
+			SourceIP:   row.SourceIP,
+			CreatedAt:  row.CreatedAt,
+		}
+		m.rules[r.PublicPort] = r
+		if r.Enabled {
+			if err := m.ServeRule(r); err != nil {
+				log.Printf("[portmap] 恢复规则 %d 监听失败: %v", r.PublicPort, err)
+				r.Enabled = false
+			} else {
+				log.Printf("[portmap] 恢复规则 %d -> agent=%s:%d", r.PublicPort, r.AgentID, r.LocalPort)
+			}
+		}
 	}
 }
 
@@ -207,6 +245,21 @@ func (m *Manager) CreateRule(r *Rule) error {
 	m.mu.Lock()
 	m.rules[r.PublicPort] = r
 	m.mu.Unlock()
+	// 持久化到 SQLite
+	if m.db != nil {
+		if err := m.db.SavePortmapRule(&storage.PortmapRuleRow{
+			ID:         r.ID,
+			PublicPort: r.PublicPort,
+			AgentID:    r.AgentID,
+			LocalHost:  r.LocalHost,
+			LocalPort:  r.LocalPort,
+			Enabled:    r.Enabled,
+			SourceIP:   r.SourceIP,
+			CreatedAt:  r.CreatedAt,
+		}); err != nil {
+			log.Printf("[portmap] 规则 %d 持久化失败: %v", r.PublicPort, err)
+		}
+	}
 	return m.ServeRule(r)
 }
 
@@ -216,6 +269,12 @@ func (m *Manager) DeleteRule(publicPort int) {
 	m.mu.Lock()
 	delete(m.rules, publicPort)
 	m.mu.Unlock()
+	// 从 SQLite 删除
+	if m.db != nil {
+		if err := m.db.DeletePortmapRule(publicPort); err != nil {
+			log.Printf("[portmap] 删除规则 %d 持久化失败: %v", publicPort, err)
+		}
+	}
 }
 
 // DisableRule 停用规则：停止公网监听，但保留规则供后续重新启用。
@@ -226,6 +285,12 @@ func (m *Manager) DisableRule(publicPort int) {
 		r.Enabled = false
 	}
 	m.mu.Unlock()
+	// 更新 SQLite 中的启用状态
+	if m.db != nil {
+		if err := m.db.UpdatePortmapRuleEnabled(publicPort, false); err != nil {
+			log.Printf("[portmap] 停用规则 %d 持久化失败: %v", publicPort, err)
+		}
+	}
 }
 
 // EnableRule 重新启用规则：若规则仍存在且已停用，则恢复公网监听。
@@ -246,6 +311,12 @@ func (m *Manager) EnableRule(publicPort int) error {
 	m.mu.Lock()
 	r.Enabled = true
 	m.mu.Unlock()
+	// 更新 SQLite 中的启用状态
+	if m.db != nil {
+		if err := m.db.UpdatePortmapRuleEnabled(publicPort, true); err != nil {
+			log.Printf("[portmap] 启用规则 %d 持久化失败: %v", publicPort, err)
+		}
+	}
 	return nil
 }
 

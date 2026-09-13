@@ -27,6 +27,13 @@ _obf/
 # 运行时数据（敏感，不纳入版本控制）
 server/audits.jsonl
 server/users.json
+*.db
+*.db-shm
+*.db-wal
+
+# AI 助手本机记忆/工作日志（含本机路径与临时状态，不纳入版本控制）
+.codefree/
+.workbuddy/
 
 # Node
 node_modules/

@@ -19,6 +19,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -40,6 +41,7 @@ import (
 	"mocenter/server/internal/remark"
 	"mocenter/server/internal/route"
 	"mocenter/server/internal/session"
+	"mocenter/server/internal/storage"
 	"mocenter/server/internal/vnc"
 	"mocenter/server/internal/ws"
 )
@@ -193,8 +195,22 @@ func main() {
 		}
 	}
 
+	// 打开 SQLite 持久化存储
+	dbPath := filepath.Join(*dataDir, "mocenter.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		log.Fatalf("[server] 打开 SQLite 数据库失败: %v", err)
+	}
+	defer db.Close()
+	log.Printf("[server] SQLite 数据库: %s", dbPath)
+
+	// 初始化内置黑名单规则（幂等）
+	if err := db.InitDefaultBlacklist(route.DefaultBlacklistPatterns); err != nil {
+		log.Printf("[server] 初始化内置黑名单失败: %v", err)
+	}
+
 	sess := session.NewManager()
-	store := probe.NewStore()
+	store := probe.NewStore(db)
 	geoResolver := geo.NewResolver()
 	store.SetGeoResolver(geoResolver)
 	remarks := remark.NewStore(*dataDir)
@@ -203,10 +219,45 @@ func main() {
 	authz := auth.NewAuth(*apiKey, wl)
 	userMgr := auth.NewUserManager(filepath.Join(*dataDir, "users.json"))
 	if err := userMgr.InitFromFlags(*user, *password, *totpSecret); err != nil {
-		log.Printf("警告: 初始化用户失败: %v", err)
+		if errors.Is(err, auth.ErrInitPasswordRequired) {
+			// 提供了 -user 但缺少 -password：给出明确提示，避免静默生成空密码坏账号
+			log.Printf("警告: 已指定 -user %q 但未提供 -password，未创建账号。请补充 -password 后重启。", *user)
+		} else {
+			log.Printf("警告: 初始化用户失败: %v", err)
+		}
 	}
-	router := route.NewRouter(sess, filepath.Join(*dataDir, "audits.jsonl"))
-	pm := portmap.NewManager(sess)
+	// 若尚无任何账号，则创建内置默认账号 admin/123456，保证开箱可登录。
+	// 可用 -user/-password 覆盖默认用户名与密码。
+	if !userMgr.HasUsers() {
+		defUser := *user
+		if defUser == "" {
+			defUser = "admin"
+		}
+		defPass := *password
+		if defPass == "" {
+			defPass = "123456"
+		}
+		if err := userMgr.UpsertUser(defUser, defPass, *totpSecret); err != nil {
+			log.Printf("警告: 创建默认账号失败: %v", err)
+		} else if defUser == "admin" && defPass == "123456" {
+			log.Printf("已创建内置默认账号 admin/123456（请登录后尽快修改密码）")
+		} else {
+			log.Printf("已创建默认账号 %s", defUser)
+		}
+	}
+	// 修复历史版本因缺少 -password 而误建的空密码账号，重置为 123456 并提示。
+	if broken := userMgr.BrokenAccounts(); len(broken) > 0 {
+		for _, name := range broken {
+			if err := userMgr.SetPassword(name, "123456"); err != nil {
+				log.Printf("警告: 修复账号 %s 失败: %v", name, err)
+				continue
+			}
+			log.Printf("已修复历史空密码账号 %s，密码重置为 123456，请登录后立即修改", name)
+		}
+	}
+	router := route.NewRouter(sess, db, filepath.Join(*dataDir, "audits.jsonl"))
+	defer router.Close()
+	pm := portmap.NewManager(sess, db)
 	ft := filetransfer.NewManager("/tmp/mocenter_uploads")
 	pushMgr := filetransfer.NewPushManager()
 	vncMgr := vnc.NewMgr(sess)
@@ -214,18 +265,20 @@ func main() {
 	hub := ws.NewHub()
 
 	// WebSocket 收到 Web 消息后的统一处理入口
-	hub.SetMessageHandler(func(data []byte) {
-		handleWebMessage(data, sess, store, router, hub, ft, pm, pushMgr, vncMgr)
+	hub.SetMessageHandler(func(operator string, data []byte) {
+		handleWebMessage(operator, data, sess, store, router, hub, ft, pm, pushMgr, vncMgr)
 	})
 
 	// 服务端启动后台任务
 	go heartbeatSweeper(sess, store, hub)
 	go cleanupSweeper(pm, hub)
+	// 探针历史定期清理（保留 30 天）
+	go probeHistoryCleaner(db)
 
 	// 启动 HTTP 服务（REST + WebSocket）
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		hub.HandleUpgrade(w, r, authz.ValidateToken)
+		hub.HandleUpgrade(w, r, authz.ValidateToken, authz.OperatorOf)
 	})
 	mux.HandleFunc("/vnc-ws", func(w http.ResponseWriter, r *http.Request) {
 		vncMgr.HandleViewer(w, r, authz.ValidateToken)
@@ -245,6 +298,9 @@ func main() {
 	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz))
 	mux.HandleFunc("/api/login", loginHandler(userMgr, authz))
 	mux.HandleFunc("/api/password", changePasswordHandler(userMgr, authz))
+	mux.HandleFunc("/api/otp/setup", otpSetupHandler(userMgr, authz))
+	mux.HandleFunc("/api/otp/enable", otpEnableHandler(userMgr, authz))
+	mux.HandleFunc("/api/otp/disable", otpDisableHandler(userMgr, authz))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
@@ -390,12 +446,8 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			_ = json.Unmarshal(env.Data, &cr)
 			// 转发给 Web 端
 			hub.Broadcast(protocol.TypeCommandResp, cr)
-			info := store.Get(sessConn.AgentID)
-			_ = info
-			router.Audit(&route.AuditLog{
-				Time: time.Now().Unix(), AgentID: sessConn.AgentID, Command: "(cmd-" + cr.CommandID + ")",
-				Result: cr.Stdout, ExitCode: cr.ExitCode, Duration: cr.Duration,
-			})
+			// 回填命令审计结果（不新增记录，避免 operator 为空的重复条目）
+			router.CompleteByCommand(cr.CommandID, sessConn.AgentID, cr.Stdout, cr.ExitCode, cr.Duration)
 		case protocol.TypeInteractiveOut:
 			var io protocol.InteractiveOutput
 			_ = json.Unmarshal(env.Data, &io)
@@ -573,7 +625,7 @@ func commandHandler(router *route.Router, authz *auth.Auth) http.HandlerFunc {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		ok, msg := router.Dispatch(&req, "web-admin", r.RemoteAddr)
+		ok, msg := router.Dispatch(&req, authz.Operator(r.Header.Get("Authorization")), r.RemoteAddr)
 		writeJSON(w, map[string]interface{}{"ok": ok, "msg": msg})
 	}
 }
@@ -613,7 +665,7 @@ func batchCommandHandler(router *route.Router, authz *auth.Auth) http.HandlerFun
 		if req.CommandID == "" {
 			req.CommandID = fmt.Sprintf("batch-%d", time.Now().UnixNano())
 		}
-		results := router.DispatchBatch(req, body.AgentIDs, "web-admin", r.RemoteAddr)
+		results := router.DispatchBatch(req, body.AgentIDs, authz.Operator(r.Header.Get("Authorization")), r.RemoteAddr)
 		writeJSON(w, map[string]interface{}{"ok": true, "results": results})
 	}
 }
@@ -758,11 +810,11 @@ func writeAuditCSV(w http.ResponseWriter, logs []*route.AuditLog) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="audits.csv"`)
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"time", "operator", "agent_id", "command", "result", "exit_code", "blocked", "block_reason", "duration_ms"})
+	_ = cw.Write([]string{"time", "operator", "agent_id", "command_id", "command", "result", "exit_code", "blocked", "block_reason", "duration_ms"})
 	for _, l := range logs {
 		_ = cw.Write([]string{
 			strconv.FormatInt(l.Time, 10),
-			l.Operator, l.AgentID, l.Command, l.Result,
+			l.Operator, l.AgentID, l.CommandID, l.Command, l.Result,
 			strconv.Itoa(l.ExitCode),
 			strconv.FormatBool(l.Blocked), l.BlockReason,
 			strconv.FormatInt(l.Duration, 10),
@@ -868,7 +920,7 @@ func loginHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 			return
 		}
 		tok := randHex(32)
-		authz.RegisterToken(tok)
+		authz.RegisterToken(tok, body.Username)
 		log.Printf("[auth] 用户 %s 登录成功", body.Username)
 		writeJSON(w, map[string]interface{}{"ok": true, "token": tok})
 	}
@@ -912,6 +964,111 @@ func randHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// otpSetupHandler 生成一个新的 TOTP 密钥与 otpauth URI，
+// 供前端渲染二维码；此时尚未落盘，须经 /api/otp/enable 验证码校验通过后才绑定。
+func otpSetupHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		// 支持 GET（URL 参数）与 POST（JSON body）两种调用方式
+		username := r.URL.Query().Get("username")
+		if username == "" {
+			var body struct {
+				Username string `json:"username"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			username = body.Username
+		}
+		if username == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "请提供用户名"})
+			return
+		}
+		enabled, exists := um.TOTPStatus(username)
+		if !exists {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "用户不存在"})
+			return
+		}
+		secret, err := auth.GenerateTOTPSecret()
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "生成密钥失败: " + err.Error()})
+			return
+		}
+		uri := auth.TOTPUri("MoCenter", username, secret)
+		writeJSON(w, map[string]interface{}{
+			"ok":      true,
+			"secret":  secret,
+			"uri":     uri,
+			"enabled": enabled,
+		})
+	}
+}
+
+// otpEnableHandler 校验用户输入的动态验证码，正确后绑定 OTP 密钥。
+func otpEnableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Secret   string `json:"secret"`
+			Code     string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if body.Username == "" || body.Secret == "" || body.Code == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "用户名、密钥与验证码均不能为空"})
+			return
+		}
+		// 扫码绑定前先比对验证码是否正确
+		if !um.VerifyTOTP(body.Username, body.Secret, body.Code) {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "验证码不正确，请确认扫码后输入的是当前动态码"})
+			return
+		}
+		if err := um.BindTOTP(body.Username, body.Secret); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "绑定失败: " + err.Error()})
+			return
+		}
+		log.Printf("[auth] 用户 %s 已启用 OTP 动态验证码", body.Username)
+		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已启用"})
+	}
+}
+
+// otpDisableHandler 关闭 OTP（需校验密码，启用中还需当前验证码）。
+func otpDisableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			OTP      string `json:"otp"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := um.UnbindTOTP(body.Username, body.Password, body.OTP); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+			return
+		}
+		log.Printf("[auth] 用户 %s 已关闭 OTP 动态验证码", body.Username)
+		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已关闭"})
+	}
 }
 
 // guard 统一鉴权中间件。
@@ -962,7 +1119,7 @@ func serveSPA(mux *http.ServeMux, webDir string) {
 
 // handleWebMessage 处理 Web 前端通过 WebSocket 发来的消息。
 // 支持：命令下发、交互输入、端口映射操作。
-func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr) {
+func handleWebMessage(operator string, data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr) {
 	// WebSocket 消息中 data 为 JSON 对象，需用 RawMessage 解码（不同于 TCP 的 base64 []byte）
 	var raw struct {
 		Type string          `json:"type"`
@@ -980,7 +1137,7 @@ func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, ro
 		if err := json.Unmarshal(env.Data, &req); err != nil {
 			return
 		}
-		ok, msg := router.Dispatch(&req, "web-admin", "ws")
+		ok, msg := router.Dispatch(&req, operator, "ws")
 		if !ok {
 			hub.Broadcast(protocol.TypeCommandResp, protocol.CommandResp{
 				CommandID: req.CommandID, Status: 1, Stderr: msg,
@@ -1136,6 +1293,20 @@ func handlePortMapOp(pm *portmap.Manager, sess *session.Manager, op *protocol.Po
 	case "delete":
 		if op.PublicPort > 0 {
 			pm.DeleteRule(op.PublicPort)
+		}
+	}
+}
+
+// probeHistoryCleaner 定期清理超过 30 天的探针历史数据。
+func probeHistoryCleaner(db *storage.DB) {
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		n, err := db.CleanupOldProbeHistory(30)
+		if err != nil {
+			log.Printf("[server] 清理探针历史失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[server] 清理了 %d 条过期探针历史", n)
 		}
 	}
 }

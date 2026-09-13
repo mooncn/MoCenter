@@ -6,11 +6,17 @@ export default function Audit() {
   const [logs, setLogs] = useState([])
   const [keyword, setKeyword] = useState('')
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   useEffect(() => {
     Api.audits()
-      .then((data) => setLogs(data))
-      .catch(() => {})
+      .then((data) => {
+        setLogs(data)
+        setError('')
+      })
+      .catch((err) => {
+        setError(err?.message || '获取审计日志失败')
+      })
       .finally(() => setLoading(false))
   }, [])
 
@@ -29,6 +35,11 @@ export default function Audit() {
       </div>
 
       <div className="card">
+        {error && (
+          <div style={{ marginBottom: 12, padding: '8px 12px', background: '#fef0f0', color: '#f56c6c', borderRadius: 4, fontSize: 14 }}>
+            {error}
+          </div>
+        )}
         <div className="form-row" style={{ maxWidth: 400 }}>
           <label>按命令 / 主机关键字检索</label>
           <input value={keyword} onChange={(e) => setKeyword(e.target.value)} placeholder="输入关键字过滤..." />

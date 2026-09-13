@@ -93,6 +93,7 @@ type CommandResp struct {
 // ProbeDataReq Agent -> Server 探针数据
 type ProbeDataReq struct {
 	AgentID        string  `json:"agent_id"`
+	UUID           string  `json:"uuid,omitempty"` // 硬件唯一标识
 	Timestamp      int64   `json:"timestamp"`
 	CPUUsage       float64 `json:"cpu_usage"`
 	MemUsage       float64 `json:"mem_usage"`
@@ -124,6 +125,7 @@ type ProbeDataResp struct {
 // AgentInfo Server 保存/向 Web 推送的主机信息
 type AgentInfo struct {
 	AgentID        string  `json:"agent_id"`
+	UUID           string  `json:"uuid,omitempty"` // 硬件唯一标识（如 wmic csproduct get UUID）
 	Hostname       string  `json:"hostname"`
 	OSType         string  `json:"os_type"`
 	Arch           string  `json:"arch"`

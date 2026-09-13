@@ -45,7 +45,7 @@ export default function VncPage({ agents }) {
 
     const rfb = new RFB(viewerRef.current, buildWsUrl(), { credentials: { password } })
     rfb.scaleViewport = true
-    rfb.resizeSession = true
+    rfb.resizeSession = false
     rfbRef.current = rfb
 
     setStatus('connecting')
@@ -95,25 +95,39 @@ export default function VncPage({ agents }) {
     setInstalling(true)
     setNotice('正在下发安装/启动指令，请稍候...')
     const apply = (r) => {
-      setNotice((r.ok ? '✅ ' : '❌ ') + (r.msg || '执行完成') + (r.password ? '（已获取口令）' : ''))
+      setNotice((r.ok ? '✅ ' : '❌ ') + (r.msg || r.message || '执行完成') + (r.password ? '（已获取口令）' : ''))
       if (r.password) { setPassword(r.password); sessionStorage.setItem(pwKey(), r.password) }
       setVncUp(!!r.ok)
     }
+    // 轮询 /vnc/status 补取安装结果（含口令），最多等 5 分钟
+    const pollStatus = async () => {
+      for (let i = 0; i < 60; i++) {
+        await new Promise((res) => setTimeout(res, 3000))
+        try {
+          const r = await Api.vncStatus(host)
+          if (r && (r.password || r.ok)) return r
+          // 安装明确失败时也提前退出
+          if (r && r.ok === false && r.msg && /失败|错误|不支持/.test(r.msg)) return r
+        } catch { /* retry */ }
+      }
+      return null
+    }
     try {
       let r = await Api.vncInstall({ agent_id: host, port })
-      // 请求超时/未带口令时，轮询最近结果以补取口令
+      // 请求成功但未带口令时，轮询补取
       if (!r.password) {
-        for (let i = 0; i < 40; i++) {
-          await new Promise((res) => setTimeout(res, 2000))
-          try {
-            r = await Api.vncStatus(host)
-            if (r.password || r.ok) break
-          } catch { /* retry */ }
-        }
+        r = await pollStatus() || r
       }
       apply(r)
     } catch (ex) {
-      setNotice('下发失败：' + (ex.response?.data?.msg || ex.message))
+      // 请求超时或网络错误：安装可能仍在后台进行，轮询补取结果
+      setNotice('请求超时或网络异常，正在轮询安装结果...')
+      const r = await pollStatus()
+      if (r) {
+        apply(r)
+      } else {
+        setNotice('下发失败：' + (ex.response?.data?.msg || ex.message) + '。可稍后点击"一键安装VNC"重试，或以管理员身份运行 Agent。')
+      }
     } finally {
       setInstalling(false)
     }
@@ -159,9 +173,9 @@ export default function VncPage({ agents }) {
         </div>
 
         <div className="vnc-wrap" style={{
-          marginTop: 12, background: '#0b0e11', border: '1px solid #232a33', borderRadius: 8, minHeight: 420, overflow: 'auto',
+          marginTop: 12, background: '#0b0e11', border: '1px solid #232a33', borderRadius: 8, height: 'calc(100vh - 280px)', minHeight: 420, overflow: 'hidden', position: 'relative',
         }}>
-          <div ref={viewerRef} style={{ width: '100%', minHeight: 420 }} />
+          <div ref={viewerRef} style={{ width: '100%', height: '100%', minHeight: 420 }} />
         </div>
         {notice && <div className="notice" style={{ marginTop: 10 }}>{notice}</div>}
       </div>

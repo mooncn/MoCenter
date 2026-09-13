@@ -158,8 +158,10 @@ func (c *Client) connectAndServe() error {
 // register 发送上线消息。
 func (c *Client) register() {
 	ips := c.collect.PublicIPs()
+	uuid := c.collect.UUID()
 	info := map[string]interface{}{
 		"agent_id":    c.cfg.AgentID,
+		"uuid":        uuid,
 		"hostname":    c.collect.Host(),
 		"os_type":     c.collect.OSType(),
 		"arch":        c.collect.Arch(),

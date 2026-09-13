@@ -109,6 +109,14 @@ export default function Dashboard({ agents }) {
                     {a.hostname}
                     {a.remark ? ' · ' + a.agent_id : ''}
                   </div>
+                  {a.uuid ? (
+                    <div
+                      style={{ color: '#6b7280', fontSize: 10, fontFamily: 'Menlo, Consolas, monospace', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      title={`设备唯一 UUID：${a.uuid}`}
+                    >
+                      UUID: {a.uuid}
+                    </div>
+                  ) : null}
                   <RemarkEditor agent={a} onSaved={() => window.dispatchEvent(new Event('mc-remark-saved'))} />
                 </td>
                 <td>

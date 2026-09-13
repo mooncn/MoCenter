@@ -78,6 +78,7 @@ type CommandResp struct {
 // ProbeDataReq Agent -> Server
 type ProbeDataReq struct {
 	AgentID       string  `json:"agent_id"`
+	UUID          string  `json:"uuid,omitempty"` // 硬件唯一标识
 	Timestamp     int64   `json:"timestamp"`
 	CPUUsage      float64 `json:"cpu_usage"`
 	MemUsage      float64 `json:"mem_usage"`

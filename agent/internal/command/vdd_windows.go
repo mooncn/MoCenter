@@ -31,71 +31,63 @@ import (
 // vddReleaseBase VirtualDrivers/Virtual-Display-Driver 的 GitHub Release 地址。
 // 若内置地址不可用，可通过 VncConfig.DownloadBase 或 Proxy 覆盖。
 const (
-	vddReleaseURL   = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/v2.1/VirtualDisplayDriver.zip"
+	vddReleaseURL   = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip"
 	vddReleaseProxy = "http://fa.mooncn.win/?url="
 )
 
 // hasActiveDisplay 检测系统是否已有活动显示器。
-// 通过 WMI 枚举监视器设备（Win32_DesktopMonitor / PnP 显示器），
-// 若无任何已连接显示器则判定为「无头」。
+// 通过多种方式综合判断：
+//   1. 检查是否有物理/虚拟监视器设备连接到桌面；
+//   2. 排除仅存在显示适配器但无实际监视器的情况（如无头 VM）。
+// 若判定为无头系统，后续流程会安装虚拟显示驱动。
 func hasActiveDisplay() bool {
-	// 方式1：检查注册表中的活动显示设备
-	out, err := exec.Command("reg.exe", "query", `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`, "/v", "MonitorNumber").Output()
+	// 方式1：通过 PowerShell 查询已连接的监视器设备（非适配器）
+	// Win32_DesktopMonitor 只列出真正连接的监视器，不包括显示适配器
+	psScript := `
+$monitors = Get-CimInstance -ClassName Win32_DesktopMonitor -ErrorAction SilentlyContinue |
+    Where-Object { $_.Status -eq 'OK' -and $_.ScreenWidth -gt 0 }
+if ($monitors) { $monitors.Count } else { 0 }
+`
+	out, err := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript).Output()
 	if err == nil {
-		// MonitorNumber 存在表示有显示器驱动加载
-		if strings.Contains(strings.TrimSpace(string(out)), "0x1") {
+		n := strings.TrimSpace(string(out))
+		if n != "" && n != "0" {
+			log.Printf("[vdd] 检测到 %s 个活动监视器设备", n)
 			return true
 		}
 	}
 
-	// 方式2：通过 PowerShell 查询是否有关联到桌面的显示设备
-	psScript := `
+	// 方式2：通过 QueryDisplayConfig 检查是否有活动的显示路径
+	// 这比 EnumDisplayDevices 更准确，能区分"有适配器"和"有监视器"
+	psScript2 := `
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-public struct DISPLAY_DEVICE {
-    public int cb;
-    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
-    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
-    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
-    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
-    public int StateFlags;
-}
-public class DisplayEnum {
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern bool EnumDisplayDevices(string lpDevice, int iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, int dwFlags);
+public class DisplayConfig {
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
+    // SM_CMONITORS = 80 (number of display monitors on desktop)
+    public const int SM_CMONITORS = 80;
 }
 '@
-$flags = [DisplayEnum+DISPLAY_DEVICE]::new()
-$flags.cb = [System.Runtime.InteropServices.Marshal]::SizeOf([type][DisplayEnum+DISPLAY_DEVICE])
-$count = 0
-$i = 0
-while ([DisplayEnum]::EnumDisplayDevices($null, $i, [ref]$flags, 0)) {
-    if (($flags.StateFlags -band 0x1) -ne 0) { $count++ }
-    $flags = [DisplayEnum+DISPLAY_DEVICE]::new()
-    $flags.cb = [System.Runtime.InteropServices.Marshal]::SizeOf([type][DisplayEnum+DISPLAY_DEVICE])
-    $i++
-}
-$count
+[DisplayConfig]::GetSystemMetrics([DisplayConfig]::SM_CMONITORS)
 `
-	out2, err := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript).Output()
+	out2, err := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript2).Output()
 	if err == nil {
 		n := strings.TrimSpace(string(out2))
-		if n == "0" {
-			return false
-		}
-		if n != "" {
+		if n != "" && n != "0" {
+			log.Printf("[vdd] GetSystemMetrics(SM_CMONITORS)=%s，判定有活动显示器", n)
 			return true
 		}
 	}
 
-	// 方式3：检查 PnP 显示器设备
-	out3, err := exec.Command("powershell.exe", "-NoProfile", "-Command",
-		`(Get-WmiObject -Class Win32_DesktopMonitor | Where-Object {$_.Status -eq 'OK' -and $_.ScreenWidth -gt 0}).Count`).Output()
+	// 方式3：检查注册表中是否有活动的显示配置
+	out3, err := exec.Command("reg.exe", "query", `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Configuration`, "/s").Output()
 	if err == nil {
-		n := strings.TrimSpace(string(out3))
-		if n != "" && n != "0" {
+		content := string(out3)
+		// 检查是否有 Scaling 值（表示有活动的显示配置）
+		if strings.Contains(content, "Scaling") && !strings.Contains(content, "0x0") {
+			log.Printf("[vdd] 注册表中检测到活动显示配置")
 			return true
 		}
 	}

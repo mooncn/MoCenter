@@ -24,6 +24,7 @@ type Collector struct {
 	osVersion string
 	cpuModel  string
 	cpuMHz    float64
+	uuid      string
 	staticGot bool
 	// 上次采样用于计算速率
 	lastCPU  cpuTimes
@@ -69,6 +70,14 @@ func (c *Collector) OSType() string { return c.osType }
 // Arch 返回 CPU 架构。
 func (c *Collector) Arch() string { return c.arch }
 
+// UUID 返回硬件唯一标识（首次调用后缓存）。获取失败返回空字符串。
+func (c *Collector) UUID() string {
+	if c.uuid == "" {
+		c.uuid = HardwareUUID()
+	}
+	return c.uuid
+}
+
 // Sample 采集一次探针数据。
 func (c *Collector) Sample() *protocol.ProbeDataReq {
 	now := time.Now()
@@ -78,6 +87,7 @@ func (c *Collector) Sample() *protocol.ProbeDataReq {
 	diskTotal, diskUsed := diskDetails()
 	p := &protocol.ProbeDataReq{
 		AgentID:       c.AgentID,
+		UUID:          c.UUID(),
 		Timestamp:     now.Unix(),
 		OSType:        c.osType,
 		Arch:          c.arch,
