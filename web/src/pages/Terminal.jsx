@@ -52,8 +52,10 @@ export default function TerminalPage({ agents }) {
       }, 0)
     }
 
-    const onResize = () => fit.fit()
+    const onResize = () => { try { fit.fit() } catch { /* 布局时序，忽略 */ } }
     window.addEventListener('resize', onResize)
+    // 移动设备旋转屏幕后尺寸变化，需要重新 fit
+    window.addEventListener('orientationchange', onResize)
 
     // 接收交互输出：PTY 回显 + 命令输出均由此到达
     if (socket) {
@@ -75,6 +77,7 @@ export default function TerminalPage({ agents }) {
     return () => {
       window.clearTimeout(fitTimer)
       window.removeEventListener('resize', onResize)
+      window.removeEventListener('orientationchange', onResize)
       term.dispose()
     }
   }, [socket])
@@ -194,7 +197,7 @@ export default function TerminalPage({ agents }) {
           </button>
         </div>
         <div className="terminal-wrap">
-          <div ref={termRef} style={{ height: 420 }} />
+          <div ref={termRef} className="terminal-body" style={{ height: 'clamp(280px, 55vh, 560px)' }} />
         </div>
         {notice && <div className="notice err">{notice}</div>}
       </div>

@@ -5,6 +5,7 @@ import { Api } from '../api/api.js'
 // VNC 远程桌面：通过服务端隧道连接目标主机内网 VNC，浏览器侧由 noVNC 渲染桌面。
 export default function VncPage({ agents }) {
   const viewerRef = useRef(null)
+  const wrapRef = useRef(null)
   const rfbRef = useRef(null)
   const hostRef = useRef('')
 
@@ -15,6 +16,14 @@ export default function VncPage({ agents }) {
   const [vncUp, setVncUp] = useState(false)
   const [installing, setInstalling] = useState(false)
   const [password, setPassword] = useState('')
+  const [fullscreen, setFullscreen] = useState(false)
+  // 连接工具栏（右下角）展开状态：窄屏默认收起，避免遮挡桌面
+  const [toolsOpen, setToolsOpen] = useState(false)
+
+  // 连接成功后，右下角工具栏默认展开，方便直接使用全屏
+  useEffect(() => {
+    if (status === 'connected') setToolsOpen(true)
+  }, [status])
 
   const onlineHosts = (agents || []).filter((a) => a.online)
 
@@ -65,6 +74,73 @@ export default function VncPage({ agents }) {
       rfb.sendCredentials({ password })
     })
   }
+
+  // 全屏：优先使用 Fullscreen API（真正隐藏浏览器 UI），
+  // 不支持时回退为「沉浸式」样式（固定铺满视口并由 noVNC 自适应缩放）。
+  const enterFullscreen = () => {
+    const el = wrapRef.current
+    const rfb = rfbRef.current
+    if (!el) return
+    const isFs = document.fullscreenElement || document.webkitFullscreenElement
+    if (!isFs) {
+      try {
+        const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen
+        const ret = req && req.call(el)
+        if (ret && typeof ret.then === 'function') ret.catch(() => {})
+      } catch { /* 回退沉浸式 */ }
+    }
+    setFullscreen(true)
+    // 容器尺寸变化后让 noVNC 重新按视口缩放
+    setTimeout(() => { resizeViewer(rfb) }, 120)
+  }
+
+  const exitFullscreen = () => {
+    const isFs = document.fullscreenElement || document.webkitFullscreenElement
+    if (isFs) {
+      try {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
+        exit && exit.call(document)
+      } catch { /* ignore */ }
+    }
+    setFullscreen(false)
+    setTimeout(() => { resizeViewer(rfbRef.current) }, 120)
+  }
+
+  const toggleFullscreen = () => (fullscreen ? exitFullscreen() : enterFullscreen())
+
+  // resizeViewer 触发 noVNC 重新计算缩放比例（切换全屏/旋转屏幕后需要）
+  const resizeViewer = (rfb) => {
+    if (!rfb) return
+    try {
+      rfb.scaleViewport = true
+      if (typeof rfb._screenSize === 'object') rfb._screenSize = null
+      window.dispatchEvent(new Event('resize'))
+    } catch { /* ignore */ }
+  }
+
+  // 同步浏览器全屏状态（用户按 Esc / 切换全屏时保持一致）
+  useEffect(() => {
+    const onChange = () => {
+      const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement)
+      setFullscreen(isFs)
+      setTimeout(() => resizeViewer(rfbRef.current), 120)
+    }
+    document.addEventListener('fullscreenchange', onChange)
+    document.addEventListener('webkitfullscreenchange', onChange)
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange)
+      document.removeEventListener('webkitfullscreenchange', onChange)
+    }
+  }, [])
+
+  // 全屏时按 Esc 也退出沉浸式模式
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape' && fullscreen) exitFullscreen()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
 
   // 连接桌面：先探测可达性，再建立查看器
   const connect = async () => {
@@ -172,10 +248,46 @@ export default function VncPage({ agents }) {
           {vncUp && <button className="secondary" onClick={disconnect} disabled={status === 'disconnected' || status === 'idle'}>断开</button>}
         </div>
 
-        <div className="vnc-wrap" style={{
-          marginTop: 12, background: '#0b0e11', border: '1px solid #232a33', borderRadius: 8, height: 'calc(100vh - 280px)', minHeight: 420, overflow: 'hidden', position: 'relative',
-        }}>
-          <div ref={viewerRef} style={{ width: '100%', height: '100%', minHeight: 420 }} />
+        <div
+          ref={wrapRef}
+          className={`vnc-wrap ${fullscreen ? 'vnc-fullscreen' : ''}`}
+        >
+          <div ref={viewerRef} style={{ width: '100%', height: '100%', minHeight: 320 }} />
+
+          {/* 右下角悬浮工具条：全屏 / 缩放 / 快捷键 */}
+          <div className={`vnc-fab ${toolsOpen ? 'open' : ''}`}>
+            {toolsOpen && (
+              <div className="vnc-fab-menu">
+                <button className="vnc-fab-item" onClick={toggleFullscreen} title="全屏显示桌面（Esc 退出）">
+                  {fullscreen ? '⤡ 退出全屏' : '⛶ 全屏'}
+                </button>
+                <button className="vnc-fab-item" onClick={() => { const r = rfbRef.current; if (r) r.scaleViewport = !r.scaleViewport }} title="切换自适应缩放 / 原始分辨率">
+                  ⇱ 自适应缩放
+                </button>
+                <button className="vnc-fab-item" onClick={() => { const r = rfbRef.current; if (r) r.sendCtrlAltDel() }} title="发送 Ctrl+Alt+Del">
+                  ⌨ Ctrl+Alt+Del
+                </button>
+                <button className="vnc-fab-item" onClick={() => setToolsOpen(false)}>✕ 收起</button>
+              </div>
+            )}
+            <button
+              className="vnc-fab-toggle"
+              onClick={() => setToolsOpen(!toolsOpen)}
+              title={toolsOpen ? '收起工具' : '展开工具（全屏等）'}
+              aria-label="VNC 工具栏"
+            >
+              {toolsOpen ? '✕' : (fullscreen ? '⤡' : '⛶')}
+            </button>
+          </div>
+
+          {status !== 'connected' && (
+            <div className="vnc-overlay">
+              <div>
+                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>{status === 'connecting' ? '正在连接…' : '未连接'}</div>
+                <div style={{ fontSize: 12, color: 'var(--muted)' }}>连接成功后右下角可开启全屏</div>
+              </div>
+            </div>
+          )}
         </div>
         {notice && <div className="notice" style={{ marginTop: 10 }}>{notice}</div>}
       </div>

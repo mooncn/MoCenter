@@ -272,8 +272,9 @@ func main() {
 	// 服务端启动后台任务
 	go heartbeatSweeper(sess, store, hub)
 	go cleanupSweeper(pm, hub)
-	// 探针历史定期清理（保留 30 天）
+	// 探针历史定期清理（保留 30 天）+ 审计日志留存清理（保留 180 天）
 	go probeHistoryCleaner(db)
+	go auditRetentionCleaner(db)
 
 	// 启动 HTTP 服务（REST + WebSocket）
 	mux := http.NewServeMux()
@@ -294,9 +295,9 @@ func main() {
 	mux.HandleFunc("/api/agents/remark", setRemarkHandler(remarks, authz))
 	mux.HandleFunc("/api/audits", auditsHandler(router, authz))
 	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
-	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz))
+	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz, router))
 	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz))
-	mux.HandleFunc("/api/login", loginHandler(userMgr, authz))
+	mux.HandleFunc("/api/login", loginHandler(userMgr, authz, router))
 	mux.HandleFunc("/api/password", changePasswordHandler(userMgr, authz))
 	mux.HandleFunc("/api/otp/setup", otpSetupHandler(userMgr, authz))
 	mux.HandleFunc("/api/otp/enable", otpEnableHandler(userMgr, authz))
@@ -570,15 +571,33 @@ func historyHandler(store *probe.Store, authz *auth.Auth) http.HandlerFunc {
 		if !guard(w, r, authz) {
 			return
 		}
-		agentID := r.URL.Query().Get("agent")
+		q := r.URL.Query()
+		agentID := q.Get("agent")
 		since := time.Now().Add(-24 * time.Hour)
-		if r.URL.Query().Get("since") != "" {
-			if ts, err := time.Parse(time.RFC3339, r.URL.Query().Get("since")); err == nil {
+		if q.Get("since") != "" {
+			if ts, err := time.Parse(time.RFC3339, q.Get("since")); err == nil {
 				since = ts
 			}
 		}
-		writeJSON(w, store.History(agentID, since))
+		// max 限制返回点数（默认 300，上限 2000），避免长时间跨度返回海量采样点
+		maxPoints, _ := strconv.Atoi(q.Get("max"))
+		if maxPoints <= 0 {
+			maxPoints = 300
+		}
+		if maxPoints > 2000 {
+			maxPoints = 2000
+		}
+		writeJSON(w, store.HistoryDownsampled(agentID, since, maxPoints))
 	}
+}
+
+// operatorIPOf 取请求来源 IP（用于登录审计留痕）。
+func operatorIPOf(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // setRemarkHandler 设置/更新指定主机的备注（POST 或 PUT）。
@@ -784,24 +803,31 @@ func auditsHandler(router *route.Router, authz *auth.Auth) http.HandlerFunc {
 		}
 		offset, _ := strconv.Atoi(q.Get("offset"))
 		limit, _ := strconv.Atoi(q.Get("limit"))
-		logs := router.SearchAudits(route.AuditQuery{
+		query := route.AuditQuery{
 			Agent:    q.Get("agent"),
 			Operator: q.Get("operator"),
 			Command:  q.Get("cmd"),
+			Category: q.Get("category"),
 			Since:    since,
 			Until:    until,
 			Offset:   offset,
 			Limit:    limit,
-		})
-		// 脱敏：命令中的敏感字段掩码后返回
-		for _, l := range logs {
-			l.Command = route.MaskCommand(l.Command)
 		}
-		if q.Get("format") == "csv" {
-			writeAuditCSV(w, logs)
+		page, err := router.SearchAuditsPage(query)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, logs)
+		// 脱敏：命令中的敏感字段掩码后返回
+		for _, l := range page.Items {
+			l.Command = route.MaskCommand(l.Command)
+			l.Result = route.MaskCommand(l.Result)
+		}
+		if q.Get("format") == "csv" {
+			writeAuditCSV(w, page.Items)
+			return
+		}
+		writeJSON(w, page)
 	}
 }
 
@@ -832,7 +858,7 @@ func portmapRulesHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc
 	}
 }
 
-func portmapOpHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc {
+func portmapOpHandler(pm *portmap.Manager, authz *auth.Auth, router *route.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
@@ -847,6 +873,14 @@ func portmapOpHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc {
 			return
 		}
 		handlePortMapOp(pm, nil, &op)
+		// 端口映射增删改属于关键运维操作，纳入操作审计留痕
+		if router != nil {
+			router.Audit(&route.AuditLog{
+				Time: time.Now().Unix(), Operator: authz.Operator(r.Header.Get("Authorization")), OperatorIP: operatorIPOf(r),
+				Command: fmt.Sprintf("端口映射 %s public:%d local:%d agent:%s", op.Action, op.PublicPort, op.LocalPort, op.AgentID),
+				Result:  "ok", Category: "op",
+			})
+		}
 		writeJSON(w, pm.Rules())
 	}
 }
@@ -896,7 +930,7 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 }
 
 // loginHandler 处理用户名+密码（+OTP 可选）登录，成功后颁发访问 Token。
-func loginHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+func loginHandler(um *auth.UserManager, authz *auth.Auth, router *route.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -915,12 +949,22 @@ func loginHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 			http.Error(w, "未配置可登录用户", http.StatusNotImplemented)
 			return
 		}
+		opIP := operatorIPOf(r)
 		if err := um.Authenticate(body.Username, body.Password, body.OTP); err != nil {
+			// 登录失败同样留痕，便于安全审计与暴力破解排查
+			router.Audit(&route.AuditLog{
+				Time: time.Now().Unix(), Operator: body.Username, OperatorIP: opIP,
+				Command: "登录失败", Result: err.Error(), ExitCode: -1, Category: "auth",
+			})
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 			return
 		}
 		tok := randHex(32)
 		authz.RegisterToken(tok, body.Username)
+		router.Audit(&route.AuditLog{
+			Time: time.Now().Unix(), Operator: body.Username, OperatorIP: opIP,
+			Command: "登录成功", Result: "ok", Category: "auth",
+		})
 		log.Printf("[auth] 用户 %s 登录成功", body.Username)
 		writeJSON(w, map[string]interface{}{"ok": true, "token": tok})
 	}
@@ -1293,6 +1337,22 @@ func handlePortMapOp(pm *portmap.Manager, sess *session.Manager, op *protocol.Po
 	case "delete":
 		if op.PublicPort > 0 {
 			pm.DeleteRule(op.PublicPort)
+		}
+	}
+}
+
+// auditRetentionCleaner 定期清理超过留存期的审计日志。
+// 审计日志随运行时间持续增长，需按留存策略归档/清理，避免单表无界膨胀。
+func auditRetentionCleaner(db *storage.DB) {
+	const keepDays = 180
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		n, err := db.CleanupOldAuditLogs(keepDays)
+		if err != nil {
+			log.Printf("[server] 清理审计日志失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[server] 清理了 %d 条超出 %d 天留存期的审计日志", n, keepDays)
 		}
 	}
 }

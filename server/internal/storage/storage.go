@@ -73,11 +73,13 @@ func (db *DB) migrate() error {
 			exit_code     INTEGER NOT NULL DEFAULT 0,
 			blocked       INTEGER NOT NULL DEFAULT 0,
 			block_reason  TEXT    NOT NULL DEFAULT '',
-			duration_ms   INTEGER NOT NULL DEFAULT 0
+			duration_ms   INTEGER NOT NULL DEFAULT 0,
+			category      TEXT    NOT NULL DEFAULT 'command'
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_logs(time)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_logs(agent_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_operator ON audit_logs(operator)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_category_time ON audit_logs(category, time)`,
 		// 探针历史
 		`CREATE TABLE IF NOT EXISTS probe_history (
 			id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +153,10 @@ func (db *DB) migrate() error {
 	}
 	// 缺失 command_id 会导致审计写入直接报错，表现为「操作审计看不到记录」。
 	if err := db.ensureColumn("audit_logs", "command_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// 审计类别（命令执行/运维操作/登录认证），旧库补列并回填默认值
+	if err := db.ensureColumn("audit_logs", "category", "TEXT NOT NULL DEFAULT 'command'"); err != nil {
 		return err
 	}
 	// 依赖上述列的索引（放在补列之后执行）

@@ -14,9 +14,32 @@ import { Api, MCSocket } from './api/api.js'
 // 全局 WebSocket 上下文
 export const SocketContext = React.createContext(null)
 
+// 侧边栏导航项（移动端抽屉与桌面端共用同一份定义）
+const NAV_ITEMS = [
+  { to: '/', label: '仪表盘', icon: '📊', end: true },
+  { to: '/terminal', label: '远程终端', icon: '💻' },
+  { to: '/vnc', label: '远程桌面', icon: '🖥' },
+  { to: '/portmap', label: '端口映射', icon: '🔀' },
+  { to: '/ops', label: '运维操作', icon: '🛠' },
+  { to: '/offline', label: '离线机器', icon: '📴' },
+  { to: '/audit', label: '操作审计', icon: '📋' },
+  { to: '/account', label: '账号设置', icon: '⚙️' },
+]
+
 function Layout() {
   const [agents, setAgents] = useState([])
+  const [navOpen, setNavOpen] = useState(false) // 移动端抽屉开关
   const socketRef = useRef(null)
+  const location = useLocation()
+
+  // 路由变化时自动收起移动端抽屉
+  useEffect(() => { setNavOpen(false) }, [location.pathname])
+
+  // 抽屉展开时锁定页面滚动，避免背景随手指滚动
+  useEffect(() => {
+    document.body.style.overflow = navOpen ? 'hidden' : ''
+    return () => { document.body.style.overflow = '' }
+  }, [navOpen])
 
   useEffect(() => {
     // 拉取主机列表
@@ -44,25 +67,36 @@ function Layout() {
 
   return (
     <SocketContext.Provider value={socketRef.current}>
-      <div className="layout">
+      <div className={`layout ${navOpen ? 'nav-open' : ''}`}>
+        {/* 移动端抽屉遮罩 */}
+        <div className="nav-backdrop" onClick={() => setNavOpen(false)} />
+
         <aside className="sidebar">
-          <div className="logo">🖥 MoCenter</div>
+          <div className="logo">
+            <span>🖥 MoCenter</span>
+            <button className="sidebar-close" onClick={() => setNavOpen(false)} aria-label="关闭菜单">✕</button>
+          </div>
           <nav>
-            <NavLink to="/" end>仪表盘</NavLink>
-            <NavLink to="/terminal">远程终端</NavLink>
-            <NavLink to="/vnc">远程桌面</NavLink>
-            <NavLink to="/portmap">端口映射</NavLink>
-            <NavLink to="/ops">运维操作</NavLink>
-            <NavLink to="/offline">离线机器</NavLink>
-            <NavLink to="/audit">操作审计</NavLink>
-            <NavLink to="/account">账号设置</NavLink>
+            {NAV_ITEMS.map((it) => (
+              <NavLink key={it.to} to={it.to} end={it.end}>
+                <span className="nav-icon">{it.icon}</span>{it.label}
+              </NavLink>
+            ))}
           </nav>
           <div className="spacer" />
           <nav>
-            <a onClick={logout} style={{ cursor: 'pointer' }}>退出登录</a>
+            <a onClick={logout} style={{ cursor: 'pointer' }}><span className="nav-icon">🚪</span>退出登录</a>
           </nav>
         </aside>
+
         <div className="content">
+          {/* 移动端顶部栏：菜单按钮 + 当前页面标题 */}
+          <div className="mobile-topbar">
+            <button className="menu-btn" onClick={() => setNavOpen(true)} aria-label="打开菜单">☰</button>
+            <span className="mobile-title">
+              {NAV_ITEMS.find((i) => (i.end ? location.pathname === i.to : location.pathname.startsWith(i.to)))?.label || 'MoCenter'}
+            </span>
+          </div>
           <Routes>
             <Route path="/" element={<Dashboard agents={agents} />} />
             <Route path="/terminal" element={<Terminal agents={agents} />} />

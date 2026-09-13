@@ -37,9 +37,9 @@ export const Api = {
     const { data } = await api.get('/agents')
     return data
   },
-  // 获取主机历史探针趋势
-  async history(agent, since) {
-    const { data } = await api.get('/agents/history', { params: { agent, since } })
+  // 获取主机历史探针趋势；max 控制返回采样点上限（服务端按需降采样）
+  async history(agent, since, max) {
+    const { data } = await api.get('/agents/history', { params: { agent, since, max } })
     return data
   },
   // 下发命令
@@ -47,9 +47,18 @@ export const Api = {
     const { data } = await api.post('/command', req)
     return data
   },
-  // 审计日志
-  async audits() {
-    const { data } = await api.get('/audits')
+  // 审计日志（服务端分页）：返回 { items, total }
+  async audits(params = {}) {
+    const { data } = await api.get('/audits', { params })
+    // 兼容旧版服务端直接返回数组的情形
+    if (Array.isArray(data)) {
+      return { items: data, total: data.length }
+    }
+    return { items: data?.items || [], total: data?.total || 0 }
+  },
+  // 导出审计日志为 CSV（当前筛选条件下的当前页）
+  async auditsCsv(params = {}) {
+    const { data } = await api.get('/audits', { params: { ...params, format: 'csv' }, responseType: 'blob', timeout: 30000 })
     return data
   },
   // 批量命令

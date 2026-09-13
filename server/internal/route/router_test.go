@@ -194,3 +194,136 @@ func TestImportLegacyAuditsMissingFile(t *testing.T) {
 		t.Fatalf("无文件时不应导入任何记录，实得 %d", n)
 	}
 }
+// TestSearchAuditsPageMemory 验证内存回退路径下的分页与总数统计。
+func TestSearchAuditsPageMemory(t *testing.T) {
+	r := NewRouter(nil, nil)
+	for i := 0; i < 25; i++ {
+		r.Audit(&AuditLog{
+			Time:     int64(1000 + i),
+			Operator: "admin",
+			AgentID:  "agent-1",
+			Command:  "echo " + string(rune('a'+i%26)),
+		})
+	}
+	// 第一页：默认 limit=20，返回最新的 20 条，total 为总数
+	page, err := r.SearchAuditsPage(AuditQuery{Limit: 20})
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if page.Total != 25 {
+		t.Fatalf("expected total 25, got %d", page.Total)
+	}
+	if len(page.Items) != 20 {
+		t.Fatalf("expected 20 items, got %d", len(page.Items))
+	}
+	// 倒序：第一条应为最后写入的
+	if page.Items[0].Time != 1024 {
+		t.Fatalf("expected first item time 1024, got %d", page.Items[0].Time)
+	}
+
+	// 第二页：offset=20，应剩余 5 条
+	page2, _ := r.SearchAuditsPage(AuditQuery{Offset: 20, Limit: 20})
+	if len(page2.Items) != 5 {
+		t.Fatalf("expected 5 items on page 2, got %d", len(page2.Items))
+	}
+	if page2.Total != 25 {
+		t.Fatalf("expected total 25 on page 2, got %d", page2.Total)
+	}
+
+	// 超界 offset 应返回空列表而非报错
+	page3, _ := r.SearchAuditsPage(AuditQuery{Offset: 100, Limit: 20})
+	if len(page3.Items) != 0 {
+		t.Fatalf("expected empty page, got %d", len(page3.Items))
+	}
+
+	// limit 超上限时收敛到 500
+	_, limit := normalizePage(0, 99999)
+	if limit != auditMaxPageSize {
+		t.Fatalf("expected limit clamped to %d, got %d", auditMaxPageSize, limit)
+	}
+}
+
+// TestSearchAuditsPageFilter 验证条件过滤与类别过滤。
+func TestSearchAuditsPageFilter(t *testing.T) {
+	r := NewRouter(nil, nil)
+	r.Audit(&AuditLog{Time: 100, Operator: "alice", AgentID: "web-1", Command: "uptime", Category: "command"})
+	r.Audit(&AuditLog{Time: 200, Operator: "bob", AgentID: "web-2", Command: "登录成功", Category: "auth"})
+	r.Audit(&AuditLog{Time: 300, Operator: "alice", AgentID: "web-1", Command: "扩容磁盘", Category: "op"})
+
+	page, _ := r.SearchAuditsPage(AuditQuery{Category: "auth"})
+	if page.Total != 1 || page.Items[0].Command != "登录成功" {
+		t.Fatalf("category filter failed: total=%d", page.Total)
+	}
+
+	page, _ = r.SearchAuditsPage(AuditQuery{Operator: "alice"})
+	if page.Total != 2 {
+		t.Fatalf("operator filter failed: total=%d", page.Total)
+	}
+
+	// 空类别按命令执行处理（兼容历史记录）
+	page, _ = r.SearchAuditsPage(AuditQuery{Category: "command"})
+	if page.Total != 1 || page.Items[0].Category != "command" {
+		t.Fatalf("default category failed: total=%d", page.Total)
+	}
+
+	page, _ = r.SearchAuditsPage(AuditQuery{Since: 150, Until: 250})
+	if page.Total != 1 || page.Items[0].Time != 200 {
+		t.Fatalf("time range filter failed: total=%d", page.Total)
+	}
+}
+
+// TestSearchAuditsPageSQLite 验证 SQLite 路径下的分页、计数与类别过滤。
+func TestSearchAuditsPageSQLite(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	r := NewRouter(nil, db)
+	for i := 0; i < 30; i++ {
+		cat := "command"
+		if i%3 == 0 {
+			cat = "op"
+		}
+		if _, err := db.InsertAuditLog(&storage.AuditLogRow{
+			Time: int64(1000 + i), Operator: "admin", AgentID: "host-1",
+			Command: "cmd", Category: cat,
+		}); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	page, err := r.SearchAuditsPage(AuditQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if page.Total != 30 {
+		t.Fatalf("expected total 30, got %d", page.Total)
+	}
+	if len(page.Items) != 10 {
+		t.Fatalf("expected 10 items, got %d", len(page.Items))
+	}
+	// 分页不重叠：第二页首条时间小于第一页末条
+	page2, _ := r.SearchAuditsPage(AuditQuery{Offset: 10, Limit: 10})
+	if len(page2.Items) != 10 {
+		t.Fatalf("expected 10 items on page2, got %d", len(page2.Items))
+	}
+	if page2.Items[0].Time >= page.Items[len(page.Items)-1].Time {
+		t.Fatalf("pages overlap: %d >= %d", page2.Items[0].Time, page.Items[len(page.Items)-1].Time)
+	}
+
+	// 类别过滤 + 计数
+	opPage, _ := r.SearchAuditsPage(AuditQuery{Category: "op", Limit: 5})
+	if opPage.Total != 10 {
+		t.Fatalf("expected 10 op logs, got %d", opPage.Total)
+	}
+
+	// 留存清理不影响近期数据
+	n, err := db.CleanupOldAuditLogs(1)
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if n != 30 {
+		t.Fatalf("expected 30 cleaned (old), got %d", n)
+	}
+}

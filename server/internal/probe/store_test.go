@@ -59,3 +59,38 @@ func TestUUIDPreservedOnReconnect(t *testing.T) {
 		t.Fatalf("探针应补齐 UUID，实得 %q", got)
 	}
 }
+// TestHistoryDownsampledMemory 验证内存回退路径下按 maxPoints 抽稀，
+// 避免长时间跨度返回全量采样点。
+func TestHistoryDownsampledMemory(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", Online: true})
+	base := time.Now().Unix()
+	for i := 0; i < 500; i++ {
+		s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "a1", Timestamp: base + int64(i), CPUUsage: float64(i)})
+	}
+
+	full := s.HistoryDownsampled("a1", time.Unix(base-10, 0), 500)
+	if len(full) != 500 {
+		t.Fatalf("expected 500 points when maxPoints>=total, got %d", len(full))
+	}
+
+	small := s.HistoryDownsampled("a1", time.Unix(base-10, 0), 50)
+	if len(small) != 50 {
+		t.Fatalf("expected 50 downsampled points, got %d", len(small))
+	}
+	// 抽稀结果应保持时间升序
+	for i := 1; i < len(small); i++ {
+		if small[i].Timestamp < small[i-1].Timestamp {
+			t.Fatalf("downsampled history not time-ascending at %d", i)
+		}
+	}
+	// 首点应接近起点
+	if small[0].Timestamp < base {
+		t.Fatalf("first point %d should be >= base %d", small[0].Timestamp, base)
+	}
+
+	// 空 agentID 返回空切片而非 nil panic
+	if got := s.HistoryDownsampled("", time.Unix(base-10, 0), 50); len(got) != 0 {
+		t.Fatalf("expected empty for empty agentID, got %d", len(got))
+	}
+}

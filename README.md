@@ -180,11 +180,14 @@ mocenter-server -user admin -password your-password -totp-secret JBSWY3DPEHPK3PX
 - ✅ **批量命令**：一次下发到多台在线主机，审计留痕
 - ✅ **远程升级 Agent**：下载升级包 → MD5 校验 → 备份 → 替换 → 自动重启，失败回滚
 - ✅ 离线机器列表、操作审计界面
+- ✅ **操作审计分页与分类**：命令执行 / 运维操作 / 登录认证三类留痕，服务端分页检索（类别、关键字、操作人、时间范围筛选）+ CSV 导出；审计日志按留存策略自动清理
+- ✅ **数据增长治理**：审计/探针等持续增长的数据统一采用服务端分页 + 降采样 + 留存清理，长时间跨度趋势图自动按桶聚合，避免全量返回拖垮浏览器与内存
+- ✅ **移动端自适应 UI**：响应式布局（侧边栏抽屉、表格卡片化、栅格表单），支持手机/平板操作
 - ✅ 鉴权（Token）+ IP 白名单 + 速率限制
 - ✅ Agent 断线指数退避重连、进程守护崩溃自启
 - ✅ **TLS/mTLS 加密**：Agent<->Server 可选全链路 TLS 单向加密，或 mTLS 双向认证（客户端证书 + CA 校验）
 - ✅ **服务端托管 Web 静态资源**：`-web web/dist` 单进程部署
-- ✅ **远程桌面 (VNC)**：服务端隧道 + noVNC 浏览器渲染，一键安装/启动（Windows TightVNC/TigerVNC、Linux x11vnc，支持国内加速代理）
+- ✅ **远程桌面 (VNC)**：服务端隧道 + noVNC 浏览器渲染，一键安装/启动（Windows TightVNC/TigerVNC、Linux x11vnc，支持国内加速代理）；连接后右下角悬浮工具栏支持**全屏**、自适应缩放、Ctrl+Alt+Del
 - ✅ **多架构打包**：Windows x86/x86_64/ARM/ARM64、Linux amd64/arm64/arm/386 二进制，及 .deb/.rpm 安装包
 - ✅ **系统服务注册**：Agent 一键注册为 Windows 服务 / Linux systemd 服务，开机自启
 

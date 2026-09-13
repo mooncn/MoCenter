@@ -234,6 +234,66 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// HistoryDownsampled 返回某 Agent 的历史采样，并按需降采样到 maxPoints 个点。
+// 数据量随时间增长，长时间跨度直接返回全量会拖慢前端渲染与网络传输，
+// 因此按「总采样数 / maxPoints」计算分桶步长，在 SQL 层聚合求平均。
+func (s *Store) HistoryDownsampled(agentID string, since time.Time, maxPoints int) []*protocol.ProbeDataReq {
+	if maxPoints <= 0 {
+		maxPoints = 300
+	}
+	if agentID == "" {
+		return []*protocol.ProbeDataReq{}
+	}
+	if s.db != nil {
+		count, err := s.db.CountProbeHistory(agentID, since.Unix())
+		if err == nil && count > 0 {
+			step := int(count) / maxPoints
+			if step < 1 {
+				step = 1
+			}
+			rows, qerr := s.db.QueryProbeHistorySince(agentID, since.Unix(), maxPoints, step)
+			if qerr == nil {
+				out := make([]*protocol.ProbeDataReq, 0, len(rows))
+				for _, r := range rows {
+					out = append(out, &protocol.ProbeDataReq{
+						AgentID:        r.AgentID,
+						Timestamp:      r.Timestamp,
+						CPUUsage:       r.CPUUsage,
+						MemUsage:       r.MemUsage,
+						DiskUsage:      r.DiskUsage,
+						NetInBytes:     r.NetInBytes,
+						NetOutBytes:    r.NetOutBytes,
+						OSType:         r.OSType,
+						KernelVersion:  r.KernelVersion,
+						Uptime:         r.Uptime,
+						PublicIP:       r.PublicIP,
+						OSVersion:      r.OSVersion,
+						CPUModel:       r.CPUModel,
+						CPUMHz:         r.CPUMHz,
+						MemTotalBytes:  r.MemTotal,
+						MemUsedBytes:   r.MemUsed,
+						DiskTotalBytes: r.DiskTotal,
+						DiskUsedBytes:  r.DiskUsed,
+					})
+				}
+				return out
+			}
+			log.Printf("[probe] 降采样查询失败，回退常规查询: %v", qerr)
+		}
+	}
+	// 内存回退：直接切片抽稀
+	all := s.History(agentID, since)
+	if len(all) <= maxPoints {
+		return all
+	}
+	step := float64(len(all)) / float64(maxPoints)
+	out := make([]*protocol.ProbeDataReq, 0, maxPoints)
+	for i := 0; i < maxPoints; i++ {
+		out = append(out, all[int(float64(i)*step)])
+	}
+	return out
+}
+
 // History 返回某 Agent 的历史采样（按时间范围过滤）。
 // 优先从 SQLite 查询（突破 1000 条内存上限），DB 不可用时回退内存。
 func (s *Store) History(agentID string, since time.Time) []*protocol.ProbeDataReq {

@@ -49,6 +49,9 @@ type AuditLog struct {
 	Blocked     bool   `json:"blocked"`
 	BlockReason string `json:"block_reason"`
 	Duration    int64  `json:"duration_ms"`
+	// Category 审计类别：command（命令执行）/ op（运维操作）/ auth（登录认证）。
+	// 由 SQLite 列 category 提供，内存日志未设置时为空（按命令执行处理）。
+	Category string `json:"category"`
 }
 
 // DefaultBlacklistPatterns 内置黑名单规则列表，用于 SQLite 初始化（幂等）。
@@ -331,8 +334,10 @@ func (r *Router) DispatchBatch(req *protocol.CommandReq, agentIDs []string, oper
 func (r *Router) Audit(l *AuditLog) int64 {
 	r.auditMu.Lock()
 	r.audits = append(r.audits, l)
-	if len(r.audits) > 10000 {
-		r.audits = r.audits[len(r.audits)-10000:]
+	// 内存仅保留最近 auditMemoryKeep 条：历史全量数据由 SQLite 承载，
+	// 避免长时间运行后内存无界增长。
+	if len(r.audits) > auditMemoryKeep {
+		r.audits = r.audits[len(r.audits)-auditMemoryKeep:]
 	}
 	var writeErr error
 	if r.auditFile != nil {
@@ -447,80 +452,150 @@ type AuditQuery struct {
 	Agent    string
 	Operator string
 	Command  string
-	Since    int64 // 时间戳，0 表示不限制
+	Category string // command / op / auth，空表示全部
+	Since    int64  // 时间戳，0 表示不限制
 	Until    int64
 	Offset   int
 	Limit    int
 }
 
-// SearchAudits 按条件检索审计日志。若 SQLite 可用则从数据库查询（支持全量历史），
-// 否则回退到内存查询。
+// AuditPage 分页查询结果：当前页数据 + 命中总数。
+// Total 用于前端渲染页码，避免把全量数据一次性返回给浏览器。
+type AuditPage struct {
+	Items []*AuditLog `json:"items"`
+	Total int64       `json:"total"`
+}
+
+// 单页最大返回条数，防止 limit 参数过大导致内存与网络压力。
+const auditMaxPageSize = 500
+
+// auditMemoryKeep 内存中保留的审计日志条数上限。
+const auditMemoryKeep = 10000
+
+// normalizePage 归一化分页参数：limit 取 (0,500]，offset 非负。
+func normalizePage(offset, limit int) (int, int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > auditMaxPageSize {
+		limit = auditMaxPageSize
+	}
+	return offset, limit
+}
+
+// SearchAudits 按条件检索审计日志（兼容旧调用：不分页返回列表）。
 func (r *Router) SearchAudits(q AuditQuery) []*AuditLog {
-	// 优先从 SQLite 查询
+	page, err := r.SearchAuditsPage(q)
+	if err != nil {
+		log.Printf("[audit] 检索审计日志失败: %v", err)
+	}
+	return page.Items
+}
+
+// SearchAuditsPage 分页检索审计日志，返回当前页数据与命中总数。
+// 优先从 SQLite 查询（支持全量历史 + 分页计数），DB 不可用时回退内存分页。
+func (r *Router) SearchAuditsPage(q AuditQuery) (*AuditPage, error) {
 	if r.db != nil {
-		rows, err := r.db.SearchAuditLogs(storage.AuditQueryCond{
+		offset, limit := normalizePage(q.Offset, q.Limit)
+		cond := storage.AuditQueryCond{
 			Agent:    q.Agent,
 			Operator: q.Operator,
 			Command:  q.Command,
+			Category: q.Category,
 			Since:    q.Since,
 			Until:    q.Until,
-			Offset:   q.Offset,
-			Limit:    q.Limit,
-		})
-		if err != nil {
-			log.Printf("[audit] SQLite 查询失败，回退内存: %v", err)
-		} else {
-			out := make([]*AuditLog, 0, len(rows))
-			for _, row := range rows {
-				out = append(out, &AuditLog{
-					ID:          row.ID,
-					Time:        row.Time,
-					Operator:    row.Operator,
-					OperatorIP:  row.OperatorIP,
-					AgentID:     row.AgentID,
-					CommandID:   row.CommandID,
-					Command:     row.Command,
-					Result:      row.Result,
-					ExitCode:    row.ExitCode,
-					Blocked:     row.Blocked,
-					BlockReason: row.BlockReason,
-					Duration:    row.Duration,
-				})
+		}
+		total, err := r.db.CountAuditLogsFiltered(cond)
+		if err == nil {
+			rows, qerr := r.db.SearchAuditLogs(cond, offset, limit)
+			if qerr == nil {
+				items := make([]*AuditLog, 0, len(rows))
+				for _, row := range rows {
+					items = append(items, &AuditLog{
+						ID:          row.ID,
+						Time:        row.Time,
+						Operator:    row.Operator,
+						OperatorIP:  row.OperatorIP,
+						AgentID:     row.AgentID,
+						CommandID:   row.CommandID,
+						Command:     row.Command,
+						Result:      row.Result,
+						ExitCode:    row.ExitCode,
+						Blocked:     row.Blocked,
+						BlockReason: row.BlockReason,
+						Duration:    row.Duration,
+						Category:    row.Category,
+					})
+				}
+				return &AuditPage{Items: items, Total: total}, nil
 			}
-			return out
+			log.Printf("[audit] SQLite 查询失败，回退内存: %v", qerr)
+		} else {
+			log.Printf("[audit] SQLite 计数失败，回退内存: %v", err)
 		}
 	}
-	// 回退：内存查询
+
+	// 回退：内存查询（内存仅保留最近 auditMemoryKeep 条，便于重启后立即可见）
 	r.auditMu.Lock()
-	defer r.auditMu.Unlock()
-	all := make([]*AuditLog, len(r.audits))
-	copy(all, r.audits)
-	out := make([]*AuditLog, 0, len(all))
-	for _, l := range all {
-		if q.Agent != "" && !strings.Contains(l.AgentID, q.Agent) {
+	matched := make([]*AuditLog, 0, len(r.audits))
+	for _, l := range r.audits {
+		if !matchAudit(l, q) {
 			continue
 		}
-		if q.Operator != "" && !strings.Contains(l.Operator, q.Operator) {
-			continue
-		}
-		if q.Command != "" && !strings.Contains(l.Command, q.Command) {
-			continue
-		}
-		if q.Since > 0 && l.Time < q.Since {
-			continue
-		}
-		if q.Until > 0 && l.Time > q.Until {
-			continue
-		}
-		out = append(out, l)
+		clone := *l
+		clone.Category = categoryOrDefault(clone.Category)
+		matched = append(matched, &clone)
 	}
-	if q.Offset > 0 && q.Offset < len(out) {
-		out = out[q.Offset:]
+	r.auditMu.Unlock()
+
+	// 内存切片按写入顺序递增，倒序后即为时间倒序（与 SQLite 保持一致）
+	for i, j := 0, len(matched)-1; i < j; i, j = i+1, j-1 {
+		matched[i], matched[j] = matched[j], matched[i]
 	}
-	if q.Limit > 0 && q.Limit < len(out) {
-		out = out[:q.Limit]
+	total := int64(len(matched))
+	offset, limit := normalizePage(q.Offset, q.Limit)
+	if offset >= len(matched) {
+		return &AuditPage{Items: []*AuditLog{}, Total: total}, nil
 	}
-	return out
+	matched = matched[offset:]
+	if limit < len(matched) {
+		matched = matched[:limit]
+	}
+	return &AuditPage{Items: matched, Total: total}, nil
+}
+
+// categoryOrDefault 空类别按命令执行归类，兼容历史记录。
+func categoryOrDefault(c string) string {
+	if c == "" {
+		return "command"
+	}
+	return c
+}
+
+// matchAudit 判断单条内存审计日志是否命中检索条件（与 SQL 语义保持一致）。
+func matchAudit(l *AuditLog, q AuditQuery) bool {
+	if q.Agent != "" && !strings.Contains(l.AgentID, q.Agent) {
+		return false
+	}
+	if q.Operator != "" && !strings.Contains(l.Operator, q.Operator) {
+		return false
+	}
+	if q.Command != "" && !strings.Contains(l.Command, q.Command) {
+		return false
+	}
+	if q.Category != "" && q.Category != categoryOrDefault(l.Category) {
+		return false
+	}
+	if q.Since > 0 && l.Time < q.Since {
+		return false
+	}
+	if q.Until > 0 && l.Time > q.Until {
+		return false
+	}
+	return true
 }
 
 // MaskCommand 对命令中的敏感字段做脱敏（如密码、密钥、Token）。

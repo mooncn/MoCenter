@@ -94,6 +94,8 @@ type AuditLogRow struct {
 	Blocked     bool   `json:"blocked"`
 	BlockReason string `json:"block_reason"`
 	Duration    int64  `json:"duration_ms"`
+	// Category 审计类别：command / op / auth。
+	Category string `json:"category"`
 }
 
 // InsertAuditLog 插入一条审计日志，并返回新记录的 ID（供回填命令执行结果）。
@@ -102,10 +104,13 @@ func (db *DB) InsertAuditLog(l *AuditLogRow) (int64, error) {
 	if l.Blocked {
 		blocked = 1
 	}
+	if l.Category == "" {
+		l.Category = "command"
+	}
 	res, err := db.Exec(`INSERT INTO audit_logs
-		(time, operator, operator_ip, agent_id, command_id, command, result, exit_code, blocked, block_reason, duration_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		l.Time, l.Operator, l.OperatorIP, l.AgentID, l.CommandID, l.Command, l.Result, l.ExitCode, blocked, l.BlockReason, l.Duration)
+		(time, operator, operator_ip, agent_id, command_id, command, result, exit_code, blocked, block_reason, duration_ms, category)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		l.Time, l.Operator, l.OperatorIP, l.AgentID, l.CommandID, l.Command, l.Result, l.ExitCode, blocked, l.BlockReason, l.Duration, l.Category)
 	if err != nil {
 		return 0, fmt.Errorf("插入审计日志失败: %w", err)
 	}
@@ -154,16 +159,14 @@ type AuditQueryCond struct {
 	Agent    string
 	Operator string
 	Command  string
+	Category string
 	Since    int64
 	Until    int64
-	Offset   int
-	Limit    int
 }
 
-// SearchAuditLogs 从数据库查询审计日志。
-func (db *DB) SearchAuditLogs(cond AuditQueryCond) ([]*AuditLogRow, error) {
-	q := `SELECT id, time, operator, operator_ip, agent_id, command_id, command, result, exit_code, blocked, block_reason, duration_ms
-		FROM audit_logs WHERE 1=1`
+// buildAuditWhere 根据条件拼装审计日志查询的 WHERE 子句与参数。
+func buildAuditWhere(cond AuditQueryCond) (string, []interface{}) {
+	q := ` WHERE 1=1`
 	var args []interface{}
 	if cond.Agent != "" {
 		q += ` AND agent_id LIKE ?`
@@ -177,6 +180,11 @@ func (db *DB) SearchAuditLogs(cond AuditQueryCond) ([]*AuditLogRow, error) {
 		q += ` AND command LIKE ?`
 		args = append(args, "%"+cond.Command+"%")
 	}
+	if cond.Category != "" {
+		// 历史记录 category 为空表示命令执行，用 IFNULL 兼容
+		q += ` AND IFNULL(NULLIF(category, ''), 'command') = ?`
+		args = append(args, cond.Category)
+	}
 	if cond.Since > 0 {
 		q += ` AND time >= ?`
 		args = append(args, cond.Since)
@@ -185,16 +193,32 @@ func (db *DB) SearchAuditLogs(cond AuditQueryCond) ([]*AuditLogRow, error) {
 		q += ` AND time <= ?`
 		args = append(args, cond.Until)
 	}
-	q += ` ORDER BY time DESC`
-	if cond.Limit > 0 {
-		q += ` LIMIT ?`
-		args = append(args, cond.Limit)
-		if cond.Offset > 0 {
-			q += ` OFFSET ?`
-			args = append(args, cond.Offset)
-		}
-	} else {
-		q += ` LIMIT 10000`
+	return q, args
+}
+
+// CountAuditLogsFiltered 统计命中条件的审计日志总数（用于分页）。
+func (db *DB) CountAuditLogsFiltered(cond AuditQueryCond) (int64, error) {
+	where, args := buildAuditWhere(cond)
+	var n int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_logs`+where, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("统计审计日志失败: %w", err)
+	}
+	return n, nil
+}
+
+// SearchAuditLogs 分页查询审计日志：按时间倒序返回 [offset, offset+limit) 区间。
+func (db *DB) SearchAuditLogs(cond AuditQueryCond, offset, limit int) ([]*AuditLogRow, error) {
+	where, args := buildAuditWhere(cond)
+	q := `SELECT id, time, operator, operator_ip, agent_id, command_id, command, result, exit_code, blocked, block_reason, duration_ms, category
+		FROM audit_logs` + where + ` ORDER BY time DESC, id DESC`
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+	q += ` LIMIT ?`
+	args = append(args, limit)
+	if offset > 0 {
+		q += ` OFFSET ?`
+		args = append(args, offset)
 	}
 	rows, err := db.Query(q, args...)
 	if err != nil {
@@ -205,13 +229,100 @@ func (db *DB) SearchAuditLogs(cond AuditQueryCond) ([]*AuditLogRow, error) {
 	for rows.Next() {
 		var r AuditLogRow
 		var blocked int
-		if err := rows.Scan(&r.ID, &r.Time, &r.Operator, &r.OperatorIP, &r.AgentID, &r.CommandID, &r.Command, &r.Result, &r.ExitCode, &blocked, &r.BlockReason, &r.Duration); err != nil {
+		if err := rows.Scan(&r.ID, &r.Time, &r.Operator, &r.OperatorIP, &r.AgentID, &r.CommandID, &r.Command, &r.Result, &r.ExitCode, &blocked, &r.BlockReason, &r.Duration, &r.Category); err != nil {
 			return nil, err
 		}
 		r.Blocked = blocked == 1
 		out = append(out, &r)
 	}
 	return out, rows.Err()
+}
+
+// CountAuditLogsTotal 返回审计日志总行数（含全部类别）。
+func (db *DB) CountAuditLogsTotal() (int64, error) {
+	var n int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit_logs`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("统计审计日志失败: %w", err)
+	}
+	return n, nil
+}
+
+// CleanupOldAuditLogs 清理超过指定天数的审计日志（保留审计留存策略，防止无界增长）。
+func (db *DB) CleanupOldAuditLogs(maxDays int) (int64, error) {
+	if maxDays <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -maxDays).Unix()
+	res, err := db.Exec(`DELETE FROM audit_logs WHERE time < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("清理审计日志失败: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// QueryProbeHistorySince 按时间范围+聚合步长查询探针历史（分桶降采样）。
+// step > 1 时按 timestamp/step 分桶取平均，避免长时间范围返回数万个采样点。
+// 返回结果按时间升序。
+func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step int) ([]*ProbeHistoryRow, error) {
+	if agentID == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 2000 {
+		limit = 2000
+	}
+	if step < 1 {
+		step = 1
+	}
+	var rows *sql.Rows
+	var err error
+	if step == 1 {
+		rows, err = db.Query(`SELECT agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
+			os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
+			mem_total, mem_used, disk_total, disk_used
+			FROM probe_history WHERE agent_id = ? AND timestamp >= ?
+			ORDER BY timestamp DESC LIMIT ?`, agentID, since, limit)
+	} else {
+		// 分桶降采样：桶内取平均指标，桶时间取最新采样时间
+		rows, err = db.Query(`SELECT agent_id, MAX(timestamp) AS ts,
+			AVG(cpu_usage), AVG(mem_usage), AVG(disk_usage), MAX(net_in_bytes), MAX(net_out_bytes),
+			MAX(os_type), MAX(kernel_version), MAX(uptime), MAX(public_ip), MAX(os_version), MAX(cpu_model), AVG(cpu_mhz),
+			MAX(mem_total), AVG(mem_used), MAX(disk_total), AVG(disk_used)
+			FROM probe_history WHERE agent_id = ? AND timestamp >= ?
+			GROUP BY (timestamp / ?) ORDER BY ts DESC LIMIT ?`, agentID, since, step, limit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("查询探针历史失败: %w", err)
+	}
+	defer rows.Close()
+	var out []*ProbeHistoryRow
+	for rows.Next() {
+		var r ProbeHistoryRow
+		if err := rows.Scan(&r.AgentID, &r.Timestamp, &r.CPUUsage, &r.MemUsage, &r.DiskUsage, &r.NetInBytes, &r.NetOutBytes,
+			&r.OSType, &r.KernelVersion, &r.Uptime, &r.PublicIP, &r.OSVersion, &r.CPUModel, &r.CPUMHz,
+			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed); err != nil {
+			return nil, err
+		}
+		out = append(out, &r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 转为时间升序，便于前端绘图
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
+// CountProbeHistory 统计某 Agent 在指定时间之后的采样条数（用于计算降采样步长）。
+func (db *DB) CountProbeHistory(agentID string, since int64) (int64, error) {
+	var n int64
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probe_history WHERE agent_id = ? AND timestamp >= ?`,
+		agentID, since).Scan(&n); err != nil {
+		return 0, fmt.Errorf("统计探针历史失败: %w", err)
+	}
+	return n, nil
 }
 
 // ProbeHistoryRow 探针历史持久化行。
