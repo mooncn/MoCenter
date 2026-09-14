@@ -274,6 +274,36 @@ button.primary { background: var(--accent); }
   pointer-events: none; padding: 20px;
 }
 
+/* 移动端虚拟鼠标：底部覆盖条（触控板 + 按键）。
+   padding-right 预留出右下角悬浮工具条的位置，避免互相遮挡。 */
+.vnc-mouse {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 15;
+  display: flex; gap: 8px; padding: 8px 72px 8px 8px;
+  background: rgba(11, 14, 17, .88); border-top: 1px solid #232a33;
+  backdrop-filter: blur(6px);
+}
+.vnc-mouse-track {
+  flex: 1 1 auto; min-height: 96px; border-radius: 8px;
+  border: 1px dashed rgba(148, 163, 184, .45);
+  background: rgba(148, 163, 184, .08);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 12px; text-align: center; padding: 8px;
+  touch-action: none; /* 关键：拖动触控板时不要触发页面滚动/缩放 */
+  user-select: none; -webkit-user-select: none;
+}
+.vnc-mouse-track:active { background: rgba(148, 163, 184, .18); }
+.vnc-mouse-btns {
+  flex: 0 0 auto; width: 172px;
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px;
+}
+.vnc-mouse-btns button {
+  padding: 8px 6px; font-size: 13px; border-radius: 8px;
+  background: rgba(148, 163, 184, .16); color: #e2e8f0;
+  border: 1px solid rgba(148, 163, 184, .28);
+}
+.vnc-mouse-btns button:hover { background: rgba(148, 163, 184, .26); }
+.vnc-mouse-btns button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+
 /* 终端容器略作美化 */
 .terminal-wrap { border-radius: var(--radius); }
 .terminal-toolbar { flex-wrap: wrap; }
@@ -384,6 +414,11 @@ button.primary { background: var(--accent); }
   .mobile-title { font-size: 14px; }
   .btn-sm { padding: 5px 8px; }
   .vnc-fab-toggle { width: 42px; height: 42px; font-size: 17px; }
+
+  /* 窄屏：虚拟鼠标改为上下布局，触控板占满宽度 */
+  .vnc-mouse { flex-direction: column; padding: 8px 64px 8px 8px; }
+  .vnc-mouse-track { min-height: 72px; }
+  .vnc-mouse-btns { width: auto; grid-template-columns: repeat(3, 1fr); }
 }
 
 /* 横屏/平板：终端高度自适应 */

@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mocenter/server/internal/auth"
@@ -57,6 +59,7 @@ func main() {
 	caCert := flag.String("ca-cert", "", "mTLS 客户端 CA 证书文件路径（提供后启用双向认证，Agent 需携带客户端证书）")
 	insecure := flag.Bool("insecure", false, "允许非 TLS 的 Agent 连接（未提供证书时自动启用）")
 	dataDir := flag.String("data", ".", "数据目录（审计日志持久化等）")
+	pkgDir := flag.String("pkg-dir", "", "安装包托管目录（Agent 可经长连接直接拉取，避免公网下载）；留空则用 <data>/packages")
 	user := flag.String("user", "", "登录用户名（设置后启用用户名+密码登录）")
 	password := flag.String("password", "", "登录密码")
 	totpSecret := flag.String("totp-secret", "", "TOTP 密钥（base32，设置后登录需提供一次性验证码，兼容 Google Authenticator）")
@@ -70,17 +73,17 @@ func main() {
 	}
 	if cfg == nil {
 		cfg = &config.Config{
-			Listen:     *addr,
-			HTTP:       *httpAddr,
-			APIKey:     *apiKey,
-			Whitelist:  *whitelist,
-			WebDir:     *webDir,
-			TLSCert:    *tlsCert,
-			TLSKey:     *tlsKey,
-			CACert:     *caCert,
-			Insecure:   *insecure,
-			DataDir:    *dataDir,
-			User:       *user,
+			Listen:    *addr,
+			HTTP:      *httpAddr,
+			APIKey:    *apiKey,
+			Whitelist: *whitelist,
+			WebDir:    *webDir,
+			TLSCert:   *tlsCert,
+			TLSKey:    *tlsKey,
+			CACert:    *caCert,
+			Insecure:  *insecure,
+			DataDir:   *dataDir,
+			User:      *user,
 			// 不落盘明文密码与 TOTP 密钥：账号以哈希持久化到 users.json
 			Password:   "",
 			TOTPSecret: "",
@@ -187,6 +190,17 @@ func main() {
 	if *apiKey == "" {
 		*apiKey = "change-me-api-key"
 	}
+
+	// 安装包托管目录：默认 <data>/packages。
+	// Agent 一键安装 VNC 时会优先通过既有长连接从这里拉取安装包，
+	// 避免走公网（网速慢、且可能被劫持/篡改）。
+	if *pkgDir == "" {
+		*pkgDir = filepath.Join(*dataDir, "packages")
+	}
+	if err := os.MkdirAll(*pkgDir, 0755); err != nil {
+		log.Printf("[server] 创建安装包目录失败 %s: %v", *pkgDir, err)
+	}
+	logAvailablePackages(*pkgDir)
 
 	var wl []string
 	for _, s := range strings.Split(*whitelist, ",") {
@@ -364,12 +378,12 @@ func main() {
 			log.Printf("[server] accept error: %v", err)
 			continue
 		}
-		go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr)
+		go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir)
 	}
 }
 
 // handleAgentConn 处理单个 Agent 的 TCP 长连接。
-func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr) {
+func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, pkgDir string) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -468,6 +482,11 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		case protocol.TypeFilePushAck:
 			var fa protocol.FilePushAck
 			_ = json.Unmarshal(env.Data, &fa)
+			// 安装包拉取的分片 ACK 属于内部行为，不向 Web 广播传输状态，
+			// 否则文件分发列表里会冒出一条临时路径的记录。
+			if _, isPkg := pkgFetchCmds.Load(fa.CommandID); isPkg {
+				continue
+			}
 			hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
 				AgentID: sessConn.AgentID, FilePath: fa.FilePath, Action: "push",
 				Status: fa.Status, Message: fa.Message, ChunkSeq: fa.ChunkSeq,
@@ -517,6 +536,12 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			var vr protocol.VncInstallResp
 			if json.Unmarshal(env.Data, &vr) == nil {
 				vncMgr.NotifyInstall(sessConn.AgentID, &vr)
+			}
+		case protocol.TypePkgFetchReq:
+			var pr protocol.PackageFetchReq
+			if json.Unmarshal(env.Data, &pr) == nil {
+				// 独立 goroutine：大包分片下发不应阻塞该 Agent 的主消息循环
+				go servePackage(sessConn, pkgDir, &pr)
 			}
 		}
 	}
@@ -659,12 +684,12 @@ func batchCommandHandler(router *route.Router, authz *auth.Auth) http.HandlerFun
 			return
 		}
 		var body struct {
-			AgentIDs  []string            `json:"agent_ids"`
-			CommandID string              `json:"command_id"`
-			Command   string              `json:"command"`
-			ShellType string              `json:"shell_type"`
-			Timeout   int                 `json:"timeout"`
-			Env       map[string]string   `json:"env"`
+			AgentIDs  []string          `json:"agent_ids"`
+			CommandID string            `json:"command_id"`
+			Command   string            `json:"command"`
+			ShellType string            `json:"shell_type"`
+			Timeout   int               `json:"timeout"`
+			Env       map[string]string `json:"env"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -753,6 +778,7 @@ func vncInstallHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
 		var body struct {
 			AgentID string `json:"agent_id"`
 			Port    int    `json:"port"`
+			Mode    string `json:"mode"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -762,8 +788,16 @@ func vncInstallHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
 			return
 		}
-		resp := mgr.Install(body.AgentID, body.Port)
-		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port, "password": resp.Password})
+		// 归一化安装模式：仅识别 service，其余按交互会话模式处理
+		mode := protocol.VncModeInteractive
+		if strings.EqualFold(strings.TrimSpace(body.Mode), protocol.VncModeService) {
+			mode = protocol.VncModeService
+		}
+		resp := mgr.Install(body.AgentID, body.Port, mode)
+		writeJSON(w, map[string]interface{}{
+			"ok": resp.OK, "msg": resp.Message, "port": resp.Port,
+			"password": resp.Password, "mode": resp.Mode,
+		})
 	}
 }
 
@@ -779,7 +813,7 @@ func vncStatusHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "尚未执行安装/启动"})
 			return
 		}
-		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port, "password": resp.Password})
+		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port, "password": resp.Password, "mode": resp.Mode})
 	}
 }
 
@@ -1369,4 +1403,116 @@ func probeHistoryCleaner(db *storage.DB) {
 			log.Printf("[server] 清理了 %d 条过期探针历史", n)
 		}
 	}
+}
+
+// --- 安装包托管与下发 ---
+
+// pkgFetchCmds 记录正在进行的安装包拉取 command_id。
+// 这些分片的 ACK 属于内部行为，不应作为「文件分发」广播给 Web。
+var pkgFetchCmds sync.Map
+
+// logAvailablePackages 启动时列出安装包目录中可下发的包，便于运维确认。
+func logAvailablePackages(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("[pkg] 读取安装包目录失败 %s: %v", dir, err)
+		return
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if fi, ferr := e.Info(); ferr == nil {
+			names = append(names, fmt.Sprintf("%s(%.1fMB)", e.Name(), float64(fi.Size())/1024/1024))
+		}
+	}
+	if len(names) == 0 {
+		log.Printf("[pkg] 安装包目录 %s 为空；如需让 Agent 从服务端取包（避免公网下载），把安装包放进去即可", dir)
+		return
+	}
+	log.Printf("[pkg] 安装包目录 %s 已托管: %s", dir, strings.Join(names, ", "))
+}
+
+// servePackage 将服务端托管的安装包以分片形式下发给 Agent。
+//
+// 分片复用 FilePushReq（Agent 侧已有成熟的落盘实现：建目录、追加写、Done 时关闭），
+// 全部分片发完后再回执 PackageFetchResp。Agent 顺序处理消息，因此它收到回执时
+// 分片必然已全部落盘，无需轮询文件大小。
+func servePackage(conn *session.Conn, pkgDir string, req *protocol.PackageFetchReq) {
+	// 防目录穿越：只取文件名，拒绝含路径分隔或上级引用的名称
+	name := filepath.Base(strings.TrimSpace(req.Name))
+	resp := protocol.PackageFetchResp{CommandID: req.CommandID, Name: name}
+	fail := func(msg string) {
+		resp.OK = false
+		resp.Message = msg
+		_ = conn.Write(protocol.TypePkgFetchResp, resp)
+		log.Printf("[pkg] 向 %s 下发 %s 失败: %s", conn.AgentID, name, msg)
+	}
+	if name == "" || name == "." || name == ".." || name == string(filepath.Separator) {
+		fail("未指定有效的安装包名称")
+		return
+	}
+	if req.DestPath == "" {
+		fail("未指定 Agent 端落盘路径")
+		return
+	}
+	path := filepath.Join(pkgDir, name)
+	fi, err := os.Stat(path)
+	if err != nil || fi.IsDir() {
+		fail("服务端未托管该安装包：" + name)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		fail("打开安装包失败: " + err.Error())
+		return
+	}
+	defer f.Close()
+
+	if req.CommandID != "" {
+		pkgFetchCmds.Store(req.CommandID, struct{}{})
+		defer pkgFetchCmds.Delete(req.CommandID)
+	}
+
+	total := fi.Size()
+	buf := make([]byte, protocol.DefaultChunkSize)
+	var seq int
+	var sent int64
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			sent += int64(n)
+			last := sent >= total
+			sum := md5.Sum(chunk)
+			if werr := conn.Write(protocol.TypeFilePushReq, &protocol.FilePushReq{
+				CommandID: req.CommandID,
+				FilePath:  req.DestPath,
+				FileSize:  total,
+				ChunkSeq:  seq,
+				ChunkData: chunk,
+				ChunkMD5:  fmt.Sprintf("%x", sum),
+				Done:      last,
+			}); werr != nil {
+				log.Printf("[pkg] 向 %s 下发 %s 中断: %v", conn.AgentID, name, werr)
+				return
+			}
+			seq++
+			if last {
+				break
+			}
+		}
+		if rerr != nil {
+			if rerr != io.EOF {
+				log.Printf("[pkg] 读取安装包 %s 失败: %v", name, rerr)
+			}
+			break
+		}
+	}
+	resp.OK = true
+	resp.Size = total
+	resp.Message = "安装包下发完成"
+	_ = conn.Write(protocol.TypePkgFetchResp, resp)
+	log.Printf("[pkg] 已向 %s 下发安装包 %s（%d 字节，%d 分片）", conn.AgentID, name, total, seq)
 }

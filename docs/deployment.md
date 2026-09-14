@@ -157,6 +157,35 @@ Web「端口映射」页面创建规则（公网端口 → 内网服务端口）
 ### 6. 文件分发到主机
 Web「运维操作」页面选择目标在线主机与 Agent 端目标路径，上传本地文件分片经服务端中转、MD5 校验后写入 Agent 指定路径。适用于批量下发部署包、配置文件、脚本等场景。
 
+### 7. VNC 安装包由服务端分发
+
+Agent 一键安装 VNC 时，默认从公网下载安装包（UltraVNC，约 4–5MB）。为规避公网限速与
+下载被劫持/篡改的风险，可把安装包放到服务端托管目录：
+
+```bash
+bash scripts/fetch-packages.sh ./packages                 # 下载安装包到托管目录
+./mocenter-server ... -data ./data -pkg-dir ./packages    # 指向该目录（不指定则默认 <data>/packages）
+```
+
+启动日志会打印已托管的包清单（`[pkg] 安装包目录 ... 已托管: ...`）。
+Agent 会**优先通过它与服务端之间既有的长连接**拉取（该通道可启用 TLS/mTLS），
+服务端未托管该包时自动回退公网下载，因此托管是可选增强、不影响可用性。
+
+托管文件名须与 Agent 期望的一致（`scripts/fetch-packages.sh` 会按此命名下载 Windows 包，
+也可加参数只下某平台：`bash scripts/fetch-packages.sh ./packages win`）：
+
+| 文件名 | 平台 |
+|--------|------|
+| `UltraVNC_1824_x64_Setup.exe` / `UltraVNC_1824_x86_Setup.exe` | Windows |
+| `x11vnc-linux-amd64` / `-arm64` / `-arm` / `-386` | Linux（需自备） |
+
+> **Linux 说明**：x11vnc 官方只发布源码、无任何预编译产物，因此脚本不代为下载。
+> Linux 侧优先由 Agent 用发行版包管理器安装（RHEL/Rocky/Alma 走 EPEL，Debian/Ubuntu 直接有）；
+> 仅当目标机无法访问软件源时，才需自行构建/自备二进制并按上表命名放入托管目录。
+
+服务端会校验包名以防目录穿越；Agent 会校验可执行文件魔数（`MZ`/`ELF`），
+拒绝执行错误页或被替换的内容；安装包拉取属于内部行为，不会出现在「文件分发」列表中。
+
 ## 七、备份与恢复
 
 - **审计日志**：默认保留 180 天，建议定期导出归档（`/api/audits`）。

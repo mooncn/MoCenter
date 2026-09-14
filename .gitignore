@@ -24,6 +24,10 @@ _diag*/
 _obf/
 .testtools/
 
+# 服务端托管的安装包/二进制（UltraVNC 安装包、x11vnc 二进制等，体积大且可自行获取）
+# 注意：Windows 包恰好被上面的 *.exe 覆盖，但 Linux 的 x11vnc-linux-* 不会，故需显式忽略。
+packages/
+
 # 运行时数据（敏感，不纳入版本控制）
 server/audits.jsonl
 server/users.json
@@ -34,6 +38,7 @@ server/users.json
 # AI 助手本机记忆/工作日志（含本机路径与临时状态，不纳入版本控制）
 .codefree/
 .workbuddy/
+.workbuddy-ai/
 
 # Node
 node_modules/

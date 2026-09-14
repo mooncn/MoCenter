@@ -155,9 +155,10 @@ func (m *Mgr) Probe(agentID string, port int) (bool, string) {
 }
 
 // Install 向目标 Agent 下发一键安装/启动 VNC 指令并等待结果。
-func (m *Mgr) Install(agentID string, port int) *protocol.VncInstallResp {
+// mode 为安装模式：protocol.VncModeInteractive（默认）/ protocol.VncModeService（支持锁屏）。
+func (m *Mgr) Install(agentID string, port int, mode string) *protocol.VncInstallResp {
 	nf := func(msg string) *protocol.VncInstallResp {
-		return &protocol.VncInstallResp{OK: false, Message: msg, Port: port}
+		return &protocol.VncInstallResp{OK: false, Message: msg, Port: port, Mode: mode}
 	}
 	if agentID == "" {
 		return nf("未指定目标主机")
@@ -180,14 +181,14 @@ func (m *Mgr) Install(agentID string, port int) *protocol.VncInstallResp {
 		m.mu.Unlock()
 	}()
 
-	if err := a.Write(protocol.TypeVncInstallReq, &protocol.VncInstallReq{AgentID: agentID, Port: port}); err != nil {
+	if err := a.Write(protocol.TypeVncInstallReq, &protocol.VncInstallReq{AgentID: agentID, Port: port, Mode: mode}); err != nil {
 		return nf("下发安装指令失败: " + err.Error())
 	}
 	select {
 	case r := <-ch:
 		return r
 	case <-time.After(240 * time.Second):
-		return &protocol.VncInstallResp{OK: false, Message: "安装超时（下载较慢或需更高权限）", Port: port}
+		return &protocol.VncInstallResp{OK: false, Message: "安装超时（下载较慢或需更高权限）", Port: port, Mode: mode}
 	}
 }
 

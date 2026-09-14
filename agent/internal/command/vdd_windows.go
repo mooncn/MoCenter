@@ -2,9 +2,9 @@
 
 // 虚拟显示驱动(Virtual Display Driver) 安装与配置。
 //
-// 背景：无头（无物理显示器）Windows 虚拟机无法被 TightVNC 捕获到任何画面。
+// 背景：无头（无物理显示器）Windows 虚拟机无法被 VNC 捕获到任何画面。
 // 通过在系统中安装开源虚拟显示驱动 VirtualDrivers/Virtual-Display-Driver，
-// 创建一块虚拟显示器，TightVNC 在交互式用户会话中即可正常捕获桌面画面。
+// 创建一块虚拟显示器，VNC 在交互式用户会话中即可正常捕获桌面画面。
 //
 // 本项目选用 VirtualDrivers/Virtual-Display-Driver 的原因：
 //   - 开源、可商用、无授权风险；
