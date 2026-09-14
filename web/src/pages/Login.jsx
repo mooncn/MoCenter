@@ -74,7 +74,7 @@ export default function Login() {
           <label>动态验证码（OTP，可选）</label>
           <input value={otp} onChange={(e) => setOtp(e.target.value)} placeholder="Google Authenticator 6 位码，未启用可留空" />
         </div>
-        <button style={{ width: '100%', marginTop: 4 }} type="submit">登录</button>
+        <button className="btn-block" style={{ marginTop: 4 }} type="submit">登录</button>
         <div className="sub" style={{ marginTop: 16, color: '#8b98a5', fontSize: 13 }}>
           默认登录：填写服务端启动时的 <code>-apikey</code> 作为访问 Token；系统默认无内置账号密码。
           若服务端配置了 <code>-user/-password</code>，也可用用户名+密码（及可选 OTP）登录。

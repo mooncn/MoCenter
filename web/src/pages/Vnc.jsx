@@ -2,19 +2,50 @@ import React, { useRef, useState, useEffect } from 'react'
 import RFB from '@novnc/novnc'
 import { Api } from '../api/api.js'
 
+// 远端光标显示尺寸档位：相对「按视口等比缩放」基准的倍数。
+// 基准 = 显示宽度 / 远端分辨率宽度，这样光标与缩放过后的桌面比例一致。
+const CURSOR_SIZES = [
+  { label: '小', factor: 0.6 },
+  { label: '标准', factor: 1 },
+  { label: '大', factor: 1.5 },
+]
+
 // VNC 远程桌面：通过服务端隧道连接目标主机内网 VNC，浏览器侧由 noVNC 渲染桌面。
 export default function VncPage({ agents }) {
   const viewerRef = useRef(null)
+  const wrapRef = useRef(null)
   const rfbRef = useRef(null)
   const hostRef = useRef('')
+  // 虚拟鼠标：指针位置（画布坐标）、触控板拖动手势状态
+  const vptrRef = useRef({ x: 0, y: 0 })
+  const dragRef = useRef(null)
+  // 是否因认证失败而断开（用于避免通用断开文案覆盖更精确的提示）
+  const authFailedRef = useRef(false)
 
   const [host, setHost] = useState('')
   const [port, setPort] = useState(5900)
+  // 安装模式：interactive=交互会话模式（需已登录且未锁屏）；
+  // service=服务模式（UltraVNC 系统服务，锁屏/登录界面亦可查看）
+  const [mode, setMode] = useState('interactive')
   const [status, setStatus] = useState('idle') // idle/connecting/connected/disconnected
   const [notice, setNotice] = useState('')
   const [vncUp, setVncUp] = useState(false)
   const [installing, setInstalling] = useState(false)
   const [password, setPassword] = useState('')
+  const [fullscreen, setFullscreen] = useState(false)
+  // 连接工具栏（右下角）展开状态：窄屏默认收起，避免遮挡桌面
+  const [toolsOpen, setToolsOpen] = useState(false)
+  // 远端光标显示尺寸档位（索引进 CURSOR_SIZES，相对「按视口等比」基准的倍数）
+  const [cursorIdx, setCursorIdx] = useState(1)
+  // 虚拟鼠标面板（移动端触控板 + 按键）
+  const [mouseOpen, setMouseOpen] = useState(false)
+  // 虚拟鼠标是否按住左键（用于拖拽窗口/选中文本）
+  const [holdLeft, setHoldLeft] = useState(false)
+
+  // 连接成功后，右下角工具栏默认展开，方便直接使用全屏
+  useEffect(() => {
+    if (status === 'connected') setToolsOpen(true)
+  }, [status])
 
   const onlineHosts = (agents || []).filter((a) => a.online)
 
@@ -45,18 +76,24 @@ export default function VncPage({ agents }) {
 
     const rfb = new RFB(viewerRef.current, buildWsUrl(), { credentials: { password } })
     rfb.scaleViewport = true
-    rfb.resizeSession = true
+    rfb.resizeSession = false
+    // 兜底：若服务端未下发光标形状（UltraVNC 需 ForceCursorShape=1 才会下发），
+    // 至少显示一个圆点，避免完全看不到指针。收到真实光标时该圆点会自动隐藏。
+    rfb.showDotCursor = true
     rfbRef.current = rfb
 
     setStatus('connecting')
-    rfb.addEventListener('connect', () => { setStatus('connected'); setNotice('') })
+    setNotice('正在连接 VNC 桌面，等待 RFB 握手/口令认证...')
+    rfb.addEventListener('connect', () => { authFailedRef.current = false; setStatus('connected'); setNotice('') })
     rfb.addEventListener('disconnect', (e) => {
       setStatus('disconnected')
-      if (e?.detail?.clean === false) {
+      // 认证失败已有更精确的提示，不要用通用文案覆盖它（否则口令错误会被显示成"连接已断开"）
+      if (e?.detail?.clean === false && !authFailedRef.current) {
         setNotice('连接已断开。若口令有误，请核对后重试；若未安装 VNC，请先一键安装。')
       }
     })
     rfb.addEventListener('securityfailure', (e) => {
+      authFailedRef.current = true
       setNotice('认证失败：' + (e?.detail?.reason || 'VNC 口令不正确或需要口令'))
     })
     // 服务端在握手中索要口令时补交
@@ -64,6 +101,193 @@ export default function VncPage({ agents }) {
       rfb.sendCredentials({ password })
     })
   }
+
+  // ---- 远端光标显示尺寸 ----
+  //
+  // noVNC 在触屏设备上会走 Cursor 的 fallback 分支：把光标画在 document.body 下
+  // 一个 position:fixed 的独立 canvas 上，并按「远端原始像素」绘制
+  // （见 noVNC core/util/cursor.js）。它不随 scaleViewport 缩放，因此当桌面被缩小
+  // 显示时，光标仍按原尺寸绘制、看起来明显偏大。
+  // 这里按「显示宽度 / 远端分辨率宽度」等比缩放该 canvas，使光标与桌面比例一致。
+  const screenCanvas = () => (viewerRef.current ? viewerRef.current.querySelector('canvas') : null)
+
+  const findCursorCanvas = () => {
+    // fallback 光标 canvas 直接挂在 body 下，是本页面唯一的 body > canvas
+    for (const el of Array.from(document.body.children)) {
+      if (el.tagName === 'CANVAS') return el
+    }
+    return null
+  }
+
+  const applyCursorScale = () => {
+    const cur = findCursorCanvas()
+    if (!cur) return // 非 fallback 模式（桌面浏览器）由系统绘制光标，无需处理
+    const screen = screenCanvas()
+    let base = 1
+    if (screen && screen.width > 0 && screen.clientWidth > 0) {
+      base = screen.clientWidth / screen.width
+    }
+    const k = Math.max(0.25, Math.min(4, base * CURSOR_SIZES[cursorIdx].factor))
+    // 以左上角为原点缩放：标准箭头光标的热点即为 (0,0)，误差可忽略
+    cur.style.transformOrigin = '0 0'
+    cur.style.transform = `scale(${k})`
+  }
+
+  const cycleCursorSize = () => setCursorIdx((i) => (i + 1) % CURSOR_SIZES.length)
+
+  // ---- 虚拟鼠标（移动端）----
+  //
+  // 直接向 noVNC 的 canvas 派发合成 DOM 鼠标事件：由 noVNC 自己的 _handleMouse
+  // 完成 client→远端 坐标换算，并把它的光标画在我们派发的位置上，
+  // 因此「绘制出的光标」与「远端真实指针」始终一致（无需自绘光标）。
+  const dispatchMouse = (x, y, type, buttons) => {
+    const cv = screenCanvas()
+    if (!cv) return
+    const r = cv.getBoundingClientRect()
+    cv.dispatchEvent(new MouseEvent(type, {
+      clientX: r.left + x, clientY: r.top + y,
+      buttons, button: buttons === 2 ? 2 : 0,
+      bubbles: true, cancelable: true,
+    }))
+  }
+
+  const dispatchWheel = (x, y, deltaY) => {
+    const cv = screenCanvas()
+    if (!cv) return
+    const r = cv.getBoundingClientRect()
+    // noVNC 的 WHEEL_STEP = 50：deltaY 取 ±50 正好对应一格滚轮
+    cv.dispatchEvent(new WheelEvent('wheel', {
+      clientX: r.left + x, clientY: r.top + y,
+      deltaY, deltaMode: 0, bubbles: true, cancelable: true,
+    }))
+  }
+
+  // 移动虚拟指针到画布坐标 (x, y)，越界钳制在画布内
+  const movePointer = (x, y) => {
+    const cv = screenCanvas()
+    if (!cv) return
+    const r = cv.getBoundingClientRect()
+    const nx = Math.max(0, Math.min(r.width - 1, x))
+    const ny = Math.max(0, Math.min(r.height - 1, y))
+    vptrRef.current = { x: nx, y: ny }
+    dispatchMouse(nx, ny, 'mousemove', holdLeft ? 1 : 0)
+  }
+
+  const clickAt = (btn) => {
+    const { x, y } = vptrRef.current
+    dispatchMouse(x, y, 'mousedown', btn)
+    dispatchMouse(x, y, 'mouseup', 0)
+  }
+
+  const doubleClickAt = () => {
+    clickAt(1)
+    setTimeout(() => clickAt(1), 80)
+  }
+
+  // 按住/松开左键：用于拖拽窗口、选中文本等需要保持按下的操作
+  const toggleHoldLeft = () => {
+    const { x, y } = vptrRef.current
+    if (holdLeft) {
+      dispatchMouse(x, y, 'mouseup', 0)
+      setHoldLeft(false)
+    } else {
+      dispatchMouse(x, y, 'mousedown', 1)
+      setHoldLeft(true)
+    }
+  }
+
+  // 触控板：单指拖动 = 相对移动；位移很小 = 轻点（左键单击）
+  const onTrackDown = (e) => {
+    if (e.currentTarget.setPointerCapture) {
+      try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* ignore */ }
+    }
+    dragRef.current = { x: e.clientX, y: e.clientY, moved: 0 }
+  }
+
+  const onTrackMove = (e) => {
+    const d = dragRef.current
+    if (!d) return
+    const dx = e.clientX - d.x
+    const dy = e.clientY - d.y
+    if (dx === 0 && dy === 0) return
+    d.x = e.clientX
+    d.y = e.clientY
+    d.moved += Math.abs(dx) + Math.abs(dy)
+    movePointer(vptrRef.current.x + dx, vptrRef.current.y + dy)
+  }
+
+  const onTrackUp = () => {
+    const d = dragRef.current
+    dragRef.current = null
+    if (d && d.moved < 8) clickAt(1) // 轻点视为左键单击
+  }
+
+  // 全屏：优先使用 Fullscreen API（真正隐藏浏览器 UI），
+  // 不支持时回退为「沉浸式」样式（固定铺满视口并由 noVNC 自适应缩放）。
+  const enterFullscreen = () => {
+    const el = wrapRef.current
+    const rfb = rfbRef.current
+    if (!el) return
+    const isFs = document.fullscreenElement || document.webkitFullscreenElement
+    if (!isFs) {
+      try {
+        const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen
+        const ret = req && req.call(el)
+        if (ret && typeof ret.then === 'function') ret.catch(() => {})
+      } catch { /* 回退沉浸式 */ }
+    }
+    setFullscreen(true)
+    // 容器尺寸变化后让 noVNC 重新按视口缩放
+    setTimeout(() => { resizeViewer(rfb) }, 120)
+  }
+
+  const exitFullscreen = () => {
+    const isFs = document.fullscreenElement || document.webkitFullscreenElement
+    if (isFs) {
+      try {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
+        exit && exit.call(document)
+      } catch { /* ignore */ }
+    }
+    setFullscreen(false)
+    setTimeout(() => { resizeViewer(rfbRef.current) }, 120)
+  }
+
+  const toggleFullscreen = () => (fullscreen ? exitFullscreen() : enterFullscreen())
+
+  // resizeViewer 触发 noVNC 重新计算缩放比例（切换全屏/旋转屏幕后需要）
+  const resizeViewer = (rfb) => {
+    if (!rfb) return
+    try {
+      rfb.scaleViewport = true
+      if (typeof rfb._screenSize === 'object') rfb._screenSize = null
+      window.dispatchEvent(new Event('resize'))
+    } catch { /* ignore */ }
+  }
+
+  // 同步浏览器全屏状态（用户按 Esc / 切换全屏时保持一致）
+  useEffect(() => {
+    const onChange = () => {
+      const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement)
+      setFullscreen(isFs)
+      setTimeout(() => resizeViewer(rfbRef.current), 120)
+    }
+    document.addEventListener('fullscreenchange', onChange)
+    document.addEventListener('webkitfullscreenchange', onChange)
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange)
+      document.removeEventListener('webkitfullscreenchange', onChange)
+    }
+  }, [])
+
+  // 全屏时按 Esc 也退出沉浸式模式
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape' && fullscreen) exitFullscreen()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
 
   // 连接桌面：先探测可达性，再建立查看器
   const connect = async () => {
@@ -94,29 +318,65 @@ export default function VncPage({ agents }) {
     setInstalling(true)
     setNotice('正在下发安装/启动指令，请稍候...')
     const apply = (r) => {
-      setNotice((r.ok ? '✅ ' : '❌ ') + (r.msg || '执行完成') + (r.password ? '（已获取口令）' : ''))
+      const modeLabel = r.mode === 'service' ? '服务模式' : r.mode === 'interactive' ? '交互会话模式' : ''
+      setNotice((r.ok ? '✅ ' : '❌ ') + (modeLabel ? `[${modeLabel}] ` : '') + (r.msg || r.message || '执行完成') + (r.password ? '（已获取口令）' : ''))
       if (r.password) { setPassword(r.password); sessionStorage.setItem(pwKey(), r.password) }
       setVncUp(!!r.ok)
     }
+    // 轮询 /vnc/status 补取安装结果（含口令），最多等 5 分钟
+    const pollStatus = async () => {
+      for (let i = 0; i < 60; i++) {
+        await new Promise((res) => setTimeout(res, 3000))
+        try {
+          const r = await Api.vncStatus(host)
+          if (r && (r.password || r.ok)) return r
+          // 安装明确失败时也提前退出
+          if (r && r.ok === false && r.msg && /失败|错误|不支持/.test(r.msg)) return r
+        } catch { /* retry */ }
+      }
+      return null
+    }
     try {
-      let r = await Api.vncInstall({ agent_id: host, port })
-      // 请求超时/未带口令时，轮询最近结果以补取口令
+      let r = await Api.vncInstall({ agent_id: host, port, mode })
+      // 请求成功但未带口令时，轮询补取
       if (!r.password) {
-        for (let i = 0; i < 40; i++) {
-          await new Promise((res) => setTimeout(res, 2000))
-          try {
-            r = await Api.vncStatus(host)
-            if (r.password || r.ok) break
-          } catch { /* retry */ }
-        }
+        r = await pollStatus() || r
       }
       apply(r)
     } catch (ex) {
-      setNotice('下发失败：' + (ex.response?.data?.msg || ex.message))
+      // 请求超时或网络错误：安装可能仍在后台进行，轮询补取结果
+      setNotice('请求超时或网络异常，正在轮询安装结果...')
+      const r = await pollStatus()
+      if (r) {
+        apply(r)
+      } else {
+        setNotice('下发失败：' + (ex.response?.data?.msg || ex.message) + '。可稍后点击"一键安装VNC"重试，或以管理员身份运行 Agent。')
+      }
     } finally {
       setInstalling(false)
     }
   }
+
+  // 连接成功 / 尺寸档位变化 / 窗口缩放时，重新按视口比例校准远端光标大小。
+  // 用 rAF 延迟一帧，确保 noVNC 已把光标 canvas 挂到 body 上。
+  useEffect(() => {
+    if (status !== 'connected') return
+    const id = requestAnimationFrame(applyCursorScale)
+    const onResize = () => applyCursorScale()
+    window.addEventListener('resize', onResize)
+    return () => { cancelAnimationFrame(id); window.removeEventListener('resize', onResize) }
+  }, [status, cursorIdx])
+
+  // 打开虚拟鼠标面板时把指针归到桌面中心：
+  // 远端指针的真实位置客户端无从得知，先发一次移动建立共同基准，
+  // 之后的相对移动才不会出现「一拖就跳」。
+  useEffect(() => {
+    if (!mouseOpen || status !== 'connected') return
+    const cv = screenCanvas()
+    if (!cv) return
+    const r = cv.getBoundingClientRect()
+    movePointer(r.width / 2, r.height / 2)
+  }, [mouseOpen, status])
 
   return (
     <div>
@@ -146,6 +406,14 @@ export default function VncPage({ agents }) {
             <input type="number" value={port} min={1} max={65535} onChange={(e) => setPort(Number(e.target.value))} style={{ width: 160 }} />
           </div>
           <div className="form-row">
+            <label>连接模式</label>
+            <select value={mode} onChange={(e) => setMode(e.target.value)} style={{ width: 280 }}
+              title="决定连接时能看到什么。服务模式以系统服务运行，可抓取 Winlogon 安全桌面，锁屏/登录界面也能看到画面。切换模式后需重新点击「一键安装VNC」生效。">
+              <option value="interactive">交互会话模式（需已登录且未锁屏）</option>
+              <option value="service">服务模式（支持锁屏，Windows 用 UltraVNC）</option>
+            </select>
+          </div>
+          <div className="form-row">
             <label>VNC 口令</label>
             <input type="password" value={password} placeholder="一键安装后自动填充" onChange={(e) => setPassword(e.target.value)} style={{ width: 220 }} autoComplete="off" />
           </div>
@@ -157,10 +425,77 @@ export default function VncPage({ agents }) {
           {vncUp && <button className="secondary" onClick={disconnect} disabled={status === 'disconnected' || status === 'idle'}>断开</button>}
         </div>
 
-        <div className="vnc-wrap" style={{
-          marginTop: 12, background: '#0b0e11', border: '1px solid #232a33', borderRadius: 8, minHeight: 420, overflow: 'auto',
-        }}>
-          <div ref={viewerRef} style={{ width: '100%', minHeight: 420 }} />
+        <div
+          ref={wrapRef}
+          className={`vnc-wrap ${fullscreen ? 'vnc-fullscreen' : ''}`}
+        >
+          <div ref={viewerRef} style={{ width: '100%', height: '100%', minHeight: 320 }} />
+
+          {/* 右下角悬浮工具条：全屏 / 缩放 / 快捷键 */}
+          <div className={`vnc-fab ${toolsOpen ? 'open' : ''}`}>
+            {toolsOpen && (
+              <div className="vnc-fab-menu">
+                <button className="vnc-fab-item" onClick={toggleFullscreen} title="全屏显示桌面（Esc 退出）">
+                  {fullscreen ? '⤡ 退出全屏' : '⛶ 全屏'}
+                </button>
+                <button className="vnc-fab-item" onClick={() => { const r = rfbRef.current; if (r) r.scaleViewport = !r.scaleViewport; setTimeout(applyCursorScale, 0) }} title="切换自适应缩放 / 原始分辨率">
+                  ⇱ 自适应缩放
+                </button>
+                <button className="vnc-fab-item" onClick={() => { const r = rfbRef.current; if (r) r.sendCtrlAltDel() }} title="发送 Ctrl+Alt+Del">
+                  ⌨ Ctrl+Alt+Del
+                </button>
+                <button className="vnc-fab-item" onClick={() => setMouseOpen((v) => !v)} title="移动端虚拟鼠标：触控板移动 + 按键点击">
+                  🖱 {mouseOpen ? '隐藏虚拟鼠标' : '虚拟鼠标'}
+                </button>
+                <button className="vnc-fab-item" onClick={cycleCursorSize} title="调整远端光标的显示大小（小 / 标准 / 大）">
+                  ◉ 光标大小：{CURSOR_SIZES[cursorIdx].label}
+                </button>
+                <button className="vnc-fab-item" onClick={() => setToolsOpen(false)}>✕ 收起</button>
+              </div>
+            )}
+            <button
+              className="vnc-fab-toggle"
+              onClick={() => setToolsOpen(!toolsOpen)}
+              title={toolsOpen ? '收起工具' : '展开工具（全屏等）'}
+              aria-label="VNC 工具栏"
+            >
+              {toolsOpen ? '✕' : (fullscreen ? '⤡' : '⛶')}
+            </button>
+          </div>
+
+          {/* 移动端虚拟鼠标：触控板做相对移动，按钮做点击/滚轮/按住拖拽 */}
+          {mouseOpen && status === 'connected' && (
+            <div className="vnc-mouse">
+              <div
+                className="vnc-mouse-track"
+                onPointerDown={onTrackDown}
+                onPointerMove={onTrackMove}
+                onPointerUp={onTrackUp}
+                onPointerCancel={onTrackUp}
+              >
+                <span>触控板：拖动移动指针 · 轻点 = 左键</span>
+              </div>
+              <div className="vnc-mouse-btns">
+                <button onClick={() => clickAt(1)}>左键</button>
+                <button onClick={() => clickAt(2)}>右键</button>
+                <button onClick={doubleClickAt}>双击</button>
+                <button onClick={() => dispatchWheel(vptrRef.current.x, vptrRef.current.y, -50)}>滚轮↑</button>
+                <button onClick={() => dispatchWheel(vptrRef.current.x, vptrRef.current.y, 50)}>滚轮↓</button>
+                <button className={holdLeft ? 'on' : ''} onClick={toggleHoldLeft}>
+                  {holdLeft ? '松开左键' : '按住左键'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {status !== 'connected' && (
+            <div className="vnc-overlay">
+              <div>
+                <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 6 }}>{status === 'connecting' ? '正在连接…' : '未连接'}</div>
+                <div style={{ fontSize: 12, color: 'var(--muted)' }}>连接成功后右下角可开启全屏</div>
+              </div>
+            </div>
+          )}
         </div>
         {notice && <div className="notice" style={{ marginTop: 10 }}>{notice}</div>}
       </div>

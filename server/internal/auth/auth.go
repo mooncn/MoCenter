@@ -12,9 +12,9 @@ import (
 
 // Auth 鉴权器。
 type Auth struct {
-	tokens  map[string]bool // 有效 Token 集合
-	apiKey  string          // 全局 API Key
-	whitelist []string      // IP 白名单（CIDR 或精确 IP）
+	tokens  map[string]string // 有效 Token -> 登录用户名（审计归属）
+	apiKey  string            // 全局 API Key
+	whitelist []string        // IP 白名单（CIDR 或精确 IP）
 	mu      sync.Mutex
 	// 速率限制：按 IP 记录请求时间戳
 	rate     map[string][]time.Time
@@ -25,7 +25,7 @@ type Auth struct {
 // NewAuth 创建鉴权器。
 func NewAuth(apiKey string, whitelist []string) *Auth {
 	a := &Auth{
-		tokens:    make(map[string]bool),
+		tokens:    make(map[string]string),
 		apiKey:    apiKey,
 		whitelist: whitelist,
 		rate:      make(map[string][]time.Time),
@@ -35,11 +35,11 @@ func NewAuth(apiKey string, whitelist []string) *Auth {
 	return a
 }
 
-// RegisterToken 注册一个有效 Token（登录成功后颁发）。
-func (a *Auth) RegisterToken(token string) {
+// RegisterToken 注册一个有效 Token（登录成功后颁发），并绑定其归属用户名。
+func (a *Auth) RegisterToken(token, username string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.tokens[token] = true
+	a.tokens[token] = username
 }
 
 // RevokeToken 吊销 Token。
@@ -53,7 +53,27 @@ func (a *Auth) RevokeToken(token string) {
 func (a *Auth) ValidateToken(token string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.tokens[token] || token == a.apiKey
+	_, ok := a.tokens[token]
+	return ok || token == a.apiKey
+}
+
+// OperatorOf 返回该 Token 归属的操作者名称，用于审计留痕。
+// 账号登录返回用户名；API Key 登录返回 "api-key"；未知 Token 返回 "unknown"。
+func (a *Auth) OperatorOf(token string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if name, ok := a.tokens[token]; ok && name != "" {
+		return name
+	}
+	if token == a.apiKey {
+		return "api-key"
+	}
+	return "unknown"
+}
+
+// Operator 从 Authorization 请求头解析操作者名称。
+func (a *Auth) Operator(authorization string) string {
+	return a.OperatorOf(strings.TrimPrefix(authorization, "Bearer "))
 }
 
 // HashToken 计算 Token 摘要。

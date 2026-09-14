@@ -37,9 +37,9 @@ export const Api = {
     const { data } = await api.get('/agents')
     return data
   },
-  // 获取主机历史探针趋势
-  async history(agent, since) {
-    const { data } = await api.get('/agents/history', { params: { agent, since } })
+  // 获取主机历史探针趋势；max 控制返回采样点上限（服务端按需降采样）
+  async history(agent, since, max) {
+    const { data } = await api.get('/agents/history', { params: { agent, since, max } })
     return data
   },
   // 下发命令
@@ -47,9 +47,18 @@ export const Api = {
     const { data } = await api.post('/command', req)
     return data
   },
-  // 审计日志
-  async audits() {
-    const { data } = await api.get('/audits')
+  // 审计日志（服务端分页）：返回 { items, total }
+  async audits(params = {}) {
+    const { data } = await api.get('/audits', { params })
+    // 兼容旧版服务端直接返回数组的情形
+    if (Array.isArray(data)) {
+      return { items: data, total: data.length }
+    }
+    return { items: data?.items || [], total: data?.total || 0 }
+  },
+  // 导出审计日志为 CSV（当前筛选条件下的当前页）
+  async auditsCsv(params = {}) {
+    const { data } = await api.get('/audits', { params: { ...params, format: 'csv' }, responseType: 'blob', timeout: 30000 })
     return data
   },
   // 批量命令
@@ -87,6 +96,21 @@ export const Api = {
     const { data } = await api.post('/password', payload)
     return data
   },
+  // 生成 OTP 绑定密钥与 otpauth URI（返回 { secret, uri, enabled }）
+  async otpSetup(username) {
+    const { data } = await api.get('/otp/setup', { params: { username } })
+    return data
+  },
+  // 校验动态验证码并启用 OTP
+  async otpEnable(payload) {
+    const { data } = await api.post('/otp/enable', payload)
+    return data
+  },
+  // 关闭 OTP（需密码，启用中还需当前验证码）
+  async otpDisable(payload) {
+    const { data } = await api.post('/otp/disable', payload)
+    return data
+  },
   // 断开远程终端连接，结束相关进程
   async commandClose(payload) {
     const { data } = await api.post('/command/close', payload)
@@ -97,9 +121,9 @@ export const Api = {
     const { data } = await api.get('/vnc/probe', { params: { agent, port } })
     return data
   },
-  // 一键下发 VNC 安装/启动指令
+  // 一键下发 VNC 安装/启动指令（安装可能需下载+静默安装，给 120s 超时）
   async vncInstall(payload) {
-    const { data } = await api.post('/vnc/install', payload)
+    const { data } = await api.post('/vnc/install', payload, { timeout: 120000 })
     return data
   },
   // 查询最近一次 VNC 安装/启动结果（含口令，供超时后补取）

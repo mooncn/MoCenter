@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -53,6 +54,9 @@ type Client struct {
 	// 文件分发写入句柄 filePath -> *os.File
 	pushFiles map[string]*os.File
 	pushMu    sync.Mutex
+	// 安装包拉取：commandID -> 结果通道（等待 PackageFetchResp）
+	pkgWait map[string]chan protocol.PackageFetchResp
+	pkgMu   sync.Mutex
 }
 
 // New 创建 Agent 客户端。
@@ -70,6 +74,7 @@ func New(cfg Config) *Client {
 		interactive: make(map[string]*command.InteractiveSession),
 		tunnels:     make(map[string]net.Conn),
 		pushFiles:   make(map[string]*os.File),
+		pkgWait:     make(map[string]chan protocol.PackageFetchResp),
 	}
 	return c
 }
@@ -158,8 +163,10 @@ func (c *Client) connectAndServe() error {
 // register 发送上线消息。
 func (c *Client) register() {
 	ips := c.collect.PublicIPs()
+	uuid := c.collect.UUID()
 	info := map[string]interface{}{
 		"agent_id":    c.cfg.AgentID,
+		"uuid":        uuid,
 		"hostname":    c.collect.Host(),
 		"os_type":     c.collect.OSType(),
 		"arch":        c.collect.Arch(),
@@ -243,15 +250,20 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 		if json.Unmarshal(env.Data, &inp) != nil {
 			return
 		}
-		if s, ok := c.interactive[inp.CommandID]; ok {
+		// 先在锁内取指针：map 由 runInteractive goroutine 写入，无锁读取会触发
+		// Go runtime 的 concurrent map access 崩溃。
+		c.mu.Lock()
+		sess := c.interactive[inp.CommandID]
+		c.mu.Unlock()
+		if sess != nil {
 			if inp.Control != "" {
-				_ = s.SendControl(inp.Control)
+				_ = sess.SendControl(inp.Control)
 			}
 			if inp.Rows > 0 && inp.Cols > 0 {
-				_ = s.Resize(inp.Rows, inp.Cols)
+				_ = sess.Resize(inp.Rows, inp.Cols)
 			}
 			if inp.InputData != "" {
-				_ = s.Write([]byte(inp.InputData))
+				_ = sess.Write([]byte(inp.InputData))
 			}
 		}
 	case protocol.TypeFileDownloadReq:
@@ -306,6 +318,71 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 			return
 		}
 		go c.handleVncInstall(req)
+	case protocol.TypePkgFetchResp:
+		var resp protocol.PackageFetchResp
+		if json.Unmarshal(env.Data, &resp) != nil {
+			return
+		}
+		c.deliverPackageResp(resp)
+	}
+}
+
+// deliverPackageResp 把安装包拉取结果投递给等待中的拉取方。
+func (c *Client) deliverPackageResp(resp protocol.PackageFetchResp) {
+	c.pkgMu.Lock()
+	ch, ok := c.pkgWait[resp.CommandID]
+	c.pkgMu.Unlock()
+	if ok {
+		select {
+		case ch <- resp:
+		default: // 已有结果，丢弃重复投递
+		}
+	}
+}
+
+// fetchPackage 通过既有长连接从服务端拉取托管的安装包，落盘到 destPath。
+//
+// 之所以走长连接而不是 HTTP：Agent 到服务端的 TCP 端口一定是通的（否则它不会在线），
+// 而 HTTP 端口未必可达；且该通道可启用 TLS/mTLS，天然避免公网下载的劫持与限速问题。
+// 服务端未托管该包时返回错误，调用方回退到其它下载方式。
+func (c *Client) fetchPackage(name, destPath string) (int64, error) {
+	if name == "" || destPath == "" {
+		return 0, errors.New("安装包名称或落盘路径为空")
+	}
+	commandID := fmt.Sprintf("pkg-%d", time.Now().UnixNano())
+	ch := make(chan protocol.PackageFetchResp, 1)
+
+	c.pkgMu.Lock()
+	c.pkgWait[commandID] = ch
+	c.pkgMu.Unlock()
+	defer func() {
+		c.pkgMu.Lock()
+		delete(c.pkgWait, commandID)
+		c.pkgMu.Unlock()
+	}()
+
+	if err := c.write(protocol.TypePkgFetchReq, protocol.PackageFetchReq{
+		AgentID: c.cfg.AgentID, Name: name, CommandID: commandID, DestPath: destPath,
+	}); err != nil {
+		return 0, fmt.Errorf("请求服务端下发安装包失败: %w", err)
+	}
+
+	select {
+	case resp := <-ch:
+		if !resp.OK {
+			return 0, errors.New(resp.Message)
+		}
+		// 分片由消息循环顺序落盘，收到回执即表示已写完；这里再做一次大小校验兜底
+		fi, err := os.Stat(destPath)
+		if err != nil {
+			return 0, fmt.Errorf("安装包未落盘: %w", err)
+		}
+		if fi.Size() != resp.Size {
+			return 0, fmt.Errorf("安装包大小不符：期望 %d 字节，实际 %d 字节", resp.Size, fi.Size())
+		}
+		return fi.Size(), nil
+	case <-time.After(5 * time.Minute):
+		return 0, errors.New("等待服务端下发安装包超时")
 	}
 }
 
@@ -348,11 +425,23 @@ func (c *Client) closeSession(req protocol.InteractiveCloseReq) {
 
 // handleVncInstall 处理 VNC 安装/启动指令并回传结果。
 func (c *Client) handleVncInstall(req protocol.VncInstallReq) {
-	// 默认：若配置了公网 IP 探测代理，则同样用于 VNC 安装包的国内加速
-	resp := command.VncInstallCfg(req.Port, command.VncConfig{Proxy: c.cfg.ProxyIP})
-	log.Printf("[agent] VNC 安装/启动结果: ok=%v msg=%s", resp.OK, resp.Message)
+	// 默认：若配置了公网 IP 探测代理，则同样用于 VNC 安装包的国内加速。
+	// FetchPackage 让安装包优先从服务端拉取（走既有长连接，避开公网限速与劫持），
+	// 服务端未托管时自动回退到 winget/choco/公网下载。
+	resp := command.VncInstallCfg(req.Port, command.VncConfig{
+		Proxy: c.cfg.ProxyIP,
+		Mode:  req.Mode,
+		FetchPackage: func(name string) (string, error) {
+			dest := filepath.Join(os.TempDir(), name)
+			if _, err := c.fetchPackage(name, dest); err != nil {
+				return "", err
+			}
+			return dest, nil
+		},
+	})
+	log.Printf("[agent] VNC 安装/启动结果: mode=%s ok=%v msg=%s", resp.Mode, resp.OK, resp.Message)
 	_ = c.write(protocol.TypeVncInstallResp, protocol.VncInstallResp{
-		OK: resp.OK, Message: resp.Message, Port: resp.Port, Password: resp.Password,
+		OK: resp.OK, Message: resp.Message, Port: resp.Port, Password: resp.Password, Mode: resp.Mode,
 	})
 }
 
@@ -472,7 +561,10 @@ func md5Chunk(data []byte) string {
 
 func (c *Client) runCommand(req protocol.CommandReq) {
 	if req.Interactive {
-		c.runInteractive(req)
+		// 交互会话会阻塞等待 PTY 进程结束，必须在独立 goroutine 运行，
+		// 否则会阻塞主消息循环，导致后续的 InteractiveInputReq（打字输入）
+		// 永远无法被处理，表现为「有光标但无法输入」。
+		go c.runInteractive(req)
 		return
 	}
 

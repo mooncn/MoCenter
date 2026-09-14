@@ -1,6 +1,7 @@
 // VNC 远程桌面：一键安装/启动 VNC 服务端的辅助实现。
 //
-// Windows 优先尝试 winget/choco 安装 TightVNC；Linux 尝试 apt/yum/dnf 安装
+// Windows 侧统一使用 UltraVNC（应用模式 / 服务模式，见 vncinstall_windows.go
+// 与 vncinstall_ultravnc_windows.go）；Linux 尝试 apt/yum/dnf 安装
 // x11vnc 并启动（无密码，绑定 rfbport）。安装结果以消息形式回传 Web 端。
 package command
 
@@ -18,7 +19,18 @@ type VncInstallResult struct {
 	Message  string
 	Port     int
 	Password string // 生成的 VNC 口令（供 Web 端本次会话连接使用）
+	Mode     string // 实际生效的模式：interactive / service
 }
+
+// VNC 安装模式（与服务端 protocol 常量保持一致）。
+const (
+	// VncModeInteractive 交互会话模式：VNC 运行在登录用户的交互会话中，
+	// 仅在「已登录且未锁屏」时可见桌面。
+	VncModeInteractive = "interactive"
+	// VncModeService 服务模式：VNC 以系统服务运行，可抓取 Winlogon 安全桌面，
+	// 锁屏/未登录状态下仍可见画面（Windows 下为 UltraVNC）。
+	VncModeService = "service"
+)
 
 // VncConfig VNC 安装/启动配置。
 type VncConfig struct {
@@ -26,6 +38,12 @@ type VncConfig struct {
 	Proxy string
 	// DownloadBase 下载地址前缀（如官方或镜像），为空使用默认地址。
 	DownloadBase string
+	// Mode 安装模式：VncModeInteractive（默认）/ VncModeService。
+	Mode string
+	// FetchPackage 从服务端拉取托管的安装包，返回本地落盘路径（由 client 注入）。
+	// 走 Agent 与服务端既有的长连接，避免公网下载慢或被劫持；
+	// 为 nil 或返回错误时，安装流程回退到 winget/choco/公网下载。
+	FetchPackage func(name string) (string, error)
 }
 
 // VncInstall 安装并按需启动 VNC 服务，返回结果。port<=0 时默认 5900。

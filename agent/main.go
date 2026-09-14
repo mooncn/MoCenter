@@ -18,6 +18,7 @@ import (
 	"mocenter/agent/internal/client"
 	"mocenter/agent/internal/config"
 	"mocenter/agent/internal/daemon"
+	probepkg "mocenter/agent/internal/probe"
 )
 
 func main() {
@@ -135,9 +136,15 @@ func main() {
 		log.Fatal("请通过 -server、环境变量 MOCENTER_SERVER 或配置文件指定服务端地址")
 	}
 	if *agentID == "" {
-		host, _ := os.Hostname()
-		*agentID = host
-		log.Printf("未指定 AgentID，使用主机名 %q", *agentID)
+		// 优先使用硬件 UUID 作为 AgentID，获取失败时回退到主机名
+		if uuid := probepkg.HardwareUUID(); uuid != "" {
+			*agentID = uuid
+			log.Printf("未指定 AgentID，使用硬件 UUID %q", *agentID)
+		} else {
+			host, _ := os.Hostname()
+			*agentID = host
+			log.Printf("未指定 AgentID，硬件 UUID 获取失败，回退使用主机名 %q", *agentID)
+		}
 	}
 
 	// 进程守护：崩溃自动重启

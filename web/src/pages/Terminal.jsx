@@ -32,22 +32,30 @@ export default function TerminalPage({ agents }) {
       fontFamily: 'Menlo, Consolas, "Courier New", monospace',
       scrollback: 10000,
       theme: { background: '#000000', foreground: '#d4d4d4' },
-      convertEol: false,
+      convertEol: true,
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
     terminalRef.current = term
     fitAddonRef.current = fit
 
+    let fitTimer = 0
     if (termRef.current) {
       term.open(termRef.current)
-      fit.fit()
-      term.writeln('\x1b[1;32mMoCenter 远程终端\x1b[0m')
-      term.writeln('选择主机后点击「连接」，即进入持久交互会话（支持连续执行命令、Ctrl+C）。\r\n')
+      // xterm 渲染器需在 DOM 完成布局后才能读取容器尺寸；
+      // 若立即 fit，容器尚未就绪时会抛 Viewport dimensions 异常并导致整页崩溃，
+      // 故延迟到下一帧执行 fit 与横幅写入。
+      fitTimer = window.setTimeout(() => {
+        try { fit.fit() } catch { /* 布局时序，忽略 */ }
+        term.write('\r\n\x1b[1;32mMoCenter 远程终端\x1b[0m\r\n')
+        term.write('选择主机后点击「连接」，即进入持久交互会话（支持连续执行命令、Ctrl+C）。\r\n')
+      }, 0)
     }
 
-    const onResize = () => fit.fit()
+    const onResize = () => { try { fit.fit() } catch { /* 布局时序，忽略 */ } }
     window.addEventListener('resize', onResize)
+    // 移动设备旋转屏幕后尺寸变化，需要重新 fit
+    window.addEventListener('orientationchange', onResize)
 
     // 接收交互输出：PTY 回显 + 命令输出均由此到达
     if (socket) {
@@ -67,7 +75,9 @@ export default function TerminalPage({ agents }) {
     }
 
     return () => {
+      window.clearTimeout(fitTimer)
       window.removeEventListener('resize', onResize)
+      window.removeEventListener('orientationchange', onResize)
       term.dispose()
     }
   }, [socket])
@@ -187,7 +197,7 @@ export default function TerminalPage({ agents }) {
           </button>
         </div>
         <div className="terminal-wrap">
-          <div ref={termRef} style={{ height: 420 }} />
+          <div ref={termRef} className="terminal-body" style={{ height: 'clamp(280px, 55vh, 560px)' }} />
         </div>
         {notice && <div className="notice err">{notice}</div>}
       </div>

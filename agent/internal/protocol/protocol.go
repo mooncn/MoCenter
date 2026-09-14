@@ -3,28 +3,30 @@ package protocol
 
 // 消息类型常量
 const (
-	TypeHeartbeatReq   = "HeartbeatReq"
-	TypeHeartbeatResp  = "HeartbeatResp"
-	TypeCommandReq     = "CommandReq"
-	TypeCommandResp    = "CommandResp"
-	TypeProbeDataReq   = "ProbeDataReq"
-	TypeProbeDataResp  = "ProbeDataResp"
-	TypeFileUploadReq  = "FileUploadReq"
-	TypeFileDownloadReq = "FileDownloadReq"
-	TypeFilePushReq   = "FilePushReq"    // Server -> Agent 文件分发分片
-	TypeFilePushAck   = "FilePushAck"    // Agent -> Server 文件分发分片确认
-	TypeInteractiveIn  = "InteractiveInputReq"
-	TypeInteractiveOut = "InteractiveOutput"
-	TypeOnline         = "AgentOnline"
-	TypeUpgradeReq     = "UpgradeReq"
-	TypeUpgradeResp    = "UpgradeResp"
-	TypeTunnelOpen     = "TunnelOpenReq"  // Server->Agent 端口映射隧道建立请求
-	TypeTunnelOpenResp = "TunnelOpenResp" // Agent->Server 隧道建立响应
-	TypeTunnelData     = "TunnelData"     // Server<->Agent 隧道双向数据
-	TypeTunnelClose    = "TunnelClose"    // Server<->Agent 隧道关闭
+	TypeHeartbeatReq     = "HeartbeatReq"
+	TypeHeartbeatResp    = "HeartbeatResp"
+	TypeCommandReq       = "CommandReq"
+	TypeCommandResp      = "CommandResp"
+	TypeProbeDataReq     = "ProbeDataReq"
+	TypeProbeDataResp    = "ProbeDataResp"
+	TypeFileUploadReq    = "FileUploadReq"
+	TypeFileDownloadReq  = "FileDownloadReq"
+	TypeFilePushReq      = "FilePushReq" // Server -> Agent 文件分发分片
+	TypeFilePushAck      = "FilePushAck" // Agent -> Server 文件分发分片确认
+	TypeInteractiveIn    = "InteractiveInputReq"
+	TypeInteractiveOut   = "InteractiveOutput"
+	TypeOnline           = "AgentOnline"
+	TypeUpgradeReq       = "UpgradeReq"
+	TypeUpgradeResp      = "UpgradeResp"
+	TypeTunnelOpen       = "TunnelOpenReq"    // Server->Agent 端口映射隧道建立请求
+	TypeTunnelOpenResp   = "TunnelOpenResp"   // Agent->Server 隧道建立响应
+	TypeTunnelData       = "TunnelData"       // Server<->Agent 隧道双向数据
+	TypeTunnelClose      = "TunnelClose"      // Server<->Agent 隧道关闭
 	TypeInteractiveClose = "InteractiveClose" // Web->Server->Agent 断开交互终端并结束相关进程
-	TypeVncInstallReq    = "VncInstallReq"   // Server->Agent 下发 VNC 安装/启动指令
-	TypeVncInstallResp   = "VncInstallResp"  // Agent->Server VNC 安装/启动结果
+	TypeVncInstallReq    = "VncInstallReq"    // Server->Agent 下发 VNC 安装/启动指令
+	TypeVncInstallResp   = "VncInstallResp"   // Agent->Server VNC 安装/启动结果
+	TypePkgFetchReq      = "PackageFetchReq"  // Agent->Server 请求拉取服务端托管的安装包
+	TypePkgFetchResp     = "PackageFetchResp" // Server->Agent 安装包拉取结果（分片之后回执）
 )
 
 // Envelope 通用消息信封。
@@ -78,6 +80,7 @@ type CommandResp struct {
 // ProbeDataReq Agent -> Server
 type ProbeDataReq struct {
 	AgentID       string  `json:"agent_id"`
+	UUID          string  `json:"uuid,omitempty"` // 硬件唯一标识
 	Timestamp     int64   `json:"timestamp"`
 	CPUUsage      float64 `json:"cpu_usage"`
 	MemUsage      float64 `json:"mem_usage"`
@@ -124,7 +127,7 @@ type FileUploadReq struct {
 // FileSize<0 表示分发失败通知；done=true 表示最后一个分片。
 type FilePushReq struct {
 	CommandID string `json:"command_id"`
-	FilePath  string `json:"file_path"`  // Agent 端目标路径
+	FilePath  string `json:"file_path"` // Agent 端目标路径
 	FileSize  int64  `json:"file_size"`
 	ChunkSeq  int    `json:"chunk_seq"`
 	ChunkData []byte `json:"chunk_data"`
@@ -137,7 +140,7 @@ type FilePushAck struct {
 	CommandID string `json:"command_id"`
 	FilePath  string `json:"file_path"`
 	ChunkSeq  int    `json:"chunk_seq"`
-	Ack       bool   `json:"ack"` // true=ACK false=NACK
+	Ack       bool   `json:"ack"`    // true=ACK false=NACK
 	Status    string `json:"status"` // transferring/done/failed
 	Message   string `json:"message"`
 }
@@ -153,7 +156,7 @@ type FileDownloadReq struct {
 
 // InteractiveInputReq Server -> Agent
 type InteractiveInputReq struct {
-	AgentID  string `json:"agent_id"`
+	AgentID   string `json:"agent_id"`
 	CommandID string `json:"command_id"`
 	InputData string `json:"input_data"`
 	Rows      int    `json:"rows"`
@@ -220,10 +223,23 @@ type InteractiveCloseReq struct {
 	KillAll   bool   `json:"kill_all"`
 }
 
+// VNC 安装模式。
+const (
+	// VncModeInteractive 交互会话模式：VNC 运行在登录用户的交互会话中。
+	// 仅在「用户已登录且未锁屏」时可见桌面；无头场景需配合虚拟显示器。
+	VncModeInteractive = "interactive"
+	// VncModeService 服务模式：VNC 以系统服务运行，可跟随会话切换抓取
+	// Winlogon 安全桌面，从而在「锁屏 / 未登录」状态下仍能看到画面。
+	// Windows 下由 UltraVNC 的 uvnc_service 实现。
+	VncModeService = "service"
+)
+
 // VncInstallReq Server->Agent：下发 VNC 安装/启动指令。
 type VncInstallReq struct {
 	AgentID string `json:"agent_id"`
 	Port    int    `json:"port"` // VNC 端口，默认 5900
+	// Mode 安装模式：interactive（默认）/ service（支持锁屏）。
+	Mode string `json:"mode,omitempty"`
 }
 
 // VncInstallResp Agent->Server：VNC 安装/启动结果。
@@ -232,4 +248,30 @@ type VncInstallResp struct {
 	Message  string `json:"message"`
 	Port     int    `json:"port"`
 	Password string `json:"password,omitempty"` // 安装时生成的随机口令（仅服务端按需交付给前端）
+	// Mode 实际生效的模式（可能因降级与请求值不同）。
+	Mode string `json:"mode,omitempty"`
+}
+
+// PackageFetchReq Agent->Server：请求从服务端拉取托管的安装包。
+//
+// 目的：避免 Agent 从公网下载安装包（网速慢、可能被劫持），改为复用 Agent 与
+// 服务端之间既有的长连接通道（可走 TLS/mTLS）。
+// 服务端按 Name 在包目录中查找，以 FilePushReq 分片下发到 DestPath。
+type PackageFetchReq struct {
+	AgentID   string `json:"agent_id"`
+	Name      string `json:"name"`       // 包文件名，如 UltraVNC_1824_x64_Setup.exe
+	CommandID string `json:"command_id"` // 关联本次分片传输
+	DestPath  string `json:"dest_path"`  // Agent 端落盘路径（由 Agent 指定）
+}
+
+// PackageFetchResp Server->Agent：安装包拉取结果。
+//
+// 注意：该回执在所有 FilePushReq 分片之后发送。Agent 顺序处理消息，因此收到本回执
+// 即代表分片已全部处理完毕，无需再轮询文件大小。
+type PackageFetchResp struct {
+	CommandID string `json:"command_id"` // 与请求中的 CommandID 对应，用于关联等待方
+	Name      string `json:"name"`
+	OK        bool   `json:"ok"`
+	Message   string `json:"message"`
+	Size      int64  `json:"size"`
 }

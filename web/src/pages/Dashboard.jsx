@@ -33,7 +33,8 @@ export default function Dashboard({ agents }) {
       return
     }
     const sinceTs = new Date(Date.now() - sinceMap[since] * 1000).toISOString()
-    Api.history(selectedAgent, sinceTs)
+    // max=300：请求服务端降采样，避免长时间跨度返回海量采样点
+    Api.history(selectedAgent, sinceTs, 300)
       .then((data) => setHistory(data))
       .catch(() => setHistory([]))
   }, [selectedAgent, since])
@@ -84,7 +85,8 @@ export default function Dashboard({ agents }) {
       {/* 主机列表 */}
       <div className="card">
         <h3>主机列表</h3>
-        <table>
+        <div className="table-scroll">
+        <table className="table-stack">
           <thead>
             <tr>
               <th>主机</th>
@@ -95,7 +97,7 @@ export default function Dashboard({ agents }) {
               <th>CPU</th>
               <th>内存</th>
               <th>磁盘</th>
-              <th>网络 ↓ / ↑</th>
+              <th>网络(累计↓↑ / 速率↓↑)</th>
               <th>最后在线</th>
               <th>趋势</th>
             </tr>
@@ -103,57 +105,70 @@ export default function Dashboard({ agents }) {
           <tbody>
             {(agents || []).map((a) => (
               <tr key={a.agent_id}>
-                <td>
+                <td data-label="主机">
                   <b>{a.remark || a.hostname}</b>
                   <div style={{ color: '#8b98a5', fontSize: 12 }}>
                     {a.hostname}
                     {a.remark ? ' · ' + a.agent_id : ''}
                   </div>
+                  {a.uuid ? (
+                    <div
+                      style={{ color: '#6b7280', fontSize: 10, fontFamily: 'Menlo, Consolas, monospace', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      title={`设备唯一 UUID：${a.uuid}`}
+                    >
+                      UUID: {a.uuid}
+                    </div>
+                  ) : null}
                   <RemarkEditor agent={a} onSaved={() => window.dispatchEvent(new Event('mc-remark-saved'))} />
                 </td>
-                <td>
+                <td data-label="状态">
                   <span className={`badge ${a.online ? 'online' : 'offline'}`}>
                     {a.online ? '在线' : '离线'}
                   </span>
                 </td>
-                <td>
+                <td data-label="公网IP/位置">
                   <PublicIPCell agent={a} />
                 </td>
-                <td>
+                <td data-label="系统">
                   <div style={{ fontWeight: 600, fontSize: 12 }}>{a.os_version || a.os_type}</div>
                   <div style={{ color: '#8b98a5', fontSize: 11 }}>{a.os_type} · {a.arch}</div>
                 </td>
-                <td>{a.arch}</td>
-                <td>
+                <td data-label="架构">{a.arch}</td>
+                <td data-label="CPU">
                   <div style={{ fontSize: 11, maxWidth: 210, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={(a.cpu_model || '') + (a.cpu_mhz ? ` @ ${(a.cpu_mhz / 1000).toFixed(2)}GHz` : '')}>
                     {a.cpu_model || '-'}{a.cpu_mhz ? ` @ ${(a.cpu_mhz / 1000).toFixed(2)}GHz` : ''}
                   </div>
                   <CpuBar v={a.cpu_usage} />
                 </td>
-                <td>
+                <td data-label="内存">
                   <div style={{ fontSize: 11 }}>{fmtGBytes(a.mem_used_bytes)}/{fmtGBytes(a.mem_total_bytes)}</div>
                   <MemBar v={a.mem_usage} />
                 </td>
-                <td>
+                <td data-label="磁盘">
                   <div style={{ fontSize: 11 }}>{fmtGBytes(a.disk_used_bytes)}/{fmtGBytes(a.disk_total_bytes)}</div>
                   <Bar v={a.disk_usage} />
                 </td>
-                <td style={{ fontSize: 11, whiteSpace: 'nowrap' }}>
-                  ↑{fmtGB(a.net_out_bytes)}<br />↓{fmtGB(a.net_in_bytes)}
+                <td data-label="网络" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>
+                  <div style={{ color: '#4da3ff' }} title="网卡累计下行">↓ {fmtGB(a.net_in_bytes)}</div>
+                  <div style={{ color: '#fa8c16' }} title="网卡累计上行">↑ {fmtGB(a.net_out_bytes)}</div>
+                  <div style={{ color: '#52c41a', fontSize: 10 }}>
+                    {fmtSpeed(a.net_rate_in)} / {fmtSpeed(a.net_rate_out)}
+                  </div>
                 </td>
-                <td>{a.online ? fmtTime(a.last_seen) : `离线 ${fmtOffline(a)}`}</td>
-                <td>
-                  <button className="secondary" onClick={() => setSelectedAgent(selectedAgent === a.agent_id ? '' : a.agent_id)}>
+                <td data-label="最后在线">{a.online ? fmtTime(a.last_seen) : `离线 ${fmtOffline(a)}`}</td>
+                <td data-label="趋势">
+                  <button className="secondary btn-sm" onClick={() => setSelectedAgent(selectedAgent === a.agent_id ? '' : a.agent_id)}>
                     {selectedAgent === a.agent_id ? '收起' : '查看'}
                   </button>
                 </td>
               </tr>
             ))}
             {agents.length === 0 && (
-              <tr><td colSpan="11" style={{ textAlign: 'center', color: '#8b98a5' }}>暂无主机接入</td></tr>
+              <tr><td colSpan="11" className="table-empty">暂无主机接入</td></tr>
             )}
           </tbody>
         </table>
+        </div>
       </div>
 
       {/* 历史趋势图 */}
@@ -248,6 +263,14 @@ function fmtGBytes(b) {
 function fmtGB(b) {
   if (!b || b <= 0) return '0.00GB'
   return (b / 1024 / 1024 / 1024).toFixed(2) + 'GB'
+}
+
+// 字节/秒 -> 可读速率（KB/s / MB/s）
+function fmtSpeed(bps) {
+  if (!bps || bps <= 0) return '-'
+  if (bps >= 1024 * 1024) return (bps / 1024 / 1024).toFixed(2) + 'MB/s'
+  if (bps >= 1024) return (bps / 1024).toFixed(1) + 'KB/s'
+  return bps + 'B/s'
 }
 
 function fmtTime(ts) {

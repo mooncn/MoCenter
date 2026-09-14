@@ -19,8 +19,10 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -28,6 +30,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mocenter/server/internal/auth"
@@ -40,6 +43,7 @@ import (
 	"mocenter/server/internal/remark"
 	"mocenter/server/internal/route"
 	"mocenter/server/internal/session"
+	"mocenter/server/internal/storage"
 	"mocenter/server/internal/vnc"
 	"mocenter/server/internal/ws"
 )
@@ -55,6 +59,7 @@ func main() {
 	caCert := flag.String("ca-cert", "", "mTLS 客户端 CA 证书文件路径（提供后启用双向认证，Agent 需携带客户端证书）")
 	insecure := flag.Bool("insecure", false, "允许非 TLS 的 Agent 连接（未提供证书时自动启用）")
 	dataDir := flag.String("data", ".", "数据目录（审计日志持久化等）")
+	pkgDir := flag.String("pkg-dir", "", "安装包托管目录（Agent 可经长连接直接拉取，避免公网下载）；留空则用 <data>/packages")
 	user := flag.String("user", "", "登录用户名（设置后启用用户名+密码登录）")
 	password := flag.String("password", "", "登录密码")
 	totpSecret := flag.String("totp-secret", "", "TOTP 密钥（base32，设置后登录需提供一次性验证码，兼容 Google Authenticator）")
@@ -68,17 +73,17 @@ func main() {
 	}
 	if cfg == nil {
 		cfg = &config.Config{
-			Listen:     *addr,
-			HTTP:       *httpAddr,
-			APIKey:     *apiKey,
-			Whitelist:  *whitelist,
-			WebDir:     *webDir,
-			TLSCert:    *tlsCert,
-			TLSKey:     *tlsKey,
-			CACert:     *caCert,
-			Insecure:   *insecure,
-			DataDir:    *dataDir,
-			User:       *user,
+			Listen:    *addr,
+			HTTP:      *httpAddr,
+			APIKey:    *apiKey,
+			Whitelist: *whitelist,
+			WebDir:    *webDir,
+			TLSCert:   *tlsCert,
+			TLSKey:    *tlsKey,
+			CACert:    *caCert,
+			Insecure:  *insecure,
+			DataDir:   *dataDir,
+			User:      *user,
 			// 不落盘明文密码与 TOTP 密钥：账号以哈希持久化到 users.json
 			Password:   "",
 			TOTPSecret: "",
@@ -186,6 +191,17 @@ func main() {
 		*apiKey = "change-me-api-key"
 	}
 
+	// 安装包托管目录：默认 <data>/packages。
+	// Agent 一键安装 VNC 时会优先通过既有长连接从这里拉取安装包，
+	// 避免走公网（网速慢、且可能被劫持/篡改）。
+	if *pkgDir == "" {
+		*pkgDir = filepath.Join(*dataDir, "packages")
+	}
+	if err := os.MkdirAll(*pkgDir, 0755); err != nil {
+		log.Printf("[server] 创建安装包目录失败 %s: %v", *pkgDir, err)
+	}
+	logAvailablePackages(*pkgDir)
+
 	var wl []string
 	for _, s := range strings.Split(*whitelist, ",") {
 		if s = strings.TrimSpace(s); s != "" {
@@ -193,8 +209,22 @@ func main() {
 		}
 	}
 
+	// 打开 SQLite 持久化存储
+	dbPath := filepath.Join(*dataDir, "mocenter.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		log.Fatalf("[server] 打开 SQLite 数据库失败: %v", err)
+	}
+	defer db.Close()
+	log.Printf("[server] SQLite 数据库: %s", dbPath)
+
+	// 初始化内置黑名单规则（幂等）
+	if err := db.InitDefaultBlacklist(route.DefaultBlacklistPatterns); err != nil {
+		log.Printf("[server] 初始化内置黑名单失败: %v", err)
+	}
+
 	sess := session.NewManager()
-	store := probe.NewStore()
+	store := probe.NewStore(db)
 	geoResolver := geo.NewResolver()
 	store.SetGeoResolver(geoResolver)
 	remarks := remark.NewStore(*dataDir)
@@ -203,10 +233,45 @@ func main() {
 	authz := auth.NewAuth(*apiKey, wl)
 	userMgr := auth.NewUserManager(filepath.Join(*dataDir, "users.json"))
 	if err := userMgr.InitFromFlags(*user, *password, *totpSecret); err != nil {
-		log.Printf("警告: 初始化用户失败: %v", err)
+		if errors.Is(err, auth.ErrInitPasswordRequired) {
+			// 提供了 -user 但缺少 -password：给出明确提示，避免静默生成空密码坏账号
+			log.Printf("警告: 已指定 -user %q 但未提供 -password，未创建账号。请补充 -password 后重启。", *user)
+		} else {
+			log.Printf("警告: 初始化用户失败: %v", err)
+		}
 	}
-	router := route.NewRouter(sess, filepath.Join(*dataDir, "audits.jsonl"))
-	pm := portmap.NewManager(sess)
+	// 若尚无任何账号，则创建内置默认账号 admin/123456，保证开箱可登录。
+	// 可用 -user/-password 覆盖默认用户名与密码。
+	if !userMgr.HasUsers() {
+		defUser := *user
+		if defUser == "" {
+			defUser = "admin"
+		}
+		defPass := *password
+		if defPass == "" {
+			defPass = "123456"
+		}
+		if err := userMgr.UpsertUser(defUser, defPass, *totpSecret); err != nil {
+			log.Printf("警告: 创建默认账号失败: %v", err)
+		} else if defUser == "admin" && defPass == "123456" {
+			log.Printf("已创建内置默认账号 admin/123456（请登录后尽快修改密码）")
+		} else {
+			log.Printf("已创建默认账号 %s", defUser)
+		}
+	}
+	// 修复历史版本因缺少 -password 而误建的空密码账号，重置为 123456 并提示。
+	if broken := userMgr.BrokenAccounts(); len(broken) > 0 {
+		for _, name := range broken {
+			if err := userMgr.SetPassword(name, "123456"); err != nil {
+				log.Printf("警告: 修复账号 %s 失败: %v", name, err)
+				continue
+			}
+			log.Printf("已修复历史空密码账号 %s，密码重置为 123456，请登录后立即修改", name)
+		}
+	}
+	router := route.NewRouter(sess, db, filepath.Join(*dataDir, "audits.jsonl"))
+	defer router.Close()
+	pm := portmap.NewManager(sess, db)
 	ft := filetransfer.NewManager("/tmp/mocenter_uploads")
 	pushMgr := filetransfer.NewPushManager()
 	vncMgr := vnc.NewMgr(sess)
@@ -214,18 +279,21 @@ func main() {
 	hub := ws.NewHub()
 
 	// WebSocket 收到 Web 消息后的统一处理入口
-	hub.SetMessageHandler(func(data []byte) {
-		handleWebMessage(data, sess, store, router, hub, ft, pm, pushMgr, vncMgr)
+	hub.SetMessageHandler(func(operator string, data []byte) {
+		handleWebMessage(operator, data, sess, store, router, hub, ft, pm, pushMgr, vncMgr)
 	})
 
 	// 服务端启动后台任务
 	go heartbeatSweeper(sess, store, hub)
 	go cleanupSweeper(pm, hub)
+	// 探针历史定期清理（保留 30 天）+ 审计日志留存清理（保留 180 天）
+	go probeHistoryCleaner(db)
+	go auditRetentionCleaner(db)
 
 	// 启动 HTTP 服务（REST + WebSocket）
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		hub.HandleUpgrade(w, r, authz.ValidateToken)
+		hub.HandleUpgrade(w, r, authz.ValidateToken, authz.OperatorOf)
 	})
 	mux.HandleFunc("/vnc-ws", func(w http.ResponseWriter, r *http.Request) {
 		vncMgr.HandleViewer(w, r, authz.ValidateToken)
@@ -241,10 +309,13 @@ func main() {
 	mux.HandleFunc("/api/agents/remark", setRemarkHandler(remarks, authz))
 	mux.HandleFunc("/api/audits", auditsHandler(router, authz))
 	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
-	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz))
+	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz, router))
 	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz))
-	mux.HandleFunc("/api/login", loginHandler(userMgr, authz))
+	mux.HandleFunc("/api/login", loginHandler(userMgr, authz, router))
 	mux.HandleFunc("/api/password", changePasswordHandler(userMgr, authz))
+	mux.HandleFunc("/api/otp/setup", otpSetupHandler(userMgr, authz))
+	mux.HandleFunc("/api/otp/enable", otpEnableHandler(userMgr, authz))
+	mux.HandleFunc("/api/otp/disable", otpDisableHandler(userMgr, authz))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
@@ -307,12 +378,12 @@ func main() {
 			log.Printf("[server] accept error: %v", err)
 			continue
 		}
-		go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr)
+		go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir)
 	}
 }
 
 // handleAgentConn 处理单个 Agent 的 TCP 长连接。
-func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr) {
+func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, pkgDir string) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -390,12 +461,8 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			_ = json.Unmarshal(env.Data, &cr)
 			// 转发给 Web 端
 			hub.Broadcast(protocol.TypeCommandResp, cr)
-			info := store.Get(sessConn.AgentID)
-			_ = info
-			router.Audit(&route.AuditLog{
-				Time: time.Now().Unix(), AgentID: sessConn.AgentID, Command: "(cmd-" + cr.CommandID + ")",
-				Result: cr.Stdout, ExitCode: cr.ExitCode, Duration: cr.Duration,
-			})
+			// 回填命令审计结果（不新增记录，避免 operator 为空的重复条目）
+			router.CompleteByCommand(cr.CommandID, sessConn.AgentID, cr.Stdout, cr.ExitCode, cr.Duration)
 		case protocol.TypeInteractiveOut:
 			var io protocol.InteractiveOutput
 			_ = json.Unmarshal(env.Data, &io)
@@ -415,6 +482,11 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		case protocol.TypeFilePushAck:
 			var fa protocol.FilePushAck
 			_ = json.Unmarshal(env.Data, &fa)
+			// 安装包拉取的分片 ACK 属于内部行为，不向 Web 广播传输状态，
+			// 否则文件分发列表里会冒出一条临时路径的记录。
+			if _, isPkg := pkgFetchCmds.Load(fa.CommandID); isPkg {
+				continue
+			}
 			hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
 				AgentID: sessConn.AgentID, FilePath: fa.FilePath, Action: "push",
 				Status: fa.Status, Message: fa.Message, ChunkSeq: fa.ChunkSeq,
@@ -464,6 +536,12 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			var vr protocol.VncInstallResp
 			if json.Unmarshal(env.Data, &vr) == nil {
 				vncMgr.NotifyInstall(sessConn.AgentID, &vr)
+			}
+		case protocol.TypePkgFetchReq:
+			var pr protocol.PackageFetchReq
+			if json.Unmarshal(env.Data, &pr) == nil {
+				// 独立 goroutine：大包分片下发不应阻塞该 Agent 的主消息循环
+				go servePackage(sessConn, pkgDir, &pr)
 			}
 		}
 	}
@@ -518,15 +596,33 @@ func historyHandler(store *probe.Store, authz *auth.Auth) http.HandlerFunc {
 		if !guard(w, r, authz) {
 			return
 		}
-		agentID := r.URL.Query().Get("agent")
+		q := r.URL.Query()
+		agentID := q.Get("agent")
 		since := time.Now().Add(-24 * time.Hour)
-		if r.URL.Query().Get("since") != "" {
-			if ts, err := time.Parse(time.RFC3339, r.URL.Query().Get("since")); err == nil {
+		if q.Get("since") != "" {
+			if ts, err := time.Parse(time.RFC3339, q.Get("since")); err == nil {
 				since = ts
 			}
 		}
-		writeJSON(w, store.History(agentID, since))
+		// max 限制返回点数（默认 300，上限 2000），避免长时间跨度返回海量采样点
+		maxPoints, _ := strconv.Atoi(q.Get("max"))
+		if maxPoints <= 0 {
+			maxPoints = 300
+		}
+		if maxPoints > 2000 {
+			maxPoints = 2000
+		}
+		writeJSON(w, store.HistoryDownsampled(agentID, since, maxPoints))
 	}
+}
+
+// operatorIPOf 取请求来源 IP（用于登录审计留痕）。
+func operatorIPOf(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // setRemarkHandler 设置/更新指定主机的备注（POST 或 PUT）。
@@ -573,7 +669,7 @@ func commandHandler(router *route.Router, authz *auth.Auth) http.HandlerFunc {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		ok, msg := router.Dispatch(&req, "web-admin", r.RemoteAddr)
+		ok, msg := router.Dispatch(&req, authz.Operator(r.Header.Get("Authorization")), r.RemoteAddr)
 		writeJSON(w, map[string]interface{}{"ok": ok, "msg": msg})
 	}
 }
@@ -588,12 +684,12 @@ func batchCommandHandler(router *route.Router, authz *auth.Auth) http.HandlerFun
 			return
 		}
 		var body struct {
-			AgentIDs  []string            `json:"agent_ids"`
-			CommandID string              `json:"command_id"`
-			Command   string              `json:"command"`
-			ShellType string              `json:"shell_type"`
-			Timeout   int                 `json:"timeout"`
-			Env       map[string]string   `json:"env"`
+			AgentIDs  []string          `json:"agent_ids"`
+			CommandID string            `json:"command_id"`
+			Command   string            `json:"command"`
+			ShellType string            `json:"shell_type"`
+			Timeout   int               `json:"timeout"`
+			Env       map[string]string `json:"env"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -613,7 +709,7 @@ func batchCommandHandler(router *route.Router, authz *auth.Auth) http.HandlerFun
 		if req.CommandID == "" {
 			req.CommandID = fmt.Sprintf("batch-%d", time.Now().UnixNano())
 		}
-		results := router.DispatchBatch(req, body.AgentIDs, "web-admin", r.RemoteAddr)
+		results := router.DispatchBatch(req, body.AgentIDs, authz.Operator(r.Header.Get("Authorization")), r.RemoteAddr)
 		writeJSON(w, map[string]interface{}{"ok": true, "results": results})
 	}
 }
@@ -682,6 +778,7 @@ func vncInstallHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
 		var body struct {
 			AgentID string `json:"agent_id"`
 			Port    int    `json:"port"`
+			Mode    string `json:"mode"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -691,8 +788,16 @@ func vncInstallHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
 			return
 		}
-		resp := mgr.Install(body.AgentID, body.Port)
-		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port, "password": resp.Password})
+		// 归一化安装模式：仅识别 service，其余按交互会话模式处理
+		mode := protocol.VncModeInteractive
+		if strings.EqualFold(strings.TrimSpace(body.Mode), protocol.VncModeService) {
+			mode = protocol.VncModeService
+		}
+		resp := mgr.Install(body.AgentID, body.Port, mode)
+		writeJSON(w, map[string]interface{}{
+			"ok": resp.OK, "msg": resp.Message, "port": resp.Port,
+			"password": resp.Password, "mode": resp.Mode,
+		})
 	}
 }
 
@@ -708,7 +813,7 @@ func vncStatusHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "尚未执行安装/启动"})
 			return
 		}
-		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port, "password": resp.Password})
+		writeJSON(w, map[string]interface{}{"ok": resp.OK, "msg": resp.Message, "port": resp.Port, "password": resp.Password, "mode": resp.Mode})
 	}
 }
 
@@ -732,24 +837,31 @@ func auditsHandler(router *route.Router, authz *auth.Auth) http.HandlerFunc {
 		}
 		offset, _ := strconv.Atoi(q.Get("offset"))
 		limit, _ := strconv.Atoi(q.Get("limit"))
-		logs := router.SearchAudits(route.AuditQuery{
+		query := route.AuditQuery{
 			Agent:    q.Get("agent"),
 			Operator: q.Get("operator"),
 			Command:  q.Get("cmd"),
+			Category: q.Get("category"),
 			Since:    since,
 			Until:    until,
 			Offset:   offset,
 			Limit:    limit,
-		})
-		// 脱敏：命令中的敏感字段掩码后返回
-		for _, l := range logs {
-			l.Command = route.MaskCommand(l.Command)
 		}
-		if q.Get("format") == "csv" {
-			writeAuditCSV(w, logs)
+		page, err := router.SearchAuditsPage(query)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, logs)
+		// 脱敏：命令中的敏感字段掩码后返回
+		for _, l := range page.Items {
+			l.Command = route.MaskCommand(l.Command)
+			l.Result = route.MaskCommand(l.Result)
+		}
+		if q.Get("format") == "csv" {
+			writeAuditCSV(w, page.Items)
+			return
+		}
+		writeJSON(w, page)
 	}
 }
 
@@ -758,11 +870,11 @@ func writeAuditCSV(w http.ResponseWriter, logs []*route.AuditLog) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="audits.csv"`)
 	cw := csv.NewWriter(w)
-	_ = cw.Write([]string{"time", "operator", "agent_id", "command", "result", "exit_code", "blocked", "block_reason", "duration_ms"})
+	_ = cw.Write([]string{"time", "operator", "agent_id", "command_id", "command", "result", "exit_code", "blocked", "block_reason", "duration_ms"})
 	for _, l := range logs {
 		_ = cw.Write([]string{
 			strconv.FormatInt(l.Time, 10),
-			l.Operator, l.AgentID, l.Command, l.Result,
+			l.Operator, l.AgentID, l.CommandID, l.Command, l.Result,
 			strconv.Itoa(l.ExitCode),
 			strconv.FormatBool(l.Blocked), l.BlockReason,
 			strconv.FormatInt(l.Duration, 10),
@@ -780,7 +892,7 @@ func portmapRulesHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc
 	}
 }
 
-func portmapOpHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc {
+func portmapOpHandler(pm *portmap.Manager, authz *auth.Auth, router *route.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
@@ -795,6 +907,14 @@ func portmapOpHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc {
 			return
 		}
 		handlePortMapOp(pm, nil, &op)
+		// 端口映射增删改属于关键运维操作，纳入操作审计留痕
+		if router != nil {
+			router.Audit(&route.AuditLog{
+				Time: time.Now().Unix(), Operator: authz.Operator(r.Header.Get("Authorization")), OperatorIP: operatorIPOf(r),
+				Command: fmt.Sprintf("端口映射 %s public:%d local:%d agent:%s", op.Action, op.PublicPort, op.LocalPort, op.AgentID),
+				Result:  "ok", Category: "op",
+			})
+		}
 		writeJSON(w, pm.Rules())
 	}
 }
@@ -844,7 +964,7 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 }
 
 // loginHandler 处理用户名+密码（+OTP 可选）登录，成功后颁发访问 Token。
-func loginHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+func loginHandler(um *auth.UserManager, authz *auth.Auth, router *route.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -863,12 +983,22 @@ func loginHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 			http.Error(w, "未配置可登录用户", http.StatusNotImplemented)
 			return
 		}
+		opIP := operatorIPOf(r)
 		if err := um.Authenticate(body.Username, body.Password, body.OTP); err != nil {
+			// 登录失败同样留痕，便于安全审计与暴力破解排查
+			router.Audit(&route.AuditLog{
+				Time: time.Now().Unix(), Operator: body.Username, OperatorIP: opIP,
+				Command: "登录失败", Result: err.Error(), ExitCode: -1, Category: "auth",
+			})
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 			return
 		}
 		tok := randHex(32)
-		authz.RegisterToken(tok)
+		authz.RegisterToken(tok, body.Username)
+		router.Audit(&route.AuditLog{
+			Time: time.Now().Unix(), Operator: body.Username, OperatorIP: opIP,
+			Command: "登录成功", Result: "ok", Category: "auth",
+		})
 		log.Printf("[auth] 用户 %s 登录成功", body.Username)
 		writeJSON(w, map[string]interface{}{"ok": true, "token": tok})
 	}
@@ -912,6 +1042,111 @@ func randHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// otpSetupHandler 生成一个新的 TOTP 密钥与 otpauth URI，
+// 供前端渲染二维码；此时尚未落盘，须经 /api/otp/enable 验证码校验通过后才绑定。
+func otpSetupHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		// 支持 GET（URL 参数）与 POST（JSON body）两种调用方式
+		username := r.URL.Query().Get("username")
+		if username == "" {
+			var body struct {
+				Username string `json:"username"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			username = body.Username
+		}
+		if username == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "请提供用户名"})
+			return
+		}
+		enabled, exists := um.TOTPStatus(username)
+		if !exists {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "用户不存在"})
+			return
+		}
+		secret, err := auth.GenerateTOTPSecret()
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "生成密钥失败: " + err.Error()})
+			return
+		}
+		uri := auth.TOTPUri("MoCenter", username, secret)
+		writeJSON(w, map[string]interface{}{
+			"ok":      true,
+			"secret":  secret,
+			"uri":     uri,
+			"enabled": enabled,
+		})
+	}
+}
+
+// otpEnableHandler 校验用户输入的动态验证码，正确后绑定 OTP 密钥。
+func otpEnableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Secret   string `json:"secret"`
+			Code     string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if body.Username == "" || body.Secret == "" || body.Code == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "用户名、密钥与验证码均不能为空"})
+			return
+		}
+		// 扫码绑定前先比对验证码是否正确
+		if !um.VerifyTOTP(body.Username, body.Secret, body.Code) {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "验证码不正确，请确认扫码后输入的是当前动态码"})
+			return
+		}
+		if err := um.BindTOTP(body.Username, body.Secret); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "绑定失败: " + err.Error()})
+			return
+		}
+		log.Printf("[auth] 用户 %s 已启用 OTP 动态验证码", body.Username)
+		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已启用"})
+	}
+}
+
+// otpDisableHandler 关闭 OTP（需校验密码，启用中还需当前验证码）。
+func otpDisableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			OTP      string `json:"otp"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := um.UnbindTOTP(body.Username, body.Password, body.OTP); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+			return
+		}
+		log.Printf("[auth] 用户 %s 已关闭 OTP 动态验证码", body.Username)
+		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已关闭"})
+	}
 }
 
 // guard 统一鉴权中间件。
@@ -962,7 +1197,7 @@ func serveSPA(mux *http.ServeMux, webDir string) {
 
 // handleWebMessage 处理 Web 前端通过 WebSocket 发来的消息。
 // 支持：命令下发、交互输入、端口映射操作。
-func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr) {
+func handleWebMessage(operator string, data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr) {
 	// WebSocket 消息中 data 为 JSON 对象，需用 RawMessage 解码（不同于 TCP 的 base64 []byte）
 	var raw struct {
 		Type string          `json:"type"`
@@ -980,7 +1215,7 @@ func handleWebMessage(data []byte, sess *session.Manager, store *probe.Store, ro
 		if err := json.Unmarshal(env.Data, &req); err != nil {
 			return
 		}
-		ok, msg := router.Dispatch(&req, "web-admin", "ws")
+		ok, msg := router.Dispatch(&req, operator, "ws")
 		if !ok {
 			hub.Broadcast(protocol.TypeCommandResp, protocol.CommandResp{
 				CommandID: req.CommandID, Status: 1, Stderr: msg,
@@ -1138,4 +1373,146 @@ func handlePortMapOp(pm *portmap.Manager, sess *session.Manager, op *protocol.Po
 			pm.DeleteRule(op.PublicPort)
 		}
 	}
+}
+
+// auditRetentionCleaner 定期清理超过留存期的审计日志。
+// 审计日志随运行时间持续增长，需按留存策略归档/清理，避免单表无界膨胀。
+func auditRetentionCleaner(db *storage.DB) {
+	const keepDays = 180
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		n, err := db.CleanupOldAuditLogs(keepDays)
+		if err != nil {
+			log.Printf("[server] 清理审计日志失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[server] 清理了 %d 条超出 %d 天留存期的审计日志", n, keepDays)
+		}
+	}
+}
+
+// probeHistoryCleaner 定期清理超过 30 天的探针历史数据。
+func probeHistoryCleaner(db *storage.DB) {
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		n, err := db.CleanupOldProbeHistory(30)
+		if err != nil {
+			log.Printf("[server] 清理探针历史失败: %v", err)
+		} else if n > 0 {
+			log.Printf("[server] 清理了 %d 条过期探针历史", n)
+		}
+	}
+}
+
+// --- 安装包托管与下发 ---
+
+// pkgFetchCmds 记录正在进行的安装包拉取 command_id。
+// 这些分片的 ACK 属于内部行为，不应作为「文件分发」广播给 Web。
+var pkgFetchCmds sync.Map
+
+// logAvailablePackages 启动时列出安装包目录中可下发的包，便于运维确认。
+func logAvailablePackages(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("[pkg] 读取安装包目录失败 %s: %v", dir, err)
+		return
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if fi, ferr := e.Info(); ferr == nil {
+			names = append(names, fmt.Sprintf("%s(%.1fMB)", e.Name(), float64(fi.Size())/1024/1024))
+		}
+	}
+	if len(names) == 0 {
+		log.Printf("[pkg] 安装包目录 %s 为空；如需让 Agent 从服务端取包（避免公网下载），把安装包放进去即可", dir)
+		return
+	}
+	log.Printf("[pkg] 安装包目录 %s 已托管: %s", dir, strings.Join(names, ", "))
+}
+
+// servePackage 将服务端托管的安装包以分片形式下发给 Agent。
+//
+// 分片复用 FilePushReq（Agent 侧已有成熟的落盘实现：建目录、追加写、Done 时关闭），
+// 全部分片发完后再回执 PackageFetchResp。Agent 顺序处理消息，因此它收到回执时
+// 分片必然已全部落盘，无需轮询文件大小。
+func servePackage(conn *session.Conn, pkgDir string, req *protocol.PackageFetchReq) {
+	// 防目录穿越：只取文件名，拒绝含路径分隔或上级引用的名称
+	name := filepath.Base(strings.TrimSpace(req.Name))
+	resp := protocol.PackageFetchResp{CommandID: req.CommandID, Name: name}
+	fail := func(msg string) {
+		resp.OK = false
+		resp.Message = msg
+		_ = conn.Write(protocol.TypePkgFetchResp, resp)
+		log.Printf("[pkg] 向 %s 下发 %s 失败: %s", conn.AgentID, name, msg)
+	}
+	if name == "" || name == "." || name == ".." || name == string(filepath.Separator) {
+		fail("未指定有效的安装包名称")
+		return
+	}
+	if req.DestPath == "" {
+		fail("未指定 Agent 端落盘路径")
+		return
+	}
+	path := filepath.Join(pkgDir, name)
+	fi, err := os.Stat(path)
+	if err != nil || fi.IsDir() {
+		fail("服务端未托管该安装包：" + name)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		fail("打开安装包失败: " + err.Error())
+		return
+	}
+	defer f.Close()
+
+	if req.CommandID != "" {
+		pkgFetchCmds.Store(req.CommandID, struct{}{})
+		defer pkgFetchCmds.Delete(req.CommandID)
+	}
+
+	total := fi.Size()
+	buf := make([]byte, protocol.DefaultChunkSize)
+	var seq int
+	var sent int64
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			sent += int64(n)
+			last := sent >= total
+			sum := md5.Sum(chunk)
+			if werr := conn.Write(protocol.TypeFilePushReq, &protocol.FilePushReq{
+				CommandID: req.CommandID,
+				FilePath:  req.DestPath,
+				FileSize:  total,
+				ChunkSeq:  seq,
+				ChunkData: chunk,
+				ChunkMD5:  fmt.Sprintf("%x", sum),
+				Done:      last,
+			}); werr != nil {
+				log.Printf("[pkg] 向 %s 下发 %s 中断: %v", conn.AgentID, name, werr)
+				return
+			}
+			seq++
+			if last {
+				break
+			}
+		}
+		if rerr != nil {
+			if rerr != io.EOF {
+				log.Printf("[pkg] 读取安装包 %s 失败: %v", name, rerr)
+			}
+			break
+		}
+	}
+	resp.OK = true
+	resp.Size = total
+	resp.Message = "安装包下发完成"
+	_ = conn.Write(protocol.TypePkgFetchResp, resp)
+	log.Printf("[pkg] 已向 %s 下发安装包 %s（%d 字节，%d 分片）", conn.AgentID, name, total, seq)
 }

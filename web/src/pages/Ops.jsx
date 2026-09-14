@@ -164,21 +164,23 @@ export default function Ops({ agents }) {
         {batchNotice && <div className={`notice ${batchNotice.includes('失败') ? 'err' : 'ok'}`} style={{ marginTop: 12 }}>{batchNotice}</div>}
         {batchResult && (
           <div style={{ marginTop: 16 }}>
-            <h4>下发结果</h4>
-            <table>
+            <h4 style={{ marginBottom: 10 }}>下发结果</h4>
+            <div className="table-scroll">
+            <table className="table-stack">
               <thead>
                 <tr><th>目标主机</th><th>下发状态</th><th>说明</th></tr>
               </thead>
               <tbody>
                 {batchResult.map((r) => (
                   <tr key={r.agent_id}>
-                    <td>{r.agent_id}</td>
-                    <td><span className={`badge ${r.ok ? 'online' : 'offline'}`}>{r.ok ? '已下发' : '失败'}</span></td>
-                    <td>{r.msg || '-'}</td>
+                    <td data-label="目标主机">{r.agent_id}</td>
+                    <td data-label="下发状态"><span className={`badge ${r.ok ? 'online' : 'offline'}`}>{r.ok ? '已下发' : '失败'}</span></td>
+                    <td data-label="说明">{r.msg || '-'}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
+            </div>
             <div className="sub" style={{ marginTop: 8 }}>执行结果将实时推送到「远程终端」页面对应主机，也可在「操作审计」查看。</div>
           </div>
         )}

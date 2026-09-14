@@ -44,6 +44,22 @@ func wmicValue(args ...string) string {
 	return ""
 }
 
+// powershellValue 通过 PowerShell 执行表达式并返回去空白后的结果。
+// 用于 wmic 不可用/被禁用（Win11 已默认移除 wmic）时的回退路径。
+func powershellValue(script string) string {
+	for _, exe := range []string{"powershell", "pwsh"} {
+		cmd := exec.Command(exe, "-NoProfile", "-NonInteractive", "-Command", script)
+		out, err := cmd.Output()
+		if err != nil {
+			continue
+		}
+		if v := strings.TrimSpace(strings.TrimPrefix(string(out), "\ufeff")); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // wmicFields 取 wmic 多列输出的首个数据行字段（跳过表头与空行）。
 func wmicFields(args ...string) []string {
 	out := wmicOut(args...)
@@ -56,6 +72,39 @@ func wmicFields(args ...string) []string {
 		}
 	}
 	return nil
+}
+
+// HardwareUUID 返回硬件 UUID。
+// 优先 wmic（csproduct get UUID）；wmic 缺失（Win11 默认已移除）或被禁用时，
+// 回退到 PowerShell CIM 查询 (Get-CimInstance Win32_ComputerSystemProduct).UUID。
+// 全部失败返回空字符串，调用方应回退到 hostname。
+func HardwareUUID() string {
+	if v := wmicValue("csproduct", "get", "UUID"); v != "" {
+		// wmic 在部分虚拟机上返回全 0 占位符，视为无效
+		if !isAllZeroUUID(v) {
+			return v
+		}
+	}
+	if v := powershellValue("(Get-CimInstance Win32_ComputerSystemProduct).UUID"); v != "" {
+		if !isAllZeroUUID(v) {
+			return v
+		}
+	}
+	return ""
+}
+
+// isAllZeroUUID 判断形如 00000000-0000-0000-0000-000000000000 的占位 UUID。
+func isAllZeroUUID(s string) bool {
+	t := strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(s), "-", ""), " ", "")
+	if t == "" {
+		return true
+	}
+	for _, r := range t {
+		if r != '0' {
+			return false
+		}
+	}
+	return true
 }
 
 // staticSysInfo 返回 Windows 版本描述、CPU 型号与主频。
