@@ -5,11 +5,29 @@ package probe
 
 import (
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
 )
+// HardwareUUID 返回硬件 UUID。
+// 优先读 /sys/class/dmi/id/product_uuid（需要 root 权限），
+// 失败时回退执行 dmidecode -s system-uuid。
+// 全部失败返回空字符串，调用方应回退到 hostname。
+func HardwareUUID() string {
+	if b, err := os.ReadFile("/sys/class/dmi/id/product_uuid"); err == nil {
+		if v := strings.TrimSpace(string(b)); v != "" {
+			return v
+		}
+	}
+	out, err := exec.Command("dmidecode", "-s", "system-uuid").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
 
+// staticSysInfo 返回操作系统版本描述、CPU 型号与主频。
 // staticSysInfo 返回操作系统版本描述、CPU 型号与主频。
 func staticSysInfo() (osVer, cpuModel string, cpuMHz float64) {
 	// 系统版本：/etc/os-release 的 PRETTY_NAME（如 "Rocky Linux 8.10 (Green Obsidian)"）

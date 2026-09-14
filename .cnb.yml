@@ -3,7 +3,7 @@
 
 # 公共构建步骤（YAML 锚点复用）
 .x-build-go: &x-build-go
-  image: golang:1.22
+  image: golang:1.25
   script: |
     echo "=== [server] 构建 mocenter-server ==="
     cd server && go mod download && go build -ldflags "-s -w" -o mocenter-server . && cd ..
@@ -17,7 +17,7 @@ main:
   push:
     - name: build-go
       docker:
-        image: golang:1.22
+        image: golang:1.25
       stages:
         - name: build-go
           script: |
@@ -35,7 +35,7 @@ main:
             echo "web build done -> dist/"
     - name: package-linux
       docker:
-        image: golang:1.22
+        image: golang:1.25
       stages:
         - name: package-agent
           script: |
@@ -58,7 +58,7 @@ $:
   pull_request:
     - name: pr-build
       docker:
-        image: golang:1.22
+        image: golang:1.25
       stages:
         - name: go-build
           script: |

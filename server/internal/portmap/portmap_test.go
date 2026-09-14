@@ -6,7 +6,7 @@ import (
 )
 
 func TestTrackAndCleanup(t *testing.T) {
-	m := NewManager(nil)
+	m := NewManager(nil, nil)
 	m.idleTimeout = time.Second
 
 	m.TrackConn(&Track{TunnelID: "t1", PublicPort: 8080, AgentID: "a1", LastActiveAt: time.Now().Add(-time.Hour)})
@@ -30,7 +30,7 @@ func TestTrackAndCleanup(t *testing.T) {
 }
 
 func TestRuleValidation(t *testing.T) {
-	m := NewManager(nil)
+	m := NewManager(nil, nil)
 	err := m.CreateRule(&Rule{PublicPort: 0, LocalPort: 80, AgentID: "a1"})
 	if err == nil {
 		t.Fatal("invalid public port should error")
@@ -42,7 +42,7 @@ func TestRuleValidation(t *testing.T) {
 }
 
 func TestByAgentIndex(t *testing.T) {
-	m := NewManager(nil)
+	m := NewManager(nil, nil)
 	m.TrackConn(&Track{TunnelID: "t1", AgentID: "a1"})
 	m.TrackConn(&Track{TunnelID: "t2", AgentID: "a1"})
 	m.TrackConn(&Track{TunnelID: "t3", AgentID: "a2"})

@@ -14,7 +14,8 @@ export default function Offline({ agents }) {
       </div>
 
       <div className="card">
-        <table>
+        <div className="table-scroll">
+        <table className="table-stack">
           <thead>
             <tr>
               <th>主机</th>
@@ -27,21 +28,22 @@ export default function Offline({ agents }) {
           <tbody>
             {(offline || []).map((a) => (
               <tr key={a.agent_id}>
-                <td>
-                  <b>{a.hostname}</b>
-                  <div style={{ color: '#8b98a5', fontSize: 12 }}>{a.agent_id}</div>
+                <td data-label="主机">
+                  <b>{a.remark || a.hostname}</b>
+                  <div style={{ color: '#8b98a5', fontSize: 12 }}>{a.hostname !== a.agent_id ? a.hostname + ' · ' : ''}{a.agent_id}</div>
                 </td>
-                <td>{a.os_type} / {a.arch}</td>
-                <td>{fmtTime(a.last_seen)}</td>
-                <td>{offlineDuration(a)}</td>
-                <td><span className="badge offline">离线</span></td>
+                <td data-label="系统/架构">{a.os_version || a.os_type} / {a.arch}</td>
+                <td data-label="最后上线">{fmtTime(a.last_seen)}</td>
+                <td data-label="离线时长">{offlineDuration(a)}</td>
+                <td data-label="状态"><span className="badge offline">离线</span></td>
               </tr>
             ))}
             {offline.length === 0 && (
-              <tr><td colSpan="5" style={{ textAlign: 'center', color: '#8b98a5' }}>当前没有离线主机</td></tr>
+              <tr><td colSpan="5" className="table-empty">当前没有离线主机</td></tr>
             )}
           </tbody>
         </table>
+        </div>
       </div>
     </div>
   )

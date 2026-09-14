@@ -1,4 +1,4 @@
-// VNC 口令混淆（存储用）：TightVNC/TigerVNC/RealVNC 共享同一份 DES-ECB 混淆。
+// VNC 口令混淆（存储用）：TightVNC/TigerVNC/UltraVNC/RealVNC 共享同一份 DES-ECB 混淆。
 //
 // 存储口令 = DES-ECB( 口令补齐到8字节, 固定密钥 0xe84ad660c4721ae0 )
 // （该固定密钥为 d3des 内部排列后的有效 DES 密钥，见 TigerVNC common/rfb/obfuscate.cxx）
@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 var vncStoreKey, _ = hex.DecodeString("e84ad660c4721ae0")
@@ -58,4 +59,28 @@ func writeVncPasswdFile(path, pw string) error {
 		return err
 	}
 	return nil
+}
+
+// privateProfileStructValue 生成 Win32 WritePrivateProfileStruct 写入 INI 的字符串值。
+//
+// 格式：大写 HEX(数据) 之后追加 2 位大写 HEX 校验和（数据所有字节之和 mod 256）。
+// 例：24 字节结构体 → 48 位 HEX + 2 位校验和 = 50 个字符。
+//
+// 为什么需要它：UltraVNC 用 GetPrivateProfileStruct 读取 ultravnc.ini 的 passwd，
+// 该 API 会重新计算校验和并与写入值比对，不一致即判定数据损坏、直接丢弃，
+// 表现为「口令写入成功但认证始终失败」。因此必须精确复现该编码，
+// 不能只写 16 位 HEX（那样校验和对不上）。
+func privateProfileStructValue(data []byte) string {
+	const hexDigits = "0123456789ABCDEF"
+	var sb strings.Builder
+	sb.Grow(len(data)*2 + 2)
+	var sum byte
+	for _, b := range data {
+		sb.WriteByte(hexDigits[b>>4])
+		sb.WriteByte(hexDigits[b&0x0f])
+		sum += b // 字节相加自动按 256 取模
+	}
+	sb.WriteByte(hexDigits[sum>>4])
+	sb.WriteByte(hexDigits[sum&0x0f])
+	return sb.String()
 }

@@ -3,12 +3,39 @@
 package command
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 )
+
+// hasMagic 判断文件是否以指定字节序列开头。
+func hasMagic(path string, magic []byte) bool {
+	if path == "" || len(magic) == 0 {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, len(magic))
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return false
+	}
+	return bytes.Equal(buf, magic)
+}
+
+// isPEExecutable 判断是否为 Windows PE 可执行文件（以 "MZ" 开头）。
+func isPEExecutable(path string) bool { return hasMagic(path, []byte("MZ")) }
+
+// isELFExecutable 判断是否为 Linux ELF 可执行文件（以 \x7fELF 开头）。
+func isELFExecutable(path string) bool {
+	return hasMagic(path, []byte{0x7f, 'E', 'L', 'F'})
+}
 
 // minVNCBps 下载速度阈值：平均速度低于该值视为慢速，切换备选加速源。
 const minVNCBps = 300 * 1024 // 300KB/s

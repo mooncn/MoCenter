@@ -12,9 +12,15 @@ func TestTokenValidation(t *testing.T) {
 	if a.ValidateToken("wrong") {
 		t.Fatal("wrong token should be rejected")
 	}
-	a.RegisterToken("tok1")
+	a.RegisterToken("tok1", "admin")
 	if !a.ValidateToken("tok1") {
 		t.Fatal("registered token should validate")
+	}
+	if op := a.OperatorOf("tok1"); op != "admin" {
+		t.Fatalf("expected operator admin, got %q", op)
+	}
+	if op := a.OperatorOf("secret"); op != "api-key" {
+		t.Fatalf("expected operator api-key, got %q", op)
 	}
 	a.RevokeToken("tok1")
 	if a.ValidateToken("tok1") {

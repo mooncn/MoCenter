@@ -112,7 +112,8 @@ export default function PortMap({ agents }) {
 
       <div className="card">
         <h3>映射规则列表</h3>
-        <table>
+        <div className="table-scroll">
+        <table className="table-stack">
           <thead>
             <tr>
               <th>规则 ID</th>
@@ -127,29 +128,32 @@ export default function PortMap({ agents }) {
           <tbody>
             {rules.map((r) => (
               <tr key={r.public_port || r.id}>
-                <td>{r.id || `rule-${r.public_port}`}</td>
-                <td>{r.agent_id}</td>
-                <td>{r.public_port}</td>
-                <td>{r.local_port}</td>
-                <td>{r.source_ip_whitelist || r.source_ip || '不限'}</td>
-                <td>
+                <td data-label="规则 ID">{r.id || `rule-${r.public_port}`}</td>
+                <td data-label="目标主机">{r.agent_id}</td>
+                <td data-label="公网端口">{r.public_port}</td>
+                <td data-label="内网端口">{r.local_port}</td>
+                <td data-label="源 IP 白名单">{r.source_ip_whitelist || r.source_ip || '不限'}</td>
+                <td data-label="状态">
                   <span className={`badge ${r.enabled ? 'online' : 'offline'}`}>
                     {r.enabled ? '已启用' : '已禁用'}
                   </span>
                 </td>
-                <td>
-                  <button className="secondary" onClick={() => toggleRule(r)} style={{ marginRight: 8 }}>
-                    {r.enabled ? '禁用' : '启用'}
-                  </button>
-                  <button className="secondary" onClick={() => removeRule(r)}>删除</button>
+                <td data-label="操作">
+                  <span style={{ display: 'inline-flex', gap: 8 }}>
+                    <button className="secondary btn-sm" onClick={() => toggleRule(r)}>
+                      {r.enabled ? '禁用' : '启用'}
+                    </button>
+                    <button className="secondary btn-sm danger" onClick={() => removeRule(r)}>删除</button>
+                  </span>
                 </td>
               </tr>
             ))}
             {!loading && rules.length === 0 && (
-              <tr><td colSpan="7" style={{ textAlign: 'center', color: '#8b98a5' }}>暂无映射规则</td></tr>
+              <tr><td colSpan="7" className="table-empty">暂无映射规则</td></tr>
             )}
           </tbody>
         </table>
+        </div>
       </div>
     </div>
   )
