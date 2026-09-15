@@ -138,3 +138,62 @@ func TestDedupOnMigration(t *testing.T) {
 		t.Fatalf("历史应迁移到 dup-b，实得 %d 条", len(h))
 	}
 }
+
+// TestUpdateAgentOnlineDoesNotTouchOtherDevices 安全回归：
+// UpdateAgentOnline 只应按 agent_id 精确匹配。
+//
+// 原实现把入参同时当作 uuid 匹配条件（`OR uuid = ?`），而 MarkOffline 传的是
+// agent_id。当某个 agent_id 恰好等于另一台设备的 UUID 时（旧版 Agent 默认把
+// 硬件 UUID 当 agent_id，很常见），会把**别的机器**一并标离线，且它的
+// last_seen 被写成当前时间，前端展示出荒谬的"离线时长"。
+func TestUpdateAgentOnlineDoesNotTouchOtherDevices(t *testing.T) {
+	db := openTestDB(t)
+
+	// 设备 A：agent_id 恰好是设备 B 的 UUID（旧版 Agent 的典型取值）
+	if err := db.UpsertAgent(&AgentRow{AgentID: "UUID-B", UUID: "UUID-A", Hostname: "a", Online: true, LastSeen: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertAgent(&AgentRow{AgentID: "host-b", UUID: "UUID-B", Hostname: "b", Online: true, LastSeen: 2000}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.UpdateAgentOnline("UUID-B", false, 3000); err != nil {
+		t.Fatalf("更新离线状态失败: %v", err)
+	}
+
+	a, err := db.LoadAgent("UUID-B")
+	if err != nil || a == nil {
+		t.Fatalf("读取设备 A 失败: %v", err)
+	}
+	if a.Online {
+		t.Fatal("设备 A 应被标记离线")
+	}
+	b, err := db.LoadAgent("host-b")
+	if err != nil || b == nil {
+		t.Fatalf("读取设备 B 失败: %v", err)
+	}
+	if !b.Online {
+		t.Fatal("设备 B 是另一台机器，不应被连带标记离线")
+	}
+	if b.LastSeen != 2000 {
+		t.Fatalf("设备 B 的 last_seen 不应被改写，实得 %d", b.LastSeen)
+	}
+}
+
+// TestDedupLeavesSingleUUIDlessRows 回归：UUID 为空的行无法判定是否同机，
+// 迁移去重必须保持原样，否则会把不同机器的历史/备注合并。
+func TestDedupLeavesSingleUUIDlessRows(t *testing.T) {
+	db := openTestDB(t)
+	for _, id := range []string{"legacy-1", "legacy-2"} {
+		if err := db.UpsertAgent(&AgentRow{AgentID: id, UUID: "", Hostname: id, LastSeen: 100}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := db.LoadAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("无 UUID 的行不应被合并，实得 %d 条", len(rows))
+	}
+}

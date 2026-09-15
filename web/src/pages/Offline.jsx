@@ -2,7 +2,12 @@ import React from 'react'
 
 // 离线机器列表：记录历史注册过的主机，展示最后上线时间与离线时长
 export default function Offline({ agents }) {
-  const offline = (agents || []).filter((a) => !a.online)
+  // 按最后上线时间倒序：服务端返回顺序不保证稳定，直接渲染会让列表在每次
+  // 主机上报（ws 推送）后跳动，运维很难点中目标行。
+  const offline = (agents || [])
+    .filter((a) => !a.online)
+    .slice()
+    .sort((x, y) => (y.last_seen || 0) - (x.last_seen || 0))
 
   return (
     <div>
@@ -27,7 +32,7 @@ export default function Offline({ agents }) {
           </thead>
           <tbody>
             {(offline || []).map((a) => (
-              <tr key={a.agent_id}>
+              <tr key={a.uuid || a.agent_id}>
                 <td data-label="主机">
                   <b>{a.remark || a.hostname}</b>
                   <div style={{ color: '#8b98a5', fontSize: 12 }}>{a.hostname !== a.agent_id ? a.hostname + ' · ' : ''}{a.agent_id}</div>
@@ -62,11 +67,22 @@ function fmtTime(ts) {
   return new Date(ts * 1000).toLocaleString()
 }
 
+// 离线时长：从"最后上线"到"离线时刻"。
+//
+// 注意 last_offline_at 可能缺失或早于 last_seen（旧库数据、标离线时被覆盖），
+// 此时回退到 last_seen，不能直接用 now 兜底 —— 否则"最后上线=昨天"会显示成
+// "离线 1 天"而不是"离线 0 秒"，与列表里的时间自相矛盾。
 function offlineDuration(a) {
-  const end = a.last_offline_at || Date.now() / 1000
-  const diff = Math.max(0, end - (a.last_seen || 0))
-  const s = Math.floor(diff)
-  if (s < 60) return `${s}秒`
+  const start = a.last_seen || 0
+  if (!start) return '-'
+  let end = a.last_offline_at || start
+  if (end < start) end = start
+  return fmtDuration(Math.max(0, end - start))
+}
+
+// 秒 -> 可读时长
+function fmtDuration(s) {
+  if (s < 60) return `${Math.floor(s)}秒`
   if (s < 3600) return `${Math.floor(s / 60)}分`
   if (s < 86400) return `${Math.floor(s / 3600)}时`
   return `${Math.floor(s / 86400)}天`

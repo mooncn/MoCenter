@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -59,6 +60,7 @@ func TestUUIDPreservedOnReconnect(t *testing.T) {
 		t.Fatalf("探针应补齐 UUID，实得 %q", got)
 	}
 }
+
 // TestHistoryDownsampledMemory 验证内存回退路径下按 maxPoints 抽稀，
 // 避免长时间跨度返回全量采样点。
 func TestHistoryDownsampledMemory(t *testing.T) {
@@ -156,10 +158,14 @@ func TestDifferentUUIDKeepsSeparateDevices(t *testing.T) {
 // 时，设备记录被迁移到 UUID 主键下而不是新增一条。
 func TestProbeUUIDBackfillAndRename(t *testing.T) {
 	s := NewStore(nil)
-	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", Online: true})
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", Hostname: "host-a", Online: true})
 	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "a1", Timestamp: time.Now().Unix(), CPUUsage: 5})
-	// 同一台机器改名并补齐 UUID 后重新注册（真实时序：注册先于探针）
-	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a2", UUID: "UUID-X", Online: true})
+	// 同一台机器改名为 a2 并补齐 UUID 后重新注册（真实时序：注册先于探针）。
+	//
+	// 改名同时补齐 UUID 时只能靠**主机名**识别旧记录，因此这里模拟真实环境
+	// （主机名一致）—— 主机名与 agent_id 都对不上时不做认领，见
+	// TestNoBlindHostnameAdoption：宁可多留一条旧记录，也不能把别的机器合并进来。
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a2", UUID: "UUID-X", Hostname: "host-a", Online: true})
 	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "a2", UUID: "UUID-X", Timestamp: time.Now().Unix() + 1, CPUUsage: 6})
 	if got := len(s.All()); got != 1 {
 		t.Fatalf("补齐 UUID 后应仍只有一条记录，实得 %d", got)
@@ -177,5 +183,154 @@ func TestMarkOfflineByOldAlias(t *testing.T) {
 	s.MarkOffline("old")
 	if s.Get("new").Online {
 		t.Fatal("按旧 agent_id 标离线，同一设备也应变离线")
+	}
+}
+
+// TestProbeCannotRewriteDeviceUUID 安全回归：探针报文里的 uuid 不可信。
+//
+// 报文里的 agent_id 已由连接身份校验，但 uuid 仍是 Agent 自报字段。
+// 若据此把设备迁移到别的 UUID，已鉴权的 Agent 就能把指标写进他人设备记录、
+// 或凭空造出一台"新设备"（非预期资产）。这里断言自报值只用于**首次补齐**。
+func TestProbeCannotRewriteDeviceUUID(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", UUID: "UUID-OWN", Hostname: "h1", Online: true})
+
+	// 连接到 a1，却申报了别人的 UUID
+	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "a1", UUID: "UUID-VICTIM", Timestamp: 1, CPUUsage: 42})
+
+	if got := len(s.All()); got != 1 {
+		t.Fatalf("自报 UUID 不应造出新设备，实得 %d 台", got)
+	}
+	if a := s.GetByUUID("UUID-VICTIM"); a != nil {
+		t.Fatalf("不应存在 UUID-VICTIM 的设备，实得 %+v", a)
+	}
+	if a := s.Get("a1"); a == nil || a.UUID != "UUID-OWN" {
+		t.Fatalf("设备 UUID 不应被报文改写，实得 %+v", a)
+	}
+	if a := s.Get("a1"); a.CPUUsage != 42 {
+		t.Fatalf("指标仍应按连接身份落到自己的设备，实得 %v", a.CPUUsage)
+	}
+}
+
+// TestProbeBackfillsUUIDOnlyWhenAbsent 旧版 Agent：设备还没有 UUID 时才用自报值补齐。
+func TestProbeBackfillsUUIDOnlyWhenAbsent(t *testing.T) {
+	s := NewStore(nil)
+	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "legacy", UUID: "UUID-L", Timestamp: 1, CPUUsage: 1})
+	if len(s.All()) != 1 {
+		t.Fatalf("应只有一台设备，实得 %d", len(s.All()))
+	}
+	if a := s.Get("legacy"); a == nil || a.UUID != "UUID-L" {
+		t.Fatalf("无 UUID 设备应被补齐，实得 %+v", a)
+	}
+}
+
+// TestNoBlindHostnameAdoption 回归：不能因"全库只有一条无 UUID 记录"就把它
+// 认领给任意首次上报 UUID 的机器 —— 多机环境会因此合并不同主机的历史/备注/端口映射。
+func TestNoBlindHostnameAdoption(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "legacy-1", Hostname: "host-legacy", Online: true})
+
+	// 另一台机器（主机名不同）首次上报 UUID
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "other", UUID: "UUID-OTHER", Hostname: "host-other", Online: true})
+
+	if got := len(s.All()); got != 2 {
+		t.Fatalf("主机名不同不应被误合并，实得 %d 台", got)
+	}
+	if a := s.Get("legacy-1"); a == nil || a.UUID != "" {
+		t.Fatalf("旧记录不应被改写，实得 %+v", a)
+	}
+}
+
+// TestAdoptByAgentIDWhenUUIDAppears 主机名缺失时，按 agent_id 认领同一条旧记录。
+func TestAdoptByAgentIDWhenUUIDAppears(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "n1", Online: true})
+	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "n1", Timestamp: 1, CPUUsage: 7})
+
+	// 同一 agent_id 补上 UUID 重新注册
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "n1", UUID: "UUID-N1", Online: true})
+
+	if got := len(s.All()); got != 1 {
+		t.Fatalf("同 agent_id 补齐 UUID 后应只有一条记录，实得 %d", got)
+	}
+	if a := s.Get("n1"); a == nil || a.UUID != "UUID-N1" {
+		t.Fatalf("应迁移到 UUID 主键并保留指标，实得 %+v", a)
+	}
+	if h := len(s.History("n1", time.Unix(0, 0))); h != 1 {
+		t.Fatalf("历史不应因迁移丢失，实得 %d 条", h)
+	}
+}
+
+// TestRenameAbortsWhenRemarkMigrationFails 回归：备注迁移失败时不应改名。
+//
+// 备注按 agent_id 存储。若先改名再迁备注，迁移失败就会留下"新 ID 有记录、
+// 备注仍在旧 ID"的状态 —— 用户看到的正是备注莫名消失，且无人察觉。
+func TestRenameAbortsWhenRemarkMigrationFails(t *testing.T) {
+	s := NewStore(nil)
+	s.SetRemarkRenameFn(func(oldID, newID string) error {
+		return errors.New("disk full")
+	})
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "old", UUID: "UUID-R", Hostname: "h", Online: true})
+	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "old", Timestamp: 1, CPUUsage: 5})
+
+	// 同一设备改名为 new：备注迁移失败，改名应被放弃
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "new", UUID: "UUID-R", Hostname: "h", Online: true})
+
+	if got := len(s.All()); got != 1 {
+		t.Fatalf("失败时仍应只有一台设备，实得 %d", got)
+	}
+	if a := s.Get("old"); a == nil || a.AgentID != "old" {
+		t.Fatalf("改名失败后应保持旧 agent_id 可用，实得 %+v", a)
+	}
+	if a := s.Get("new"); a != nil && a.AgentID == "new" {
+		t.Fatalf("改名失败后不应把记录改成 new，实得 %+v", a)
+	}
+	// 设备指标与历史不能丢
+	if a := s.Get("old"); a == nil || a.CPUUsage != 5 {
+		t.Fatalf("指标不应丢失，实得 %+v", a)
+	}
+	if h := len(s.History("old", time.Unix(0, 0))); h != 1 {
+		t.Fatalf("历史不应丢失，实得 %d 条", h)
+	}
+}
+
+// TestMarkOfflineIsIdempotent 回归：重复标离线不应刷新离线时刻。
+//
+// 连接超时清扫（Tick）与断开回调会先后调用 MarkOffline。若每次都刷新
+// LastOfflineAt，"离线时长"会不断从 0 重算，历史离线时间线被抹掉。
+func TestMarkOfflineIsIdempotent(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", UUID: "UUID-I", Online: true})
+
+	s.MarkOffline("a1")
+	first := s.Get("a1").LastOfflineAt
+	time.Sleep(1100 * time.Millisecond)
+	s.MarkOffline("a1")
+
+	if got := s.Get("a1").LastOfflineAt; got != first {
+		t.Fatalf("重复标离线不应改写离线时刻（首次 %d，再次 %d）", first, got)
+	}
+	if s.Get("a1").Online {
+		t.Fatal("设备应处于离线状态")
+	}
+}
+
+// TestMarkOfflineByAliasUsesCurrentAgentID 回归：按旧别名标离线时，
+// 设备记录的 agent_id 应保持为当前值（落库要用它，否则离线状态写不进库）。
+func TestMarkOfflineByAliasUsesCurrentAgentID(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "old", UUID: "UUID-M", Online: true})
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "new", UUID: "UUID-M", Online: true})
+
+	s.MarkOffline("old")
+	a := s.Get("new")
+	if a == nil {
+		t.Fatal("改名后应能按新 agent_id 查到设备")
+	}
+	if a.AgentID != "new" {
+		t.Fatalf("设备记录应保留当前 agent_id，实得 %q", a.AgentID)
+	}
+	if a.Online {
+		t.Fatal("按旧别名标离线，同一设备应变离线")
 	}
 }

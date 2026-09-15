@@ -15,6 +15,7 @@
 package probe
 
 import (
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -149,6 +150,21 @@ func (s *Store) SetRemarkFn(fn func(string) string) { s.remarkFn = fn }
 // SetRemarkRenameFn 注入备注迁移函数（agent_id 变更时把备注带到新 ID）。
 func (s *Store) SetRemarkRenameFn(fn func(oldID, newID string) error) { s.remarkRenameFn = fn }
 
+// renameRemark 迁移备注归属。备注是用户输入的唯一副本，迁移失败必须可见，
+// 不能只写日志就继续（否则备注永久丢失且无人知晓）。
+//
+// 调用方须持有锁；本方法本身不获取锁（remarkRenameFn 由 remark.Store 内部加锁）。
+func (s *Store) renameRemark(oldID, newID string) error {
+	fn := s.remarkRenameFn
+	if fn == nil || oldID == "" || newID == "" || oldID == newID {
+		return nil
+	}
+	if err := fn(oldID, newID); err != nil {
+		return fmt.Errorf("迁移备注 %s -> %s: %w", oldID, newID, err)
+	}
+	return nil
+}
+
 // SetGeoResolver 注入地理位置解析器。
 func (s *Store) SetGeoResolver(r *geo.Resolver) { s.geoResolver = r }
 
@@ -236,14 +252,31 @@ func (s *Store) UpsertAgent(info *protocol.AgentInfo) {
 		}
 	}
 
-	// agent_id 变更（同一台机器改了配置）时，把旧 agent_id 对应的内存历史
-	// 一并归到当前设备键下，保证趋势图不断档。
+	// agent_id 变更（同一台机器改了配置）：先迁移备注，**成功后再落内存**。
+	//
+	// 备注是用户输入的唯一副本，按 agent_id 存储。顺序很关键：
+	// 若先改内存/落库再迁备注，而迁移失败（磁盘满、权限、文件损坏），
+	// 库里已经存在新 agent_id 的记录，备注却还挂在旧 ID 上 —— 现象正是
+	// 本 PR 要修的"备注莫名消失"，且从此无人知晓。
+	// 因此这里改为「迁移失败 → 放弃本次改名」，保持旧 agent_id 可用，
+	// 让运维能从日志里的错误中恢复。
 	renamedFrom := ""
 	if exists && old != nil && old.AgentID != "" && old.AgentID != info.AgentID {
 		renamedFrom = old.AgentID
-		if h, ok := s.history[renamedFrom]; ok && renamedFrom != key {
-			s.history[key] = append(s.history[key], h...)
-			delete(s.history, renamedFrom)
+	}
+	if renamedFrom != "" {
+		if err := s.renameRemark(renamedFrom, info.AgentID); err != nil {
+			s.mu.Unlock()
+			log.Printf("[probe] 设备 %s 的 agent_id 改名 %s -> %s 失败，本次改名已放弃（备注未迁移）: %v",
+				displayDevice(info), renamedFrom, info.AgentID, err)
+			return
+		}
+		// 备注已迁移，再把旧 agent_id 的历史归到当前设备键下，保证趋势图不断档
+		if renamedFrom != key {
+			if h, ok := s.history[renamedFrom]; ok {
+				s.history[key] = append(s.history[key], h...)
+				delete(s.history, renamedFrom)
+			}
 		}
 	}
 
@@ -255,21 +288,19 @@ func (s *Store) UpsertAgent(info *protocol.AgentInfo) {
 	}
 	s.mu.Unlock()
 
-	// agent_id 变更时同步迁移备注（备注按 agent_id 存储，不迁移会丢失）
-	if renamedFrom != "" && s.remarkRenameFn != nil {
-		if err := s.remarkRenameFn(renamedFrom, info.AgentID); err != nil {
-			log.Printf("[probe] 迁移主机备注 (%s -> %s) 失败: %v", renamedFrom, info.AgentID, err)
-		}
-	}
-
 	// 异步写入 SQLite
 	if s.db != nil {
 		go func() {
 			// agent_id 变更：先把库里旧行的 agent_id 与历史采样改归属，再落新值，
 			// 否则会留下一条"孤儿主机"（数据冗余）。
+			//
+			// 迁移失败时直接返回，不再写新记录：否则库里会同时存在旧行（历史/端口映射
+			// 仍在它名下）与新行，下次加载按 UUID 归并时才补救，期间用户看到两台机器。
 			if renamedFrom != "" {
 				if err := s.db.UpdateAgentIdentity(renamedFrom, info.AgentID, info.UUID); err != nil {
-					log.Printf("[probe] 迁移主机身份 (%s -> %s) 失败: %v", renamedFrom, info.AgentID, err)
+					log.Printf("[probe] 迁移主机身份 (%s -> %s) 失败，跳过本次落库以免产生孤儿记录: %v",
+						renamedFrom, info.AgentID, err)
+					return
 				}
 			}
 			s.persistAgent(info)
@@ -280,26 +311,35 @@ func (s *Store) UpsertAgent(info *protocol.AgentInfo) {
 // findUUIDLessByHostLocked 查找可被「首次上报 UUID」的设备认领的无 UUID 旧记录。
 //
 // 规则（从严到宽，避免误合并不同机器）：
-//  1. 主机名完全一致的无 UUID 记录；
-//  2. 仅当全局只有一条无 UUID 记录时才认领（典型场景：单机从旧版升级）。
+//  1. 主机名与 agent_id 都一致的无 UUID 记录 —— 强匹配，直接认领；
+//  2. 主机名一致（且该主机名下只有一条候选）的无 UUID 记录 —— 弱匹配；
+//  3. 其它情况一律**不认领**：宁可为旧记录多留一行，也不能把 A 机的历史、
+//     备注与端口映射合并到 B 机上（那是不可逆的数据损坏）。
 //
+// 注意：这里**不再**使用"全库只有一条无 UUID 记录就认领"的兜底规则 ——
+// 多机环境中只要有任意一台机器先上报 UUID，就会误吞另一台机器的记录。
 // 调用方须持有锁。
 func (s *Store) findUUIDLessByHostLocked(info *protocol.AgentInfo) (*protocol.AgentInfo, string) {
-	var onlyOne *protocol.AgentInfo
-	var onlyKey string
-	count := 0
+	if info.Hostname == "" && info.AgentID == "" {
+		return nil, ""
+	}
+	var hostMatch *protocol.AgentInfo
+	var hostKey string
+	hostMatches := 0
 	for k, d := range s.devices {
 		if d == nil || d.UUID != "" || !strings.HasPrefix(k, "aid:") {
 			continue
 		}
-		count++
-		onlyOne, onlyKey = d, k
+		if info.AgentID != "" && d.AgentID == info.AgentID {
+			return d, k // 规则 1：agent_id 相同（旧版记录本来就按 agent_id 建键）
+		}
 		if info.Hostname != "" && d.Hostname == info.Hostname {
-			return d, k
+			hostMatches++
+			hostMatch, hostKey = d, k
 		}
 	}
-	if count == 1 {
-		return onlyOne, onlyKey
+	if hostMatches == 1 {
+		return hostMatch, hostKey // 规则 2：主机名唯一匹配
 	}
 	return nil, ""
 }
@@ -361,24 +401,32 @@ func (s *Store) mergeDeviceLocked(from, to string) {
 }
 
 // UpdateProbe 更新探针指标并追加历史采样。
+//
+// 安全约束（重要）：**不采纳报文里的 uuid**。
+// 调用方（server.handleAgentConn）已确保 agent_id 来自连接身份，但 uuid 仍是
+// Agent 自报字段 —— 若据此 relocate，任何一条已通过注册的连接都能凭空声明别人的
+// UUID，把指标写进别人的设备记录、乃至在服务端造出"新设备"（对应 #5 指出的
+// 非预期资产增加）。设备身份只能来自已完成注册鉴权的信息，因此这里只做**补齐**：
+// 仅当该设备此前没有 UUID 时才写入（旧版 Agent 首次上报的情形）。
 func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
-	p.UUID = normalizeUUID(p.UUID)
+	claimedUUID := normalizeUUID(p.UUID)
 
 	s.mu.Lock()
-	// 以连接身份（agent_id）解析到设备；UUID 上报时按 UUID 重新归位
-	key := s.relocateByUUIDLocked(p.AgentID, p.UUID)
+	// 以连接身份（agent_id）解析到设备
+	key := s.resolveLocked(p.AgentID)
 	a, ok := s.devices[key]
 	if !ok {
 		// 探针先于注册到达（或设备信息被清理）：先建一条最小记录，
 		// 避免指标无处落库、后续注册时又新建一条（数据冗余）。
-		a = &protocol.AgentInfo{AgentID: p.AgentID, UUID: p.UUID}
+		a = &protocol.AgentInfo{AgentID: p.AgentID}
 		s.devices[key] = a
 		s.byAgent[p.AgentID] = key
 	}
 	if a != nil {
-		// 探针携带硬件 UUID 时补齐/更新（兼容旧版 Agent 未上报的情形）
-		if p.UUID != "" {
-			a.UUID = p.UUID
+		// 仅在该设备还没有身份 UUID 时用自报值补齐（兼容旧版 Agent 未上报的情形）；
+		// 已有 UUID 时忽略报文值，防止自报竞态改写可信身份。
+		if claimedUUID != "" && a.UUID == "" {
+			a.UUID = claimedUUID
 		}
 		a.CPUUsage = p.CPUUsage
 		a.MemUsage = p.MemUsage
@@ -446,19 +494,38 @@ func (s *Store) deviceAgentIDLocked(key, fallback string) string {
 }
 
 // MarkOffline 将 Agent 标记为离线。
+//
+// 幂等：设备已经离线时**不刷新** LastOfflineAt —— 否则重复调用（连接超时清扫
+// 与断开回调竞态）会把离线时刻不断后推，"离线时长"从 0 开始重算，
+// 历史离线时间线被抹掉。
 func (s *Store) MarkOffline(agentID string) {
+	now := time.Now().Unix()
 	s.mu.Lock()
 	key := s.resolveLocked(agentID)
-	if a, ok := s.devices[key]; ok {
+	a, ok := s.devices[key]
+	currentID := agentID
+	if ok && a != nil {
+		currentID = a.AgentID
+		if !a.Online && a.LastOfflineAt > 0 {
+			// 已离线：保持原离线时刻，只确保状态为离线
+			s.mu.Unlock()
+			return
+		}
 		a.Online = false
-		a.LastOfflineAt = time.Now().Unix()
+		a.LastOfflineAt = now
 	}
 	s.mu.Unlock()
+	if !ok || a == nil {
+		return
+	}
 
-	// 异步更新 SQLite 中的离线状态
+	// 异步更新 SQLite 中的离线状态。注意用**设备当前的 agent_id**：
+	// 传调用方传入的（可能是旧别名）会匹配不到行，离线状态永远落不了库，
+	// 重启后又变成"在线"，前端出现僵尸在线主机。
+	dbID := currentID
 	if s.db != nil {
 		go func() {
-			if err := s.db.UpdateAgentOnline(agentID, false, time.Now().Unix()); err != nil {
+			if err := s.db.UpdateAgentOnline(dbID, false, now); err != nil {
 				log.Printf("[probe] 更新主机离线状态到数据库失败: %v", err)
 			}
 		}()
@@ -587,22 +654,22 @@ func (s *Store) History(agentID string, since time.Time) []*protocol.ProbeDataRe
 			out := make([]*protocol.ProbeDataReq, 0, len(rows))
 			for _, r := range rows {
 				out = append(out, &protocol.ProbeDataReq{
-					AgentID:       r.AgentID,
-					Timestamp:     r.Timestamp,
-					CPUUsage:      r.CPUUsage,
-					MemUsage:      r.MemUsage,
-					DiskUsage:     r.DiskUsage,
-					NetInBytes:    r.NetInBytes,
-					NetOutBytes:   r.NetOutBytes,
-					OSType:        r.OSType,
-					KernelVersion: r.KernelVersion,
-					Uptime:        r.Uptime,
-					PublicIP:      r.PublicIP,
-					OSVersion:     r.OSVersion,
-					CPUModel:      r.CPUModel,
-					CPUMHz:        r.CPUMHz,
-					MemTotalBytes: r.MemTotal,
-					MemUsedBytes:  r.MemUsed,
+					AgentID:        r.AgentID,
+					Timestamp:      r.Timestamp,
+					CPUUsage:       r.CPUUsage,
+					MemUsage:       r.MemUsage,
+					DiskUsage:      r.DiskUsage,
+					NetInBytes:     r.NetInBytes,
+					NetOutBytes:    r.NetOutBytes,
+					OSType:         r.OSType,
+					KernelVersion:  r.KernelVersion,
+					Uptime:         r.Uptime,
+					PublicIP:       r.PublicIP,
+					OSVersion:      r.OSVersion,
+					CPUModel:       r.CPUModel,
+					CPUMHz:         r.CPUMHz,
+					MemTotalBytes:  r.MemTotal,
+					MemUsedBytes:   r.MemUsed,
 					DiskTotalBytes: r.DiskTotal,
 					DiskUsedBytes:  r.DiskUsed,
 				})

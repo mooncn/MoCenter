@@ -547,16 +547,22 @@ func (db *DB) LoadAgents() ([]*AgentRow, error) {
 
 // UpdateAgentOnline 更新主机在线状态与时间戳。
 //
-// 设备以 UUID 为唯一身份，agent_id 只是别名：这里同时匹配 agent_id 与 uuid，
-// 确保 Agent 改名后离线状态仍能落到同一台机器上（不产生"僵尸在线"记录）。
+// 只按 agent_id 精确定位设备记录：调用方传入的身份来自**连接身份**（已通过注册鉴权），
+// 而 uuid 是 Agent 自报字段。
+//
+// 历史实现把参数同时当作 uuid 匹配条件（`OR uuid = ?`），而 MarkOffline 传的是
+// agent_id。这会让 agent_id 恰好等于某个设备 UUID 时（例如默认把硬件 UUID 当
+// agent_id 的旧版 Agent）把**别的机器**一起标记为离线，且 last_seen 被写坏，
+// 表现为正确的机器"离线时长"数值荒谬。设备按 UUID 归并后，agent_id 在 agents
+// 表中是唯一的，单键匹配已足够，不再需要 uuid 兜底。
 func (db *DB) UpdateAgentOnline(agentID string, online bool, lastSeen int64) error {
 	v := 0
 	if online {
 		v = 1
 	}
 	_, err := db.Exec(`UPDATE agents SET online = ?, last_seen = ?, updated_at = ?
-		WHERE agent_id = ? OR (agent_id <> ? AND uuid <> '' AND uuid = ?)`,
-		v, lastSeen, time.Now().Unix(), agentID, agentID, strings.ToUpper(strings.TrimSpace(agentID)))
+		WHERE agent_id = ?`,
+		v, lastSeen, time.Now().Unix(), agentID)
 	if err != nil {
 		return fmt.Errorf("更新主机在线状态失败: %w", err)
 	}

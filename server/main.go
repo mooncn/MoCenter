@@ -174,21 +174,21 @@ func main() {
 		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 		// flag 名 -> (配置字段指针, 命令行变量值)
 		field := map[string]func(){
-			"listen":    func() { cfg.Listen = *addr },
-			"http":      func() { cfg.HTTP = *httpAddr },
-			"whitelist": func() { cfg.Whitelist = *whitelist },
-			"web":       func() { cfg.WebDir = *webDir },
+			"listen":       func() { cfg.Listen = *addr },
+			"http":         func() { cfg.HTTP = *httpAddr },
+			"whitelist":    func() { cfg.Whitelist = *whitelist },
+			"web":          func() { cfg.WebDir = *webDir },
 			"web-tls-cert": func() { cfg.WebTLSCert = *webTLSCert },
 			"web-tls-key":  func() { cfg.WebTLSKey = *webTLSKey },
-			"tls-cert":  func() { cfg.TLSCert = *tlsCert },
-			"tls-key":   func() { cfg.TLSKey = *tlsKey },
-			"ca-cert":   func() { cfg.CACert = *caCert },
-			"insecure":  func() { cfg.Insecure = *insecure },
-			"data":      func() { cfg.DataDir = *dataDir },
-			"user":      func() { cfg.User = *user },
-			"pkg-dir":   func() { cfg.PkgDir = *pkgDir },
-			"agent-key": func() { cfg.AgentKey = *agentKey },
-			"token-ttl": func() { cfg.TokenTTL = tokenTTL.String() },
+			"tls-cert":     func() { cfg.TLSCert = *tlsCert },
+			"tls-key":      func() { cfg.TLSKey = *tlsKey },
+			"ca-cert":      func() { cfg.CACert = *caCert },
+			"insecure":     func() { cfg.Insecure = *insecure },
+			"data":         func() { cfg.DataDir = *dataDir },
+			"user":         func() { cfg.User = *user },
+			"pkg-dir":      func() { cfg.PkgDir = *pkgDir },
+			"agent-key":    func() { cfg.AgentKey = *agentKey },
+			"token-ttl":    func() { cfg.TokenTTL = tokenTTL.String() },
 		}
 		dirty := false
 		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "pkg-dir", "agent-key", "token-ttl"} {
@@ -446,7 +446,7 @@ func main() {
 			}
 			log.Printf("[server] REST API / Web 控制台监听 %s（**明文 HTTP**）", *httpAddr)
 			if !isLoopbackAddr(*httpAddr) {
-				log.Printf("[server] 警告: Web 控制台未启用 TLS，登录口令与 Token 将明文传输。"+
+				log.Printf("[server] 警告: Web 控制台未启用 TLS，登录口令与 Token 将明文传输。" +
 					"请配置 -web-tls-cert/-web-tls-key，或确保服务只通过 TLS 反向代理对外提供")
 			}
 			srv := &http.Server{
@@ -539,10 +539,14 @@ const serverServiceName = "MoCenterServer"
 // 报文里的 AgentID 一律不可信 —— 攻击者可用它冒充别的主机上报假探针、
 // 甚至把文件写到服务端任意路径。身份只能来自注册成功的那条连接。
 func connOwns(c *session.Conn, claimed string) bool {
-	if c == nil || c.AgentID == "" || claimed == "" {
+	if c == nil || claimed == "" {
 		return false
 	}
-	return claimed == c.AgentID
+	id := c.GetAgentID()
+	if id == "" {
+		return false
+	}
+	return claimed == id
 }
 
 // uuidSuffix 返回日志里用于标识设备的 UUID 后缀（无 UUID 时为空串）。
@@ -617,8 +621,8 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			log.Printf("[server] 拒绝 Agent %q 注册: 服务端未配置注册密钥", info.AgentID)
 			return
 		}
-		sessConn.AgentID = info.AgentID
-		sessConn.UUID = info.UUID
+		sessConn.SetAgentID(info.AgentID)
+		sessConn.SetUUID(info.UUID)
 		sessConn.Hostname = info.Hostname
 		info.Online = true
 		info.LastSeen = time.Now().Unix()
@@ -636,7 +640,6 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 				info.AgentID, old.RemoteAddr)
 			return
 		}
-		_ = old
 		// 新连接已接入，再顶掉同一设备（UUID）下的旧会话：此时旧连接是被"自己"
 		// 替换的，无需标离线（否则会把刚上线的新连接状态冲掉）。
 		for _, oldID := range sess.ReplaceByUUID(info.UUID, sessConn) {
@@ -650,7 +653,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		registered = true
 		break // 上线后跳出循环，进入主消息循环
 	}
-	if !registered || sessConn.AgentID == "" {
+	if !registered || sessConn.GetAgentID() == "" {
 		log.Printf("[server] Agent 连接未完成注册，关闭: %s", conn.RemoteAddr())
 		return
 	}
@@ -661,7 +664,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		if err := json.Unmarshal(sc.Bytes(), &env); err != nil {
 			continue
 		}
-		sessConn.LastSeen = time.Now()
+		sessConn.SetLastSeen(time.Now())
 		switch env.Type {
 		case protocol.TypeHeartbeatReq:
 			var hb protocol.HeartbeatReq
@@ -683,7 +686,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			// 身份以连接为准：报文里的 agent_id 不可信，
 			// 否则一条连接可以伪造其它主机的探针数据 / 凭空造出假主机。
 			if !connOwns(sessConn, p.AgentID) {
-				log.Printf("[server] 丢弃 %s 的探针报文（自报身份 %q 与连接身份不符）", sessConn.AgentID, p.AgentID)
+				log.Printf("[server] 丢弃 %s 的探针报文（自报身份 %q 与连接身份不符）", sessConn.GetAgentID(), p.AgentID)
 				continue
 			}
 			store.UpdateProbe(&p)
@@ -697,7 +700,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			// 转发给 Web 端
 			hub.Broadcast(protocol.TypeCommandResp, cr)
 			// 回填命令审计结果（不新增记录，避免 operator 为空的重复条目）
-			router.CompleteByCommand(cr.CommandID, sessConn.AgentID, cr.Stdout, cr.ExitCode, cr.Duration)
+			router.CompleteByCommand(cr.CommandID, sessConn.GetAgentID(), cr.Stdout, cr.ExitCode, cr.Duration)
 		case protocol.TypeInteractiveOut:
 			var io protocol.InteractiveOutput
 			_ = json.Unmarshal(env.Data, &io)
@@ -707,7 +710,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			_ = json.Unmarshal(env.Data, &fu)
 			// 身份以连接为准：防止一条连接伪造他人身份把文件写到服务端
 			if !connOwns(sessConn, fu.AgentID) {
-				log.Printf("[server] 丢弃 %s 的上传分片（自报身份 %q 与连接身份不符）", sessConn.AgentID, fu.AgentID)
+				log.Printf("[server] 丢弃 %s 的上传分片（自报身份 %q 与连接身份不符）", sessConn.GetAgentID(), fu.AgentID)
 				continue
 			}
 			// 分片接收：MD5 校验 + 断点续传 + ACK/NACK
@@ -728,7 +731,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 				continue
 			}
 			hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
-				AgentID: sessConn.AgentID, FilePath: fa.FilePath, Action: "push",
+				AgentID: sessConn.GetAgentID(), FilePath: fa.FilePath, Action: "push",
 				Status: fa.Status, Message: fa.Message, ChunkSeq: fa.ChunkSeq,
 			})
 			if fa.Status == "done" || fa.Status == "failed" {
@@ -738,7 +741,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			var ur protocol.UpgradeResp
 			_ = json.Unmarshal(env.Data, &ur)
 			hub.Broadcast(protocol.TypeUpgradeResp, ur)
-			log.Printf("[server] Agent %s 升级结果: %v %s", sessConn.AgentID, ur.OK, ur.Message)
+			log.Printf("[server] Agent %s 升级结果: %v %s", sessConn.GetAgentID(), ur.OK, ur.Message)
 		case protocol.TypeTunnelOpenResp:
 			var tr protocol.TunnelOpenResp
 			if json.Unmarshal(env.Data, &tr) != nil {
@@ -775,7 +778,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		case protocol.TypeVncInstallResp:
 			var vr protocol.VncInstallResp
 			if json.Unmarshal(env.Data, &vr) == nil {
-				vncMgr.NotifyInstall(sessConn.AgentID, &vr)
+				vncMgr.NotifyInstall(sessConn.GetAgentID(), &vr)
 			}
 		case protocol.TypePkgFetchReq:
 			var pr protocol.PackageFetchReq
@@ -789,13 +792,13 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 	// 连接断开 -> 标记离线。
 	// 注意：设备身份是 UUID。旧连接被同 UUID 的新连接顶替后也会走到这里
 	// （或被顶替时已从会话池移除），此时不能把同一台机器标成离线。
-	if !sess.RemoveIfCurrent(sessConn.AgentID, sessConn) {
-		log.Printf("[server] Agent %s 的旧连接已断开（该设备已有新会话），跳过离线标记", sessConn.AgentID)
+	if !sess.RemoveIfCurrent(sessConn.GetAgentID(), sessConn) {
+		log.Printf("[server] Agent %s 的旧连接已断开（该设备已有新会话），跳过离线标记", sessConn.GetAgentID())
 		return
 	}
-	store.MarkOffline(sessConn.AgentID)
+	store.MarkOffline(sessConn.GetAgentID())
 	hub.Broadcast(protocol.TypeAgentList, store.All())
-	log.Printf("[server] Agent %s 离线", sessConn.AgentID)
+	log.Printf("[server] Agent %s 离线", sessConn.GetAgentID())
 }
 
 // heartbeatSweeper 心跳清扫：超过 3 个心跳周期（默认 90s）视为离线。

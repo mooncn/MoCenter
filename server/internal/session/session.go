@@ -15,8 +15,8 @@ import (
 
 // Conn 代表一个 Agent 的长连接会话。
 type Conn struct {
-	mu         sync.Mutex
-	AgentID    string
+	mu      sync.Mutex
+	AgentID string
 	// UUID 硬件唯一标识：设备的真正身份。agent_id 可随配置变更，
 	// 同 UUID 的连接视为同一台机器（用于注册时顶替自己的旧连接）。
 	UUID       string
@@ -30,6 +30,53 @@ type Conn struct {
 	// 用于在 Tick 中按每个 Agent 的实际心跳频率判定超时，
 	// 避免弱网下心跳间隔被拉长后仍按固定阈值误判离线。
 	HeartbeatInterval int
+}
+
+// SetLastSeen 线程安全地刷新连接的最后活跃时间。
+//
+// LastSeen 会被读连接循环（每次收到报文）写，同时被 Tick（心跳清扫）与
+// isStaleLocked（判断旧连接是否已死）读。直接赋值属于数据竞争：
+// `go test -race` 能直接报出，且 race 下 Tick 可能读到半写的时间值导致误判离线。
+func (c *Conn) SetLastSeen(t time.Time) {
+	c.mu.Lock()
+	c.LastSeen = t
+	c.mu.Unlock()
+}
+
+// GetLastSeen 线程安全地读取连接的最后活跃时间。
+func (c *Conn) GetLastSeen() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.LastSeen
+}
+
+// UUID 属于设备身份，连接建立后不再变化；ProvideUUID/GetUUID 兼顾
+// 「先用后设」的注册流程，避免在数据竞争检测中被误报。
+func (c *Conn) SetUUID(u string) {
+	c.mu.Lock()
+	c.UUID = strings.TrimSpace(u)
+	c.mu.Unlock()
+}
+
+// GetUUID 线程安全地读取设备 UUID。
+func (c *Conn) GetUUID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.UUID
+}
+
+// SetAgentID 设置连接身份（agent_id）。注册成功后才允许调用。
+func (c *Conn) SetAgentID(id string) {
+	c.mu.Lock()
+	c.AgentID = id
+	c.mu.Unlock()
+}
+
+// GetAgentID 线程安全地读取连接身份。
+func (c *Conn) GetAgentID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.AgentID
 }
 
 // SetHeartbeatInterval 记录服务端下发给该 Agent 的动态心跳间隔（秒）。
@@ -54,6 +101,20 @@ func (c *Conn) heartbeatTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(iv) * 3 * time.Second
+}
+
+// SetOnline 线程安全地设置在线状态。
+func (c *Conn) SetOnline(v bool) {
+	c.mu.Lock()
+	c.Online = v
+	c.mu.Unlock()
+}
+
+// IsOnline 线程安全地读取在线状态。
+func (c *Conn) IsOnline() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Online
 }
 
 // NewConn 创建基于给定网络连接的长连接会话。
@@ -152,7 +213,7 @@ func (m *Manager) ReplaceByUUID(uuid string, keep *Conn) []string {
 		if c == nil || c == keep {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(c.UUID), strings.TrimSpace(uuid)) {
+		if strings.EqualFold(c.GetUUID(), strings.TrimSpace(uuid)) {
 			if c.NetConn != nil {
 				_ = c.NetConn.Close()
 			}
@@ -165,14 +226,15 @@ func (m *Manager) ReplaceByUUID(uuid string, keep *Conn) []string {
 
 // isStaleLocked 判断连接是否已过 staleAfter 未心跳。
 func (m *Manager) isStaleLocked(c *Conn, now time.Time) bool {
-	if c.LastSeen.IsZero() {
+	lastSeen := c.GetLastSeen()
+	if lastSeen.IsZero() {
 		return true
 	}
 	threshold := m.staleAfter
 	if threshold <= 0 {
 		threshold = DefaultStaleAfter
 	}
-	return now.Sub(c.LastSeen) > threshold
+	return now.Sub(lastSeen) > threshold
 }
 
 // Get 获取指定 Agent 连接。
@@ -240,14 +302,14 @@ func (m *Manager) Tick(offlineAfter time.Duration) []string {
 	var offline []string
 	now := time.Now()
 	for id, c := range m.conns {
-		if !c.Online {
+		if !c.IsOnline() {
 			continue
 		}
 		threshold := c.heartbeatTimeout()
 		if threshold < offlineAfter {
 			threshold = offlineAfter
 		}
-		if now.Sub(c.LastSeen) > threshold {
+		if now.Sub(c.GetLastSeen()) > threshold {
 			offline = append(offline, id)
 		}
 	}

@@ -90,3 +90,63 @@ func TestRemoveIfCurrent(t *testing.T) {
 	}
 	_ = time.Now()
 }
+
+// TestConnAccessorsAreConcurrencySafe 回归：LastSeen / UUID / AgentID 会被
+// 读循环、心跳清扫、离线判定从不同 goroutine 并发读写，必须全部经由带锁的
+// 访问器，否则构成数据竞争（race 下可能读到半写的 time.Time 而误判离线）。
+func TestConnAccessorsAreConcurrencySafe(t *testing.T) {
+	c := NewConn(nil)
+	c.SetAgentID("a1")
+	c.SetUUID("UUID-1")
+	c.SetHeartbeatInterval(30)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			c.SetLastSeen(time.Now())
+			c.SetHeartbeatInterval(30 + i%5)
+			c.SetOnline(i%2 == 0)
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		_ = c.GetLastSeen()
+		_ = c.GetUUID()
+		_ = c.GetAgentID()
+		_ = c.IsOnline()
+		_ = c.heartbeatTimeout()
+	}
+	<-done
+
+	if got := c.GetAgentID(); got != "a1" {
+		t.Fatalf("agent_id 应可读，实得 %q", got)
+	}
+	if got := c.GetUUID(); got != "UUID-1" {
+		t.Fatalf("uuid 应可读，实得 %q", got)
+	}
+}
+
+// TestTickUsesLastSeenAccessor Tick 与写连接并发时不应触发竞争，
+// 且仍按心跳超时正确判定离线。
+func TestTickUsesLastSeenAccessor(t *testing.T) {
+	m := NewManager()
+	m.SetStaleAfter(time.Millisecond)
+	c := NewConn(nil)
+	c.SetAgentID("a1")
+	c.SetLastSeen(time.Now().Add(-time.Hour))
+	m.conns["a1"] = c
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			c.SetLastSeen(time.Now().Add(-time.Hour))
+		}
+	}()
+	offline := m.Tick(time.Millisecond)
+	<-done
+
+	if len(offline) != 1 || offline[0] != "a1" {
+		t.Fatalf("超时连接应被判离线，实得 %v", offline)
+	}
+}
