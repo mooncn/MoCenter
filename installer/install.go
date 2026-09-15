@@ -200,6 +200,9 @@ func writeConfig(role, path string, o options) error {
 		if o.agentID != "" {
 			obj["agent_id"] = o.agentID
 		}
+		if strings.TrimSpace(o.agentUUID) != "" {
+			obj["uuid"] = strings.TrimSpace(o.agentUUID)
+		}
 		if o.proxyIP != "" {
 			obj["proxy_ip"] = o.proxyIP
 		}

@@ -4,6 +4,8 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 )
 
@@ -433,24 +435,86 @@ type AgentRow struct {
 }
 
 // UpsertAgent 插入或更新主机信息。
+//
+// 设备身份以**硬件 UUID** 为准：UUID 相同即同一台机器。若该 UUID 已存在但
+// agent_id 不同（Agent 改配置/重装导致），则把原记录重命名为新 agent_id 并更新
+// 指标，而不是插入第二条 —— 这是「一台机器一条记录」的落库保证。
+//
+// 迁移期间还需处理一种情况：老记录里 agent_id 相同但 UUID 曾为空/不同，
+// 此时按 agent_id 定位到旧行并更新，同时把 UUID 补齐。
 func (db *DB) UpsertAgent(a *AgentRow) error {
 	online := 0
 	if a.Online {
 		online = 1
 	}
-	_, err := db.Exec(`INSERT OR REPLACE INTO agents
+	uuid := strings.ToUpper(strings.TrimSpace(a.UUID))
+
+	// UUID 已知且已被别的 agent_id 占用：先删除那条冗余行（历史采样/端口映射在
+	// 事务中改归属），保证唯一索引下不会冲突。
+	if uuid != "" {
+		if err := db.mergeAgentByUUID(a.AgentID, uuid); err != nil {
+			return err
+		}
+	}
+	_, err := db.Exec(`INSERT INTO agents
 		(agent_id, uuid, hostname, os_type, arch, kernel_version, online, last_seen, last_offline_at,
 		 uptime, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes, remote_addr,
 		 public_ip, public_ipv6, os_version, cpu_model, cpu_mhz, mem_total, mem_used,
 		 disk_total, disk_used, net_rate_in, net_rate_out, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.AgentID, a.UUID, a.Hostname, a.OSType, a.Arch, a.KernelVersion, online, a.LastSeen, a.LastOfflineAt,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(agent_id) DO UPDATE SET
+			uuid = excluded.uuid, hostname = excluded.hostname, os_type = excluded.os_type,
+			arch = excluded.arch, kernel_version = excluded.kernel_version, online = excluded.online,
+			last_seen = excluded.last_seen, last_offline_at = excluded.last_offline_at,
+			uptime = excluded.uptime, cpu_usage = excluded.cpu_usage, mem_usage = excluded.mem_usage,
+			disk_usage = excluded.disk_usage, net_in_bytes = excluded.net_in_bytes,
+			net_out_bytes = excluded.net_out_bytes, remote_addr = excluded.remote_addr,
+			public_ip = excluded.public_ip, public_ipv6 = excluded.public_ipv6,
+			os_version = excluded.os_version, cpu_model = excluded.cpu_model, cpu_mhz = excluded.cpu_mhz,
+			mem_total = excluded.mem_total, mem_used = excluded.mem_used,
+			disk_total = excluded.disk_total, disk_used = excluded.disk_used,
+			net_rate_in = excluded.net_rate_in, net_rate_out = excluded.net_rate_out,
+			updated_at = excluded.updated_at`,
+		a.AgentID, uuid, a.Hostname, a.OSType, a.Arch, a.KernelVersion, online, a.LastSeen, a.LastOfflineAt,
 		a.Uptime, a.CPUUsage, a.MemUsage, a.DiskUsage, a.NetInBytes, a.NetOutBytes, a.RemoteAddr,
 		a.PublicIP, a.PublicIPv6, a.OSVersion, a.CPUModel, a.CPUMHz, a.MemTotal, a.MemUsed,
 		a.DiskTotal, a.DiskUsed, a.NetRateIn, a.NetRateOut, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("保存主机信息失败: %w", err)
 	}
+	return nil
+}
+
+// mergeAgentByUUID 在同一事务内把 UUID 已被其它 agent_id 占用的旧行合并掉：
+// 历史采样与端口映射规则改归属到当前 agent_id，随后删除旧行。
+func (db *DB) mergeAgentByUUID(agentID, uuid string) error {
+	var oldID string
+	err := db.QueryRow(`SELECT agent_id FROM agents WHERE uuid = ? AND agent_id <> ? LIMIT 1`,
+		uuid, agentID).Scan(&oldID)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("查询同 UUID 主机失败: %w", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("开始主机合并事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE probe_history SET agent_id = ? WHERE agent_id = ?`, agentID, oldID); err != nil {
+		return fmt.Errorf("迁移探针历史归属失败: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE portmap_rules SET agent_id = ? WHERE agent_id = ?`, agentID, oldID); err != nil {
+		return fmt.Errorf("迁移端口映射归属失败: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM agents WHERE agent_id = ?`, oldID); err != nil {
+		return fmt.Errorf("删除冗余主机记录失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交主机合并事务失败: %w", err)
+	}
+	log.Printf("[storage] UUID %s 的 agent_id 由 %s 变更为 %s，已合并为一条记录", uuid, oldID, agentID)
 	return nil
 }
 
@@ -482,15 +546,39 @@ func (db *DB) LoadAgents() ([]*AgentRow, error) {
 }
 
 // UpdateAgentOnline 更新主机在线状态与时间戳。
+//
+// 设备以 UUID 为唯一身份，agent_id 只是别名：这里同时匹配 agent_id 与 uuid，
+// 确保 Agent 改名后离线状态仍能落到同一台机器上（不产生"僵尸在线"记录）。
 func (db *DB) UpdateAgentOnline(agentID string, online bool, lastSeen int64) error {
 	v := 0
 	if online {
 		v = 1
 	}
-	_, err := db.Exec(`UPDATE agents SET online = ?, last_seen = ?, updated_at = ? WHERE agent_id = ?`,
-		v, lastSeen, time.Now().Unix(), agentID)
+	_, err := db.Exec(`UPDATE agents SET online = ?, last_seen = ?, updated_at = ?
+		WHERE agent_id = ? OR (agent_id <> ? AND uuid <> '' AND uuid = ?)`,
+		v, lastSeen, time.Now().Unix(), agentID, agentID, strings.ToUpper(strings.TrimSpace(agentID)))
 	if err != nil {
 		return fmt.Errorf("更新主机在线状态失败: %w", err)
+	}
+	return nil
+}
+
+// UpdateAgentIdentity 把某设备的 agent_id 改名为新值并补齐 UUID（幂等）。
+// 设备身份由 UUID 决定，因此改名只影响展示/路由用的别名，不新增记录。
+func (db *DB) UpdateAgentIdentity(oldID, newID, uuid string) error {
+	if oldID == "" || newID == "" || oldID == newID {
+		return nil
+	}
+	if _, err := db.Exec(`UPDATE agents SET agent_id = ?, uuid = ?, updated_at = ?
+		WHERE agent_id = ?`, newID, strings.ToUpper(strings.TrimSpace(uuid)), time.Now().Unix(), oldID); err != nil {
+		return fmt.Errorf("更新主机 agent_id 失败: %w", err)
+	}
+	// 别名改名的同时把历史采样与端口映射一起迁移，避免趋势图断档
+	if _, err := db.Exec(`UPDATE probe_history SET agent_id = ? WHERE agent_id = ?`, newID, oldID); err != nil {
+		return fmt.Errorf("迁移探针历史归属失败: %w", err)
+	}
+	if _, err := db.Exec(`UPDATE portmap_rules SET agent_id = ? WHERE agent_id = ?`, newID, oldID); err != nil {
+		return fmt.Errorf("迁移端口映射归属失败: %w", err)
 	}
 	return nil
 }

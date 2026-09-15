@@ -298,6 +298,8 @@ func main() {
 	remarks := remark.NewStore(*dataDir)
 	remarks.Load()
 	store.SetRemarkFn(remarks.Get)
+	// agent_id 变更（同一台机器改配置）时，备注跟随设备一起迁移，避免"备注丢失"
+	store.SetRemarkRenameFn(remarks.Rename)
 	authz := auth.NewAuth(wl)
 	authz.SetTokenTTL(*tokenTTL)
 	loginGuard := auth.NewLoginGuard()
@@ -543,6 +545,14 @@ func connOwns(c *session.Conn, claimed string) bool {
 	return claimed == c.AgentID
 }
 
+// uuidSuffix 返回日志里用于标识设备的 UUID 后缀（无 UUID 时为空串）。
+func uuidSuffix(uuid string) string {
+	if strings.TrimSpace(uuid) == "" {
+		return ""
+	}
+	return "，设备 UUID " + uuid
+}
+
 // validAgentID 校验 AgentID 是否可用。
 // 允许较宽松（兼容中文主机名 / 硬件 UUID），但禁止空白与控制字符，
 // 防止不可控内容进入日志与审计。
@@ -608,10 +618,18 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			return
 		}
 		sessConn.AgentID = info.AgentID
+		sessConn.UUID = info.UUID
 		sessConn.Hostname = info.Hostname
 		info.Online = true
 		info.LastSeen = time.Now().Unix()
 		info.RemoteAddr = conn.RemoteAddr().String()
+
+		// 设备身份以 UUID 为准：先把该 UUID 名下的旧连接顶掉。
+		// 否则「同一台机器改了 agent_id 重连」会在会话池里留下两条会话，
+		// 前端与 store 都表现为两台机器（数据冗余的根因之一）。
+		//
+		// 顺序：先确认新连接能被接纳（Upsert 通过），再顶掉旧连接。
+		// 反过来会在「新连接被拒绝」时误杀仍在服务的旧连接。
 		old, accepted := sess.Upsert(info.AgentID, sessConn)
 		if !accepted {
 			log.Printf("[server] 拒绝 Agent %s 重复注册：该 ID 已有活跃连接（正在被 %s 使用）",
@@ -619,10 +637,15 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			return
 		}
 		_ = old
-		store.UpsertAgent(&info)
-		if accepted {
-			log.Printf("[server] Agent %s 上线（来自 %s）", info.AgentID, conn.RemoteAddr())
+		// 新连接已接入，再顶掉同一设备（UUID）下的旧会话：此时旧连接是被"自己"
+		// 替换的，无需标离线（否则会把刚上线的新连接状态冲掉）。
+		for _, oldID := range sess.ReplaceByUUID(info.UUID, sessConn) {
+			log.Printf("[server] 设备 %s 的旧会话 %s 已被本次连接顶替（同机 agent_id 变更或重复上线）",
+				info.UUID, oldID)
 		}
+		store.UpsertAgent(&info)
+		log.Printf("[server] Agent %s 上线（来自 %s%s）", info.AgentID, conn.RemoteAddr(),
+			uuidSuffix(info.UUID))
 		hub.Broadcast(protocol.TypeAgentList, store.All())
 		registered = true
 		break // 上线后跳出循环，进入主消息循环
@@ -763,8 +786,13 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		}
 	}
 
-	// 连接断开 -> 标记离线
-	sess.Remove(sessConn.AgentID)
+	// 连接断开 -> 标记离线。
+	// 注意：设备身份是 UUID。旧连接被同 UUID 的新连接顶替后也会走到这里
+	// （或被顶替时已从会话池移除），此时不能把同一台机器标成离线。
+	if !sess.RemoveIfCurrent(sessConn.AgentID, sessConn) {
+		log.Printf("[server] Agent %s 的旧连接已断开（该设备已有新会话），跳过离线标记", sessConn.AgentID)
+		return
+	}
 	store.MarkOffline(sessConn.AgentID)
 	hub.Broadcast(protocol.TypeAgentList, store.All())
 	log.Printf("[server] Agent %s 离线", sessConn.AgentID)

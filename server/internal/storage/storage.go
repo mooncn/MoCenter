@@ -160,9 +160,16 @@ func (db *DB) migrate() error {
 		return err
 	}
 	// 依赖上述列的索引（放在补列之后执行）
+	// 历史遗留：同一台机器因 agent_id 变更（改配置/重装）被写成多条记录。
+	// 先按 UUID 合并重复行（保留 last_seen 最新的一条），再建唯一索引，
+	// 否则 CREATE UNIQUE INDEX 会因既有重复数据直接失败、服务端起不来。
+	if err := db.dedupAgentsByUUID(); err != nil {
+		return err
+	}
 	postMigrations := []string{
-		// 硬件 UUID 索引：用于按设备唯一标识定位/去重主机
-		`CREATE INDEX IF NOT EXISTS idx_agents_uuid ON agents(uuid)`,
+		// 硬件 UUID 唯一索引：一台设备一条记录，agent_id 变更不再产生冗余行。
+		// 部分索引（uuid <> ''）：旧版 Agent 取不到 UUID 时 uuid 为空，允许多行共存。
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_uuid_unique ON agents(uuid) WHERE uuid <> ''`,
 		// 命令 ID 索引：用于审计结果回填与按命令追踪
 		`CREATE INDEX IF NOT EXISTS idx_audit_command_id ON audit_logs(command_id)`,
 	}
@@ -170,6 +177,78 @@ func (db *DB) migrate() error {
 		if _, err := db.Exec(m); err != nil {
 			return fmt.Errorf("执行迁移失败 [%s]: %w", m, err)
 		}
+	}
+	return nil
+}
+
+// dedupAgentsByUUID 按硬件 UUID 合并 agents 表中的重复设备行。
+//
+// 背景：早期版本以 agent_id 为唯一键，agent 改配置（agent_id 变化）后会插入
+// 一条新记录，同一台机器出现多条 —— 表现为前端"一台机器变两台"、数据冗余。
+// 此处做一次性收敛：UUID 相同的多行只保留 last_seen 最新的一条（agent_id 更新为
+// 该行），其余删除；UUID 为空的行保持原样（无法判定是否同机）。
+//
+// 幂等：无重复时不做任何改动。
+func (db *DB) dedupAgentsByUUID() error {
+	type dup struct {
+		uuid string
+		keep string
+	}
+	rows, err := db.Query(`SELECT uuid, COUNT(*) AS n FROM agents
+		WHERE uuid IS NOT NULL AND uuid <> '' GROUP BY uuid HAVING n > 1`)
+	if err != nil {
+		return fmt.Errorf("统计重复 UUID 主机失败: %w", err)
+	}
+	var dups []dup
+	for rows.Next() {
+		var d dup
+		var n int
+		if err := rows.Scan(&d.uuid, &n); err != nil {
+			rows.Close()
+			return err
+		}
+		dups = append(dups, d)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(dups) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("开始合并重复主机事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, d := range dups {
+		// 保留 last_seen 最新的一条
+		if err := tx.QueryRow(`SELECT agent_id FROM agents WHERE uuid = ?
+			ORDER BY last_seen DESC LIMIT 1`, d.uuid).Scan(&d.keep); err != nil {
+			return fmt.Errorf("定位 UUID %s 的主记录失败: %w", d.uuid, err)
+		}
+		// 历史采样归属重命名为保留的 agent_id（趋势图不断档）
+		if _, err := tx.Exec(`UPDATE probe_history SET agent_id = ?
+			WHERE agent_id IN (SELECT agent_id FROM agents WHERE uuid = ? AND agent_id <> ?)`,
+			d.keep, d.uuid, d.keep); err != nil {
+			return fmt.Errorf("合并 UUID %s 的探针历史失败: %w", d.uuid, err)
+		}
+		// 端口映射规则同样归并到保留的 agent_id
+		if _, err := tx.Exec(`UPDATE portmap_rules SET agent_id = ?
+			WHERE agent_id IN (SELECT agent_id FROM agents WHERE uuid = ? AND agent_id <> ?)`,
+			d.keep, d.uuid, d.keep); err != nil {
+			return fmt.Errorf("合并 UUID %s 的端口映射失败: %w", d.uuid, err)
+		}
+		if _, err := tx.Exec(`DELETE FROM agents WHERE uuid = ? AND agent_id <> ?`,
+			d.uuid, d.keep); err != nil {
+			return fmt.Errorf("删除 UUID %s 的冗余主机记录失败: %w", d.uuid, err)
+		}
+		log.Printf("[storage] 已按 UUID %s 合并重复主机记录，保留 agent_id=%s", d.uuid, d.keep)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交重复主机合并事务失败: %w", err)
 	}
 	return nil
 }

@@ -94,3 +94,88 @@ func TestHistoryDownsampledMemory(t *testing.T) {
 		t.Fatalf("expected empty for empty agentID, got %d", len(got))
 	}
 }
+
+// TestAgentIDChangeKeepsSingleDevice 回归：同一台机器改了 agent_id（配置文件变更）
+// 不应产生第二条记录，历史采样与 UUID 都要保留。
+func TestAgentIDChangeKeepsSingleDevice(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "old-id", UUID: "HW-UUID-1", Hostname: "h1", Online: true})
+	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "old-id", UUID: "HW-UUID-1", Timestamp: time.Now().Unix(), CPUUsage: 10})
+
+	// 同一台机器换了 agent_id 重新上线
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "new-id", UUID: "HW-UUID-1", Hostname: "h1", Online: true})
+	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "new-id", UUID: "HW-UUID-1", Timestamp: time.Now().Unix() + 1, CPUUsage: 20})
+
+	if got := len(s.All()); got != 1 {
+		t.Fatalf("同一 UUID 应只有一条记录，实得 %d 条", got)
+	}
+	a := s.Get("new-id")
+	if a == nil {
+		t.Fatal("按新 agent_id 应能查到该设备")
+	}
+	if a.UUID != "HW-UUID-1" {
+		t.Fatalf("UUID 应保留，实得 %q", a.UUID)
+	}
+	if a.CPUUsage != 20 {
+		t.Fatalf("指标应更新为最新值，实得 %v", a.CPUUsage)
+	}
+	// 旧 agent_id 仍作为别名可查（前端/审计不至于查不到）
+	if s.Get("old-id") == nil {
+		t.Fatal("旧 agent_id 应仍能解析到同一台设备")
+	}
+	// 历史不应因改名而丢弃
+	if h := len(s.History("new-id", time.Unix(0, 0))); h != 2 {
+		t.Fatalf("改名后历史应保留 2 条，实得 %d", h)
+	}
+}
+
+// TestUUIDCaseInsensitive 回归：UUID 大小写/空白差异不应被判成两台机器。
+func TestUUIDCaseInsensitive(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", UUID: "abcd-ef01", Online: true})
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", UUID: " ABCD-EF01\n", Online: true})
+	if got := len(s.All()); got != 1 {
+		t.Fatalf("UUID 归一化后应只有一条记录，实得 %d", got)
+	}
+	if got := s.Get("a1").UUID; got != "ABCD-EF01" {
+		t.Fatalf("UUID 应统一为大写无空白，实得 %q", got)
+	}
+}
+
+// TestDifferentUUIDKeepsSeparateDevices 反向验证：UUID 不同仍是两台机器。
+func TestDifferentUUIDKeepsSeparateDevices(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", UUID: "UUID-A", Online: true})
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a2", UUID: "UUID-B", Online: true})
+	if got := len(s.All()); got != 2 {
+		t.Fatalf("不同 UUID 应为两台机器，实得 %d", got)
+	}
+}
+
+// TestProbeUUIDBackfillAndRename 验证旧版 Agent 先以 agent_id 上报、随后补齐 UUID
+// 时，设备记录被迁移到 UUID 主键下而不是新增一条。
+func TestProbeUUIDBackfillAndRename(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", Online: true})
+	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "a1", Timestamp: time.Now().Unix(), CPUUsage: 5})
+	// 同一台机器改名并补齐 UUID 后重新注册（真实时序：注册先于探针）
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a2", UUID: "UUID-X", Online: true})
+	s.UpdateProbe(&protocol.ProbeDataReq{AgentID: "a2", UUID: "UUID-X", Timestamp: time.Now().Unix() + 1, CPUUsage: 6})
+	if got := len(s.All()); got != 1 {
+		t.Fatalf("补齐 UUID 后应仍只有一条记录，实得 %d", got)
+	}
+	if s.GetByUUID("UUID-X") == nil {
+		t.Fatal("应能按 UUID 查到设备")
+	}
+}
+
+// TestMarkOfflineByOldAlias 验证按旧 agent_id 标记离线会落到同一台设备上。
+func TestMarkOfflineByOldAlias(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "old", UUID: "UUID-Z", Online: true})
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "new", UUID: "UUID-Z", Online: true})
+	s.MarkOffline("old")
+	if s.Get("new").Online {
+		t.Fatal("按旧 agent_id 标离线，同一设备也应变离线")
+	}
+}

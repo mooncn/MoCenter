@@ -31,6 +31,14 @@ export default function Offline({ agents }) {
                 <td data-label="主机">
                   <b>{a.remark || a.hostname}</b>
                   <div style={{ color: '#8b98a5', fontSize: 12 }}>{a.hostname !== a.agent_id ? a.hostname + ' · ' : ''}{a.agent_id}</div>
+                  {a.uuid ? (
+                    <div
+                      style={{ color: '#6b7280', fontSize: 10, fontFamily: 'Menlo, Consolas, monospace', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      title={`设备唯一 UUID：${a.uuid}`}
+                    >
+                      UUID: {a.uuid}
+                    </div>
+                  ) : null}
                 </td>
                 <td data-label="系统/架构">{a.os_version || a.os_type} / {a.arch}</td>
                 <td data-label="最后上线">{fmtTime(a.last_seen)}</td>

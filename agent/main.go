@@ -25,7 +25,8 @@ import (
 
 func main() {
 	server := flag.String("server", os.Getenv("MOCENTER_SERVER"), "服务端地址 host:port")
-	agentID := flag.String("agentid", os.Getenv("MOCENTER_AGENT_ID"), "Agent 唯一标识")
+	agentID := flag.String("agentid", os.Getenv("MOCENTER_AGENT_ID"), "Agent 名称标识（可变，仅用于显示与路由）")
+	agentUUID := flag.String("uuid", os.Getenv("MOCENTER_AGENT_UUID"), "设备硬件 UUID（设备身份，留空则自动探测并写入配置）")
 	hb := flag.Int("hb", 30, "心跳间隔(秒)")
 	probe := flag.Int("probe", 10, "探针采集周期(秒)")
 	daemonize := flag.Bool("daemon", false, "以守护进程方式运行（后台运行并崩溃自启）")
@@ -51,6 +52,7 @@ func main() {
 		cfg = &config.Config{
 			Server:     *server,
 			AgentID:    *agentID,
+			UUID:       *agentUUID,
 			Heartbeat:  *hb,
 			ProbeEvery: *probe,
 			TLS:        *tlsEnabled,
@@ -76,6 +78,9 @@ func main() {
 		}
 		if cfg.AgentID != "" && *agentID == os.Getenv("MOCENTER_AGENT_ID") {
 			*agentID = cfg.AgentID
+		}
+		if cfg.UUID != "" && *agentUUID == os.Getenv("MOCENTER_AGENT_UUID") {
+			*agentUUID = cfg.UUID
 		}
 		if cfg.Heartbeat > 0 && *hb == 30 {
 			*hb = cfg.Heartbeat
@@ -123,6 +128,7 @@ func main() {
 		field := map[string]func(){
 			"server":      func() { cfg.Server = *server },
 			"agentid":     func() { cfg.AgentID = *agentID },
+			"uuid":        func() { cfg.UUID = *agentUUID },
 			"hb":          func() { cfg.Heartbeat = *hb },
 			"probe":       func() { cfg.ProbeEvery = *probe },
 			"tls":         func() { cfg.TLS = *tlsEnabled },
@@ -137,7 +143,7 @@ func main() {
 			"upgrade-allow-unsigned": func() { cfg.UpgradeAllowUnsigned = *upgradeAllowUnsigned },
 		}
 		dirty := false
-		for _, name := range []string{"server", "agentid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "upgrade-pubkey", "upgrade-allow-unsigned"} {
+		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "upgrade-pubkey", "upgrade-allow-unsigned"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -155,11 +161,25 @@ func main() {
 	if *server == "" {
 		log.Fatal("请通过 -server、环境变量 MOCENTER_SERVER 或配置文件指定服务端地址")
 	}
+	// 设备身份（UUID）：优先用配置里已持久化的值，其次实时探测；探测不到就留空
+	//（服务端会退化为按 agent_id 识别）。拿到后写回配置，保证重启/改配置都不漂移。
+	if *agentUUID == "" {
+		if u := probepkg.HardwareUUID(); u != "" {
+			*agentUUID = u
+			log.Printf("已探测到硬件 UUID %q，作为设备唯一标识", *agentUUID)
+		}
+	}
+	if *agentUUID != "" && cfg.UUID != *agentUUID {
+		cfg.UUID = *agentUUID
+		if err := config.Save(*configPath, cfg); err != nil {
+			log.Printf("警告: 写入设备 UUID 到配置失败: %v", err)
+		}
+	}
 	if *agentID == "" {
-		// 优先使用硬件 UUID 作为 AgentID，获取失败时回退到主机名
-		if uuid := probepkg.HardwareUUID(); uuid != "" {
-			*agentID = uuid
-			log.Printf("未指定 AgentID，使用硬件 UUID %q", *agentID)
+		// 未指定名称时：优先复用已持久化的 UUID，否则用硬件 UUID，再退回主机名
+		if *agentUUID != "" {
+			*agentID = *agentUUID
+			log.Printf("未指定 AgentID，使用设备 UUID %q", *agentID)
 		} else {
 			host, _ := os.Hostname()
 			*agentID = host
@@ -179,7 +199,7 @@ func main() {
 		// 服务模式：进程级重启交给 SCM（安装器已配置失败恢复动作），但进程内仍需兜住
 		// panic —— 否则 goroutine 静默死掉，服务却仍显示 Running。
 		o := runOpts{
-			server: *server, agentID: *agentID, hb: *hb, probe: *probe,
+			server: *server, agentID: *agentID, agentUUID: *agentUUID, hb: *hb, probe: *probe,
 			tls: *tlsEnabled, insecure: *insecure,
 			clientCert: *clientCert, clientKey: *clientKey, caCert: *caCert,
 			proxyIP: *proxyIP, agentKey: *agentKey,
@@ -216,7 +236,7 @@ const agentServiceName = "MoCenterAgent"
 
 // runOpts 收敛 runClient 的入参，避免继续往位置参数上堆字段时错位。
 type runOpts struct {
-	server, agentID                         string
+	server, agentID, agentUUID               string
 	hb, probe                               int
 	tls, insecure                           bool
 	clientCert, clientKey, caCert, proxyIP  string
@@ -228,6 +248,7 @@ func runClient(o runOpts) {
 	c := client.New(client.Config{
 		ServerAddr: o.server,
 		AgentID:    o.agentID,
+		UUID:       o.agentUUID,
 		Heartbeat:  seconds(o.hb),
 		ProbeEvery: seconds(o.probe),
 		TLS:        o.tls,

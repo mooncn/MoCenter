@@ -29,6 +29,7 @@ type options struct {
 	role       string // agent | server | all
 	server     string // Agent 连接的服务端地址
 	agentID    string
+	agentUUID  string // 设备硬件 UUID（设备身份；留空由 Agent 自动探测并持久化）
 	proxyIP    string
 	agentKey   string // Agent 注册预共享密钥（与服务端 agent.key 相同）
 	adminUser  string // Server 的登录用户名
@@ -49,7 +50,8 @@ func main() {
 	o := options{}
 	flag.StringVar(&o.role, "role", "agent", "安装角色：agent | server | all")
 	flag.StringVar(&o.server, "server", "", "Agent 要连接的服务端地址 host:port（role 含 agent 时必填）")
-	flag.StringVar(&o.agentID, "agentid", "", "Agent 唯一标识（留空则由 Agent 自动取硬件 UUID/主机名）")
+	flag.StringVar(&o.agentID, "agentid", "", "Agent 名称标识（可变，仅用于显示与路由；留空则回退为设备 UUID/主机名）")
+	flag.StringVar(&o.agentUUID, "uuid", "", "设备硬件 UUID（设备身份，留空则由 Agent 自动探测并写入配置）")
 	flag.StringVar(&o.proxyIP, "proxy-ip", "", "国内加速代理前缀（可选）")
 	flag.StringVar(&o.agentKey, "agent-key", "", "Agent 注册预共享密钥（取服务端 <data>\\agent.key 的内容；role 含 agent 时必填）")
 	flag.StringVar(&o.adminUser, "user", "", "Server 的登录用户名（role 含 server 时必填）")

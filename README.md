@@ -133,6 +133,11 @@ cd server
 bash agent/build.sh windows   # 生成 mocenter-agent.exe
 ```
 
+> **设备身份说明**：系统以**硬件 UUID** 作为一台机器的唯一身份，`agent_id` 只是
+> 可变的名字（显示与路由用）。首次启动会自动探测 UUID 并写入配置（`uuid` 字段），
+> 因此**修改 `agent_id`、重装或换配置目录都不会让同一台机器变成两台**，不会产生冗余数据。
+> 也可显式指定：`-agentid host-01 -uuid <硬件UUID>`。
+
 ### 4. 生成 TLS/mTLS 证书（可选）
 
 ```bash
