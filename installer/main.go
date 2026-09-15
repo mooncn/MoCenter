@@ -30,6 +30,7 @@ type options struct {
 	server     string // Agent 连接的服务端地址
 	agentID    string
 	proxyIP    string
+	agentKey   string // Agent 注册预共享密钥（与服务端 agent.key 相同）
 	adminUser  string // Server 的登录用户名
 	adminPass  string // Server 的登录密码
 	listen     string // Server 的 Agent TCP 监听
@@ -50,6 +51,7 @@ func main() {
 	flag.StringVar(&o.server, "server", "", "Agent 要连接的服务端地址 host:port（role 含 agent 时必填）")
 	flag.StringVar(&o.agentID, "agentid", "", "Agent 唯一标识（留空则由 Agent 自动取硬件 UUID/主机名）")
 	flag.StringVar(&o.proxyIP, "proxy-ip", "", "国内加速代理前缀（可选）")
+	flag.StringVar(&o.agentKey, "agent-key", "", "Agent 注册预共享密钥（取服务端 <data>\\agent.key 的内容；role 含 agent 时必填）")
 	flag.StringVar(&o.adminUser, "user", "", "Server 的登录用户名（role 含 server 时必填）")
 	flag.StringVar(&o.adminPass, "password", "", "Server 的登录密码（role 含 server 时必填）")
 	flag.StringVar(&o.listen, "listen", ":9000", "Server 的 Agent TCP 监听地址")
@@ -142,8 +144,8 @@ func usage() {
   mocenter-deploy.exe status    [选项]    查看服务与路径状态
 
 示例:
-  REM 在被控机上安装 Agent
-  mocenter-deploy.exe install -role agent -server your.server.com:9000
+  REM 在被控机上安装 Agent（-agent-key 取总控机 <data>\agent.key 的内容）
+  mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key <注册密钥>
 
   REM 在总控机上安装 Server
   mocenter-deploy.exe install -role server -user admin -password <登录密码>

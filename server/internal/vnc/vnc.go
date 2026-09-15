@@ -20,12 +20,14 @@ import (
 
 	"mocenter/server/internal/protocol"
 	"mocenter/server/internal/session"
+	"mocenter/server/internal/ws"
 )
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  256 * 1024,
 	WriteBufferSize: 256 * 1024,
 	CheckOrigin:     func(r *http.Request) bool { return true },
+	Subprotocols:    []string{ws.WSSubprotocolName},
 }
 
 // tunnelEstablishTimeout 隧道建立超时：超过该时间未收到 Agent 的 TunnelOpenResp
@@ -278,7 +280,8 @@ func (m *Mgr) NotifyInstall(agentID string, resp *protocol.VncInstallResp) {
 // 关键修复：浏览器 RFB 数据可能在隧道建立前到达，此时先缓冲，等 TunnelOpenResp
 // 确认隧道就绪后再转发，避免 RFB 握手数据丢失导致黑屏。
 func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken func(string) bool) {
-	if !validateToken(r.URL.Query().Get("token")) {
+	// Token 优先取子协议头（避免出现在 URL 里被日志留存），兼容旧 query 传参
+	if !validateToken(ws.WSToken(r)) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}

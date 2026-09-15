@@ -60,7 +60,9 @@ function Layout() {
     return () => { socket.close(); window.removeEventListener('mc-remark-saved', onRemarkSaved) }
   }, [])
 
-  const logout = () => {
+  // 登出：先通知服务端吊销当前会话 Token，再清除本地凭据
+  const logout = async () => {
+    try { await Api.logout() } catch { /* 即使请求失败也要清本地凭据 */ }
     localStorage.removeItem('mc_token')
     location.href = '/login'
   }

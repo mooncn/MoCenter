@@ -176,8 +176,13 @@ type InteractiveOutput struct {
 type UpgradeReq struct {
 	UpgradeID string `json:"upgrade_id"`
 	Version   string `json:"version"`
-	URL       string `json:"url"`
-	MD5       string `json:"md5"`
+	URL       string `json:"url"` // 升级包下载地址（必须 https）
+	// MD5 已废弃：不是安全控制（无密钥、可碰撞），仅为兼容旧服务端保留。
+	MD5 string `json:"md5,omitempty"`
+	// SHA256 升级包摘要，**必填**。为空则拒绝升级。
+	SHA256 string `json:"sha256,omitempty"`
+	// Signature Ed25519 签名（hex）。未配置公钥时必须提供。
+	Signature string `json:"signature,omitempty"`
 	Force     bool   `json:"force"`
 }
 

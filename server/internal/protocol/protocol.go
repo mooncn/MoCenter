@@ -158,6 +158,12 @@ type AgentInfo struct {
 	// 网络速率（字节/秒），由服务端根据相邻探针累计值差计算
 	NetRateIn  int64 `json:"net_rate_in,omitempty"`
 	NetRateOut int64 `json:"net_rate_out,omitempty"`
+
+	// 注册鉴权（应用层，见 internal/agentauth）：proof = HMAC-SHA256(key, agentID|nonce|ts)
+	// 服务端据此确认对端持有预共享密钥，防止未授权主机注册与身份冒用。
+	AuthNonce string `json:"auth_nonce,omitempty"`
+	AuthTime  int64  `json:"auth_time,omitempty"`
+	AuthProof string `json:"auth_proof,omitempty"`
 }
 
 // GeoInfo IP 地理位置信息。
@@ -287,8 +293,13 @@ type FileTransferState struct {
 type UpgradeReq struct {
 	UpgradeID string `json:"upgrade_id"`
 	Version   string `json:"version"`
-	URL       string `json:"url"`   // 升级包下载地址
-	MD5       string `json:"md5"`   // 升级包 MD5 校验和
+	URL       string `json:"url"` // 升级包下载地址（必须 https）
+	// MD5 已废弃：它不是安全控制（无密钥、可碰撞），保留仅为兼容旧 Agent。
+	MD5 string `json:"md5,omitempty"`
+	// SHA256 升级包摘要，**必填**。为空则拒绝升级。
+	SHA256 string `json:"sha256,omitempty"`
+	// Signature Ed25519 签名（hex），对升级包内容签名。未配置公钥时必须提供。
+	Signature string `json:"signature,omitempty"`
 	Force     bool   `json:"force"` // 是否强制升级
 }
 

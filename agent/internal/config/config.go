@@ -13,18 +13,29 @@ import (
 )
 
 // Config Agent 启动配置。
+//
+// 所有字段**不带 omitempty**：首次生成的配置文件必须完整列出全部参数，
+// 让用户一眼看到有哪些可调项（值为空/默认即表示未启用或使用内置默认）。
 type Config struct {
 	Server     string `json:"server"`                // 服务端地址 host:port
-	AgentID    string `json:"agent_id,omitempty"`    // Agent 唯一标识
-	Heartbeat  int    `json:"heartbeat,omitempty"`   // 心跳间隔（秒）
-	ProbeEvery int    `json:"probe_every,omitempty"` // 探针采集周期（秒）
-	TLS        bool   `json:"tls,omitempty"`         // 启用 TLS
-	Insecure   bool   `json:"insecure,omitempty"`    // 跳过证书校验
-	Daemon     bool   `json:"daemon,omitempty"`      // 进程守护模式
-	ClientCert string `json:"client_cert,omitempty"` // mTLS 客户端证书
-	ClientKey  string `json:"client_key,omitempty"`  // mTLS 客户端私钥
-	CACert     string `json:"ca_cert,omitempty"`     // 校验服务端证书的 CA
-	ProxyIP    string `json:"proxy_ip,omitempty"`    // 国内加速代理前缀
+	AgentID    string `json:"agent_id"`              // Agent 唯一标识
+	Heartbeat  int    `json:"heartbeat"`             // 心跳间隔（秒），默认 30
+	ProbeEvery int    `json:"probe_every"`           // 探针采集周期（秒），默认 10
+	TLS        bool   `json:"tls"`                   // 启用 TLS 加密连接
+	Insecure   bool   `json:"insecure"`              // 跳过证书校验（自签名测试用）
+	Daemon     bool   `json:"daemon"`                // 进程守护模式（后台运行并崩溃自启）
+	ClientCert string `json:"client_cert"`           // mTLS 客户端证书
+	ClientKey  string `json:"client_key"`            // mTLS 客户端私钥
+	CACert     string `json:"ca_cert"`               // 校验服务端证书的 CA
+	ProxyIP    string `json:"proxy_ip"`              // 国内加速代理前缀
+	// AgentKey 与服务端预共享的注册密钥（应用层鉴权）。
+	// 服务端在数据目录生成 agent.key 并打印，Agent 侧填同一个值。
+	AgentKey string `json:"agent_key"`
+	// UpgradePubKey 升级包 Ed25519 公钥（hex 或文件路径）。
+	// 配置后升级必须携带有效签名；未配置时默认**拒绝升级**。
+	UpgradePubKey string `json:"upgrade_pubkey"`
+	// UpgradeAllowUnsigned 显式允许无签名升级（危险，仅用于迁移期）。
+	UpgradeAllowUnsigned bool `json:"upgrade_allow_unsigned"`
 }
 
 // DefaultPath 返回默认配置文件路径（便携态：与可执行文件同目录）。
@@ -68,13 +79,14 @@ func Load(path string) (*Config, error) {
 }
 
 // Save 将配置写入文件（自动创建目录）。
+// 权限 0600：配置可能包含 agent_key（注册密钥），不能放宽。
 func Save(path string, c *Config) error {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0755)
+		_ = os.MkdirAll(dir, 0700)
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }

@@ -3,8 +3,9 @@ import { Api } from '../api/api.js'
 import { createQrSvg } from '../utils/qrcode.js'
 
 // 账号设置：修改登录密码 + OTP 动态验证码（扫码绑定/关闭）
+//
+// 身份一律以登录会话为准（服务端从 Token 解出用户名），页面不再收集用户名。
 export default function Account() {
-  const [username, setUsername] = useState('')
   const [oldPassword, setOldPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [confirm, setConfirm] = useState('')
@@ -13,7 +14,6 @@ export default function Account() {
   const [ok, setOk] = useState(false)
 
   // OTP 绑定状态
-  const [otpUser, setOtpUser] = useState('')
   const [otpEnabled, setOtpEnabled] = useState(false)
   const [otpSecret, setOtpSecret] = useState('')
   const [otpUri, setOtpUri] = useState('')
@@ -23,21 +23,17 @@ export default function Account() {
   const [otpPassword, setOtpPassword] = useState('')
   const [otpDisableCode, setOtpDisableCode] = useState('')
 
-  // 初始化：沿用上次使用的用户名
+  // 初始化
   useEffect(() => {
-    const saved = localStorage.getItem('mc_username')
-    if (saved) {
-      setUsername(saved)
-      setOtpUser(saved)
-    }
+    // 身份由服务端从会话 Token 解出，这里无需读取用户名
   }, [])
 
   const submit = async (e) => {
     e.preventDefault()
     setNotice('')
     setOk(false)
-    if (!username.trim() || !oldPassword || !newPassword) {
-      setNotice('请填写用户名、当前密码与新密码')
+    if (!oldPassword || !newPassword) {
+      setNotice('请填写当前密码与新密码')
       return
     }
     if (newPassword !== confirm) {
@@ -50,7 +46,6 @@ export default function Account() {
     }
     try {
       const res = await Api.changePassword({
-        username: username.trim(),
         old_password: oldPassword,
         new_password: newPassword,
         otp: otp.trim(),
@@ -58,7 +53,6 @@ export default function Account() {
       if (res && res.ok) {
         setNotice(res.msg || '密码修改成功')
         setOk(true)
-        localStorage.setItem('mc_username', username.trim())
         setOldPassword('')
         setNewPassword('')
         setConfirm('')
@@ -72,15 +66,12 @@ export default function Account() {
   }
 
   // 生成新密钥与二维码（此时尚未启用，需输入验证码确认）
+  // 服务端以当前会话身份为准，无需传用户名
   const startOtpSetup = async () => {
     setOtpNotice('')
     setOtpOk(false)
-    if (!otpUser.trim()) {
-      setOtpNotice('请先填写要绑定 OTP 的用户名')
-      return
-    }
     try {
-      const res = await Api.otpSetup(otpUser.trim())
+      const res = await Api.otpSetup()
       if (!res || !res.ok) {
         setOtpNotice((res && res.msg) || '生成密钥失败')
         return
@@ -89,7 +80,6 @@ export default function Account() {
       setOtpUri(res.uri)
       setOtpEnabled(!!res.enabled)
       setOtpCode('')
-      localStorage.setItem('mc_username', otpUser.trim())
     } catch (ex) {
       setOtpNotice(ex.response?.data?.msg || ex.message)
     }
@@ -99,7 +89,7 @@ export default function Account() {
   const confirmOtp = async () => {
     setOtpNotice('')
     setOtpOk(false)
-    if (!otpUser.trim() || !otpSecret) {
+    if (!otpSecret) {
       setOtpNotice('请先生成二维码')
       return
     }
@@ -109,7 +99,6 @@ export default function Account() {
     }
     try {
       const res = await Api.otpEnable({
-        username: otpUser.trim(),
         secret: otpSecret,
         code: otpCode.trim(),
       })
@@ -132,13 +121,12 @@ export default function Account() {
   const disableOtp = async () => {
     setOtpNotice('')
     setOtpOk(false)
-    if (!otpUser.trim() || !otpPassword) {
-      setOtpNotice('请填写用户名与当前密码')
+    if (!otpPassword) {
+      setOtpNotice('请填写当前密码')
       return
     }
     try {
       const res = await Api.otpDisable({
-        username: otpUser.trim(),
         password: otpPassword,
         otp: otpDisableCode.trim(),
       })
@@ -172,9 +160,8 @@ export default function Account() {
       <div className="card" style={{ maxWidth: 520 }}>
         <h3>修改密码</h3>
         <form onSubmit={submit}>
-          <div className="form-row">
-            <label>用户名</label>
-            <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder="输入你的登录用户名" />
+          <div className="sub" style={{ marginBottom: 8, color: 'var(--muted)', fontSize: 12 }}>
+            身份以当前登录会话为准，无需填写用户名。
           </div>
           <div className="form-row">
             <label>当前密码</label>
@@ -204,9 +191,8 @@ export default function Account() {
           点击「生成二维码」后用验证器扫码，再输入验证器当前显示的 6 位验证码完成绑定。
         </div>
 
-        <div className="form-row">
-          <label>用户名</label>
-          <input value={otpUser} onChange={(e) => setOtpUser(e.target.value)} placeholder="要绑定 OTP 的登录用户名" />
+        <div className="sub" style={{ marginBottom: 8, color: 'var(--muted)', fontSize: 12 }}>
+          绑定到当前登录账号，无需填写用户名。
         </div>
 
         {otpEnabled && !otpUri && (

@@ -36,6 +36,9 @@ func main() {
 	caCert := flag.String("ca-cert", "", "用于校验服务端证书的 CA 证书路径（不指定则用 -insecure 跳过校验）")
 	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
 	proxyIP := flag.String("proxy-ip", os.Getenv("MOCENTER_PROXY_IP"), "国内加速代理前缀（用于公网 IP 探测等境外服务，如 http://fa.mooncn.win/?url= ）")
+	agentKey := flag.String("agent-key", os.Getenv("MOCENTER_AGENT_KEY"), "与服务端预共享的注册密钥（服务端 agent.key 的内容）")
+	upgradePubKey := flag.String("upgrade-pubkey", "", "升级包 Ed25519 公钥（hex 或文件路径）；未配置则拒绝升级，除非加 -upgrade-allow-unsigned")
+	upgradeAllowUnsigned := flag.Bool("upgrade-allow-unsigned", false, "允许无签名升级（危险：任何人拿到通道即可让本机执行任意二进制）")
 	flag.Parse()
 
 	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
@@ -57,6 +60,9 @@ func main() {
 			ClientKey:  *clientKey,
 			CACert:     *caCert,
 			ProxyIP:    *proxyIP,
+			AgentKey:   *agentKey,
+			UpgradePubKey:        *upgradePubKey,
+			UpgradeAllowUnsigned: *upgradeAllowUnsigned,
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
 			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
@@ -98,6 +104,15 @@ func main() {
 		if cfg.ProxyIP != "" && *proxyIP == os.Getenv("MOCENTER_PROXY_IP") {
 			*proxyIP = cfg.ProxyIP
 		}
+		if cfg.AgentKey != "" && *agentKey == os.Getenv("MOCENTER_AGENT_KEY") {
+			*agentKey = cfg.AgentKey
+		}
+		if cfg.UpgradePubKey != "" && *upgradePubKey == "" {
+			*upgradePubKey = cfg.UpgradePubKey
+		}
+		if cfg.UpgradeAllowUnsigned && !*upgradeAllowUnsigned {
+			*upgradeAllowUnsigned = true
+		}
 	}
 
 	// 命令行显式传入的参数（flag.Visit）优先级最高，并自动保存回配置文件，
@@ -117,9 +132,12 @@ func main() {
 			"client-key":  func() { cfg.ClientKey = *clientKey },
 			"ca-cert":     func() { cfg.CACert = *caCert },
 			"proxy-ip":    func() { cfg.ProxyIP = *proxyIP },
+			"agent-key":   func() { cfg.AgentKey = *agentKey },
+			"upgrade-pubkey":         func() { cfg.UpgradePubKey = *upgradePubKey },
+			"upgrade-allow-unsigned": func() { cfg.UpgradeAllowUnsigned = *upgradeAllowUnsigned },
 		}
 		dirty := false
-		for _, name := range []string{"server", "agentid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip"} {
+		for _, name := range []string{"server", "agentid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "upgrade-pubkey", "upgrade-allow-unsigned"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -160,13 +178,18 @@ func main() {
 	start := func() {
 		// 服务模式：进程级重启交给 SCM（安装器已配置失败恢复动作），但进程内仍需兜住
 		// panic —— 否则 goroutine 静默死掉，服务却仍显示 Running。
+		o := runOpts{
+			server: *server, agentID: *agentID, hb: *hb, probe: *probe,
+			tls: *tlsEnabled, insecure: *insecure,
+			clientCert: *clientCert, clientKey: *clientKey, caCert: *caCert,
+			proxyIP: *proxyIP, agentKey: *agentKey,
+			upgradePubKey: *upgradePubKey, allowUnsigned: *upgradeAllowUnsigned,
+		}
 		if *daemonize || winapp.IsWindowsService() {
-			daemon.Supervise(func() {
-				runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert, *proxyIP)
-			})
+			daemon.Supervise(func() { runClient(o) })
 			return
 		}
-		runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert, *proxyIP)
+		runClient(o)
 	}
 
 	// 被 SCM 拉起时走服务控制协议（sc query/stop 才能正常工作）；否则按普通进程运行。
@@ -191,20 +214,33 @@ func main() {
 // （svc.Run 的名字对不上会导致 SCM 无法完成握手）。
 const agentServiceName = "MoCenterAgent"
 
-func runClient(server, agentID string, hb, probe int, tlsEnabled, insecure bool, clientCert, clientKey, caCert, proxyIP string) {
+// runOpts 收敛 runClient 的入参，避免继续往位置参数上堆字段时错位。
+type runOpts struct {
+	server, agentID                         string
+	hb, probe                               int
+	tls, insecure                           bool
+	clientCert, clientKey, caCert, proxyIP  string
+	agentKey, upgradePubKey                 string
+	allowUnsigned                           bool
+}
+
+func runClient(o runOpts) {
 	c := client.New(client.Config{
-		ServerAddr: server,
-		AgentID:    agentID,
-		Heartbeat:  seconds(hb),
-		ProbeEvery: seconds(probe),
-		TLS:        tlsEnabled,
-		Insecure:   insecure,
-		ClientCert: clientCert,
-		ClientKey:  clientKey,
-		CACert:     caCert,
-		ProxyIP:    proxyIP,
+		ServerAddr: o.server,
+		AgentID:    o.agentID,
+		Heartbeat:  seconds(o.hb),
+		ProbeEvery: seconds(o.probe),
+		TLS:        o.tls,
+		Insecure:   o.insecure,
+		ClientCert: o.clientCert,
+		ClientKey:  o.clientKey,
+		CACert:     o.caCert,
+		ProxyIP:    o.proxyIP,
+		AgentKey:   o.agentKey,
+		UpgradePubKey:        o.upgradePubKey,
+		UpgradeAllowUnsigned: o.allowUnsigned,
 	})
-	log.Printf("[agent] 启动 Agent %s，目标服务端 %s", agentID, server)
+	log.Printf("[agent] 启动 Agent %s，目标服务端 %s", o.agentID, o.server)
 	c.Run()
 }
 

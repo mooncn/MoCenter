@@ -2,10 +2,7 @@ package auth
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base32"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,12 +70,14 @@ func (m *UserManager) Load() error {
 }
 
 // Save 将账号持久化到文件。
+//
+// 权限 0600：文件里有口令哈希与 OTP 密钥，属敏感数据，不能让同机其他用户读到。
 func (m *UserManager) Save() error {
 	if m.path == "" {
 		return nil
 	}
 	if dir := filepath.Dir(m.path); dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0755)
+		_ = os.MkdirAll(dir, 0700)
 	}
 	payload := struct {
 		Users map[string]*User `json:"users"`
@@ -87,7 +86,7 @@ func (m *UserManager) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.path, data, 0644)
+	return os.WriteFile(m.path, data, 0600)
 }
 
 // ErrInitPasswordRequired 首次创建账号时未提供密码。
@@ -216,7 +215,7 @@ func (m *UserManager) UnbindTOTP(username, password, otp string) error {
 	if !ok {
 		return ErrBadUsername
 	}
-	if subtle.ConstantTimeCompare([]byte(u.PasswordHash), []byte(hashPassword(password))) != 1 {
+	if ok, _ := verifyPassword(u.PasswordHash, password); !ok {
 		return ErrBadLogin
 	}
 	if u.TOTPSecret != "" && !validateTOTP(u.TOTPSecret, otp, 1) {
@@ -269,6 +268,9 @@ func (m *UserManager) EnabledOTP(username string) bool {
 }
 
 // Authenticate 校验用户名+密码，以及（若启用）OTP 验证码。
+//
+// 若该账号仍存着旧版单轮 SHA-256 哈希，校验通过后**透明升级**为 PBKDF2，
+// 因此老用户不需要改密即可获得新的强度。
 func (m *UserManager) Authenticate(username, password, otp string) error {
 	m.mu.RLock()
 	u, ok := m.users[username]
@@ -276,7 +278,8 @@ func (m *UserManager) Authenticate(username, password, otp string) error {
 	if !ok {
 		return ErrBadLogin
 	}
-	if subtle.ConstantTimeCompare([]byte(u.PasswordHash), []byte(hashPassword(password))) != 1 {
+	passOK, needsUpgrade := verifyPassword(u.PasswordHash, password)
+	if !passOK {
 		return ErrBadLogin
 	}
 	if u.TOTPSecret != "" {
@@ -284,7 +287,29 @@ func (m *UserManager) Authenticate(username, password, otp string) error {
 			return ErrBadOTP
 		}
 	}
+	if needsUpgrade {
+		m.upgradeHash(username, password)
+	}
 	return nil
+}
+
+// upgradeHash 把旧格式口令哈希改写为新格式（仅在口令校验通过后调用）。
+func (m *UserManager) upgradeHash(username, password string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[username]
+	if !ok {
+		return
+	}
+	// 双重检查：期间可能已被改密为新格式
+	if _, needs := verifyPassword(u.PasswordHash, password); !needs {
+		return
+	}
+	u.PasswordHash = hashPassword(password)
+	if err := m.Save(); err != nil {
+		// 升级失败不影响本次登录；下次登录会再试一次
+		return
+	}
 }
 
 // ChangePassword 修改用户密码（需校验当前密码，若启用 OTP 还需验证码），并持久化。
@@ -295,10 +320,10 @@ func (m *UserManager) ChangePassword(username, oldPassword, newPassword, otp str
 	if !ok {
 		return ErrBadUsername
 	}
-	if subtle.ConstantTimeCompare([]byte(u.PasswordHash), []byte(hashPassword(oldPassword))) != 1 {
+	if ok, _ := verifyPassword(u.PasswordHash, oldPassword); !ok {
 		return ErrBadOldPassword
 	}
-	if newPassword == "" || len(newPassword) < 6 {
+	if !isStrongPassword(newPassword) {
 		return ErrBadNewPassword
 	}
 	if u.TOTPSecret != "" {
@@ -308,9 +333,4 @@ func (m *UserManager) ChangePassword(username, oldPassword, newPassword, otp str
 	}
 	u.PasswordHash = hashPassword(newPassword)
 	return m.Save()
-}
-
-func hashPassword(p string) string {
-	h := sha256.Sum256([]byte(p))
-	return hex.EncodeToString(h[:])
 }

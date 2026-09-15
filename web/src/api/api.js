@@ -91,14 +91,20 @@ export const Api = {
     const { data } = await api.post('/login', { username, password, otp })
     return data
   },
+  // 登出：吊销当前会话 Token
+  async logout() {
+    const { data } = await api.post('/logout')
+    return data
+  },
   // 修改用户密码
   async changePassword(payload) {
     const { data } = await api.post('/password', payload)
     return data
   },
   // 生成 OTP 绑定密钥与 otpauth URI（返回 { secret, uri, enabled }）
-  async otpSetup(username) {
-    const { data } = await api.get('/otp/setup', { params: { username } })
+  // 服务端以当前会话身份为准，无需再传 username
+  async otpSetup() {
+    const { data } = await api.get('/otp/setup')
     return data
   },
   // 校验动态验证码并启用 OTP
@@ -143,8 +149,11 @@ export class MCSocket {
   constructor({ onAgentList, onCommandResp, onInteractive, onPortMap, onFileTransfer, onUpgrade, token }) {
     this.url = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-      return `${proto}://${location.host}/ws?token=${encodeURIComponent(token || '')}`
+      // Token 改走 Sec-WebSocket-Protocol 子协议头，不再拼在 URL 上：
+      // URL 会进反向代理访问日志与浏览器历史，属于敏感信息泄露面。
+      return `${proto}://${location.host}/ws`
     }
+    this.protocols = ['mocenter', encodeURIComponent(token || '')]
     this.handlers = { onAgentList, onCommandResp, onInteractive, onPortMap, onFileTransfer, onUpgrade }
     // 文件传输状态缓存 key=agentId:path:action -> {total, done}
     this.transferState = new Map()
@@ -164,7 +173,7 @@ export class MCSocket {
   }
 
   connect() {
-    this.ws = new WebSocket(this.url())
+    this.ws = new WebSocket(this.url(), this.protocols)
     this.ws.onopen = () => {
       this.reconnectDelay = 1000
       this.onStatus('connected')

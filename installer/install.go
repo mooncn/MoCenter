@@ -70,6 +70,10 @@ func doInstall(o options) error {
 		if r == "agent" && strings.TrimSpace(o.server) == "" {
 			return errors.New("安装 Agent 必须指定 -server（服务端地址 host:port）")
 		}
+		if r == "agent" && strings.TrimSpace(o.agentKey) == "" {
+			return errors.New("安装 Agent 必须指定 -agent-key（取总控机数据目录下 agent.key 的内容）：" +
+				"服务端要求 Agent 携带注册密钥，否则连接会被拒绝")
+		}
 		if r == "server" && (strings.TrimSpace(o.adminUser) == "" || strings.TrimSpace(o.adminPass) == "") {
 			return errors.New("安装 Server 必须指定 -user 与 -password（后台登录账号）")
 		}
@@ -184,9 +188,14 @@ func writeConfig(role, path string, o options) error {
 			obj["web_dir"] = o.webDir
 		}
 	} else {
+		if strings.TrimSpace(o.agentKey) == "" {
+			return errors.New("安装 Agent 必须指定 -agent-key（取服务端 <data>\\agent.key 的内容）：" +
+				"服务端默认要求 Agent 携带注册密钥，否则连接会被拒绝")
+		}
 		obj = map[string]any{
-			"server": o.server,
-			"daemon": true,
+			"server":    o.server,
+			"agent_key": strings.TrimSpace(o.agentKey),
+			"daemon":    true,
 		}
 		if o.agentID != "" {
 			obj["agent_id"] = o.agentID
@@ -199,18 +208,19 @@ func writeConfig(role, path string, o options) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0644)
+	// 配置里有注册密钥，权限收紧
+	return os.WriteFile(path, b, 0600)
 }
 
 // ensureServerAccount 在数据目录下创建/补全后台登录账号（users.json）。
 //
 // 为什么不把密码写进 mocenter-server.json：本项目的既有约定是「密码不落盘明文」
-// （见 server/main.go：-password 只用于首次创建账号，随后以哈希持久化到 users.json）。
-// 因此这里直接写 users.json，密码只以 SHA-256 摘要落盘。
+// （见 server/main.go：-password 只用于首次创建账号，随后以摘要持久化到 users.json）。
+// 因此这里直接写 users.json。
 //
-// sha256 摘要与文件结构必须与 server/internal/auth/user.go 保持一致
-// （HashPassword / users.json 的 {"users":{...}} 结构）。那边若改为加盐或迭代，
-// 这里必须同步 —— 这也是三个 module 各自独立、不做包引用带来的代价，属既有取舍。
+// 摘要算法：这里仍写**单轮 SHA-256**（三个 module 相互独立、不做包引用，属既有取舍）。
+// 服务端 auth.verifyPassword 兼容该旧格式：首次用它登录成功后会**透明升级**为
+// PBKDF2-HMAC-SHA256，因此兼容性没有问题；users.json 的 {"users":{...}} 结构必须一致。
 //
 // ⚠️ 已存在账号时**不做任何改动**：重装/升级不能用安装时输入的密码覆盖用户后来
 // 自己修改过的密码。

@@ -13,19 +13,35 @@ import (
 )
 
 // Config 总控服务端启动配置。
+//
+// 所有字段**不带 omitempty**：首次生成的配置文件必须完整列出全部参数，
+// 让用户一眼看到有哪些可调项（值为空/默认即表示未启用或使用内置默认）。
 type Config struct {
-	Listen     string `json:"listen,omitempty"`      // Agent TCP 长连接监听地址
-	HTTP       string `json:"http,omitempty"`        // REST API / WebSocket 监听地址
-	Whitelist  string `json:"whitelist,omitempty"`   // IP 白名单（逗号分隔）
-	WebDir     string `json:"web_dir,omitempty"`     // Web 静态资源目录
-	TLSCert    string `json:"tls_cert,omitempty"`    // Agent TLS 证书
-	TLSKey     string `json:"tls_key,omitempty"`     // Agent TLS 私钥
-	CACert     string `json:"ca_cert,omitempty"`     // mTLS 客户端 CA
-	Insecure   bool   `json:"insecure,omitempty"`    // 允许非 TLS 的 Agent 连接
-	DataDir    string `json:"data_dir,omitempty"`    // 数据目录（审计日志持久化等）
-	User       string `json:"user,omitempty"`        // 登录用户名
-	Password   string `json:"password,omitempty"`    // 登录密码
-	TOTPSecret string `json:"totp_secret,omitempty"` // TOTP 密钥（base32）
+	Listen     string `json:"listen"`      // Agent TCP 长连接监听地址，默认 :9000
+	HTTP       string `json:"http"`        // REST API / WebSocket 监听地址，默认 :8080
+	Whitelist  string `json:"whitelist"`   // IP 白名单（逗号分隔，留空不限制）
+	WebDir     string `json:"web_dir"`     // Web 静态资源目录，留空则不托管前端
+	TLSCert    string `json:"tls_cert"`    // Agent TLS 证书
+	TLSKey     string `json:"tls_key"`     // Agent TLS 私钥
+	CACert     string `json:"ca_cert"`     // mTLS 客户端 CA
+	Insecure   bool   `json:"insecure"`    // 允许非 TLS 的 Agent 连接
+	DataDir    string `json:"data_dir"`    // 数据目录（审计日志、users.json、agent.key、uploads 等）
+	User       string `json:"user"`        // 登录用户名
+	Password   string `json:"password"`    // 登录密码（仅首次创建账号用，**不落盘**，恒为空）
+	TOTPSecret string `json:"totp_secret"` // TOTP 密钥（base32；**不落盘**，恒为空）
+	// PkgDir 安装包托管目录（Agent 可经长连接直接拉取）；留空用 <data>/packages。
+	PkgDir string `json:"pkg_dir"`
+	// AgentKey Agent 注册预共享密钥；留空则自动生成并写到 <data>/agent.key。
+	AgentKey string `json:"agent_key"`
+	// TokenTTL 会话 Token 有效期（Go duration 字符串，如 12h / 30m）；留空用内置默认 12h。
+	TokenTTL string `json:"token_ttl"`
+	// WebTLSCert / WebTLSKey Web 控制台 TLS 证书与私钥。
+	// 不配置则 :8080 为明文 HTTP —— 登录口令与 Token 将明文上网，
+	// 仅在前面有 TLS 反向代理时才可接受。
+	WebTLSCert string `json:"web_tls_cert"`
+	WebTLSKey  string `json:"web_tls_key"`
+	// AllowAnonAgents 允许 Agent 无凭证注册（危险，仅迁移期使用）。
+	AllowAnonAgents bool `json:"allow_anon_agents"`
 }
 
 // DefaultPath 返回默认配置文件路径（便携态：与可执行文件同目录）。
@@ -73,13 +89,14 @@ func Load(path string) (*Config, error) {
 }
 
 // Save 将配置写入文件（自动创建目录）。
+// 权限 0600：配置虽不含明文口令，但属于服务运行的核心文件，收紧无副作用。
 func Save(path string, c *Config) error {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0755)
+		_ = os.MkdirAll(dir, 0700)
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }

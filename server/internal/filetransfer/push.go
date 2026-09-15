@@ -135,9 +135,14 @@ func (m *PushManager) SaveToTemp(commandID string, baseDir string) (string, erro
 	if t == nil {
 		return "", fmt.Errorf("任务不存在")
 	}
-	_ = os.MkdirAll(baseDir, 0755)
-	safe := filepath.Base(filepath.Clean(t.FilePath))
-	path := filepath.Join(baseDir, t.AgentID+"_"+safe)
+	_ = os.MkdirAll(baseDir, 0700)
+	// 与 filetransfer.localPath 同一套净化逻辑：AgentID 来自报文，不能直接拼进路径
+	safeID := sanitizeComponent(t.AgentID)
+	safe := sanitizeComponent(filepath.Base(filepath.Clean(t.FilePath)))
+	path := filepath.Join(baseDir, safeID+"_"+safe)
+	if !within(baseDir, path) {
+		return "", fmt.Errorf("非法的落盘路径")
+	}
 	f, err := os.Create(path)
 	if err != nil {
 		return "", err

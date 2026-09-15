@@ -68,27 +68,76 @@ func (c *Conn) Write(typ string, payload interface{}) error {
 	return c.enc.Encode(protocol.Envelope{Type: typ, Data: data})
 }
 
+// DefaultStaleAfter 判定「旧连接已死」的阈值：超过它仍无心跳才允许被新连接替换。
+//
+// 取 3 倍默认心跳（30s）。太长会让正常重启的 Agent 等太久，太短则给了
+// 冒名顶替者可乘之机。
+const DefaultStaleAfter = 90 * time.Second
+
 // Manager 维护全部 Agent 会话。
 type Manager struct {
-	mu    sync.RWMutex
-	conns map[string]*Conn
+	mu         sync.RWMutex
+	conns      map[string]*Conn
+	staleAfter time.Duration
 }
 
 // NewManager 创建会话管理器。
 func NewManager() *Manager {
-	return &Manager{conns: make(map[string]*Conn)}
+	return &Manager{
+		conns:      make(map[string]*Conn),
+		staleAfter: DefaultStaleAfter,
+	}
 }
 
-// Upsert 注册或更新 Agent 连接。
+// SetStaleAfter 覆盖「旧连接视为已死」的阈值。
+func (m *Manager) SetStaleAfter(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d <= 0 {
+		d = DefaultStaleAfter
+	}
+	m.staleAfter = d
+}
+
+// Upsert 注册 Agent 连接。
+//
+// 语义变更（安全加固）：同名 AgentID 已有**仍然存活**的连接时，**拒绝**本次注册并
+// 返回 accepted=false —— 旧实现会直接 Close() 旧连接再顶替，等于任何人只要知道
+// 一个 AgentID 就能把真实主机踢下线并接管其身份（从而收到发往该主机的命令、
+// 推送的文件与 VNC 隧道数据）。
+//
+// 只有在旧连接已超过 staleAfter 没有心跳（视为死连接）时才允许替换，
+// 以免正常重启的 Agent 被自己的僵尸连接挡住。
+//
+// 返回 (existing, accepted)。
 func (m *Manager) Upsert(agentID string, c *Conn) (*Conn, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	old, exists := m.conns[agentID]
-	if exists && old != nil && old.NetConn != nil {
-		_ = old.NetConn.Close()
+	if exists && old != nil && old != c {
+		if !m.isStaleLocked(old, time.Now()) {
+			return old, false // 拒绝：该 ID 已有活跃连接
+		}
+		log.Printf("[session] Agent %s 的旧连接已超时未心跳，允许新连接替换（旧来自 %s，新来自 %s）",
+			agentID, old.RemoteAddr, c.RemoteAddr)
+		if old.NetConn != nil {
+			_ = old.NetConn.Close()
+		}
 	}
 	m.conns[agentID] = c
-	return old, exists
+	return old, true
+}
+
+// isStaleLocked 判断连接是否已过 staleAfter 未心跳。
+func (m *Manager) isStaleLocked(c *Conn, now time.Time) bool {
+	if c.LastSeen.IsZero() {
+		return true
+	}
+	threshold := m.staleAfter
+	if threshold <= 0 {
+		threshold = DefaultStaleAfter
+	}
+	return now.Sub(c.LastSeen) > threshold
 }
 
 // Get 获取指定 Agent 连接。

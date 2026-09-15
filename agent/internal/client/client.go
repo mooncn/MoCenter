@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"mocenter/agent/internal/agentauth"
 	"mocenter/agent/internal/command"
 	"mocenter/agent/internal/probe"
 	"mocenter/agent/internal/protocol"
@@ -35,6 +36,12 @@ type Config struct {
 	CACert     string        // 校验服务端证书的 CA 证书路径
 	// ProxyIP 国内加速代理前缀（用于公网 IP 探测等境外服务，如 http://fa.mooncn.win/?url= ）
 	ProxyIP string
+	// AgentKey 与服务端预共享的注册密钥；为空则无法通过服务端的注册鉴权。
+	AgentKey string
+	// UpgradePubKey 升级包 Ed25519 公钥（hex 或文件路径）。
+	UpgradePubKey string
+	// UpgradeAllowUnsigned 显式允许无签名升级（危险，仅迁移期使用）。
+	UpgradeAllowUnsigned bool
 }
 
 // Client Agent 客户端。
@@ -161,6 +168,9 @@ func (c *Client) connectAndServe() error {
 }
 
 // register 发送上线消息。
+//
+// 若配置了 -agent-key，会附带 HMAC 注册证明（密钥本身不上线传输），
+// 使服务端能够确认对端确实持有密钥 —— 这是 :9000 通道唯一的应用层身份凭证。
 func (c *Client) register() {
 	ips := c.collect.PublicIPs()
 	uuid := c.collect.UUID()
@@ -174,6 +184,15 @@ func (c *Client) register() {
 		"remote_addr": "",
 		"public_ip":   ips.IPv4,
 		"public_ipv6": ips.IPv6,
+	}
+	if c.cfg.AgentKey != "" {
+		nonce := agentauth.NewNonce()
+		ts := time.Now().Unix()
+		info["auth_nonce"] = nonce
+		info["auth_time"] = ts
+		info["auth_proof"] = agentauth.Proof(c.cfg.AgentKey, c.cfg.AgentID, nonce, ts)
+	} else {
+		log.Printf("[agent] 警告: 未配置 -agent-key，无法通过服务端的注册鉴权（若服务端已启用校验将被拒绝连接）")
 	}
 	_ = c.write(protocol.TypeOnline, info)
 }
@@ -303,7 +322,10 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 		if json.Unmarshal(env.Data, &up) != nil {
 			return
 		}
-		go upgrade.Perform(&up, func(resp *protocol.UpgradeResp) {
+		go upgrade.Perform(&up, upgrade.Policy{
+			PubKey:        c.cfg.UpgradePubKey,
+			AllowUnsigned: c.cfg.UpgradeAllowUnsigned,
+		}, func(resp *protocol.UpgradeResp) {
 			_ = c.write(protocol.TypeUpgradeResp, resp)
 		})
 	case protocol.TypeInteractiveClose:

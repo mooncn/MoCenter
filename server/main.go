@@ -28,13 +28,16 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
+	"mocenter/server/internal/agentauth"
 	"mocenter/server/internal/auth"
 	"mocenter/server/internal/config"
 	"mocenter/server/internal/filetransfer"
@@ -68,6 +71,11 @@ func main() {
 	password := flag.String("password", "", "登录密码")
 	totpSecret := flag.String("totp-secret", "", "TOTP 密钥（base32，设置后登录需提供一次性验证码，兼容 Google Authenticator）")
 	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
+	agentKey := flag.String("agent-key", os.Getenv("MOCENTER_AGENT_KEY"), "Agent 注册预共享密钥（留空则自动生成并写到 <data>/agent.key）")
+	allowAnonAgents := flag.Bool("allow-unauthenticated-agents", false, "允许 Agent 无凭证注册（危险：任何能连通 :9000 的主机都可注册/冒名）")
+	webTLSCert := flag.String("web-tls-cert", "", "Web 控制台 TLS 证书（不配置则 :8080 为明文 HTTP）")
+	webTLSKey := flag.String("web-tls-key", "", "Web 控制台 TLS 私钥")
+	tokenTTL := flag.Duration("token-ttl", auth.DefaultTokenTTL, "会话 Token 有效期（默认 12h）")
 	flag.Parse()
 
 	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
@@ -90,6 +98,9 @@ func main() {
 			// 不落盘明文密码与 TOTP 密钥：账号以哈希持久化到 users.json
 			Password:   "",
 			TOTPSecret: "",
+			PkgDir:     *pkgDir,
+			AgentKey:   *agentKey,
+			TokenTTL:   tokenTTL.String(),
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
 			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
@@ -134,6 +145,26 @@ func main() {
 		if cfg.TOTPSecret != "" && *totpSecret == "" {
 			*totpSecret = cfg.TOTPSecret
 		}
+		if cfg.WebTLSCert != "" && *webTLSCert == "" {
+			*webTLSCert = cfg.WebTLSCert
+		}
+		if cfg.WebTLSKey != "" && *webTLSKey == "" {
+			*webTLSKey = cfg.WebTLSKey
+		}
+		if cfg.PkgDir != "" && *pkgDir == "" {
+			*pkgDir = cfg.PkgDir
+		}
+		if cfg.AgentKey != "" && *agentKey == os.Getenv("MOCENTER_AGENT_KEY") {
+			*agentKey = cfg.AgentKey
+		}
+		if cfg.TokenTTL != "" && tokenTTL.String() == auth.DefaultTokenTTL.String() {
+			if d, err := time.ParseDuration(cfg.TokenTTL); err == nil && d > 0 {
+				*tokenTTL = d
+			}
+		}
+		if cfg.AllowAnonAgents {
+			*allowAnonAgents = true
+		}
 	}
 
 	// 命令行显式传入的参数（flag.Visit）优先级最高，并自动保存回配置文件，
@@ -147,15 +178,20 @@ func main() {
 			"http":      func() { cfg.HTTP = *httpAddr },
 			"whitelist": func() { cfg.Whitelist = *whitelist },
 			"web":       func() { cfg.WebDir = *webDir },
+			"web-tls-cert": func() { cfg.WebTLSCert = *webTLSCert },
+			"web-tls-key":  func() { cfg.WebTLSKey = *webTLSKey },
 			"tls-cert":  func() { cfg.TLSCert = *tlsCert },
 			"tls-key":   func() { cfg.TLSKey = *tlsKey },
 			"ca-cert":   func() { cfg.CACert = *caCert },
 			"insecure":  func() { cfg.Insecure = *insecure },
 			"data":      func() { cfg.DataDir = *dataDir },
 			"user":      func() { cfg.User = *user },
+			"pkg-dir":   func() { cfg.PkgDir = *pkgDir },
+			"agent-key": func() { cfg.AgentKey = *agentKey },
+			"token-ttl": func() { cfg.TokenTTL = tokenTTL.String() },
 		}
 		dirty := false
-		for _, name := range []string{"listen", "http", "whitelist", "web", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user"} {
+		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "pkg-dir", "agent-key", "token-ttl"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -197,6 +233,35 @@ func main() {
 	}
 	logAvailablePackages(*pkgDir)
 
+	// Agent 注册预共享密钥：应用层鉴权的信任根。
+	// 优先级：-agent-key > <dataDir>/agent.key（自动生成）。
+	// 有了它，未授权主机无法注册，也无法用别人的 AgentID 冒名顶替。
+	agentKeyPath := filepath.Join(*dataDir, agentauth.KeyFileName)
+	agentKeyVal := strings.TrimSpace(*agentKey)
+	agentKeyCreated := false
+	if agentKeyVal == "" {
+		k, created, err := agentauth.LoadOrCreateKey(agentKeyPath)
+		if err != nil {
+			log.Fatalf("[server] 读取/生成 Agent 注册密钥失败: %v", err)
+		}
+		agentKeyVal, agentKeyCreated = k, created
+	} else if err := os.MkdirAll(*dataDir, 0700); err != nil {
+		log.Printf("[server] 警告: 创建数据目录失败: %v", err)
+	} else if err := os.WriteFile(agentKeyPath, []byte(agentKeyVal+"\n"), 0600); err != nil {
+		log.Printf("[server] 警告: 保存 Agent 注册密钥失败: %v", err)
+	}
+	verifier := agentauth.NewVerifier(agentKeyVal)
+	if agentKeyCreated {
+		log.Printf("[server] 已生成 Agent 注册密钥并写入 %s（权限 0600）", agentKeyPath)
+	}
+	if verifier.Enabled() {
+		log.Printf("[server] Agent 注册鉴权已启用（密钥指纹 %s）。请给每台 Agent 配置同一密钥："+
+			"agent 启动参数 -agent-key，或配置文件字段 agent_key；来源：本文件 / -agent-key 参数", verifier.KeyFingerprint())
+	} else {
+		log.Printf("[server] 警告: Agent 注册鉴权已关闭（-allow-unauthenticated-agents）——"+
+			"任何能连通 %s 的主机都可注册为 Agent 或冒用他人 AgentID", *addr)
+	}
+
 	var wl []string
 	for _, s := range strings.Split(*whitelist, ",") {
 		if s = strings.TrimSpace(s); s != "" {
@@ -234,6 +299,8 @@ func main() {
 	remarks.Load()
 	store.SetRemarkFn(remarks.Get)
 	authz := auth.NewAuth(wl)
+	authz.SetTokenTTL(*tokenTTL)
+	loginGuard := auth.NewLoginGuard()
 	userMgr := auth.NewUserManager(filepath.Join(*dataDir, "users.json"))
 	if err := userMgr.InitFromFlags(*user, *password, *totpSecret); err != nil {
 		if errors.Is(err, auth.ErrInitPasswordRequired) {
@@ -243,8 +310,9 @@ func main() {
 			log.Printf("警告: 初始化用户失败: %v", err)
 		}
 	}
-	// 若尚无任何账号，则创建内置默认账号 admin/123456，保证开箱可登录。
-	// 可用 -user/-password 覆盖默认用户名与密码。
+	// 若尚无任何账号，则创建初始账号（**不再使用固定弱口令** admin/123456 ——
+	// 口令写在源码里等于公开，"凭证未泄露"的前提对它不成立）。
+	// 可用 -user/-password 覆盖；未指定密码时生成随机强口令，写入 <data>/initial-password.txt（0600）。
 	if !userMgr.HasUsers() {
 		defUser := *user
 		if defUser == "" {
@@ -252,30 +320,49 @@ func main() {
 		}
 		defPass := *password
 		if defPass == "" {
-			defPass = "123456"
+			defPass = randPassword(16)
 		}
 		if err := userMgr.UpsertUser(defUser, defPass, *totpSecret); err != nil {
 			log.Printf("警告: 创建默认账号失败: %v", err)
-		} else if defUser == "admin" && defPass == "123456" {
-			log.Printf("已创建内置默认账号 admin/123456（请登录后尽快修改密码）")
+		} else if strings.TrimSpace(*password) == "" {
+			pwFile := filepath.Join(*dataDir, "initial-password.txt")
+			_ = os.MkdirAll(*dataDir, 0700)
+			body := fmt.Sprintf("账号: %s\n初始密码: %s\n生成时间: %s\n\n请登录后立即在「账号设置」修改密码，随后删除本文件。\n",
+				defUser, defPass, time.Now().Format("2006-01-02 15:04:05"))
+			if werr := os.WriteFile(pwFile, []byte(body), 0600); werr != nil {
+				log.Printf("已创建初始账号 %s，但初始密码写入 %s 失败: %v", defUser, pwFile, werr)
+			} else {
+				log.Printf("已创建初始账号 %s，初始密码已写入 %s（权限 0600，请查看后删除）", defUser, pwFile)
+			}
+			if !winapp.IsWindowsService() {
+				log.Printf(">>> 初始账号 %s / %s （请登录后立即修改密码） <<<", defUser, defPass)
+			}
 		} else {
 			log.Printf("已创建默认账号 %s", defUser)
 		}
 	}
-	// 修复历史版本因缺少 -password 而误建的空密码账号，重置为 123456 并提示。
+	// 修复历史版本因缺少 -password 而误建的空密码账号：改用**随机口令**（不再固定 123456）。
 	if broken := userMgr.BrokenAccounts(); len(broken) > 0 {
 		for _, name := range broken {
-			if err := userMgr.SetPassword(name, "123456"); err != nil {
+			pw := randPassword(16)
+			if err := userMgr.SetPassword(name, pw); err != nil {
 				log.Printf("警告: 修复账号 %s 失败: %v", name, err)
 				continue
 			}
-			log.Printf("已修复历史空密码账号 %s，密码重置为 123456，请登录后立即修改", name)
+			if !winapp.IsWindowsService() {
+				log.Printf("已修复历史空密码账号 %s，临时密码：%s（请登录后立即修改）", name, pw)
+			} else {
+				log.Printf("已修复历史空密码账号 %s，临时密码见 %s", name,
+					filepath.Join(*dataDir, "initial-password.txt"))
+			}
 		}
 	}
 	router := route.NewRouter(sess, db, filepath.Join(*dataDir, "audits.jsonl"))
 	defer router.Close()
 	pm := portmap.NewManager(sess, db)
-	ft := filetransfer.NewManager("/tmp/mocenter_uploads")
+	// 上传/下传文件的暂存目录：放在数据目录下并收紧权限。
+	// 旧版硬编码 /tmp/mocenter_uploads（全局可写目录），且 Linux 下任何用户可读。
+	ft := filetransfer.NewManager(filepath.Join(*dataDir, "uploads"))
 	pushMgr := filetransfer.NewPushManager()
 	vncMgr := vnc.NewMgr(sess)
 
@@ -314,7 +401,8 @@ func main() {
 	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
 	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz, router))
 	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz))
-	mux.HandleFunc("/api/login", loginHandler(userMgr, authz, router))
+	mux.HandleFunc("/api/login", loginHandler(userMgr, authz, loginGuard, router))
+	mux.HandleFunc("/api/logout", logoutHandler(authz))
 	mux.HandleFunc("/api/password", changePasswordHandler(userMgr, authz))
 	mux.HandleFunc("/api/otp/setup", otpSetupHandler(userMgr, authz))
 	mux.HandleFunc("/api/otp/enable", otpEnableHandler(userMgr, authz))
@@ -332,8 +420,39 @@ func main() {
 	// 监听与接收循环封装成函数：被 SCM 拉起时由服务启动回调调用。
 	start := func() {
 		go func() {
-			log.Printf("[server] REST API 监听 %s", *httpAddr)
-			if err := http.ListenAndServe(*httpAddr, mux); err != nil {
+			// Web 控制台 TLS：配置了证书就走 https，否则明文 ——
+			// 明文意味着登录口令与 Token 会上网，必须在前面挂 TLS 反代才能接受。
+			if *webTLSCert != "" && *webTLSKey != "" {
+				cert, err := tls.LoadX509KeyPair(*webTLSCert, *webTLSKey)
+				if err != nil {
+					log.Fatalf("[server] 加载 Web TLS 证书失败: %v", err)
+				}
+				webSrv := &http.Server{
+					Addr:    *httpAddr,
+					Handler: securityHeaders(mux),
+					TLSConfig: &tls.Config{
+						Certificates: []tls.Certificate{cert},
+						MinVersion:   tls.VersionTLS12,
+					},
+					ReadHeaderTimeout: 10 * time.Second,
+				}
+				log.Printf("[server] REST API / Web 控制台监听 %s（TLS）", *httpAddr)
+				if err := webSrv.ListenAndServeTLS("", ""); err != nil {
+					log.Fatalf("[server] https error: %v", err)
+				}
+				return
+			}
+			log.Printf("[server] REST API / Web 控制台监听 %s（**明文 HTTP**）", *httpAddr)
+			if !isLoopbackAddr(*httpAddr) {
+				log.Printf("[server] 警告: Web 控制台未启用 TLS，登录口令与 Token 将明文传输。"+
+					"请配置 -web-tls-cert/-web-tls-key，或确保服务只通过 TLS 反向代理对外提供")
+			}
+			srv := &http.Server{
+				Addr:              *httpAddr,
+				Handler:           securityHeaders(mux),
+				ReadHeaderTimeout: 10 * time.Second,
+			}
+			if err := srv.ListenAndServe(); err != nil {
 				log.Fatalf("[server] http error: %v", err)
 			}
 		}()
@@ -387,7 +506,7 @@ func main() {
 				log.Printf("[server] accept error: %v", err)
 				continue
 			}
-			go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir)
+			go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir, verifier, *allowAnonAgents)
 		}
 	}
 
@@ -413,46 +532,102 @@ func main() {
 // （svc.Run 的名字对不上会导致 SCM 无法完成握手）。
 const serverServiceName = "MoCenterServer"
 
+// connOwns 判断报文自报的身份是否与连接身份一致。
+//
+// 报文里的 AgentID 一律不可信 —— 攻击者可用它冒充别的主机上报假探针、
+// 甚至把文件写到服务端任意路径。身份只能来自注册成功的那条连接。
+func connOwns(c *session.Conn, claimed string) bool {
+	if c == nil || c.AgentID == "" || claimed == "" {
+		return false
+	}
+	return claimed == c.AgentID
+}
+
+// validAgentID 校验 AgentID 是否可用。
+// 允许较宽松（兼容中文主机名 / 硬件 UUID），但禁止空白与控制字符，
+// 防止不可控内容进入日志与审计。
+func validAgentID(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > 128 {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+		if unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
+
 // handleAgentConn 处理单个 Agent 的 TCP 长连接。
-func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, pkgDir string) {
+//
+// 安全模型（加固后）：
+//   - 注册需携带预共享密钥的 HMAC 证明（verifier），否则拒绝；
+//   - 同名 AgentID 的活跃连接**不允许被顶替**（由 session.Upsert 拒绝）；
+//   - 报文里自带的 AgentID 一律以**连接身份**为准，不一致即丢弃 —— 这是
+//     "身份取自连接而不是取自报文"的关键，否则伪造 AgentID 仍能冒用他人。
+func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, pkgDir string, verifier *agentauth.Verifier, allowAnon bool) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 
 	sessConn := session.NewConn(conn)
 	sessConn.RemoteAddr = conn.RemoteAddr().String()
-	// 先读取 Agent 上线消息以获取 AgentID
+	// 先读取 Agent 上线消息以完成注册
+	registered := false
 	for sc.Scan() {
 		var env protocol.Envelope
 		if err := json.Unmarshal(sc.Bytes(), &env); err != nil {
 			log.Printf("[server] decode error from %s: %v", conn.RemoteAddr(), err)
 			continue
 		}
-		switch env.Type {
-		case protocol.TypeOnline:
-			var info protocol.AgentInfo
-			if err := json.Unmarshal(env.Data, &info); err != nil {
-				continue
-			}
-			sessConn.AgentID = info.AgentID
-			sessConn.Hostname = info.Hostname
-			sessConn.RemoteAddr = conn.RemoteAddr().String()
-			info.Online = true
-			info.LastSeen = time.Now().Unix()
-			info.RemoteAddr = conn.RemoteAddr().String()
-			old, existed := sess.Upsert(info.AgentID, sessConn)
-			_ = old
-			store.UpsertAgent(&info)
-			if existed {
-				log.Printf("[server] Agent %s 重新上线", info.AgentID)
-			} else {
-				log.Printf("[server] Agent %s 上线", info.AgentID)
-			}
-			hub.Broadcast(protocol.TypeAgentList, store.All())
+		// 注册完成前只接受上线消息，其余一律丢弃（避免未注册连接触碰业务逻辑）
+		if env.Type != protocol.TypeOnline {
+			continue
 		}
+		var info protocol.AgentInfo
+		if err := json.Unmarshal(env.Data, &info); err != nil {
+			continue
+		}
+		if !validAgentID(info.AgentID) {
+			log.Printf("[server] 拒绝注册（agent_id 非法或为空）: %s", conn.RemoteAddr())
+			return
+		}
+		// 应用层注册鉴权：HMAC 证明 + 时间窗 + 防重放
+		if verifier.Enabled() {
+			if err := verifier.Verify(info.AgentID, info.AuthNonce, info.AuthProof, info.AuthTime); err != nil {
+				// 只写日志、不写审计库：这里的内容来自未认证方，写库会被灌垃圾
+				log.Printf("[server] 拒绝 Agent %q 注册: %v（来自 %s）", info.AgentID, err, conn.RemoteAddr())
+				return
+			}
+		} else if !allowAnon {
+			log.Printf("[server] 拒绝 Agent %q 注册: 服务端未配置注册密钥", info.AgentID)
+			return
+		}
+		sessConn.AgentID = info.AgentID
+		sessConn.Hostname = info.Hostname
+		info.Online = true
+		info.LastSeen = time.Now().Unix()
+		info.RemoteAddr = conn.RemoteAddr().String()
+		old, accepted := sess.Upsert(info.AgentID, sessConn)
+		if !accepted {
+			log.Printf("[server] 拒绝 Agent %s 重复注册：该 ID 已有活跃连接（正在被 %s 使用）",
+				info.AgentID, old.RemoteAddr)
+			return
+		}
+		_ = old
+		store.UpsertAgent(&info)
+		if accepted {
+			log.Printf("[server] Agent %s 上线（来自 %s）", info.AgentID, conn.RemoteAddr())
+		}
+		hub.Broadcast(protocol.TypeAgentList, store.All())
+		registered = true
 		break // 上线后跳出循环，进入主消息循环
 	}
-	if sessConn.AgentID == "" {
+	if !registered || sessConn.AgentID == "" {
 		log.Printf("[server] Agent 连接未完成注册，关闭: %s", conn.RemoteAddr())
 		return
 	}
@@ -482,6 +657,12 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		case protocol.TypeProbeDataReq:
 			var p protocol.ProbeDataReq
 			_ = json.Unmarshal(env.Data, &p)
+			// 身份以连接为准：报文里的 agent_id 不可信，
+			// 否则一条连接可以伪造其它主机的探针数据 / 凭空造出假主机。
+			if !connOwns(sessConn, p.AgentID) {
+				log.Printf("[server] 丢弃 %s 的探针报文（自报身份 %q 与连接身份不符）", sessConn.AgentID, p.AgentID)
+				continue
+			}
 			store.UpdateProbe(&p)
 			hub.Broadcast(protocol.TypeAgentList, store.All())
 			_ = sessConn.Write(protocol.TypeProbeDataResp, protocol.ProbeDataResp{
@@ -501,6 +682,11 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		case protocol.TypeFileUploadReq:
 			var fu protocol.FileUploadReq
 			_ = json.Unmarshal(env.Data, &fu)
+			// 身份以连接为准：防止一条连接伪造他人身份把文件写到服务端
+			if !connOwns(sessConn, fu.AgentID) {
+				log.Printf("[server] 丢弃 %s 的上传分片（自报身份 %q 与连接身份不符）", sessConn.AgentID, fu.AgentID)
+				continue
+			}
 			// 分片接收：MD5 校验 + 断点续传 + ACK/NACK
 			ack := ft.HandleUploadChunk(&fu)
 			_ = sessConn.Write(protocol.TypeFileAck, ack)
@@ -645,15 +831,6 @@ func historyHandler(store *probe.Store, authz *auth.Auth) http.HandlerFunc {
 		}
 		writeJSON(w, store.HistoryDownsampled(agentID, since, maxPoints))
 	}
-}
-
-// operatorIPOf 取请求来源 IP（用于登录审计留痕）。
-func operatorIPOf(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 // setRemarkHandler 设置/更新指定主机的备注（POST 或 PUT）。
@@ -941,7 +1118,7 @@ func portmapOpHandler(pm *portmap.Manager, authz *auth.Auth, router *route.Route
 		// 端口映射增删改属于关键运维操作，纳入操作审计留痕
 		if router != nil {
 			router.Audit(&route.AuditLog{
-				Time: time.Now().Unix(), Operator: authz.Operator(r.Header.Get("Authorization")), OperatorIP: operatorIPOf(r),
+				Time: time.Now().Unix(), Operator: authz.Operator(r.Header.Get("Authorization")), OperatorIP: auth.LoginIPOf(r.RemoteAddr),
 				Command: fmt.Sprintf("端口映射 %s public:%d local:%d agent:%s", op.Action, op.PublicPort, op.LocalPort, op.AgentID),
 				Result:  "ok", Category: "op",
 			})
@@ -960,11 +1137,13 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			AgentID string `json:"agent_id"`
-			Version string `json:"version"`
-			URL     string `json:"url"`
-			MD5     string `json:"md5"`
-			Force   bool   `json:"force"`
+			AgentID   string `json:"agent_id"`
+			Version   string `json:"version"`
+			URL       string `json:"url"`
+			SHA256    string `json:"sha256"`
+			Signature string `json:"signature"`
+			MD5       string `json:"md5"` // 已废弃，仅为兼容旧前端
+			Force     bool   `json:"force"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -972,6 +1151,29 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 		}
 		if body.AgentID == "" {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+			return
+		}
+		// 服务端侧先做一次校验，尽早把错误反馈给操作者（Agent 侧还会再校验一次）
+		if strings.TrimSpace(body.SHA256) == "" {
+			writeJSON(w, map[string]interface{}{"ok": false,
+				"msg": "必须提供升级包的 sha256 摘要（md5 已废弃，且不能作为唯一校验）"})
+			return
+		}
+		if !isHex64(strings.ToLower(strings.TrimSpace(body.SHA256))) {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "sha256 摘要格式不合法"})
+			return
+		}
+		// 下载源协议白名单：http 会被明文传输、易被中间人篡改，等同于给目标机投毒
+		if u, perr := url.Parse(strings.TrimSpace(body.URL)); perr != nil || u.Scheme == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "升级包地址不合法"})
+			return
+		} else if strings.EqualFold(u.Scheme, "http") {
+			writeJSON(w, map[string]interface{}{"ok": false,
+				"msg": "升级包地址必须是 https（http 明文传输，升级包可能被篡改）"})
+			return
+		} else if !strings.EqualFold(u.Scheme, "https") {
+			writeJSON(w, map[string]interface{}{"ok": false,
+				"msg": "升级包地址协议不被允许: " + u.Scheme})
 			return
 		}
 		conn := sess.Get(body.AgentID)
@@ -983,6 +1185,8 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 			UpgradeID: fmt.Sprintf("up-%d", time.Now().UnixNano()),
 			Version:   body.Version,
 			URL:       body.URL,
+			SHA256:    strings.ToLower(strings.TrimSpace(body.SHA256)),
+			Signature: strings.TrimSpace(body.Signature),
 			MD5:       body.MD5,
 			Force:     body.Force,
 		}
@@ -994,11 +1198,33 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 	}
 }
 
+// isHex64 判断是否为 64 位十六进制（SHA-256 摘要）。
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // loginHandler 处理用户名+密码（+OTP 可选）登录，成功后颁发访问 Token。
-func loginHandler(um *auth.UserManager, authz *auth.Auth, router *route.Router) http.HandlerFunc {
+//
+// 安全说明：这是唯一无法要求 Token 的入口，因此必须自行做
+// IP 白名单校验、专用限流与失败退避 —— 此前完全没有，弱口令可被无限次在线尝试。
+func loginHandler(um *auth.UserManager, authz *auth.Auth, loginGuard *auth.LoginGuard, router *route.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// IP 白名单：配置了白名单就同样适用于登录（否则限流只能挡速率，挡不住来源）
+		if !authz.IsAllowedIP(r.RemoteAddr) {
+			http.Error(w, "ip not allowed", http.StatusForbidden)
 			return
 		}
 		var body struct {
@@ -1014,28 +1240,76 @@ func loginHandler(um *auth.UserManager, authz *auth.Auth, router *route.Router) 
 			http.Error(w, "未配置可登录用户", http.StatusNotImplemented)
 			return
 		}
-		opIP := operatorIPOf(r)
+		// 限流 + 失败退避（按 IP 与用户名双重约束）
+		if ok, retry := loginGuard.Allow(r.RemoteAddr, body.Username); !ok {
+			w.Header().Set("Retry-After", auth.RetryAfter(retry))
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(retry/time.Second)+1)})
+			return
+		}
+		opIP := auth.LoginIPOf(r.RemoteAddr)
 		if err := um.Authenticate(body.Username, body.Password, body.OTP); err != nil {
+			loginGuard.Fail(body.Username)
 			// 登录失败同样留痕，便于安全审计与暴力破解排查
 			router.Audit(&route.AuditLog{
-				Time: time.Now().Unix(), Operator: body.Username, OperatorIP: opIP,
+				Time: time.Now().Unix(), Operator: auditSafeText(body.Username), OperatorIP: opIP,
 				Command: "登录失败", Result: err.Error(), ExitCode: -1, Category: "auth",
 			})
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 			return
 		}
+		loginGuard.Success(body.Username)
 		tok := randHex(32)
 		authz.RegisterToken(tok, body.Username)
 		router.Audit(&route.AuditLog{
-			Time: time.Now().Unix(), Operator: body.Username, OperatorIP: opIP,
+			Time: time.Now().Unix(), Operator: auditSafeText(body.Username), OperatorIP: opIP,
 			Command: "登录成功", Result: "ok", Category: "auth",
 		})
-		log.Printf("[auth] 用户 %s 登录成功", body.Username)
+		log.Printf("[auth] 用户 %s 登录成功（来自 %s）", body.Username, opIP)
 		writeJSON(w, map[string]interface{}{"ok": true, "token": tok})
 	}
 }
 
+// logoutHandler 登出：吊销当前会话 Token。
+func logoutHandler(authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !guard(w, r, authz) {
+			return
+		}
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		authz.RevokeToken(token)
+		writeJSON(w, map[string]interface{}{"ok": true, "msg": "已登出"})
+	}
+}
+
+// auditSafeText 收敛来自未认证方的审计字段：限长并去掉控制字符，
+// 防止未认证请求向审计库注入伪造条目或超长垃圾。
+func auditSafeText(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+		if b.Len() >= 128 {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return "(空)"
+	}
+	return b.String()
+}
+
 // changePasswordHandler 修改用户密码（需鉴权；校验当前密码，若启用 OTP 还需验证码）。
+//
+// 身份以 Token 为准：不再信任请求体里的 username —— 否则任何持有有效 Token 的
+// 会话都能对其它账号发起改密尝试。成功后吊销该用户的**其它**会话
+// （被盗的旧 Token 也会一并失效，但当前会话不受影响）。
 func changePasswordHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
@@ -1049,8 +1323,13 @@ func changePasswordHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerF
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未启用账号登录，无需修改密码"})
 			return
 		}
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		username := authz.OperatorOf(token)
+		if username == "" || username == "unknown" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "会话无效，请重新登录"})
+			return
+		}
 		var body struct {
-			Username    string `json:"username"`
 			OldPassword string `json:"old_password"`
 			NewPassword string `json:"new_password"`
 			OTP         string `json:"otp"`
@@ -1059,11 +1338,16 @@ func changePasswordHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerF
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if err := um.ChangePassword(body.Username, body.OldPassword, body.NewPassword, body.OTP); err != nil {
+		if err := um.ChangePassword(username, body.OldPassword, body.NewPassword, body.OTP); err != nil {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 			return
 		}
-		log.Printf("[auth] 用户 %s 修改密码成功", body.Username)
+		// 吊销该用户的其它会话：被盗 Token 即使不知道新密码也会立即失效
+		if n := authz.RevokeUserTokens(username, token); n > 0 {
+			log.Printf("[auth] 用户 %s 修改密码成功，已吊销 %d 个其它会话", username, n)
+		} else {
+			log.Printf("[auth] 用户 %s 修改密码成功", username)
+		}
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "密码修改成功"})
 	}
 }
@@ -1075,24 +1359,37 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// otpSetupHandler 生成一个新的 TOTP 密钥与 otpauth URI，
-// 供前端渲染二维码；此时尚未落盘，须经 /api/otp/enable 验证码校验通过后才绑定。
+// randPassword 生成可读的随机口令（去除易混淆字符，默认 16 位）。
+// 用于「不再使用固定弱口令」之后的初始账号生成。
+func randPassword(n int) string {
+	const charset = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789"
+	if n <= 0 {
+		n = 16
+	}
+	out := make([]byte, n)
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		// 熵源故障时不应生成可预测口令：直接退出，让运维看到原因
+		log.Fatalf("生成随机口令失败（系统熵源不可用）: %v", err)
+	}
+	for i := range out {
+		out[i] = charset[int(buf[i])%len(charset)]
+	}
+	return string(out)
+}
+
+// otpSetupHandler 生成一个新的 TOTP 密钥与 otpauth URI，供前端渲染二维码。
+//
+// 身份以 Token 为准：不再接受请求体/查询串里的 username —— 否则任何会话都能为
+// 其它账号生成密钥。此时尚未落盘，须经 /api/otp/enable 验证码校验通过后才绑定。
 func otpSetupHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
 		}
-		// 支持 GET（URL 参数）与 POST（JSON body）两种调用方式
-		username := r.URL.Query().Get("username")
-		if username == "" {
-			var body struct {
-				Username string `json:"username"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			username = body.Username
-		}
-		if username == "" {
-			writeJSON(w, map[string]interface{}{"ok": false, "msg": "请提供用户名"})
+		username := authz.OperatorOf(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if username == "" || username == "unknown" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "会话无效，请重新登录"})
 			return
 		}
 		enabled, exists := um.TOTPStatus(username)
@@ -1116,6 +1413,10 @@ func otpSetupHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 }
 
 // otpEnableHandler 校验用户输入的动态验证码，正确后绑定 OTP 密钥。
+//
+// 身份以 Token 为准（请求体里的 username 被忽略）：
+// 否则任何会话都能把**自己知道**的密钥绑到其它账号上，
+// 造成他人账号被锁在门外 / 二次验证被悄然替换。
 func otpEnableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
@@ -1125,34 +1426,44 @@ func otpEnableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		username := authz.OperatorOf(token)
+		if username == "" || username == "unknown" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "会话无效，请重新登录"})
+			return
+		}
 		var body struct {
-			Username string `json:"username"`
-			Secret   string `json:"secret"`
-			Code     string `json:"code"`
+			Secret string `json:"secret"`
+			Code   string `json:"code"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if body.Username == "" || body.Secret == "" || body.Code == "" {
-			writeJSON(w, map[string]interface{}{"ok": false, "msg": "用户名、密钥与验证码均不能为空"})
+		if body.Secret == "" || body.Code == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "密钥与验证码均不能为空"})
 			return
 		}
 		// 扫码绑定前先比对验证码是否正确
-		if !um.VerifyTOTP(body.Username, body.Secret, body.Code) {
+		if !um.VerifyTOTP(username, body.Secret, body.Code) {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "验证码不正确，请确认扫码后输入的是当前动态码"})
 			return
 		}
-		if err := um.BindTOTP(body.Username, body.Secret); err != nil {
+		if err := um.BindTOTP(username, body.Secret); err != nil {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "绑定失败: " + err.Error()})
 			return
 		}
-		log.Printf("[auth] 用户 %s 已启用 OTP 动态验证码", body.Username)
+		// 绑定 OTP 属于安全状态变更：吊销其它会话
+		if n := authz.RevokeUserTokens(username, token); n > 0 {
+			log.Printf("[auth] 用户 %s 启用 OTP，吊销 %d 个其它会话", username, n)
+		} else {
+			log.Printf("[auth] 用户 %s 已启用 OTP 动态验证码", username)
+		}
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已启用"})
 	}
 }
 
-// otpDisableHandler 关闭 OTP（需校验密码，启用中还需当前验证码）。
+// otpDisableHandler 关闭 OTP（需校验密码，启用中还需当前验证码）。身份以 Token 为准。
 func otpDisableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
@@ -1162,8 +1473,13 @@ func otpDisableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc 
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		username := authz.OperatorOf(token)
+		if username == "" || username == "unknown" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "会话无效，请重新登录"})
+			return
+		}
 		var body struct {
-			Username string `json:"username"`
 			Password string `json:"password"`
 			OTP      string `json:"otp"`
 		}
@@ -1171,11 +1487,11 @@ func otpDisableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc 
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if err := um.UnbindTOTP(body.Username, body.Password, body.OTP); err != nil {
+		if err := um.UnbindTOTP(username, body.Password, body.OTP); err != nil {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 			return
 		}
-		log.Printf("[auth] 用户 %s 已关闭 OTP 动态验证码", body.Username)
+		log.Printf("[auth] 用户 %s 已关闭 OTP 动态验证码", username)
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已关闭"})
 	}
 }
@@ -1196,6 +1512,34 @@ func guard(w http.ResponseWriter, r *http.Request, authz *auth.Auth) bool {
 		return false
 	}
 	return true
+}
+
+// securityHeaders 给所有响应加基础防护头。
+//
+// 刻意不含 CSP：Vite 产物对内联样式的依赖需要实测后才能收紧，
+// 贸然上线可能把前端整个拍死（那本身也是一次"破坏原有功能"）。
+// 这里只放确定无副作用的三个头。
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackAddr 判断监听地址是否只绑定了回环地址（用于明文告警）。
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		return false // 绑所有接口，必然包含非回环
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
@@ -1254,10 +1598,32 @@ func handleWebMessage(operator string, data []byte, sess *session.Manager, store
 		}
 	case protocol.TypeInteractiveIn:
 		var inp protocol.InteractiveInputReq
-		if err := json.Unmarshal(env.Data, &inp); err != nil {
+		if json.Unmarshal(env.Data, &inp) != nil {
 			return
 		}
-		// 交互输入转发给目标 Agent（按 command 中的 agent 字段下发，这里简化直接广播给指定 agent）
+		// 交互输入同样过黑名单（逐行检查）：远程终端此前是黑名单的最大旁路
+		safe, blocked := router.FilterInteractive(inp.AgentID+"|"+inp.CommandID, inp.InputData)
+		if blocked != "" {
+			hub.Broadcast(protocol.TypeInteractiveOut, protocol.InteractiveOutput{
+				CommandID: inp.CommandID,
+				Data:      "\r\n[server] 输入被黑名单拦截: " + blocked + "\r\n",
+				Type:      "stderr",
+			})
+			router.Audit(&route.AuditLog{
+				Time: time.Now().Unix(), Operator: operator, AgentID: inp.AgentID,
+				CommandID: inp.CommandID, Command: inp.InputData,
+				Blocked: true, BlockReason: blocked, Category: "command",
+			})
+			// 补发 Ctrl-C：清掉 Agent 侧已经敲进去的半行，恢复提示符
+			if c := sess.Get(inp.AgentID); c != nil {
+				_ = c.Write(protocol.TypeInteractiveIn, &protocol.InteractiveInputReq{
+					AgentID: inp.AgentID, CommandID: inp.CommandID, Control: "ctrl_c",
+				})
+			}
+			return
+		}
+		inp.InputData = safe
+		// 交互输入转发给目标 Agent
 		if c := sess.Get(inp.AgentID); c != nil {
 			_ = c.Write(protocol.TypeInteractiveIn, inp)
 		}

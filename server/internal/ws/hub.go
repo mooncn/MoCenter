@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,10 +17,33 @@ import (
 	"mocenter/server/internal/protocol"
 )
 
+// WSSubprotocolName WebSocket 子协议名：前端用它携带会话 Token。
+//
+// 为什么不用 URL query：Token 写进 URL 会被反向代理访问日志、浏览器历史、
+// 截图工具留存。子协议头只出现在握手请求里，不会进日志。
+const WSSubprotocolName = "mocenter"
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 4096,
 	CheckOrigin:     func(r *http.Request) bool { return true },
+	Subprotocols:    []string{WSSubprotocolName},
+}
+
+// WSToken 从请求中解析会话 Token。
+// 优先取 Sec-WebSocket-Protocol 中的第二个子协议（第一个是固定名 "mocenter"），
+// 兼容旧的 query 传参方式。
+func WSToken(r *http.Request) string {
+	if h := r.Header.Get("Sec-WebSocket-Protocol"); h != "" {
+		for _, p := range strings.Split(h, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" || p == WSSubprotocolName {
+				continue
+			}
+			return p
+		}
+	}
+	return r.URL.Query().Get("token")
 }
 
 // Client 代表一个连接的 Web 前端。
@@ -50,7 +74,7 @@ func (h *Hub) SetMessageHandler(fn func(operator string, data []byte)) {
 // ResolveOperator 由调用方提供 token -> 操作者名称的解析函数。
 // HandleUpgrade 用它把操作者绑定到连接上，供审计使用。
 func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request, tokenValidator func(string) bool, resolveOperator func(string) string) {
-	token := r.URL.Query().Get("token")
+	token := WSToken(r)
 	if tokenValidator == nil || !tokenValidator(token) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return

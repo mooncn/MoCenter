@@ -64,16 +64,21 @@ export default function VncPage({ agents }) {
   }, [])
 
   const buildWsUrl = () => {
-    const token = localStorage.getItem('mc_token') || ''
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    return `${proto}://${location.host}/vnc-ws?agent=${encodeURIComponent(hostRef.current)}&port=${port}&token=${encodeURIComponent(token)}`
+    // Token 改走 Sec-WebSocket-Protocol 子协议头（见下），不再拼在 URL 上
+    return `${proto}://${location.host}/vnc-ws?agent=${encodeURIComponent(hostRef.current)}&port=${port}`
   }
 
   const openViewer = () => {
     if (!viewerRef.current) return
     if (rfbRef.current) { try { rfbRef.current.disconnect() } catch {} rfbRef.current = null }
 
-    const rfb = new RFB(viewerRef.current, buildWsUrl(), { credentials: { password } })
+    const token = localStorage.getItem('mc_token') || ''
+    // noVNC 支持 wsProtocols：借子协议头把 Token 交给服务端，避免 Token 进 URL/日志
+    const rfb = new RFB(viewerRef.current, buildWsUrl(), {
+      credentials: { password },
+      wsProtocols: ['mocenter', encodeURIComponent(token)],
+    })
     rfb.scaleViewport = true
     rfb.resizeSession = false
     // 兜底：若服务端未下发光标形状（UltraVNC 需 ForceCursorShape=1 才会下发），

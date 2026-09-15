@@ -15,10 +15,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"mocenter/server/internal/auth"
 	"mocenter/server/internal/protocol"
 	"mocenter/server/internal/session"
 	"mocenter/server/internal/storage"
@@ -320,12 +322,30 @@ func (m *Manager) EnableRule(publicPort int) error {
 	return nil
 }
 
+// parseSourceIPList 解析逗号分隔的源 IP 白名单（IP 或 CIDR），忽略空项。
+func parseSourceIPList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
 // ServeRule 为一条映射规则启动公网监听端口，将入站连接转发至目标 Agent。
+//
+// 安全提示：监听绑定在所有接口（:port）。规则未设置源 IP 白名单时，
+// 映射出去的内网服务对**全网**开放 —— 这一点会打印警告。
 func (m *Manager) ServeRule(r *Rule) error {
 	publicPort := r.PublicPort
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", publicPort))
 	if err != nil {
 		return err
+	}
+	if len(parseSourceIPList(r.SourceIP)) == 0 {
+		log.Printf("[portmap] 警告: 规则 %d (%s:%d) 未设置源 IP 白名单，将对全网开放",
+			publicPort, r.AgentID, r.LocalPort)
 	}
 	m.mu.Lock()
 	m.listeners[publicPort] = ln
@@ -354,8 +374,17 @@ func (m *Manager) StopRule(publicPort int) {
 }
 
 // handleConnection 处理一条公网入站连接：建立隧道并双向转发。
+//
+// 这里是源 IP 白名单真正生效的地方（此前字段只存不用，等于没做）。
 func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, r *Rule) {
 	defer clientConn.Close()
+
+	// 源 IP 白名单：逗号分隔的 IP / CIDR；为空表示不限制
+	if list := parseSourceIPList(r.SourceIP); len(list) > 0 && !auth.AddrAllowed(list, clientConn.RemoteAddr()) {
+		log.Printf("[portmap] 拒绝来自 %s 的连接（不在端口 %d 的源 IP 白名单内）",
+			clientConn.RemoteAddr(), publicPort)
+		return
+	}
 
 	var agent *session.Conn
 	if m.sessions != nil {

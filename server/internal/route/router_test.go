@@ -3,6 +3,7 @@ package route
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"mocenter/server/internal/protocol"
@@ -62,15 +63,54 @@ func TestBlacklistBlocksAndAudits(t *testing.T) {
 
 func TestMaskCommand(t *testing.T) {
 	cases := map[string]string{
-		"mysql -u root -p secret123":  "mysql -u root -p ***",
-		"export TOKEN=abc123":         "export TOKEN=***",
+		"mysql -u root -p secret123":   "mysql -u root -p ***",
+		"export TOKEN=abc123":          "export TOKEN=***",
 		"curl -H 'Authorization: xyz'": "curl -H 'Authorization: ***",
-		"echo hello world":            "echo hello world",
+		"echo hello world":             "echo hello world",
+		// 连写形态（此前漏掉，口令明文进审计库）
+		"mysql -u root -pP@ss0rd -h db": "mysql -u root -p*** -h db",
+		"sshpass -pSecret123 ssh host":  "sshpass -p*** ssh host",
+		"app --password=abc":            "app --password=***",
+		"app --password abc":            "app --password ***",
+		"set PASSPHRASE=zzz":            "set PASSPHRASE=***",
+		// 不得误伤普通旗标（-p 后跟小写字母的连写形式）
+		"netstat -port 5900":      "netstat -port 5900",
+		"tool -path /tmp -pid 12": "tool -path /tmp -pid 12",
 	}
 	for c, want := range cases {
 		if got := MaskCommand(c); got != want {
 			t.Errorf("MaskCommand(%q)=%q, want %q", c, got, want)
 		}
+	}
+}
+
+// TestAuditMasksAtWrite 脱敏必须在写入时完成：audits.jsonl 与 SQLite 存的应是已脱敏内容。
+func TestAuditMasksAtWrite(t *testing.T) {
+	r := NewRouter(session.NewManager(), nil)
+	r.Audit(&AuditLog{Time: 1, Operator: "alice", AgentID: "a1", Command: "mysql -uroot -pSecret1 x"})
+	got := r.Audits()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 audit, got %d", len(got))
+	}
+	if strings.Contains(got[0].Command, "Secret1") {
+		t.Fatalf("审计落库前未脱敏: %q", got[0].Command)
+	}
+	if !strings.Contains(got[0].Command, "***") {
+		t.Fatalf("应包含脱敏标记: %q", got[0].Command)
+	}
+}
+
+// TestAuditOperatorSanitized 未认证方提交的字段不得注入控制字符或超长垃圾。
+func TestAuditOperatorSanitized(t *testing.T) {
+	r := NewRouter(session.NewManager(), nil)
+	raw := "bob\x01\x02\nFAKE: 管理员执行了 rm -rf /" + strings.Repeat("x", 500)
+	r.Audit(&AuditLog{Time: 1, Operator: raw, Command: "登录失败"})
+	got := r.Audits()[0]
+	if strings.ContainsAny(got.Operator, "\x01\x02\n") {
+		t.Fatalf("审计字段仍含控制字符: %q", got.Operator)
+	}
+	if len(got.Operator) > 200 {
+		t.Fatalf("审计字段未限长: %d", len(got.Operator))
 	}
 }
 
@@ -194,6 +234,7 @@ func TestImportLegacyAuditsMissingFile(t *testing.T) {
 		t.Fatalf("无文件时不应导入任何记录，实得 %d", n)
 	}
 }
+
 // TestSearchAuditsPageMemory 验证内存回退路径下的分页与总数统计。
 func TestSearchAuditsPageMemory(t *testing.T) {
 	r := NewRouter(nil, nil)

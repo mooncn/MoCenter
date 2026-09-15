@@ -116,7 +116,10 @@ begin
        ' -data "' + SafeVal(PageAdv.Values[0]) + '"';
 
   if Pos('agent', role) > 0 then
+  begin
     s := s + ' -server "' + SafeVal(PageBasic.Values[0]) + '"';
+    s := s + ' -agent-key "' + SafeVal(PageBasic.Values[3]) + '"';
+  end;
 
   if Pos('server', role) > 0 then
   begin
@@ -156,6 +159,7 @@ begin
   PageBasic.Add('服务端地址（host:port，安装 Agent 时必填）：', False);
   PageBasic.Add('Server 后台登录用户名（安装 Server 时必填）：', False);
   PageBasic.Add('Server 后台登录密码（安装 Server 时必填，至少 6 位）：', True);
+  PageBasic.Add('Agent 注册密钥（安装 Agent 时必填，取总控机数据目录下 agent.key 的内容）：', False);
 
   // 第 3 页：高级
   PageAdv := CreateInputQueryPage(PageBasic.ID,
@@ -188,6 +192,14 @@ begin
     if (Pos('agent', role) > 0) and (SafeVal(PageBasic.Values[0]) = '') then
     begin
       MsgBox('安装 Agent 必须填写服务端地址（host:port）。', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    if (Pos('agent', role) > 0) and (SafeVal(PageBasic.Values[3]) = '') then
+    begin
+      MsgBox('安装 Agent 必须填写 Agent 注册密钥。' + #13#10#13#10 +
+             '该密钥在总控机的数据目录下（agent.key），服务端用它在应用层校验 Agent 身份；' +
+             '没有它，Agent 的连接会被服务端拒绝。', mbError, MB_OK);
       Result := False;
       Exit;
     end;

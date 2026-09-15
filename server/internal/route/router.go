@@ -33,6 +33,9 @@ type Router struct {
 	auditFile *os.File
 	// SQLite 持久化（可选）
 	db *storage.DB
+	// 交互终端输入的黑名单过滤状态（惰性初始化）
+	imu    sync.Mutex
+	iguard *InteractiveGuard
 }
 
 // AuditLog 操作审计日志。
@@ -331,7 +334,19 @@ func (r *Router) DispatchBatch(req *protocol.CommandReq, agentIDs []string, oper
 }
 
 // Audit 记录审计日志，返回落库后的记录 ID（供回填执行结果；无 DB 时返回 0）。
+//
+// 安全说明：脱敏必须在这里（写入时）完成，而不是只在读取时做 ——
+// 否则 audits.jsonl 与 SQLite 里保存的是明文命令，任何能读到数据目录
+// 或备份的人都能直接拿到 `mysql -pP@ss`、`net user bob P@ss /add` 这类凭据。
 func (r *Router) Audit(l *AuditLog) int64 {
+	if l == nil {
+		return 0
+	}
+	l.Command = MaskCommand(l.Command)
+	l.Result = MaskCommand(l.Result)
+	if l.Operator != "" {
+		l.Operator = sanitizeAuditField(l.Operator)
+	}
 	r.auditMu.Lock()
 	r.audits = append(r.audits, l)
 	// 内存仅保留最近 auditMemoryKeep 条：历史全量数据由 SQLite 承载，
@@ -599,15 +614,52 @@ func matchAudit(l *AuditLog, q AuditQuery) bool {
 }
 
 // MaskCommand 对命令中的敏感字段做脱敏（如密码、密钥、Token）。
+//
+// 注意覆盖连写形态：`mysql -pP@ss0rd`、`sshpass -pXXX` 这类**没有空格**的写法
+// 曾经漏掉，导致口令明文进入审计库。
 func MaskCommand(cmd string) string {
 	if cmd == "" {
 		return cmd
 	}
-	// 形如 key=value / key: value / key value，且 key 为敏感关键字
-	re := regexp.MustCompile(`(?i)(password|passwd|secret|token|apikey|api_key|authorization)(\s*[=:]\s*|\s+)(\S+)`)
-	cmd = re.ReplaceAllString(cmd, "$1$2***")
-	// 短参数形态：-p x / --password x
-	re2 := regexp.MustCompile(`(?i)((-p|--password)(\s+))(\S+)`)
-	cmd = re2.ReplaceAllString(cmd, "$2$3***")
+	// 顺序很重要：先处理**最具体**的形态，再处理宽泛的关键字规则。
+	// 否则像 `-u admin:secret http://x` 会被关键字规则抢先命中，
+	// 把 `secret` 后面的 `http://x` 当成值脱敏掉，而真正的口令留在原文里。
+
+	// 1) -u user:pass / --user user:pass（curl、ftp 等）—— 最具体
+	reUser := regexp.MustCompile(`(?i)((?:^|\s)-{1,2}user\s+[^\s:@=]+[:=])(\S+)`)
+	cmd = reUser.ReplaceAllString(cmd, "$1***")
+	// 2) --password x / --password=x
+	reLong := regexp.MustCompile(`(?i)((?:^|\s)--password(?:\s+|=))(\S+)`)
+	cmd = reLong.ReplaceAllString(cmd, "$1***")
+	// 3) -p x / -p=x（要求空白或等号跟随，避免误伤 -port / -pid / -path）
+	reShort := regexp.MustCompile(`((?:^|\s)-p(?:\s+|=))(\S+)`)
+	cmd = reShort.ReplaceAllString(cmd, "$1***")
+	// 4) -pX@ss 连写：仅当值以**大写字母/数字/符号**开头（区分大小写），mysql/sshpass 风格
+	reConcat := regexp.MustCompile(`((?:^|\s)-p)([A-Z0-9@#%^&*!_.~/\\][^\s]*)`)
+	cmd = reConcat.ReplaceAllString(cmd, "$1***")
+	// 5) 形如 key=value / key: value / key value，且 key 为敏感关键字（最宽泛，放最后）
+	reGeneric := regexp.MustCompile(`(?i)(password|passwd|passphrase|secret|token|apikey|api_key|authorization)(\s*[=:]\s*|\s+)(\S+)`)
+	cmd = reGeneric.ReplaceAllString(cmd, "$1$2***")
 	return cmd
+}
+
+// sanitizeAuditField 收敛审计字段：限长并去掉控制字符。
+// 用于可能来自**未认证方**的字段（如登录接口的 username），
+// 防止向审计库注入伪造条目或超长垃圾。
+func sanitizeAuditField(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+		if b.Len() >= 128 {
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return "(空)"
+	}
+	return b.String()
 }
