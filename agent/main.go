@@ -13,12 +13,14 @@ import (
 	"flag"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"mocenter/agent/internal/client"
 	"mocenter/agent/internal/config"
 	"mocenter/agent/internal/daemon"
 	probepkg "mocenter/agent/internal/probe"
+	"mocenter/agent/internal/winapp"
 )
 
 func main() {
@@ -147,16 +149,47 @@ func main() {
 		}
 	}
 
-	// 进程守护：崩溃自动重启
-	if *daemonize {
-		daemon.Supervise(func() {
-			runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert, *proxyIP)
-		})
+	// 单实例保护：同一份配置只允许一个 Agent 实例。
+	// 否则「服务 + 手工启动一份」会同时连服务端、互相顶掉，隧道与 VNC 状态也会错乱。
+	release, ok := winapp.AcquireSingleton(winapp.SingletonKey("Agent", *configPath))
+	if !ok {
+		log.Fatalf("已有一个使用同一配置(%s)的 Agent 在运行，本次启动终止", *configPath)
+	}
+	defer release()
+
+	start := func() {
+		// 服务模式：进程级重启交给 SCM（安装器已配置失败恢复动作），但进程内仍需兜住
+		// panic —— 否则 goroutine 静默死掉，服务却仍显示 Running。
+		if *daemonize || winapp.IsWindowsService() {
+			daemon.Supervise(func() {
+				runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert, *proxyIP)
+			})
+			return
+		}
+		runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert, *proxyIP)
+	}
+
+	// 被 SCM 拉起时走服务控制协议（sc query/stop 才能正常工作）；否则按普通进程运行。
+	// 用 IsWindowsService 自动识别，无需额外开关，也就不会"忘了加参数导致服务起不来"。
+	if winapp.IsWindowsService() {
+		logPath := filepath.Join(filepath.Dir(*configPath), "logs", agentServiceName+".log")
+		if err := winapp.RedirectLogToFile(logPath); err != nil {
+			log.Printf("警告: 重定向服务日志到 %s 失败: %v", logPath, err)
+		} else {
+			log.Printf("[agent] 服务模式启动，日志输出到 %s", logPath)
+		}
+		if err := winapp.RunAsService(agentServiceName, start, func() { os.Exit(0) }); err != nil {
+			log.Fatalf("以 Windows 服务方式运行失败: %v", err)
+		}
 		return
 	}
 
-	runClient(*server, *agentID, *hb, *probe, *tlsEnabled, *insecure, *clientCert, *clientKey, *caCert, *proxyIP)
+	start()
 }
+
+// agentServiceName Windows 服务名。必须与安装器注册时使用的名称一致
+// （svc.Run 的名字对不上会导致 SCM 无法完成握手）。
+const agentServiceName = "MoCenterAgent"
 
 func runClient(server, agentID string, hb, probe int, tlsEnabled, insecure bool, clientCert, clientKey, caCert, proxyIP string) {
 	c := client.New(client.Config{

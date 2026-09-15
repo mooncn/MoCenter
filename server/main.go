@@ -45,6 +45,7 @@ import (
 	"mocenter/server/internal/session"
 	"mocenter/server/internal/storage"
 	"mocenter/server/internal/vnc"
+	"mocenter/server/internal/winapp"
 	"mocenter/server/internal/ws"
 )
 
@@ -58,7 +59,9 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "Agent TCP 连接 TLS 私钥文件路径")
 	caCert := flag.String("ca-cert", "", "mTLS 客户端 CA 证书文件路径（提供后启用双向认证，Agent 需携带客户端证书）")
 	insecure := flag.Bool("insecure", false, "允许非 TLS 的 Agent 连接（未提供证书时自动启用）")
-	dataDir := flag.String("data", ".", "数据目录（审计日志持久化等）")
+	// 便携态默认与可执行文件同目录（不随启动方式变化）；安装态由安装器显式传 -data
+	defaultDataDir := config.DefaultDataDir()
+	dataDir := flag.String("data", defaultDataDir, "数据目录（审计日志持久化等）")
 	pkgDir := flag.String("pkg-dir", "", "安装包托管目录（Agent 可经长连接直接拉取，避免公网下载）；留空则用 <data>/packages")
 	user := flag.String("user", "", "登录用户名（设置后启用用户名+密码登录）")
 	password := flag.String("password", "", "登录密码")
@@ -122,7 +125,7 @@ func main() {
 		if cfg.Insecure && !*insecure {
 			*insecure = true
 		}
-		if cfg.DataDir != "" && *dataDir == "." {
+		if cfg.DataDir != "" && *dataDir == defaultDataDir {
 			*dataDir = cfg.DataDir
 		}
 		if cfg.User != "" && *user == "" {
@@ -208,6 +211,14 @@ func main() {
 			wl = append(wl, s)
 		}
 	}
+
+	// 单实例保护：必须在打开数据库之前拿到 —— 两个实例共用同一个 SQLite 文件
+	// （以及同一个审计日志）会互相踩踏。服务与手工启动的实例共用同一配置时尤其要注意。
+	release, ok := winapp.AcquireSingleton(winapp.SingletonKey("Server", *configPath))
+	if !ok {
+		log.Fatalf("已有一个使用同一配置(%s)的 Server 在运行，本次启动终止", *configPath)
+	}
+	defer release()
 
 	// 打开 SQLite 持久化存储
 	dbPath := filepath.Join(*dataDir, "mocenter.db")
@@ -326,61 +337,89 @@ func main() {
 		log.Printf("[server] 托管 Web 静态资源: %s", *webDir)
 	}
 
-	go func() {
-		log.Printf("[server] REST API 监听 %s", *httpAddr)
-		if err := http.ListenAndServe(*httpAddr, mux); err != nil {
-			log.Fatalf("[server] http error: %v", err)
-		}
-	}()
-	log.Printf("[server] Agent TCP 监听 %s (apikey=%s)", *addr, auth.HashToken(*apiKey))
-	ln, err := net.Listen("tcp", *addr)
-	if err != nil {
-		log.Fatalf("[server] listen error: %v", err)
-	}
-
-	// 若提供证书则启用 TLS（全链路加密）。提供 CA 时启用 mTLS 双向认证。
-	var tlsLn net.Listener
-	if *tlsCert != "" && *tlsKey != "" {
-		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+	// 监听与接收循环封装成函数：被 SCM 拉起时由服务启动回调调用。
+	start := func() {
+		go func() {
+			log.Printf("[server] REST API 监听 %s", *httpAddr)
+			if err := http.ListenAndServe(*httpAddr, mux); err != nil {
+				log.Fatalf("[server] http error: %v", err)
+			}
+		}()
+		log.Printf("[server] Agent TCP 监听 %s", *addr)
+		ln, err := net.Listen("tcp", *addr)
 		if err != nil {
-			log.Fatalf("[server] 加载 TLS 证书失败: %v", err)
+			log.Fatalf("[server] listen error: %v", err)
 		}
-		tlsCfg := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
-		if *caCert != "" {
-			caPEM, err := os.ReadFile(*caCert)
+
+		// 若提供证书则启用 TLS（全链路加密）。提供 CA 时启用 mTLS 双向认证。
+		var tlsLn net.Listener
+		if *tlsCert != "" && *tlsKey != "" {
+			cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
 			if err != nil {
-				log.Fatalf("[server] 读取 CA 证书失败: %v", err)
+				log.Fatalf("[server] 加载 TLS 证书失败: %v", err)
 			}
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(caPEM) {
-				log.Fatalf("[server] 解析 CA 证书失败")
+			tlsCfg := &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				MinVersion:   tls.VersionTLS12,
 			}
-			tlsCfg.ClientCAs = pool
-			tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
-			log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（校验客户端 CA 证书）")
+			if *caCert != "" {
+				caPEM, err := os.ReadFile(*caCert)
+				if err != nil {
+					log.Fatalf("[server] 读取 CA 证书失败: %v", err)
+				}
+				pool := x509.NewCertPool()
+				if !pool.AppendCertsFromPEM(caPEM) {
+					log.Fatalf("[server] 解析 CA 证书失败")
+				}
+				tlsCfg.ClientCAs = pool
+				tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+				log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（校验客户端 CA 证书）")
+			} else {
+				log.Printf("[server] Agent TCP 已启用 TLS 加密（单向）")
+			}
+			tlsLn = tls.NewListener(ln, tlsCfg)
 		} else {
-			log.Printf("[server] Agent TCP 已启用 TLS 加密（单向）")
+			tlsLn = ln
+			if !*insecure {
+				log.Printf("[server] 警告: 未提供 TLS 证书，Agent 连接为明文传输；生产环境请配置证书")
+			}
+			// Agent 通道没有应用层鉴权（握手不校验任何口令）：能连通本端口的主机
+			// 就可以注册为 Agent。唯一可用的身份校验是 mTLS，故在此明确提示。
+			log.Printf("[server] 警告: Agent 通道未启用 mTLS，任何能连通 %s 的主机都可注册为 Agent；"+
+				"如需限制请用 -ca-cert 启用双向认证，或用防火墙/安全组限制来源", *addr)
 		}
-		tlsLn = tls.NewListener(ln, tlsCfg)
-	} else {
-		tlsLn = ln
-		if !*insecure {
-			log.Printf("[server] 警告: 未提供 TLS 证书，Agent 连接为明文传输；生产环境请配置证书")
+
+		for {
+			conn, err := tlsLn.Accept()
+			if err != nil {
+				log.Printf("[server] accept error: %v", err)
+				continue
+			}
+			go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir)
 		}
 	}
 
-	for {
-		conn, err := tlsLn.Accept()
-		if err != nil {
-			log.Printf("[server] accept error: %v", err)
-			continue
+	// 被 SCM 拉起时走服务控制协议（sc query/stop 才能正常工作）；否则按普通进程运行。
+	// 用 IsWindowsService 自动识别，无需额外开关。
+	if winapp.IsWindowsService() {
+		logPath := filepath.Join(filepath.Dir(*configPath), "logs", serverServiceName+".log")
+		if err := winapp.RedirectLogToFile(logPath); err != nil {
+			log.Printf("警告: 重定向服务日志到 %s 失败: %v", logPath, err)
+		} else {
+			log.Printf("[server] 服务模式启动，日志输出到 %s", logPath)
 		}
-		go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir)
+		if err := winapp.RunAsService(serverServiceName, start, func() { os.Exit(0) }); err != nil {
+			log.Fatalf("以 Windows 服务方式运行失败: %v", err)
+		}
+		return
 	}
+
+	start()
 }
+
+// serverServiceName Windows 服务名。必须与安装器注册时使用的名称一致
+// （svc.Run 的名字对不上会导致 SCM 无法完成握手）。
+const serverServiceName = "MoCenterServer"
 
 // handleAgentConn 处理单个 Agent 的 TCP 长连接。
 func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, pkgDir string) {

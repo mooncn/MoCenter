@@ -1,8 +1,12 @@
 @echo off
 REM =============================================================
-REM MoCenter 一键构建脚本 (Windows)
-REM 构建 web / server / agent 三大部分
-REM 用法: scripts\build-all.bat
+REM MoCenter one-shot build script (Windows)
+REM Builds: server / agent / web / Windows GUI setup
+REM Usage: scripts\build-all.bat
+REM
+REM NOTE: this file is deliberately ASCII-only. cmd.exe reads .bat files
+REM using the system ANSI codepage, so non-ASCII text gets mangled and can
+REM break line parsing. User-facing Chinese text lives in the Inno script.
 REM =============================================================
 setlocal enabledelayedexpansion
 
@@ -17,8 +21,8 @@ echo ==========================================
 
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
 
-echo.
-echo [1/3] Building Server ...
+echo(
+echo [1/4] Building Server ...
 where go >nul 2>nul
 if %errorlevel%==0 (
   pushd "%ROOT_DIR%\server"
@@ -30,8 +34,8 @@ if %errorlevel%==0 (
   echo   !! Go not found, skip Server build
 )
 
-echo.
-echo [2/3] Building Agent (Windows amd64) ...
+echo(
+echo [2/4] Building Agent (Windows amd64) ...
 where go >nul 2>nul
 if %errorlevel%==0 (
   pushd "%ROOT_DIR%\agent"
@@ -46,8 +50,8 @@ if %errorlevel%==0 (
   echo   !! Go not found, skip Agent build
 )
 
-echo.
-echo [3/3] Building Web ...
+echo(
+echo [3/4] Building Web ...
 where npm >nul 2>nul
 if %errorlevel%==0 (
   pushd "%ROOT_DIR%\web"
@@ -61,7 +65,17 @@ if %errorlevel%==0 (
   echo   !! Node.js/npm not found, skip Web build
 )
 
-echo.
+echo(
+echo [4/4] Building Windows GUI Setup (Inno Setup) ...
+REM All setup-related work (build engine, collect payload, invoke ISCC) lives in
+REM build-setup.bat so it is defined in exactly one place. It requires Inno
+REM Setup 6 and prints guidance instead of failing hard when ISCC is missing.
+REM Deliberately a single-line call: multi-line "if ( ... )" blocks are the most
+REM fragile construct in cmd, so keep this file as boring as possible.
+if exist "%ROOT_DIR%\installer\setup.iss" call "%ROOT_DIR%\scripts\packaging\build-setup.bat"
+if not exist "%ROOT_DIR%\installer\setup.iss" echo   ** installer\setup.iss not found, skip
+
+echo(
 echo ==========================================
 echo  Build finished. Artifacts in: %OUT_DIR%
 dir /b "%OUT_DIR%"

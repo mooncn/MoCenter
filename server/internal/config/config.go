@@ -29,7 +29,33 @@ type Config struct {
 	TOTPSecret string `json:"totp_secret,omitempty"` // TOTP 密钥（base32）
 }
 
-func DefaultPath() string { return "mocenter-server.json" }
+// DefaultPath 返回默认配置文件路径（便携态：与可执行文件同目录）。
+//
+// 关键：基准是**可执行文件所在目录**，而不是当前工作目录 —— 否则服务、计划任务、
+// 双击运行会各自落在不同目录，表现为"配置莫名其妙丢了/重新生成了"。
+//
+// 安装态由安装器显式传 -config 指向 %ProgramData%\MoCenter\server\（配置与数据均在此，
+// 与二进制分离，升级不覆盖）。
+func DefaultPath() string {
+	return filepath.Join(exeDir(), "mocenter-server.json")
+}
+
+// exeDir 返回可执行文件所在目录；取不到时退回当前工作目录。
+func exeDir() string {
+	p, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	// 解析符号链接失败不算错误，直接用原路径
+	if resolved, rerr := filepath.EvalSymlinks(p); rerr == nil {
+		p = resolved
+	}
+	return filepath.Dir(p)
+}
+
+// DefaultDataDir 返回默认数据目录（便携态：可执行文件同目录）。
+// 安装态由安装器显式传 -data 指向 %ProgramData%\MoCenter\server\。
+func DefaultDataDir() string { return exeDir() }
 
 // Load 读取配置文件；文件不存在时返回 (nil, nil)。
 func Load(path string) (*Config, error) {

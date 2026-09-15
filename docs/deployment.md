@@ -68,13 +68,46 @@ systemctl enable --now mocenter-agent
 
 ### Windows 开机自启
 
-将 Agent 注册为系统服务（如使用 NSSM）：
+**推荐：图形安装程序** —— 双击 `MoCenter-Setup-<版本>.exe`，按向导走：
+
+1. **选择角色**：Agent（被控端）/ Server（总控端）/ 两者
+2. **连接与认证**：服务端地址（装 Agent 必填）、后台登录用户名与密码（装 Server 必填）
+3. **高级设置**：数据目录、监听端口、代理前缀、TLS 参数（均有默认值）
+
+安装后：
+
+| 项目 | 位置 |
+|------|------|
+| 二进制 | `%ProgramFiles%\MoCenter\` |
+| 配置与数据 | `%ProgramData%\MoCenter\<角色>\`（与二进制分离，升级不覆盖） |
+| 服务 | `MoCenterAgent` / `MoCenterServer`（开机自启 + 失败自动重启） |
+| 日志 | `%ProgramData%\MoCenter\<角色>\logs\`（服务模式 stdout 无去处，故落文件） |
+
+卸载走控制面板「应用和功能」，服务会被停止并移除，**配置与数据默认保留**。
+
+**批量/静默部署**用随包安装的命令行引擎（参数与向导一致）：
 
 ```bat
-nssm install MoCenterAgent "C:\opt\mocenter-agent.exe" -server your.server.com:9000 -agentid host-01
-nssm set MoCenterAgent AppStdout C:\opt\agent.log
-nssm start MoCenterAgent
+mocenter-deploy.exe install -role agent -server your.server.com:9000
+mocenter-deploy.exe install -role server -user admin -password <登录密码>
+mocenter-deploy.exe status -role all      REM 无需管理员
+mocenter-deploy.exe uninstall -role all   REM 默认保留配置与数据
 ```
+
+**手动注册**（服务名必须与程序内置的一致，并用 `-config` 指向固定位置的配置）：
+
+```bat
+sc create MoCenterAgent binPath= "\"C:\Program Files\MoCenter\mocenter-agent.exe\" -config C:\ProgramData\MoCenter\agent\mocenter-agent.json" start= auto
+sc start MoCenterAgent
+```
+
+> 程序通过 `svc.IsWindowsService()` 自动识别"被 SCM 拉起"，**不需要 NSSM 之类的包装器**，
+> 也不需要 `-daemon` 开关。早前用 `-daemon` 注册的方式没有 SCM 握手，SCM 会报 1053
+> 且 `sc stop` 管不住它，现已修正。
+>
+> 便携形态仍然可用：直接运行 `mocenter-agent.exe` 即可，配置落在 **exe 同目录**。
+>
+> 打包安装程序：`scripts\packaging\build-setup.bat`（需先装 Inno Setup 6）。
 
 ## 四、Web 前端部署
 
