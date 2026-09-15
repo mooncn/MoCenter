@@ -18,7 +18,10 @@ import (
 // 让用户一眼看到有哪些可调项（值为空/默认即表示未启用或使用内置默认）。
 type Config struct {
 	Server     string `json:"server"`                // 服务端地址 host:port
-	AgentID    string `json:"agent_id"`              // Agent 唯一标识
+	AgentID    string `json:"agent_id"`              // Agent 名称/标识（可变，仅作显示与路由）
+	// UUID 硬件唯一标识：**设备身份**，同一台机器恒定不变。
+	// 首次启动自动探测并写入配置，之后即使 agent_id 改了也仍被识别为同一台机器。
+	UUID       string `json:"uuid"`
 	Heartbeat  int    `json:"heartbeat"`             // 心跳间隔（秒），默认 30
 	ProbeEvery int    `json:"probe_every"`           // 探针采集周期（秒），默认 10
 	TLS        bool   `json:"tls"`                   // 启用 TLS 加密连接

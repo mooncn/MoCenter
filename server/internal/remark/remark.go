@@ -74,6 +74,27 @@ func (s *Store) persistLocked() error {
 	return os.WriteFile(s.path, data, 0644)
 }
 
+// Rename 把旧 agent_id 的备注迁移到新 agent_id。
+//
+// 备注挂在 agent_id 上，但设备身份是 UUID；agent 改配置后 agent_id 会变，
+// 若不迁移，用户此前写的备注就会"莫名消失"（并且留成一条孤儿数据）。
+func (s *Store) Rename(oldID, newID string) error {
+	if oldID == "" || newID == "" || oldID == newID {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	text, ok := s.items[oldID]
+	if !ok {
+		return nil
+	}
+	if _, exists := s.items[newID]; !exists {
+		s.items[newID] = text
+	}
+	delete(s.items, oldID)
+	return s.persistLocked()
+}
+
 // All 返回全部备注的副本。
 func (s *Store) All() map[string]string {
 	s.mu.Lock()
