@@ -274,13 +274,14 @@ button.primary { background: var(--accent); }
   pointer-events: none; padding: 20px;
 }
 
-/* 移动端虚拟鼠标：底部覆盖条（触控板 + 按键）。
-   padding-right 预留出右下角悬浮工具条的位置，避免互相遮挡。 */
+/* 移动端虚拟鼠标：触控板 + 按键。
+   刻意排在画布**下方**（普通文档流），而不是浮在桌面之上 —— 覆盖式会把远端桌面
+   最底部一条挡住且点不到，而任务栏就在那条上。 */
 .vnc-mouse {
-  position: absolute; left: 0; right: 0; bottom: 0; z-index: 15;
-  display: flex; gap: 8px; padding: 8px 72px 8px 8px;
-  background: rgba(11, 14, 17, .88); border-top: 1px solid #232a33;
-  backdrop-filter: blur(6px);
+  margin-top: 10px;
+  display: flex; gap: 8px; padding: 8px;
+  background: rgba(11, 14, 17, .88); border: 1px solid #232a33;
+  border-radius: var(--radius);
 }
 .vnc-mouse-track {
   flex: 1 1 auto; min-height: 96px; border-radius: 8px;
@@ -416,7 +417,7 @@ button.primary { background: var(--accent); }
   .vnc-fab-toggle { width: 42px; height: 42px; font-size: 17px; }
 
   /* 窄屏：虚拟鼠标改为上下布局，触控板占满宽度 */
-  .vnc-mouse { flex-direction: column; padding: 8px 64px 8px 8px; }
+  .vnc-mouse { flex-direction: column; padding: 8px; }
   .vnc-mouse-track { min-height: 72px; }
   .vnc-mouse-btns { width: auto; grid-template-columns: repeat(3, 1fr); }
 }

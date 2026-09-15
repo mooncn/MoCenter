@@ -1,6 +1,7 @@
-import React, { useRef, useState, useEffect } from 'react'
+import React, { useRef, useState, useEffect, useMemo } from 'react'
 import RFB from '@novnc/novnc'
 import { Api } from '../api/api.js'
+import { createVncPointer, WHEEL_STEP_DELTA } from '../utils/vncPointer.js'
 
 // 远端光标显示尺寸档位：相对「按视口等比缩放」基准的倍数。
 // 基准 = 显示宽度 / 远端分辨率宽度，这样光标与缩放过后的桌面比例一致。
@@ -16,9 +17,7 @@ export default function VncPage({ agents }) {
   const wrapRef = useRef(null)
   const rfbRef = useRef(null)
   const hostRef = useRef('')
-  // 虚拟鼠标：指针位置（画布坐标）、触控板拖动手势状态
-  const vptrRef = useRef({ x: 0, y: 0 })
-  const dragRef = useRef(null)
+  // 虚拟鼠标的指针位置/手势状态由 vncPointer 控制器持有（见下方 vp）
   // 是否因认证失败而断开（用于避免通用断开文案覆盖更精确的提示）
   const authFailedRef = useRef(false)
 
@@ -137,90 +136,65 @@ export default function VncPage({ agents }) {
 
   // ---- 虚拟鼠标（移动端）----
   //
-  // 直接向 noVNC 的 canvas 派发合成 DOM 鼠标事件：由 noVNC 自己的 _handleMouse
-  // 完成 client→远端 坐标换算，并把它的光标画在我们派发的位置上，
-  // 因此「绘制出的光标」与「远端真实指针」始终一致（无需自绘光标）。
-  const dispatchMouse = (x, y, type, buttons) => {
+  // 手势状态与「该发出什么鼠标事件」全部交给 vncPointer 控制器（纯逻辑、可单测）；
+  // 这里只做两件事：把 DOM 指针事件转发进去，以及把控制器给出的画布内坐标换算成
+  // client 坐标、派发给 noVNC 的 canvas —— 由 noVNC 自己的 _handleMouse 完成
+  // client→远端 坐标换算并绘制光标，因此「画出的光标」与「远端真实指针」始终一致。
+  const emitMouse = (evt) => {
     const cv = screenCanvas()
     if (!cv) return
     const r = cv.getBoundingClientRect()
-    cv.dispatchEvent(new MouseEvent(type, {
-      clientX: r.left + x, clientY: r.top + y,
-      buttons, button: buttons === 2 ? 2 : 0,
+    const clientX = r.left + evt.x
+    const clientY = r.top + evt.y
+    if (evt.type === 'wheel') {
+      cv.dispatchEvent(new WheelEvent('wheel', {
+        clientX, clientY, deltaY: evt.deltaY, deltaMode: 0, bubbles: true, cancelable: true,
+      }))
+      return
+    }
+    cv.dispatchEvent(new MouseEvent(evt.type, {
+      clientX, clientY,
+      buttons: evt.buttons, button: evt.buttons === 2 ? 2 : 0,
       bubbles: true, cancelable: true,
     }))
   }
 
-  const dispatchWheel = (x, y, deltaY) => {
-    const cv = screenCanvas()
-    if (!cv) return
-    const r = cv.getBoundingClientRect()
-    // noVNC 的 WHEEL_STEP = 50：deltaY 取 ±50 正好对应一格滚轮
-    cv.dispatchEvent(new WheelEvent('wheel', {
-      clientX: r.left + x, clientY: r.top + y,
-      deltaY, deltaMode: 0, bubbles: true, cancelable: true,
-    }))
-  }
+  const vp = useMemo(() => createVncPointer({
+    getRect: () => {
+      const cv = screenCanvas()
+      if (!cv) return null
+      const r = cv.getBoundingClientRect()
+      return { width: r.width, height: r.height }
+    },
+    emit: emitMouse,
+    onHoldChange: setHoldLeft,
+  }), [])
 
-  // 移动虚拟指针到画布坐标 (x, y)，越界钳制在画布内
-  const movePointer = (x, y) => {
-    const cv = screenCanvas()
-    if (!cv) return
-    const r = cv.getBoundingClientRect()
-    const nx = Math.max(0, Math.min(r.width - 1, x))
-    const ny = Math.max(0, Math.min(r.height - 1, y))
-    vptrRef.current = { x: nx, y: ny }
-    dispatchMouse(nx, ny, 'mousemove', holdLeft ? 1 : 0)
-  }
-
-  const clickAt = (btn) => {
-    const { x, y } = vptrRef.current
-    dispatchMouse(x, y, 'mousedown', btn)
-    dispatchMouse(x, y, 'mouseup', 0)
-  }
-
-  const doubleClickAt = () => {
-    clickAt(1)
-    setTimeout(() => clickAt(1), 80)
-  }
-
-  // 按住/松开左键：用于拖拽窗口、选中文本等需要保持按下的操作
-  const toggleHoldLeft = () => {
-    const { x, y } = vptrRef.current
-    if (holdLeft) {
-      dispatchMouse(x, y, 'mouseup', 0)
-      setHoldLeft(false)
-    } else {
-      dispatchMouse(x, y, 'mousedown', 1)
-      setHoldLeft(true)
-    }
-  }
-
-  // 触控板：单指拖动 = 相对移动；位移很小 = 轻点（左键单击）
+  // 触控板：单指拖动 = 相对移动；移动量很小的抬手 = 轻点（左键单击）。
+  // 指针捕获让手指移出触控板范围后仍能继续收到事件。
   const onTrackDown = (e) => {
     if (e.currentTarget.setPointerCapture) {
       try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* ignore */ }
     }
-    dragRef.current = { x: e.clientX, y: e.clientY, moved: 0 }
+    vp.gestureStart(e.clientX, e.clientY)
   }
 
-  const onTrackMove = (e) => {
-    const d = dragRef.current
-    if (!d) return
-    const dx = e.clientX - d.x
-    const dy = e.clientY - d.y
-    if (dx === 0 && dy === 0) return
-    d.x = e.clientX
-    d.y = e.clientY
-    d.moved += Math.abs(dx) + Math.abs(dy)
-    movePointer(vptrRef.current.x + dx, vptrRef.current.y + dy)
-  }
+  const onTrackMove = (e) => vp.gestureMove(e.clientX, e.clientY)
 
-  const onTrackUp = () => {
-    const d = dragRef.current
-    dragRef.current = null
-    if (d && d.moved < 8) clickAt(1) // 轻点视为左键单击
-  }
+  const onTrackUp = () => vp.gestureEnd()
+
+  // 手势被系统取消（iOS 边缘返回、下拉通知、来电等）时不能当作轻点，
+  // 否则会在远端凭空多出一次左键点击。
+  const onTrackCancel = () => vp.gestureCancel()
+
+  // 面板收起 / 连接断开时收尾「按住的左键」：否则远端会一直停在按下状态
+  // （表现为拖选一切），而面板已收起、连释放按钮都点不到。
+  useEffect(() => {
+    if (holdLeft && (!mouseOpen || status !== 'connected')) vp.releaseHold()
+  }, [holdLeft, mouseOpen, status, vp])
+
+  // 组件卸载时同样收尾（手势 + 按住状态）
+  useEffect(() => () => vp.detach(), [vp])
 
   // 全屏：优先使用 Fullscreen API（真正隐藏浏览器 UI），
   // 不支持时回退为「沉浸式」样式（固定铺满视口并由 noVNC 自适应缩放）。
@@ -306,6 +280,8 @@ export default function VncPage({ agents }) {
   }
 
   const disconnect = () => {
+    // 先收尾虚拟鼠标按住的左键，再断开 —— 反过来就没有通道把它送到远端了
+    try { vp.detach() } catch { /* ignore */ }
     if (rfbRef.current) { try { rfbRef.current.disconnect() } catch {} rfbRef.current = null }
     setStatus('disconnected')
     setNotice('')
@@ -372,11 +348,8 @@ export default function VncPage({ agents }) {
   // 之后的相对移动才不会出现「一拖就跳」。
   useEffect(() => {
     if (!mouseOpen || status !== 'connected') return
-    const cv = screenCanvas()
-    if (!cv) return
-    const r = cv.getBoundingClientRect()
-    movePointer(r.width / 2, r.height / 2)
-  }, [mouseOpen, status])
+    vp.syncToCenter()
+  }, [mouseOpen, status, vp])
 
   return (
     <div>
@@ -463,31 +436,6 @@ export default function VncPage({ agents }) {
             </button>
           </div>
 
-          {/* 移动端虚拟鼠标：触控板做相对移动，按钮做点击/滚轮/按住拖拽 */}
-          {mouseOpen && status === 'connected' && (
-            <div className="vnc-mouse">
-              <div
-                className="vnc-mouse-track"
-                onPointerDown={onTrackDown}
-                onPointerMove={onTrackMove}
-                onPointerUp={onTrackUp}
-                onPointerCancel={onTrackUp}
-              >
-                <span>触控板：拖动移动指针 · 轻点 = 左键</span>
-              </div>
-              <div className="vnc-mouse-btns">
-                <button onClick={() => clickAt(1)}>左键</button>
-                <button onClick={() => clickAt(2)}>右键</button>
-                <button onClick={doubleClickAt}>双击</button>
-                <button onClick={() => dispatchWheel(vptrRef.current.x, vptrRef.current.y, -50)}>滚轮↑</button>
-                <button onClick={() => dispatchWheel(vptrRef.current.x, vptrRef.current.y, 50)}>滚轮↓</button>
-                <button className={holdLeft ? 'on' : ''} onClick={toggleHoldLeft}>
-                  {holdLeft ? '松开左键' : '按住左键'}
-                </button>
-              </div>
-            </div>
-          )}
-
           {status !== 'connected' && (
             <div className="vnc-overlay">
               <div>
@@ -497,6 +445,33 @@ export default function VncPage({ agents }) {
             </div>
           )}
         </div>
+
+        {/* 移动端虚拟鼠标：触控板做相对移动，按钮做点击/滚轮/按住拖拽。
+            刻意放在画布**下方**（而不是浮在桌面之上）：覆盖式会把远端桌面最底部一条
+            挡住且点不到（任务栏就在那条上）。 */}
+        {mouseOpen && status === 'connected' && (
+          <div className="vnc-mouse">
+            <div
+              className="vnc-mouse-track"
+              onPointerDown={onTrackDown}
+              onPointerMove={onTrackMove}
+              onPointerUp={onTrackUp}
+              onPointerCancel={onTrackCancel}
+            >
+              <span>触控板：拖动移动指针 · 轻点 = 左键</span>
+            </div>
+            <div className="vnc-mouse-btns">
+              <button onClick={() => vp.click(1)}>左键</button>
+              <button onClick={() => vp.click(2)}>右键</button>
+              <button onClick={() => vp.doubleClick()}>双击</button>
+              <button onClick={() => vp.wheel(-WHEEL_STEP_DELTA)}>滚轮↑</button>
+              <button onClick={() => vp.wheel(WHEEL_STEP_DELTA)}>滚轮↓</button>
+              <button className={holdLeft ? 'on' : ''} onClick={() => vp.toggleHold()}>
+                {holdLeft ? '松开左键' : '按住左键'}
+              </button>
+            </div>
+          </div>
+        )}
         {notice && <div className="notice" style={{ marginTop: 10 }}>{notice}</div>}
       </div>
     </div>
