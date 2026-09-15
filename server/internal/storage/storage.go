@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	_ "modernc.org/sqlite"
 )
@@ -174,9 +175,31 @@ func (db *DB) migrate() error {
 	return nil
 }
 
+// identPattern 用于校验表名/列名等 SQL 标识符，仅允许字母、数字和下划线，且不以数字开头。
+// 标识符无法作为 SQL 占位符参数传递，只能拼接进语句，因此拼接前必须做白名单校验。
+var identPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// quoteIdent 校验并引用 SQL 标识符（表名/列名）。
+// 非法标识符（含引号、分号、空白等）直接报错，从源头阻断 SQL 注入。
+func quoteIdent(ident string) (string, error) {
+	if !identPattern.MatchString(ident) {
+		return "", fmt.Errorf("非法的 SQL 标识符: %q", ident)
+	}
+	return `"` + ident + `"`, nil
+}
+
 // ensureColumn 检查表中是否存在指定列，缺失则通过 ALTER TABLE 补上（用于老库平滑升级）。
 func (db *DB) ensureColumn(table, column, definition string) error {
-	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	// table/column 为 SQL 标识符，无法参数化，需先校验再引用，避免拼接注入。
+	quotedTable, err := quoteIdent(table)
+	if err != nil {
+		return err
+	}
+	quotedColumn, err := quoteIdent(column)
+	if err != nil {
+		return err
+	}
+	rows, err := db.Query(`PRAGMA table_info(` + quotedTable + `)`)
 	if err != nil {
 		return fmt.Errorf("读取表结构失败 [%s]: %w", table, err)
 	}
@@ -201,7 +224,7 @@ func (db *DB) ensureColumn(table, column, definition string) error {
 	if exists {
 		return nil
 	}
-	if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition); err != nil {
+	if _, err := db.Exec(`ALTER TABLE ` + quotedTable + ` ADD COLUMN ` + quotedColumn + ` ` + definition); err != nil {
 		return fmt.Errorf("为表 %s 添加列 %s 失败: %w", table, column, err)
 	}
 	return nil
