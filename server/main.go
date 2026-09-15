@@ -7,7 +7,9 @@
 //   - 提供 REST API（鉴权、主机列表、命令下发、端口映射管理等）
 //   - 端口映射反向代理与连接跟踪
 //
-// 用法：go run . 或 ./server -listen :9000 -http :8080 -apikey xxx
+// 用法：go run . 或 ./server -listen :9000 -http :8080 -user admin -password <密码>
+// 登录凭证只有一种：用户名 + 密码（可选 OTP）。首次启动未指定 -user 时
+// 会自动创建内置账号 admin/123456。
 package main
 
 import (
@@ -52,7 +54,6 @@ import (
 func main() {
 	addr := flag.String("listen", ":9000", "Agent TCP 长连接监听地址")
 	httpAddr := flag.String("http", ":8080", "REST API / WebSocket 监听地址")
-	apiKey := flag.String("apikey", os.Getenv("MOCENTER_API_KEY"), "全局 API Key")
 	whitelist := flag.String("whitelist", os.Getenv("MOCENTER_WHITELIST"), "IP 白名单，逗号分隔")
 	webDir := flag.String("web", os.Getenv("MOCENTER_WEB_DIR"), "Web 静态资源目录，留空则不托管前端")
 	tlsCert := flag.String("tls-cert", "", "Agent TCP 连接 TLS 证书文件路径")
@@ -78,7 +79,6 @@ func main() {
 		cfg = &config.Config{
 			Listen:    *addr,
 			HTTP:      *httpAddr,
-			APIKey:    *apiKey,
 			Whitelist: *whitelist,
 			WebDir:    *webDir,
 			TLSCert:   *tlsCert,
@@ -103,9 +103,6 @@ func main() {
 		}
 		if cfg.HTTP != "" && *httpAddr == ":8080" {
 			*httpAddr = cfg.HTTP
-		}
-		if cfg.APIKey != "" && *apiKey == os.Getenv("MOCENTER_API_KEY") {
-			*apiKey = cfg.APIKey
 		}
 		if cfg.Whitelist != "" && *whitelist == os.Getenv("MOCENTER_WHITELIST") {
 			*whitelist = cfg.Whitelist
@@ -148,7 +145,6 @@ func main() {
 		field := map[string]func(){
 			"listen":    func() { cfg.Listen = *addr },
 			"http":      func() { cfg.HTTP = *httpAddr },
-			"apikey":    func() { cfg.APIKey = *apiKey },
 			"whitelist": func() { cfg.Whitelist = *whitelist },
 			"web":       func() { cfg.WebDir = *webDir },
 			"tls-cert":  func() { cfg.TLSCert = *tlsCert },
@@ -159,7 +155,7 @@ func main() {
 			"user":      func() { cfg.User = *user },
 		}
 		dirty := false
-		for _, name := range []string{"listen", "http", "apikey", "whitelist", "web", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user"} {
+		for _, name := range []string{"listen", "http", "whitelist", "web", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -188,10 +184,6 @@ func main() {
 				break
 			}
 		}
-	}
-
-	if *apiKey == "" {
-		*apiKey = "change-me-api-key"
 	}
 
 	// 安装包托管目录：默认 <data>/packages。
@@ -241,7 +233,7 @@ func main() {
 	remarks := remark.NewStore(*dataDir)
 	remarks.Load()
 	store.SetRemarkFn(remarks.Get)
-	authz := auth.NewAuth(*apiKey, wl)
+	authz := auth.NewAuth(wl)
 	userMgr := auth.NewUserManager(filepath.Join(*dataDir, "users.json"))
 	if err := userMgr.InitFromFlags(*user, *password, *totpSecret); err != nil {
 		if errors.Is(err, auth.ErrInitPasswordRequired) {

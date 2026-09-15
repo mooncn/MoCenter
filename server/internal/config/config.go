@@ -16,7 +16,6 @@ import (
 type Config struct {
 	Listen     string `json:"listen,omitempty"`      // Agent TCP 长连接监听地址
 	HTTP       string `json:"http,omitempty"`        // REST API / WebSocket 监听地址
-	APIKey     string `json:"apikey,omitempty"`      // 全局 API Key
 	Whitelist  string `json:"whitelist,omitempty"`   // IP 白名单（逗号分隔）
 	WebDir     string `json:"web_dir,omitempty"`     // Web 静态资源目录
 	TLSCert    string `json:"tls_cert,omitempty"`    // Agent TLS 证书

@@ -2,8 +2,6 @@
 package auth
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"net"
 	"strings"
 	"sync"
@@ -11,22 +9,25 @@ import (
 )
 
 // Auth 鉴权器。
+//
+// 只有一种凭证：登录成功后颁发、并绑定用户名的 Token（见 RegisterToken）。
+// 早前的「全局 API Key」已移除 —— 它是一把对所有接口都有效的万能口令，
+// 会绕过账号体系，且审计里只能记成 "api-key"，与「用户名+密码(+OTP)」的单一登录
+// 模型冲突。Agent 侧从不使用它（见 Auth 的说明与 handleAgentConn）。
 type Auth struct {
-	tokens  map[string]string // 有效 Token -> 登录用户名（审计归属）
-	apiKey  string            // 全局 API Key
-	whitelist []string        // IP 白名单（CIDR 或精确 IP）
-	mu      sync.Mutex
+	tokens    map[string]string // 有效 Token -> 登录用户名（审计归属）
+	whitelist []string          // IP 白名单（CIDR 或精确 IP）
+	mu        sync.Mutex
 	// 速率限制：按 IP 记录请求时间戳
-	rate     map[string][]time.Time
-	rateMax  int           // 窗口内最大请求数
-	rateWin  time.Duration
+	rate    map[string][]time.Time
+	rateMax int // 窗口内最大请求数
+	rateWin time.Duration
 }
 
 // NewAuth 创建鉴权器。
-func NewAuth(apiKey string, whitelist []string) *Auth {
+func NewAuth(whitelist []string) *Auth {
 	a := &Auth{
 		tokens:    make(map[string]string),
-		apiKey:    apiKey,
 		whitelist: whitelist,
 		rate:      make(map[string][]time.Time),
 		rateMax:   120,
@@ -49,24 +50,24 @@ func (a *Auth) RevokeToken(token string) {
 	delete(a.tokens, token)
 }
 
-// ValidateToken 校验 Token。
+// ValidateToken 校验 Token：只认登录成功后颁发的、登记在册的 Token。
 func (a *Auth) ValidateToken(token string) bool {
+	if token == "" {
+		return false
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_, ok := a.tokens[token]
-	return ok || token == a.apiKey
+	return ok
 }
 
 // OperatorOf 返回该 Token 归属的操作者名称，用于审计留痕。
-// 账号登录返回用户名；API Key 登录返回 "api-key"；未知 Token 返回 "unknown"。
+// 账号登录返回用户名；未知 Token 返回 "unknown"。
 func (a *Auth) OperatorOf(token string) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if name, ok := a.tokens[token]; ok && name != "" {
 		return name
-	}
-	if token == a.apiKey {
-		return "api-key"
 	}
 	return "unknown"
 }
@@ -74,12 +75,6 @@ func (a *Auth) OperatorOf(token string) string {
 // Operator 从 Authorization 请求头解析操作者名称。
 func (a *Auth) Operator(authorization string) string {
 	return a.OperatorOf(strings.TrimPrefix(authorization, "Bearer "))
-}
-
-// HashToken 计算 Token 摘要。
-func HashToken(token string) string {
-	h := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(h[:])
 }
 
 // IsAllowedIP 判断源 IP 是否在白名单中。白名单为空表示不限制。

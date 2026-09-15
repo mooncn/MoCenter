@@ -88,7 +88,7 @@ scripts\build-all.bat
 
 ```bash
 cd server
-./mocenter-server -listen :9000 -http :8080 -apikey your-secret-key
+./mocenter-server -listen :9000 -http :8080 -user admin -password your-password
 # 可选: -whitelist 1.2.3.4,10.0.0.0/8   # IP 白名单
 # 可选: -web web/dist                  # 同时托管 Web 前端（单进程部署）
 # 可选: -tls-cert server.crt -tls-key server.key   # Agent 连接启用 TLS 加密
@@ -126,44 +126,52 @@ npm run dev     # 开发模式 (代理到 :8080)
 # 或部署构建产物 web/dist 到 Nginx / 由 Go 托管
 ```
 
-浏览器打开后，使用服务端启动时的 `-apikey` 作为登录 Token。
+浏览器打开后，用服务端配置的**用户名 + 密码**登录（首次启动未指定 `-user` 时会自动创建
+内置账号 `admin` / `123456`，请登录后立即修改）。
 
 ## 登录认证
 
-系统**默认没有内置的账号密码**。登录后台有两种方式：
+后台**只有一种登录方式：用户名 + 密码**（可再叠加 OTP 二次校验）。
+登录成功后服务端颁发一次性会话 Token，前端存在 `localStorage` 并在后续请求中以
+`Authorization: Bearer <token>` 携带。
 
-### 方式一：使用 API Key（默认，推荐）
-- 在登录页顶部的 **「访问 Token / API Key」** 输入框中，填写服务端启动时的 `-apikey` 值。
-- 服务端未通过 `-apikey` 指定时，默认值为 `change-me-api-key`。
-- 在后端程序目录的 `mocenter-server.json` 配置文件中，字段 `apikey` 也即该值。
+> 历史版本曾有一把「全局 API Key」（`-apikey`）作为替代登录凭证，**现已移除**：
+> 它是一把对所有接口都有效的万能口令，会绕过账号体系，审计里也只能记成 `api-key`。
+> 现在任何未由 `/api/login` 颁发的 Token 都会被拒绝。
 
-> 例如：启动服务端执行了 `mocenter-server -apikey MySecretKey`，登录时在输入框填 `MySecretKey` 即可。
+### 首次启动与账号
 
-### 方式二：用户名 + 密码（可选，需服务端启用）
-服务端可通过启动参数（或写入配置）启用账号登录，并可选启用 OTP 二次校验：
+未指定 `-user` 时，服务端**会自动创建内置账号 `admin` / `123456`**，保证开箱即可登录
+（请登录后立即在「账号设置」里修改）。也可在启动时直接指定：
 
 ```bash
-# 仅账号（用户名+密码）
+# 指定用户名 + 密码
 mocenter-server -user admin -password your-password
 
-# 账号 + OTP（需提供 base32 密钥，可用任意 TOTP 生成器生成，兼容 Google Authenticator）
+# 再叠加 OTP：需提供 base32 密钥（兼容 Google Authenticator）
 mocenter-server -user admin -password your-password -totp-secret JBSWY3DPEHPK3PXP
 ```
 
-启用后，登录页填写 **用户名、密码**（及 OTP 动态验证码，若启用了）即可登录；此时“访问 Token”可留空。
-对应配置字段：`user` / `password` / `totp_secret`（`mocenter-server.json`）。
+登录页只填 **用户名、密码**（若该账号绑定了 OTP，再填 6 位动态验证码）。
 
-> ⚠️ 安全说明：**密码不会明文落盘**。首次通过 `-user/-password` 创建账号时，密码会以 SHA-256 哈希持久化到服务端数据目录的 **`users.json`**；`mocenter-server.json` 配置文件**不保存**明文密码与 TOTP 密钥。
-> 创建完成后，即可在 Web 端侧边栏 **「账号设置」** 页面修改密码（无需再在命令行用明文参数），修改同样只写哈希到 `users.json`。
+> ⚠️ **密码不落盘明文**：首次创建账号时密码以 SHA-256 摘要写入服务端数据目录的
+> **`users.json`**；`mocenter-server.json` **不保存**明文密码与 TOTP 密钥。
+> 之后在 Web 端 **「账号设置」** 修改密码，同样只写摘要。
+>
+> **会话 Token 是内存态**，服务端重启后全部失效，需要重新登录。
 
 ### 修改密码
+
 1. 登录后点击左侧 **「账号设置」**。
 2. 填写 用户名、当前密码、两次新密码（至少 6 位；若该账号启用了 OTP，需一并填写动态验证码）。
 3. 提交成功后，下次登录使用新密码。
 
-### 说明
-- 未配置 `-user` 时后端 `/api/login` 返回 501，登录页仅需填写 API Key（Token）。
-- Token 为空时才走账号登录；两种方式互不冲突。
+### 账号与 OTP 的其它入口
+
+- **绑定/解绑 OTP**：同样在「账号设置」页，用手机扫描二维码（`otpauth://`）即可绑定。
+- **静默部署时创建账号**：`mocenter-deploy.exe install -role server -user <名> -password <密码>`
+  会把账号直接写进 `users.json`（只存摘要）。重复安装**不会覆盖**已有账号，避免把用户
+  后来改过的密码重置回安装时的值。
 
 ## 功能清单
 
@@ -242,7 +250,7 @@ Windows 的 VNC 安装包（UltraVNC，约 4–5MB）默认从公网下载。若
 bash scripts/fetch-packages.sh ./packages
 
 # 2) 启动服务端时指向该目录（不指定则默认 <data>/packages）
-./mocenter-server -listen :9000 -http :8080 -apikey xxx -data ./data -pkg-dir ./packages
+./mocenter-server -listen :9000 -http :8080 -user admin -password <密码> -data ./data -pkg-dir ./packages
 # 启动日志会确认: [pkg] 安装包目录 ./packages 已托管: UltraVNC_1824_x64_Setup.exe(4.6MB)
 ```
 

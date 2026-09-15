@@ -18,8 +18,7 @@
 # 构建服务端镜像（需 Dockerfile，可参考规划书容器化章节）
 docker build -t mocenter-server ./server
 docker run -d -p 9000:9000 -p 8080:8080 \
-  -e MOCENTER_API_KEY=your-secret-key \
-  mocenter-server
+  mocenter-server -listen :9000 -http :8080 -user admin -password your-password
 ```
 
 ### 方式二：物理机直接部署（单进程托管 Web）
@@ -29,7 +28,7 @@ docker run -d -p 9000:9000 -p 8080:8080 \
 cd web && bash build.sh   # 生成 dist/
 cd ../server && bash build.sh
 # 2. 启动（同时托管 Web 静态资源，单进程部署）
-./mocenter-server -listen :9000 -http :8080 -apikey your-secret-key -web ../web/dist
+./mocenter-server -listen :9000 -http :8080 -user admin -password your-password -web ../web/dist
 ```
 
 ## 三、Agent 部署
@@ -142,7 +141,8 @@ server {
 
 ## 五、安全配置
 
-1. **修改 API Key**：服务端启动时通过 `-apikey` 设置强随机密钥，Web 登录时使用该 Key。
+1. **设置登录账号**：服务端启动时通过 `-user` / `-password` 指定后台账号，并在 Web「账号设置」里
+   绑定 OTP 二次校验。凭证只有一种：用户名 + 密码(+OTP)，**没有全局 API Key**。
 2. **IP 白名单**：通过 `-whitelist 1.2.3.4,10.0.0.0/8` 限制可访问服务端的源 IP。
 3. **TLS/mTLS**：Agent<->Server 支持全链路 TLS 加密，可升级为 mTLS 双向认证。生成自签名证书：
 
@@ -153,7 +153,7 @@ server {
    **单向 TLS**（加密传输）：
    ```bash
    # 服务端
-   ./mocenter-server -listen :9000 -http :8080 -apikey xxx -tls-cert certs/server.crt -tls-key certs/server.key
+   ./mocenter-server -listen :9000 -http :8080 -user admin -password <密码> -tls-cert certs/server.crt -tls-key certs/server.key
    # Agent（自签名跳过校验）
    ./mocenter-agent -server host:9000 -agentid host-01 -tls -insecure
    ```
@@ -161,7 +161,7 @@ server {
    **mTLS 双向认证**（服务端校验 Agent 客户端证书）：
    ```bash
    # 服务端（额外提供 -ca-cert，要求 Agent 携带有效客户端证书）
-   ./mocenter-server -listen :9000 -http :8080 -apikey xxx -tls-cert certs/server.crt -tls-key certs/server.key -ca-cert certs/ca.crt
+   ./mocenter-server -listen :9000 -http :8080 -user admin -password <密码> -tls-cert certs/server.crt -tls-key certs/server.key -ca-cert certs/ca.crt
    # Agent（携带客户端证书，并用 CA 校验服务端证书）
    ./mocenter-agent -server host:9000 -agentid host-01 -tls -client-cert certs/client.crt -client-key certs/client.key -ca-cert certs/ca.crt
    ```

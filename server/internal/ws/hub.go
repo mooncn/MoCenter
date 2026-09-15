@@ -27,7 +27,7 @@ type Client struct {
 	conn     *websocket.Conn
 	send     chan []byte
 	done     chan struct{}
-	operator string // 该连接的操作者（登录用户名/API Key），用于审计留痕
+	operator string // 该连接的操作者（登录用户名），用于审计留痕
 }
 
 // Hub 管理所有 WebSocket 客户端，并向上层暴露消息处理回调。
