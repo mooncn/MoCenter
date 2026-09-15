@@ -28,7 +28,7 @@
 
 | 模块 | 技术 | 说明 |
 |------|------|------|
-| 后端 | Go 1.22 | 高并发网络通信 |
+| 后端 | Go 1.25 | 高并发网络通信（`server` 最低 1.22，`agent`/`installer` 的 `go.mod` 要求 1.25） |
 | 前端 | React 18 + Vite 5 + xterm.js 5 | 组件化 + 标准终端模拟 |
 | 通信 | TCP 长连接 + WebSocket | Agent<->Server 用 TCP，Web<->Server 用 WebSocket |
 | 协议 | JSON（可迁移 Protobuf） | 协议定义见 `proto/` |
@@ -62,9 +62,25 @@ MoCenter/
 │       ├── pages/         # 各页面
 │       └── App.jsx
 ├── proto/                 # Protobuf 协议定义
-├── scripts/               # 一键构建脚本
-│   ├── build-all.sh
-│   └── build-all.bat
+├── installer/             # Windows 图形安装程序（Inno Setup 工程）
+│   ├── setup.iss          # 向导定义（角色 / 参数 / 服务注册）
+│   ├── messages-cn.iss    # 向导中文文案覆盖
+│   ├── main.go            # mocenter-deploy.exe：命令行安装引擎
+│   └── payload/           # 打包输入：三个二进制 + web 前端
+├── scripts/               # 构建 / 打包 / 部署脚本
+│   ├── build-all.sh       # 一键构建（Linux/macOS）
+│   ├── build-all.bat      # 一键构建（Windows，含图形安装程序）
+│   ├── gen-cert.sh        # 生成 TLS/mTLS 证书
+│   ├── fetch-packages.sh  # 拉取 VNC 安装包到服务端托管目录
+│   ├── mcmd/              # 远程命令调试工具（REST + WebSocket）
+│   ├── gencerts/          # 证书生成的 Go 实现
+│   └── packaging/         # 多架构打包与部署
+│       ├── build-win-all.bat    # Windows 多架构 Agent
+│       ├── build-linux-all.sh   # Linux 多架构 Agent
+│       ├── build-linux-pkg.sh   # .deb / .rpm 安装包
+│       ├── build-setup.bat      # Windows 图形安装程序
+│       ├── install-windows.bat  # Windows 手动注册服务（备选）
+│       └── install-linux.sh     # Linux systemd 注册
 └── docs/                  # 部署与运维手册
 ```
 
@@ -72,17 +88,22 @@ MoCenter/
 
 ### 1. 构建
 
-一键构建三大部分（需安装 Go 1.22+ 与 Node.js 18+）：
+一键构建（需 **Go 1.25+** 与 **Node.js 18+**）：
 
 ```bash
-# Linux/macOS
+# Linux/macOS：Server + Agent + Web -> build/
 bash scripts/build-all.sh
+bash scripts/build-all.sh windows        # 交叉编译 Windows Agent
 
-# Windows
+# Windows：Server + Agent + Web + 图形安装程序 -> build\
 scripts\build-all.bat
 ```
 
+产物统一落在仓库根的 `build/`：`mocenter-server[.exe]`、`mocenter-agent[.exe]`、`web/`；
+Windows 版还会在第 `[4/4]` 步编译出 `MoCenter-Setup-<版本>.exe`。
+
 各子目录也提供独立构建脚本（`server/build.sh`、`agent/build.sh`、`web/build.sh`，及对应 `.bat`）。
+**全部脚本的用法、参数与产物位置见 [构建脚本参考](#构建脚本参考)。**
 
 ### 2. 启动服务端
 
@@ -128,6 +149,171 @@ npm run dev     # 开发模式 (代理到 :8080)
 
 浏览器打开后，用服务端配置的**用户名 + 密码**登录（首次启动未指定 `-user` 时会自动创建
 内置账号 `admin` / `123456`，请登录后立即修改）。
+
+## 构建脚本参考
+
+> 所有脚本均以**仓库根目录**为基准定位文件，可在任意当前目录下调用。
+
+### 环境要求
+
+| 工具 | 版本 | 用于 |
+|------|------|------|
+| Go | **1.25+** | 编译 `server` / `agent` / `installer`（`server` 最低 1.22） |
+| Node.js + npm | 18+ | 构建 Web 前端 |
+| [Inno Setup 6](https://jrsoftware.org/isdl.php) | 6.x | **仅**编译 Windows 图形安装程序 |
+| OpenSSL | — | **仅**生成 TLS/mTLS 证书 |
+| `dpkg-deb` 或 `fpm` | — | **仅**生成 Linux `.deb`（`.rpm` 需 `fpm`） |
+
+> Go / npm 缺失时，一键脚本会打印 `!! ... 跳过 ...` 并**继续构建其余部分**（不中断）。
+> 因此看到跳过提示不等于构建失败，请以最终产物为准。
+
+### 脚本总览
+
+| 脚本 | 平台 | 作用 | 产物 |
+|------|------|------|------|
+| `scripts/build-all.bat` | Windows | 一键构建 Server + Agent + Web + 图形安装程序 | `build\` |
+| `scripts/build-all.sh` | Linux/macOS | 一键构建 Server + Agent + Web | `build/` |
+| `agent/build.sh` · `agent/build.bat` | 跨平台 | 单独构建 Agent | `agent/mocenter-agent[.exe]` |
+| `server/build.sh` · `server/build.bat` | 跨平台 | 单独构建 Server | `server/mocenter-server[.exe]` |
+| `web/build.sh` · `web/build.bat` | 跨平台 | 单独构建前端 | `web/dist/` |
+| `scripts/packaging/build-win-all.bat` | Windows | Agent 多架构（x86_64 / x86 / arm64 / arm） | `build\agent\windows\` |
+| `scripts/packaging/build-linux-all.sh` | Linux/macOS | Agent 多架构（amd64 / arm64 / arm / 386） | `build/agent/linux/` |
+| `scripts/packaging/build-linux-pkg.sh` | Linux/macOS | 生成 `.deb` / `.rpm` | `build/packages/` |
+| `scripts/packaging/build-setup.bat` | Windows | 编译图形安装程序 | `build\MoCenter-Setup-<版本>.exe` |
+| `scripts/packaging/install-windows.bat` | Windows | 手动注册 Windows 服务（备选） | — |
+| `scripts/packaging/install-linux.sh` | Linux | 注册 systemd 服务 | — |
+| `scripts/gen-cert.sh` | Linux/macOS | 生成 CA / 服务端 / 客户端证书 | 指定目录（默认 `certs/`） |
+| `scripts/fetch-packages.sh` | Linux/macOS | 拉取 VNC 安装包到服务端托管目录 | 指定目录 |
+| `scripts/mcmd/` | 跨平台 | 远程命令调试（REST + WebSocket） | — |
+
+### 一键构建
+
+```bat
+REM Windows：Server + Agent + Web + 图形安装程序
+scripts\build-all.bat
+```
+
+```bash
+# Linux/macOS：Server + Agent + Web
+bash scripts/build-all.sh              # Agent 目标平台默认为当前系统
+bash scripts/build-all.sh windows      # 交叉编译 Windows Agent
+bash scripts/build-all.sh linux
+bash scripts/build-all.sh darwin
+```
+
+`build-all.sh` 的**唯一参数是 Agent 目标平台**（`linux` / `windows` / `darwin`，缺省取 `uname`）。
+Windows 版在第 `[4/4]` 步会调用 `build-setup.bat`；若 `installer/setup.iss` 不存在则跳过。
+
+### 单独构建某个模块
+
+```bash
+bash agent/build.sh [linux|windows|darwin] [amd64|386|arm64|arm]   # 默认当前平台 / amd64
+bash server/build.sh
+bash web/build.sh
+```
+
+```bat
+REM Windows：参数为架构，默认 amd64
+agent\build.bat [386|amd64|arm|arm64]
+server\build.bat
+web\build.bat
+```
+
+输出分别是 `agent/mocenter-agent[.exe]`、`server/mocenter-server[.exe]`、`web/dist/`（注意：**落在模块目录内**，
+与一键脚本输出到 `build/` 不同）。
+
+### 多架构打包
+
+```bat
+REM Windows Agent：amd64 / 386 / arm64 / arm -> build\agent\windows\
+REM 同时会把 install-windows.bat 复制过去
+scripts\packaging\build-win-all.bat
+```
+
+```bash
+# Linux Agent：amd64 / arm64 / arm / 386 -> build/agent/linux/
+bash scripts/packaging/build-linux-all.sh
+
+# .deb / .rpm -> build/packages/
+bash scripts/packaging/build-linux-pkg.sh all amd64
+bash scripts/packaging/build-linux-pkg.sh deb arm64
+bash scripts/packaging/build-linux-pkg.sh rpm amd64
+
+MOCENTER_VERSION=1.2.3 bash scripts/packaging/build-linux-pkg.sh all amd64   # 指定版本号
+```
+
+`build-linux-pkg.sh` 参数为 `[deb|rpm|all] [arch]`，版本号取自环境变量 `MOCENTER_VERSION`（默认 `1.0.0`）。
+生成的安装包内置 systemd 单元：安装后自动注册 `mocenter-agent.service`、设置开机自启，
+二进制落在 `/usr/local/bin/mocenter-agent`，配置文件为 `/etc/mocenter/mocenter-agent.conf`（**安装后请修改服务端地址**）。
+
+### Windows 图形安装程序
+
+```bat
+scripts\packaging\build-setup.bat
+```
+
+脚本分三步：
+
+1. 编译 `agent` / `server` / 安装引擎 → `installer\payload\`
+2. 复制 `web\dist` → `installer\payload\web\`（前端尚未构建时会告警，但不影响打包，只是不含 Web UI）
+3. 调用 ISCC 编译 `installer\setup.iss` → `build\MoCenter-Setup-<版本>.exe`
+
+**ISCC 自动探测顺序**（Inno Setup **不必装在 C 盘**，D 盘等非系统盘同样会被找到）：
+
+1. 环境变量 `INNO_SETUP_ISCC`
+2. `PATH`
+3. `%ProgramFiles(x86)%\Inno Setup 6\` 与 `%ProgramFiles%\Inno Setup 6\`
+4. `C:` ~ `J:` 各盘符下的 `Program Files [x86]\Inno Setup 6\`
+
+装在其它盘符或自定义目录时，显式指定即可：
+
+```bat
+set INNO_SETUP_ISCC=D:\Tools\Inno Setup 6\ISCC.exe
+scripts\packaging\build-setup.bat
+```
+
+> 改版本号：编辑 `installer\setup.iss` 里的 `#define AppVersion` —— 它同时决定输出文件名与注册表版本。
+> 安装包**无需维护文件清单**：向导只负责收集参数与摆放文件，服务注册、配置落盘、单实例保护
+> 都交给随包安装的 `mocenter-deploy.exe`（其失败原因会写入安装目录下的 `mocenter-deploy.log`）。
+
+### 部署 / 安装脚本
+
+```bat
+REM Windows：注册为系统服务（需管理员）
+scripts\packaging\install-windows.bat install your.server.com:9000 [agentid] [proxy]
+scripts\packaging\install-windows.bat status
+scripts\packaging\install-windows.bat uninstall
+```
+
+```bash
+# Linux：注册 systemd 服务（需 root）
+sudo bash scripts/packaging/install-linux.sh install ./mocenter-agent
+sudo bash scripts/packaging/install-linux.sh status
+sudo bash scripts/packaging/install-linux.sh uninstall
+```
+
+> Windows 侧**推荐使用图形安装程序或 `mocenter-deploy.exe install`**（见下方「Windows 静默 / 脚本化安装」）：
+> 它们走 SCM 握手，服务状态可被 `sc query` / 服务管理器正确观察。
+> `install-windows.bat` 是直接用 `sc create` 的手动备选路径（**其 binPath 仍带 `-daemon`**），
+> 仅适合不便运行安装器的场景 —— 正在用它的主机建议改用上述两种方式注册。
+
+### 辅助工具
+
+```bash
+# 生成 CA / 服务端 / 客户端三套证书（Agent<->Server 的 TLS 或 mTLS）
+bash scripts/gen-cert.sh ./certs
+
+# 把 VNC 安装包放进服务端托管目录（供 Agent 经长连接拉取，避免公网慢/被劫持）
+bash scripts/fetch-packages.sh ./packages win
+
+# 远程命令调试：经 REST 下发 + WebSocket 收结果，等效一次「远程终端」命令
+cd scripts/mcmd
+go run . -agent <agent_id> -cmd "ipconfig" -server http://127.0.0.1:8088 -shell cmd -timeout 60
+```
+
+- `fetch-packages.sh` 用法为 `[目标目录] [win|linux|all]`；目标目录需与服务端 `-pkg-dir` 一致
+  （未指定时为 `<数据目录>/packages`）。启动日志会打印 `[pkg] 安装包目录 ... 已托管: ...` 以便确认。
+- `scripts/gencerts/` 是证书生成的 Go 实现，用法见其 `README.md`。
 
 ## 登录认证
 
@@ -195,6 +381,7 @@ mocenter-server -user admin -password your-password -totp-secret JBSWY3DPEHPK3PX
 - ✅ Agent 断线指数退避重连、进程守护崩溃自启
 - ✅ **TLS/mTLS 加密**：Agent<->Server 可选全链路 TLS 单向加密，或 mTLS 双向认证（客户端证书 + CA 校验）
 - ✅ **服务端托管 Web 静态资源**：`-web web/dist` 单进程部署
+- ✅ **Windows 图形安装程序**：向导式安装（选择角色 → 连接与认证 → 高级设置），一键注册为**真正的 Windows 服务**（SCM 握手、失败自动重启），配置与数据固定于 `%ProgramData%\MoCenter\<角色>\`；另附命令行引擎用于静默批量部署；带命名互斥体单实例保护，同时保留便携单文件形态
 - ✅ **远程桌面 (VNC)**：服务端隧道 + noVNC 浏览器渲染，一键安装/启动（Windows **UltraVNC** / Linux **x11vnc**，支持国内加速代理）；**安装包可由服务端托管并经长连接分发**（避免公网慢/被劫持）；Windows 与 Linux 均支持**交互会话模式**与**服务模式**（后者可查看锁屏/登录界面）；连接后右下角悬浮工具栏支持**全屏**、自适应缩放、Ctrl+Alt+Del、**光标大小调节**与**移动端虚拟鼠标**
 - ✅ **多架构打包**：Windows x86/x86_64/ARM/ARM64、Linux amd64/arm64/arm/386 二进制，及 .deb/.rpm 安装包
 - ✅ **系统服务注册**：Agent 一键注册为 Windows 服务 / Linux systemd 服务，开机自启
@@ -273,48 +460,97 @@ bash scripts/fetch-packages.sh ./packages
 
 ## Agent 安装包与系统服务
 
-### 多架构二进制构建
+> 各构建 / 打包脚本的参数与产物位置统一见 **[构建脚本参考](#构建脚本参考)**。
+> 本节只讲「装到目标机之后会发生什么」。
+
+### 多架构二进制
+
+| 平台 | 脚本 | 产物目录 |
+|------|------|----------|
+| Linux（amd64 / arm64 / arm / 386） | `bash scripts/packaging/build-linux-all.sh` | `build/agent/linux/` |
+| Windows（x86_64 / x86 / arm64 / arm） | `scripts\packaging\build-win-all.bat` | `build\agent\windows\` |
+
+Windows 版会同时把 `install-windows.bat` 复制到产物目录，便于随二进制一起分发到目标机。
+
+### Linux .deb / .rpm 安装包（含 systemd 服务）
 
 ```bash
-# Linux 多架构（amd64/arm64/arm/386）
-bash scripts/packaging/build-linux-all.sh
-
-# Windows 多架构（x86_64/x86/arm64/arm）
-# 在 Windows 上执行:
-scripts\packaging\build-win-all.bat
-```
-
-### Linux .deb/.rpm 安装包（含 systemd 服务）
-
-```bash
-# 一键生成 .deb 与 .rpm（默认 amd64）
-bash scripts/packaging/build-linux-pkg.sh all amd64
-
-# 单独生成 .deb / .rpm
-bash scripts/packaging/build-linux-pkg.sh deb arm64
-bash scripts/packaging/build-linux-pkg.sh rpm amd64
+bash scripts/packaging/build-linux-pkg.sh all amd64    # 亦可 deb/rpm + arm64/arm/386
 ```
 
 安装包内置 systemd 服务单元，安装后自动：
 - 注册 `mocenter-agent.service` 服务
 - 设置开机自启并启动
-- 配置文件位于 `/etc/mocenter/mocenter-agent.conf`（请修改服务端地址）
+- 二进制位于 `/usr/local/bin/mocenter-agent`，配置文件位于 `/etc/mocenter/mocenter-agent.conf`（**请修改服务端地址**）
 
-> 依赖 `dpkg-deb`（Debian/Ubuntu）或 `fpm`；也可直接使用一键脚本：
-> `sudo bash scripts/packaging/install-linux.sh install <server>`
+不想自行打包时，也可用一键安装脚本（需 root；**第二个参数是本地 Agent 二进制的路径**）：
 
-### Windows 系统服务（开机自启）
-
-将对应架构的 `mocenter-agent-*.exe` 命名为 `mocenter-agent.exe` 与 `install-windows.bat` 放在同目录，然后以**管理员**运行：
-
-```bat
-install-windows.bat install your.server.com:9000 [agentid] [proxy]
+```bash
+sudo bash scripts/packaging/install-linux.sh install ./mocenter-agent
+# 服务端地址取自 /etc/mocenter/mocenter-agent.conf 或环境变量 MOCENTER_SERVER
 ```
 
-脚本会：
-- 复制二进制到 `%ProgramFiles%\MoCenter`
-- 注册 Windows 服务 `MoCenterAgent`（`sc create`）
-- 设置开机自启并启动
+> 打包依赖 `dpkg-deb`（Debian/Ubuntu）或 `fpm`；`.rpm` 需要 `fpm`。
+
+### Windows 图形安装程序（推荐）
+
+双击 `MoCenter-Setup-<版本>.exe` 即进入安装向导：
+
+1. **选择角色** —— Agent（被控端）/ Server（总控端）/ 两者都装
+2. **连接与认证** —— 服务端地址（装 Agent 必填）、后台登录用户名与密码（装 Server 必填）
+3. **高级设置** —— 数据目录、监听端口、代理前缀、TLS 参数（均有默认值，可一路下一步）
+
+安装后：
+
+| 项目 | 位置 / 行为 |
+|------|-------------|
+| 二进制 | `%ProgramFiles%\MoCenter\` |
+| 配置与数据 | `%ProgramData%\MoCenter\<角色>\`（与二进制分离，升级/重装不覆盖） |
+| 服务 | `MoCenterAgent` / `MoCenterServer`，开机自启 + 失败自动重启 |
+| 日志 | `%ProgramData%\MoCenter\<角色>\logs\`（服务模式下 stdout 无去处，故落文件） |
+| 卸载 | 控制面板「应用和功能」；服务会停止并移除，**配置与数据默认保留** |
+
+> 向导本身只负责**收集参数 + 摆放文件**；服务注册、配置落盘、单实例保护、日志重定向
+> 都交给随包安装的 `mocenter-deploy.exe`，两处不重复实现，也就不会出现"界面说的和实际做的"不一致。
+> 安装引擎的失败原因会写入安装目录下的 **`mocenter-deploy.log`**，安装失败时先看这个文件。
+>
+> 打包脚本的用法、以及 Inno Setup 装在非系统盘时如何指定，见
+> **[构建脚本参考 → Windows 图形安装程序](#windows-图形安装程序)**。
+
+### Windows 静默 / 脚本化安装（mocenter-deploy.exe）
+
+批量部署时用命令行引擎，参数与向导完全一致：
+
+```bat
+REM 被控机
+mocenter-deploy.exe install -role agent -server your.server.com:9000
+
+REM 总控机
+mocenter-deploy.exe install -role server -user admin -password <登录密码>
+
+REM 查看状态（无需管理员）/ 卸载（默认保留配置与数据）
+mocenter-deploy.exe status -role all
+mocenter-deploy.exe uninstall -role all
+```
+
+> - 需以**管理员**身份运行（注册服务、写 Program Files 都需要）。
+> - 监听地址用 `-listen` / `-http`；TLS 等参数用 `-extra "-tls -ca-cert C:\ca.crt"` 透传。
+> - **便携形态不受影响**：不安装时直接运行 `mocenter-agent.exe` 即可，配置落在 **exe 同目录**
+>   （基准是 exe 位置而非当前工作目录，所以服务、计划任务、双击运行都落在同一处）。
+> - **单实例保护**：同一份配置只允许一个实例（Windows 命名互斥体），避免"服务 + 手工启动"并存。
+
+### Windows 手动注册服务（备选）
+
+不方便用安装器时也可手动注册。两点必须注意：服务名要与程序内置的一致
+（`MoCenterAgent` / `MoCenterServer`），并用 `-config` 指向固定位置的配置：
+
+```bat
+sc create MoCenterAgent binPath= "\"C:\Program Files\MoCenter\mocenter-agent.exe\" -config C:\ProgramData\MoCenter\agent\mocenter-agent.json" start= auto
+sc start MoCenterAgent
+```
+
+> 程序通过 `svc.IsWindowsService()` 自动识别"被 SCM 拉起"，**不需要**额外开关 ——
+> 早前用 `-daemon` 注册服务的做法没有 SCM 握手，SCM 会报 1053、`sc stop` 也管不住，现已修正。
 
 ### 国内加速代理
 
