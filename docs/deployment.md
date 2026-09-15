@@ -70,8 +70,12 @@ systemctl enable --now mocenter-agent
 **推荐：图形安装程序** —— 双击 `MoCenter-Setup-<版本>.exe`，按向导走：
 
 1. **选择角色**：Agent（被控端）/ Server（总控端）/ 两者
-2. **连接与认证**：服务端地址（装 Agent 必填）、后台登录用户名与密码（装 Server 必填）
+2. **连接与认证**：服务端地址、Agent 注册密钥（装 Agent 必填）、后台登录用户名与密码（装 Server 必填）
 3. **高级设置**：数据目录、监听端口、代理前缀、TLS 参数（均有默认值）
+
+> **Agent 注册密钥**在总控机的数据目录下（`agent.key`，权限 0600；首次启动自动生成，
+> 也可用 `-agent-key` 显式指定）。Agent 注册时用 HMAC 证明持有该密钥，
+> 没有它连接会被服务端拒绝 —— 这是 :9000 通道唯一的应用层身份凭证。
 
 安装后：
 
@@ -87,7 +91,7 @@ systemctl enable --now mocenter-agent
 **批量/静默部署**用随包安装的命令行引擎（参数与向导一致）：
 
 ```bat
-mocenter-deploy.exe install -role agent -server your.server.com:9000
+mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key <注册密钥>
 mocenter-deploy.exe install -role server -user admin -password <登录密码>
 mocenter-deploy.exe status -role all      REM 无需管理员
 mocenter-deploy.exe uninstall -role all   REM 默认保留配置与数据

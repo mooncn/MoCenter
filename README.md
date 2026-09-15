@@ -147,8 +147,9 @@ npm run dev     # 开发模式 (代理到 :8080)
 # 或部署构建产物 web/dist 到 Nginx / 由 Go 托管
 ```
 
-浏览器打开后，用服务端配置的**用户名 + 密码**登录（首次启动未指定 `-user` 时会自动创建
-内置账号 `admin` / `123456`，请登录后立即修改）。
+浏览器打开后，用服务端配置的**用户名 + 密码**登录（首次启动未指定 `-user`/`-password` 时
+会自动创建账号 `admin` 并生成**随机强口令**，写入 `<数据目录>/initial-password.txt`，
+权限 0600；请查看后立即登录修改并删除该文件）。
 
 ## 构建脚本参考
 
@@ -327,8 +328,9 @@ go run . -agent <agent_id> -cmd "ipconfig" -server http://127.0.0.1:8088 -shell 
 
 ### 首次启动与账号
 
-未指定 `-user` 时，服务端**会自动创建内置账号 `admin` / `123456`**，保证开箱即可登录
-（请登录后立即在「账号设置」里修改）。也可在启动时直接指定：
+未指定 `-user` 时，服务端会自动创建账号 `admin` 并生成**随机强口令**
+（写入 `<数据目录>/initial-password.txt`，权限 0600，请查看后删除）。
+也可在启动时直接指定：
 
 ```bash
 # 指定用户名 + 密码
@@ -340,16 +342,32 @@ mocenter-server -user admin -password your-password -totp-secret JBSWY3DPEHPK3PX
 
 登录页只填 **用户名、密码**（若该账号绑定了 OTP，再填 6 位动态验证码）。
 
-> ⚠️ **密码不落盘明文**：首次创建账号时密码以 SHA-256 摘要写入服务端数据目录的
-> **`users.json`**；`mocenter-server.json` **不保存**明文密码与 TOTP 密钥。
+> ⚠️ **密码不落盘明文**：密码以 **PBKDF2-HMAC-SHA256**（加盐 + 12 万次迭代）摘要写入
+> 服务端数据目录的 **`users.json`**（权限 0600）；`mocenter-server.json` **不保存**
+> 明文密码与 TOTP 密钥。旧版单轮 SHA-256 哈希仍可登录，登录成功后会**自动升级**为新格式。
 > 之后在 Web 端 **「账号设置」** 修改密码，同样只写摘要。
 >
-> **会话 Token 是内存态**，服务端重启后全部失效，需要重新登录。
+> **会话 Token 是内存态**（默认 12 小时有效，活跃自动续期）：服务端重启后全部失效；
+> **登出**会立即吊销当前 Token；**修改密码或开关 OTP** 会吊销该账号的其它会话。
+> WebSocket 的 Token 走 `Sec-WebSocket-Protocol` 子协议头，不再出现在 URL 里。
+
+### Agent 注册密钥（应用层鉴权）
+
+Agent TCP 通道要求每台 Agent 持有与服务端一致的**预共享密钥**，注册时以
+`HMAC-SHA256(key, agent_id|nonce|ts)` 证明身份（密钥不上线传输，且带时间窗与重放保护）。
+
+- 服务端：`-agent-key` 显式指定；否则自动生成并写入 `<数据目录>/agent.key`（0600）。
+- Agent：`-agent-key` 或配置文件字段 `agent_key` 填同一个值。
+- 图形安装器在「连接与认证」页填写该密钥。
+- 迁移期如需临时回退旧行为（不校验），可在服务端加
+  `-allow-unauthenticated-agents`（**危险**，会打印醒目警告）。
 
 ### 修改密码
 
 1. 登录后点击左侧 **「账号设置」**。
-2. 填写 用户名、当前密码、两次新密码（至少 6 位；若该账号启用了 OTP，需一并填写动态验证码）。
+2. 填写 当前密码、两次新密码（至少 6 位；若该账号启用了 OTP，需一并填写动态验证码）。
+   身份以登录会话为准，无需填写用户名。
+3. 提交成功后，**其它已登录会话会被吊销**（当前会话保留），请用新密码重新登录其它设备。
 3. 提交成功后，下次登录使用新密码。
 
 ### 账号与 OTP 的其它入口
@@ -372,7 +390,7 @@ mocenter-server -user admin -password your-password -totp-secret JBSWY3DPEHPK3PX
 - ✅ **文件传输断点续传**：分片收发、MD5 校验、ACK/NACK、断点续传、合并落盘
 - ✅ **文件分发到主机**：Web 上传文件 → 服务端中转 → Agent 指定路径落盘（分片 + MD5 校验）
 - ✅ **批量命令**：一次下发到多台在线主机，审计留痕
-- ✅ **远程升级 Agent**：下载升级包 → MD5 校验 → 备份 → 替换 → 自动重启，失败回滚
+- ✅ **远程升级 Agent**：下载升级包（仅 https）→ SHA-256 + Ed25519 签名校验（未配置公钥时默认拒绝）→ 备份 → 替换 → 自动重启，失败回滚
 - ✅ 离线机器列表、操作审计界面
 - ✅ **操作审计分页与分类**：命令执行 / 运维操作 / 登录认证三类留痕，服务端分页检索（类别、关键字、操作人、时间范围筛选）+ CSV 导出；审计日志按留存策略自动清理
 - ✅ **数据增长治理**：审计/探针等持续增长的数据统一采用服务端分页 + 降采样 + 留存清理，长时间跨度趋势图自动按桶聚合，避免全量返回拖垮浏览器与内存
@@ -523,7 +541,7 @@ sudo bash scripts/packaging/install-linux.sh install ./mocenter-agent
 
 ```bat
 REM 被控机
-mocenter-deploy.exe install -role agent -server your.server.com:9000
+mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key <注册密钥>
 
 REM 总控机
 mocenter-deploy.exe install -role server -user admin -password <登录密码>
