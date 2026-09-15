@@ -27,6 +27,9 @@ import (
 type Config struct {
 	ServerAddr string // 服务端地址 host:port
 	AgentID    string
+	// UUID 硬件唯一标识（设备身份）。为空时由探针自动探测；
+	// 服务端以它判定"同一台机器"，agent_id 变更不会产生新设备。
+	UUID       string
 	Heartbeat  time.Duration // 默认 30s
 	ProbeEvery time.Duration // 探针采集周期，默认 10s
 	TLS        bool          // 是否启用 TLS 加密连接
@@ -173,7 +176,11 @@ func (c *Client) connectAndServe() error {
 // 使服务端能够确认对端确实持有密钥 —— 这是 :9000 通道唯一的应用层身份凭证。
 func (c *Client) register() {
 	ips := c.collect.PublicIPs()
-	uuid := c.collect.UUID()
+	// 设备身份优先用配置里持久化的 UUID：探测失败或换环境时也不会漂移
+	uuid := c.cfg.UUID
+	if uuid == "" {
+		uuid = c.collect.UUID()
+	}
 	info := map[string]interface{}{
 		"agent_id":    c.cfg.AgentID,
 		"uuid":        uuid,
