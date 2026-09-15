@@ -26,7 +26,7 @@ func TestBuildCmd(t *testing.T) {
 		{"", "ls", wantDefault}, // 默认按目标平台推断
 	}
 	for _, c := range cases {
-		name, _ := buildCmd(&protocol.CommandReq{Command: c.cmd, ShellType: c.shell})
+		name, _, _ := buildCmd(&protocol.CommandReq{Command: c.cmd, ShellType: c.shell})
 		if name != c.want {
 			t.Errorf("buildCmd(%q) name=%q, want %q", c.shell, name, c.want)
 		}

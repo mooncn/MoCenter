@@ -34,7 +34,14 @@ type Result struct {
 // buildCmd 根据 shell_type 构造命令行参数。
 // 交互模式（req.Interactive）下返回登录式 shell（不带 -c），
 // 使会话可连续执行多条命令，而非“一命令一进程一退出”。
-func buildCmd(req *protocol.CommandReq) (name string, args []string) {
+//
+// 第三个返回值 localEcho 表示「这个 shell 在管道模式下不会自己回显用户输入，
+// 需要 Agent 代做实时回显」。实测（见 echo 相关探针）：
+//   - cmd.exe：管道模式下只在读到**整行后**才把输入行打印一遍 —— 敲字时不可见、
+//     回车后才出现；故需 Agent 补实时回显，并用 /Q 关掉 cmd 自己那次滞后回显。
+//   - powershell.exe：从管道读入时**逐字符即时回显**，Agent 不能代劳，否则每个
+//     字符都会显示两遍。
+func buildCmd(req *protocol.CommandReq) (name string, args []string, localEcho bool) {
 	shell := req.ShellType
 	if shell == "" {
 		if runtime.GOOS == "windows" {
@@ -46,42 +53,45 @@ func buildCmd(req *protocol.CommandReq) (name string, args []string) {
 	if req.Interactive {
 		switch shell {
 		case "bash":
-			return "/bin/bash", []string{"-i"}
+			return "/bin/bash", []string{"-i"}, false
 		case "sh":
-			return "/bin/sh", []string{"-i"}
+			return "/bin/sh", []string{"-i"}, false
 		case "powershell":
 			if runtime.GOOS == "windows" {
-				return "powershell.exe", []string{"-NoProfile"}
+				return "powershell.exe", []string{"-NoProfile"}, false
 			}
-			return "pwsh", []string{"-NoProfile"}
+			return "pwsh", []string{"-NoProfile"}, false
 		case "cmd":
+			// /Q 关掉 cmd 自己的「行回显」：管道模式下 cmd 要等读到整行才把输入行
+			// 打印一遍（表现为「敲的时候看不见、回车后才显示」）。回显改由 Agent 实时
+			// 补做（见 InteractiveSession.localEcho），先关掉 cmd 的以免重复两遍。
 			// /K 先切 UTF-8 代码页：cmd 默认按系统 GBK 输出，透传到按 UTF-8
 			// 解码的 Web 终端会乱码；随后保持交互 shell 常驻。
-			return "cmd.exe", []string{"/K", "chcp 65001>nul"}
+			return "cmd.exe", []string{"/Q", "/K", "chcp 65001>nul"}, true
 		default:
 			if runtime.GOOS == "windows" {
-				return "cmd.exe", nil
+				return "cmd.exe", []string{"/Q"}, true
 			}
-			return "/bin/bash", []string{"-i"}
+			return "/bin/bash", []string{"-i"}, false
 		}
 	}
 	switch shell {
 	case "bash":
-		return "/bin/bash", []string{"-c", req.Command}
+		return "/bin/bash", []string{"-c", req.Command}, false
 	case "sh":
-		return "/bin/sh", []string{"-c", req.Command}
+		return "/bin/sh", []string{"-c", req.Command}, false
 	case "powershell":
 		if runtime.GOOS == "windows" {
-			return "powershell.exe", []string{"-NoProfile", "-Command", req.Command}
+			return "powershell.exe", []string{"-NoProfile", "-Command", req.Command}, false
 		}
-		return "pwsh", []string{"-NoProfile", "-Command", req.Command}
+		return "pwsh", []string{"-NoProfile", "-Command", req.Command}, false
 	case "cmd":
-		return "cmd.exe", []string{"/c", winUtf8Prefix() + req.Command}
+		return "cmd.exe", []string{"/c", winUtf8Prefix() + req.Command}, false
 	default:
 		if runtime.GOOS == "windows" {
-			return "cmd.exe", []string{"/c", winUtf8Prefix() + req.Command}
+			return "cmd.exe", []string{"/c", winUtf8Prefix() + req.Command}, false
 		}
-		return "/bin/bash", []string{"-c", req.Command}
+		return "/bin/bash", []string{"-c", req.Command}, false
 	}
 }
 
@@ -114,7 +124,7 @@ func Execute(req *protocol.CommandReq) *Result {
 func runCmd(req *protocol.CommandReq, ctx context.Context, cmdOut **exec.Cmd) *Result {
 	start := time.Now()
 
-	name, args := buildCmd(req)
+	name, args, _ := buildCmd(req)
 	cmd := exec.CommandContext(ctx, name, args...)
 	if cmdOut != nil {
 		*cmdOut = cmd

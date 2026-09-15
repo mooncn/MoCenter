@@ -5,6 +5,7 @@
 package command
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"os/exec"
@@ -25,6 +26,7 @@ type InteractiveSession struct {
 	stdin      io.WriteCloser
 	in         io.Writer // 实际输入句柄（含平台编码转换）
 	xlateInput bool      // 管道模式：需把 CR 规范为 CRLF、DEL 规范为 BS
+	localEcho  bool      // 管道模式且 shell 自己不回显：由本端代做实时回显
 	closed     bool
 	onOutput   func(*protocol.InteractiveOutput)
 	stop       chan struct{}
@@ -40,7 +42,7 @@ func StartInteractive(req *protocol.CommandReq, onOutput func(*protocol.Interact
 		done:     make(chan struct{}),
 	}
 
-	name, args := buildCmd(req)
+	name, args, localEcho := buildCmd(req)
 	cmd := exec.Command(name, args...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
@@ -98,6 +100,10 @@ func StartInteractive(req *protocol.CommandReq, onOutput func(*protocol.Interact
 		s.stdin = stdinPipe
 		s.in = stdinPipe
 		s.xlateInput = true
+		// cmd.exe 在管道模式下不会实时回显（只在读到整行后才滞后打印一次，
+		// 且已被 /Q 关掉），因此由本端代做回显，使敲键即时可见。
+		// powershell / PTY 场景 localEcho 为 false —— 它们自己就会逐字符回显。
+		s.localEcho = localEcho
 		go s.readLoop(stdoutPipe)
 		go s.readLoop(stderrPipe)
 		go s.waitLoop()
@@ -127,18 +133,80 @@ func StartInteractive(req *protocol.CommandReq, onOutput func(*protocol.Interact
 // Write 向交互进程写入输入。
 func (s *InteractiveSession) Write(data []byte) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return io.EOF
 	}
 	if s.xlateInput {
 		data = normalizeInput(data)
 	}
-	if s.in != nil {
-		_, err := s.in.Write(data)
-		return err
+	// 回显内容在锁内算好，emit 放到锁外：onOutput 可能写网络，阻塞时不应连带
+	// 卡住 Close()。
+	var echo string
+	if s.localEcho {
+		echo = echoForPipe(data)
 	}
-	return io.EOF
+	var err error
+	if s.in != nil {
+		_, err = s.in.Write(data)
+	} else {
+		err = io.EOF
+	}
+	s.mu.Unlock()
+
+	if err == nil && echo != "" {
+		s.emit(&protocol.InteractiveOutput{
+			CommandID: s.cmdID,
+			Data:      normalizePTYOutput(echo),
+			Type:      "stdout",
+		})
+	}
+	return err
+}
+
+// echoForPipe 生成管道模式下需由本端代做的回显内容。
+//
+// 背景：Windows 用普通管道接 shell（见 StartInteractive 说明），管道不是控制台，
+// cmd.exe 也就没有逐字符回显 —— 用户敲进去的字要等到回车、cmd 把整行打印出来才
+// 看得见。这里按「敲什么显示什么」补上，使 Windows 与 Linux(PTY) 体验一致。
+//
+// 只回显可见字符与两个行编辑键，其余控制键一律不代劳：
+//
+//	CR / LF      -> 换行
+//	BS / DEL     -> 退格（"\b \b" 把上一格擦掉）
+//	ESC 起头的串  -> 方向键/功能键等，本身不含可见字符，整段跳过
+//	其他控制字符  -> 不显示（交由 shell 自身的输出表达，如 ^C）
+//
+// 多字节 UTF-8（中文等）所有字节都 >= 0x20，原样透传。
+func echoForPipe(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	// xterm 每次按键单独回调，方向键等会整段以 ESC 开头；直接判整段跳过即可。
+	if bytes.IndexByte(data, 0x1b) >= 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.Grow(len(data))
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		switch {
+		case c == '\r':
+			sb.WriteString("\r\n")
+			if i+1 < len(data) && data[i+1] == '\n' {
+				i++ // CRLF 只回显成一个换行
+			}
+		case c == '\n':
+			sb.WriteString("\r\n")
+		case c == '\b' || c == 0x7f:
+			sb.WriteString("\b \b")
+		case c >= 0x20:
+			sb.WriteByte(c)
+		default:
+			// 其他控制字符不代劳
+		}
+	}
+	return sb.String()
 }
 
 // normalizeInput 规范化送进管道模式 shell 的控制字符：
