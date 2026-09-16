@@ -21,10 +21,12 @@ api.interceptors.response.use(
   (error) => {
     if (error.response?.status === 401) {
       localStorage.removeItem('mc_token')
-      // 不在登录页时跳转；登录页自身的 401 由页面逻辑处理
-      if (!window.location.pathname.startsWith('/login')) {
+      // 不在登录页时跳转；登录页自身的 401 由页面逻辑处理。
+      // 注意用 /admin/login —— 根级 /login 只作为兼容别名重定向过来，
+      // 在它上面判断会漏掉真实地址（/admin/login）。
+      if (!window.location.pathname.startsWith('/admin/login')) {
         const current = window.location.pathname + window.location.search
-        window.location.href = `/login?redirect=${encodeURIComponent(current)}`
+        window.location.href = `/admin/login?redirect=${encodeURIComponent(current)}`
       }
     }
     return Promise.reject(error)

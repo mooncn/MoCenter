@@ -17,17 +17,22 @@ import { Api, MCSocket } from './api/api.js'
 export const SocketContext = React.createContext(null)
 
 // 侧边栏导航项（移动端抽屉与桌面端共用同一份定义）
-const NAV_ITEMS = [
-  { to: '/', label: '仪表盘', icon: '📊', end: true },
-  { to: '/terminal', label: '远程终端', icon: '💻' },
-  { to: '/vnc', label: '远程桌面', icon: '🖥' },
-  { to: '/portmap', label: '端口映射', icon: '🔀' },
-  { to: '/ops', label: '运维操作', icon: '🛠' },
-  { to: '/offline', label: '离线机器', icon: '📴' },
-  { to: '/audit', label: '操作审计', icon: '📋' },
-  { to: '/site-config', label: '展示配置', icon: '🪧' },
-  { to: '/account', label: '账号设置', icon: '⚙️' },
+// 管理后台统一挂在 /admin/* 前缀下：首页（/）留给公开状态页，
+// 后台的"仪表盘"必须有自己的地址，否则登录后又被公开页顶掉。
+const ADMIN = '/admin'
+export const NAV_ITEMS = [
+  { to: `${ADMIN}`, label: '仪表盘', icon: '📊', end: true },
+  { to: `${ADMIN}/terminal`, label: '远程终端', icon: '💻' },
+  { to: `${ADMIN}/vnc`, label: '远程桌面', icon: '🖥' },
+  { to: `${ADMIN}/portmap`, label: '端口映射', icon: '🔀' },
+  { to: `${ADMIN}/ops`, label: '运维操作', icon: '🛠' },
+  { to: `${ADMIN}/offline`, label: '离线机器', icon: '📴' },
+  { to: `${ADMIN}/audit`, label: '操作审计', icon: '📋' },
+  { to: `${ADMIN}/site-config`, label: '展示配置', icon: '🪧' },
+  { to: `${ADMIN}/account`, label: '账号设置', icon: '⚙️' },
 ]
+// 后台入口：登录成功后的默认落地页。
+export const ADMIN_HOME = ADMIN
 
 function Layout() {
   const [agents, setAgents] = useState([])
@@ -67,7 +72,7 @@ function Layout() {
   const logout = async () => {
     try { await Api.logout() } catch { /* 即使请求失败也要清本地凭据 */ }
     localStorage.removeItem('mc_token')
-    location.href = '/login'
+    location.href = '/admin/login'
   }
 
   return (
@@ -112,6 +117,8 @@ function Layout() {
             <Route path="/audit" element={<Audit />} />
             <Route path="/site-config" element={<SiteConfig />} />
             <Route path="/account" element={<Account />} />
+            {/* 兜底：未知后台路径回到仪表盘，而不是空白页 */}
+            <Route path="*" element={<Navigate to={ADMIN} replace />} />
           </Routes>
         </div>
       </div>
@@ -119,55 +126,70 @@ function Layout() {
   )
 }
 
-function Guard() {
+function Guard({ children }) {
   const location = useLocation()
   const token = localStorage.getItem('mc_token')
   if (!token) {
-    // 未登录访问管理页：回登录页并记住原地址；登录后若没指定跳转，也回到公开页
-    return <Navigate to={`/login?redirect=${encodeURIComponent(location.pathname + location.search)}`} replace />
+    // 未登录访问后台：回登录页并记住原地址，登录后回到原地址（而不是公开页）
+    return <Navigate to={`/admin/login?redirect=${encodeURIComponent(location.pathname + location.search)}`} replace />
   }
-  return <Layout />
+  return children
 }
 
 export default function App() {
   return (
     <Routes>
-      {/* 首页 = 公开节点状态页（**免登录**）。
-          打开站点默认看到的就是 /public 的内容，而不是登录表单；
-          登录表单只在主动访问 /login 或访问管理页被拦下时出现。
-          /public 与 / 指向同一个组件，两条路径都保留，避免旧书签失效。 */}
+      {/* 首页 = 公开节点状态页（**免登录**）：打开站点默认看到的就是它。
+          管理后台不再占用根路径，统一挂在 /admin/*（见下）。 */}
       <Route path="/" element={<PublicStatus />} />
       <Route path="/public" element={<PublicStatus />} />
       <Route path="/public/node/:nodeId" element={<PublicNode />} />
-      <Route path="/login" element={<Login />} />
-      {/* 管理后台：/admin/* 需要登录；同时保留根级旧路径（见下方 LegacyAdmin） */}
-      <Route path="/admin/*" element={<Guard />} />
-      <Route path="/*" element={<HomeOrAdmin />} />
+      {/* 后台登录：/login 保留为旧地址别名（书签/文档里可能仍是它） */}
+      <Route path="/admin/login" element={<Login />} />
+      <Route path="/login" element={<Navigate to="/admin/login" replace />} />
+      {/* 管理后台：**仪表盘在 /admin**，其余页面在 /admin/<page>。
+          Guard 保留原始路径交给 Layout，Layout 内部按相对路径匹配。 */}
+      <Route
+        path="/admin/*"
+        element={
+          <Guard>
+            <Layout />
+          </Guard>
+        }
+      />
+      <Route path="/*" element={<LegacyRedirect />} />
     </Routes>
   )
 }
 
-// HomeOrAdmin 处理"根级旧路径"（/terminal、/audit …）。
+// LegacyRedirect 处理管理后台的**根级旧地址**，其余未知路径给出 404。
 //
-// 背景：管理页此前挂在根路径（/terminal），现在首页让给公开状态页，
-// 但外部链接/书签/文档里仍有旧地址。这里把它们**原样**交给管理后台渲染，
-// 而不是 404 或重定向丢失路径；真正未登录时 Guard 会带去登录页。
-function HomeOrAdmin() {
+// 背景：管理页曾挂在根路径（/terminal、/audit…），首页让给公开状态页后，
+// 这些地址被原样交给管理后台渲染 —— 而 Layout 内部是按 `/`（仪表盘）匹配的，
+// 于是登录后打开后台仪表盘，看到的却是公开状态页。现在旧地址一律重定向到
+// 对应的 /admin 地址：既不丢书签，也不会再和公开页混淆。
+function LegacyRedirect() {
   const location = useLocation()
-  const adminPrefixes = NAV_ITEMS.map((i) => i.to)
-  const isAdminPath = adminPrefixes.some((p) => (p === '/' ? false : location.pathname.startsWith(p)))
-  if (!isAdminPath) {
-    return (
-      <div className="public-shell">
-        <div className="public-empty">
-          <div className="public-empty-icon">🧭</div>
-          <div className="public-empty-title">页面不存在</div>
-          <div className="public-empty-actions">
-            <Link className="public-btn" to="/">返回节点状态页</Link>
-          </div>
+  const legacy = [
+    '/terminal', '/vnc', '/portmap', '/ops', '/offline', '/audit', '/site-config', '/account',
+  ]
+  const hit = legacy.find((p) => location.pathname === p || location.pathname.startsWith(p + '/'))
+  if (hit) {
+    const rest = location.pathname.slice(hit.length)
+    return <Navigate to={`/admin${hit}${rest}${location.search}`} replace />
+  }
+  // 真正未知的地址：给出明确的 404 与回程入口（而不是重定向，
+  // 否则打错的地址会被静默"纠正"，用户以为访问成功）
+  return (
+    <div className="public-shell">
+      <div className="public-empty">
+        <div className="public-empty-icon">🧭</div>
+        <div className="public-empty-title">页面不存在</div>
+        <div className="public-empty-actions">
+          <Link className="public-btn" to="/">返回节点状态页</Link>
+          <Link className="public-btn ghost" to="/admin">进入管理后台</Link>
         </div>
       </div>
-    )
-  }
-  return <Guard />
+    </div>
+  )
 }

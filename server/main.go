@@ -76,6 +76,7 @@ func main() {
 	totpSecret := flag.String("totp-secret", "", "TOTP 密钥（base32，设置后登录需提供一次性验证码，兼容 Google Authenticator）")
 	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
 	agentKey := flag.String("agent-key", os.Getenv("MOCENTER_AGENT_KEY"), "Agent 注册预共享密钥（留空则自动生成并写到 <data>/agent.key）")
+	proxyIP := flag.String("proxy-ip", os.Getenv("MOCENTER_PROXY_IP"), "国内加速代理前缀（如 http://fa.mooncn.win/?url= ），用于节点地理位置的境外接口 ip-api.com")
 	allowAnonAgents := flag.Bool("allow-unauthenticated-agents", false, "允许 Agent 无凭证注册（危险：任何能连通 :9000 的主机都可注册/冒名）")
 	webTLSCert := flag.String("web-tls-cert", "", "Web 控制台 TLS 证书（不配置则 :8080 为明文 HTTP）")
 	webTLSKey := flag.String("web-tls-key", "", "Web 控制台 TLS 私钥")
@@ -192,10 +193,11 @@ func main() {
 			"user":         func() { cfg.User = *user },
 			"pkg-dir":      func() { cfg.PkgDir = *pkgDir },
 			"agent-key":    func() { cfg.AgentKey = *agentKey },
+			"proxy-ip":     func() { cfg.ProxyIP = *proxyIP },
 			"token-ttl":    func() { cfg.TokenTTL = tokenTTL.String() },
 		}
 		dirty := false
-		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "pkg-dir", "agent-key", "token-ttl"} {
+		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "pkg-dir", "agent-key", "proxy-ip", "token-ttl"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -297,7 +299,7 @@ func main() {
 
 	sess := session.NewManager()
 	store := probe.NewStore(db)
-	geoResolver := geo.NewResolver()
+	geoResolver := geo.NewResolverWithProxy(*proxyIP)
 	store.SetGeoResolver(geoResolver)
 	remarks := remark.NewStore(*dataDir)
 	remarks.Load()

@@ -22,9 +22,11 @@
 
 - **Agent 客户端**（`agent/`）：部署在各内网主机，主动连接公网服务端维持 TCP 长连接；心跳保活、探针采集、命令执行、断线指数退避重连、进程守护崩溃自启。
 - **总控服务端**（`server/`）：维护在线会话池，命令路由、交互转发、端口映射反向代理、探针聚合、鉴权/审计/命令黑名单、REST API + WebSocket。
-- **Web 前端**（`web/`）：主机探针面板、远程终端（xterm.js）、端口映射管理、离线机器、操作审计；
-  **首页即公开状态页**（未登录可见的非敏感指标、地区国旗、单节点与站点级网络流量、历史趋势，
-  可在后台「展示配置」中逐项开关），管理后台在 `/admin/*` 下。
+- **Web 前端**（`web/`）：主机探针面板、远程终端（xterm.js）、端口映射管理、离线机器、操作审计。
+  **首页（`/`）即公开状态页**（未登录可见的非敏感指标、地区国旗、单节点与站点级网络流量、历史趋势，
+  可在后台「展示配置」中逐项开关）；**管理后台整体在 `/admin/*`** ——
+  `/admin` 为后台仪表盘，登录页为 `/admin/login`，登录成功后落地到 `/admin`；
+  根级旧路径（`/terminal`、`/audit` …）自动跳转到对应 `/admin` 地址。
 
 ## 技术选型
 
@@ -581,6 +583,14 @@ sc start MoCenterAgent
 
 Agent 支持 `-proxy-ip http://fa.mooncn.win/?url=` 参数（或配置文件 `MOCENTER_PROXY_IP`），
 用于国内网络环境下加速：公网 IP 探测、VNC 安装包下载等境外服务。
+
+Server 侧解析节点地理位置（`ip-api.com`）同样支持该参数（配置文件 `proxy_ip` /
+环境变量 `MOCENTER_PROXY_IP`），直连不稳定时可一并配上：
+`mocenter-server -proxy-ip http://fa.mooncn.win/?url=`。
+
+公网 IP 探测的回显服务按**国内可达性**排序（`api-ipv4.ip.sb` → `ipv4.icanhazip.com`
+→ `ipv4.ident.me` → `api.ipify.org`），探测失败 60 秒后自动重试。
+排查"节点地区 / 国旗不显示"见 `docs/deployment.md`。
 
 ## 许可证
 

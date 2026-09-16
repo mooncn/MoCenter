@@ -85,11 +85,17 @@ func urlEncode(s string) string {
 
 // DetectIPv4 探测公网 IPv4。
 func (d *Detector) DetectIPv4() (string, error) {
-	// 依次尝试多个回显服务，取首个成功结果
+	// 依次尝试多个回显服务，取首个成功结果。
+	//
+	// 顺序按**国内可达性**排：ipify / ident.me 在部分国内网络下不可达
+	// （连接重置 / DNS 污染），会导致公网 IP 拿不到 —— 而服务端的地理位置
+	// （节点地区、国旗）完全依赖这个 IP，于是表现为"地区和国旗不显示"。
+	// 因此把国内厂商回显（ip.sb、腾讯 Anycast）放在前面，境外服务仅作兜底。
 	services := []string{
-		"https://api.ipify.org?format=json",
+		"https://api-ipv4.ip.sb/ip",
+		"https://ipv4.icanhazip.com",
 		"https://ipv4.ident.me/",
-		"https://api.ip.sb/geoip",
+		"https://api.ipify.org?format=json",
 	}
 	var lastErr error
 	for _, svc := range services {
@@ -107,9 +113,12 @@ func (d *Detector) DetectIPv4() (string, error) {
 
 // DetectIPv6 探测公网 IPv6。
 func (d *Detector) DetectIPv6() (string, error) {
+	// 同样优先国内可达的回显服务（ip.sb 走腾讯 Anycast）。
 	services := []string{
-		"https://api6.ipify.org?format=json",
+		"https://api-ipv6.ip.sb/ip",
+		"https://ipv6.icanhazip.com",
 		"https://ipv6.ident.me/",
+		"https://api6.ipify.org?format=json",
 	}
 	var lastErr error
 	for _, svc := range services {
@@ -151,11 +160,23 @@ func parseIPResponse(body []byte) string {
 	return ""
 }
 
+// 探测结果的缓存时长。
+const (
+	// cacheOK 探测到公网 IP 后的缓存时长：地址在运营商层面变化不频繁。
+	cacheOK = 30 * time.Minute
+	// cacheFail 探测失败后的重试间隔：必须**远短于** cacheOK。
+	//
+	// 这里曾是一个隐藏 Bug：失败结果（空 IP）也被当成"有效结果"缓存 30 分钟，
+	// 于是开机/断网/回显服务抖动导致的首轮失败，会让这台机器在半小时内
+	// 一直上报空公网 IP —— 服务端因此解析不出地理位置，公开页的
+	// "节点地区 + 国旗"就一直是空的，且**重启 Agent 也可能再撞上**。
+	cacheFail = 60 * time.Second
+)
+
 // Resolve 综合探测 IPv4 与 IPv6，带结果缓存。
 func (d *Detector) Resolve() Result {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	// 缓存 30 分钟
 	if time.Now().Before(d.expireAt) {
 		return d.result
 	}
@@ -167,6 +188,12 @@ func (d *Detector) Resolve() Result {
 		r.IPv6 = v6
 	}
 	d.result = r
-	d.expireAt = time.Now().Add(30 * time.Minute)
+	// 只探测到部分结果时按"成功"缓存，但下一次仍会重新尝试补齐缺失的那一类
+	// （expireAt 到期即重探，成功结果本身也会被重新探测刷新）。
+	if r.IPv4 != "" || r.IPv6 != "" {
+		d.expireAt = time.Now().Add(cacheOK)
+	} else {
+		d.expireAt = time.Now().Add(cacheFail)
+	}
 	return r
 }

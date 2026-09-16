@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Api, PublicApi } from '../api/api.js'
+// 登录成功后的默认落地页：**后台仪表盘**（不是公开状态页）
+const DEFAULT_REDIRECT = '/admin'
 
 export default function Login() {
   const [username, setUsername] = useState('')
@@ -11,7 +13,7 @@ export default function Login() {
   const [publicEnabled, setPublicEnabled] = useState(false)
   const nav = useNavigate()
   const [searchParams] = useSearchParams()
-  const redirectTo = searchParams.get('redirect') || '/'
+  const redirectTo = searchParams.get('redirect') || DEFAULT_REDIRECT
 
   useEffect(() => {
     let alive = true

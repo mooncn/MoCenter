@@ -33,6 +33,9 @@ type Config struct {
 	PkgDir string `json:"pkg_dir"`
 	// AgentKey Agent 注册预共享密钥；留空则自动生成并写到 <data>/agent.key。
 	AgentKey string `json:"agent_key"`
+	// ProxyIP 国内加速代理前缀（如 http://fa.mooncn.win/?url= ）。
+	// 服务端用它访问 ip-api.com 解析节点地理位置；直连不稳定时配置。
+	ProxyIP string `json:"proxy_ip"`
 	// TokenTTL 会话 Token 有效期（Go duration 字符串，如 12h / 30m）；留空用内置默认 12h。
 	TokenTTL string `json:"token_ttl"`
 	// WebTLSCert / WebTLSKey Web 控制台 TLS 证书与私钥。

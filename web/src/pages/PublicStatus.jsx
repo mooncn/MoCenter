@@ -108,7 +108,7 @@ export default function PublicStatus() {
             公开状态页需要在后台「展示配置」中开启总开关后才会生效。
           </div>
           <div className="public-empty-actions">
-            <Link className="public-btn" to="/login">登录管理后台</Link>
+            <Link className="public-btn" to="/admin/login">登录管理后台</Link>
           </div>
         </div>
       </div>
@@ -151,7 +151,7 @@ export default function PublicStatus() {
               </div>
             </>
           )}
-          <Link className="public-btn ghost" to="/login">登录后台</Link>
+          <Link className="public-btn ghost" to="/admin/login">登录后台</Link>
         </div>
       </header>
 
@@ -175,7 +175,7 @@ export default function PublicStatus() {
       )}
 
       <footer className="public-foot">
-        数据每 5 秒由 Agent 上报 · 页面实时刷新 · <Link to="/login">管理后台</Link>
+        数据每 5 秒由 Agent 上报 · 页面实时刷新 · <Link to="/admin/login">管理后台</Link>
       </footer>
     </div>
   )
