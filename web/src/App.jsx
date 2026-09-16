@@ -8,7 +8,9 @@ import Offline from './pages/Offline.jsx'
 import Audit from './pages/Audit.jsx'
 import Ops from './pages/Ops.jsx'
 import Account from './pages/Account.jsx'
+import SiteConfig from './pages/SiteConfig.jsx'
 import Login from './pages/Login.jsx'
+import PublicStatus, { PublicNode } from './pages/PublicStatus.jsx'
 import { Api, MCSocket } from './api/api.js'
 
 // 全局 WebSocket 上下文
@@ -23,6 +25,7 @@ const NAV_ITEMS = [
   { to: '/ops', label: '运维操作', icon: '🛠' },
   { to: '/offline', label: '离线机器', icon: '📴' },
   { to: '/audit', label: '操作审计', icon: '📋' },
+  { to: '/site-config', label: '展示配置', icon: '🪧' },
   { to: '/account', label: '账号设置', icon: '⚙️' },
 ]
 
@@ -107,6 +110,7 @@ function Layout() {
             <Route path="/ops" element={<Ops agents={agents} />} />
             <Route path="/offline" element={<Offline agents={agents} />} />
             <Route path="/audit" element={<Audit />} />
+            <Route path="/site-config" element={<SiteConfig />} />
             <Route path="/account" element={<Account />} />
           </Routes>
         </div>
@@ -127,6 +131,9 @@ function Guard() {
 export default function App() {
   return (
     <Routes>
+      {/* 公开状态页：**免登录**，必须放在 Guard 之前匹配 */}
+      <Route path="/public" element={<PublicStatus />} />
+      <Route path="/public/node/:nodeId" element={<PublicNode />} />
       <Route path="/login" element={<Login />} />
       <Route path="/*" element={<Guard />} />
     </Routes>

@@ -1,15 +1,23 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { Api } from '../api/api.js'
+import { Api, PublicApi } from '../api/api.js'
 
 export default function Login() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [otp, setOtp] = useState('')
   const [err, setErr] = useState('')
+  // 公开状态页是否启用：启用时给未登录访客一个入口（无信息泄露，只查布尔值）
+  const [publicEnabled, setPublicEnabled] = useState(false)
   const nav = useNavigate()
   const [searchParams] = useSearchParams()
   const redirectTo = searchParams.get('redirect') || '/'
+
+  useEffect(() => {
+    let alive = true
+    PublicApi.enabled().then((v) => alive && setPublicEnabled(v)).catch(() => {})
+    return () => { alive = false }
+  }, [])
 
   const doLogin = async (e) => {
     e.preventDefault()
@@ -50,6 +58,9 @@ export default function Login() {
           <input value={otp} onChange={(e) => setOtp(e.target.value)} placeholder="Google Authenticator 6 位码，未启用可留空" />
         </div>
         <button className="btn-block" style={{ marginTop: 4 }} type="submit">登录</button>
+        {publicEnabled && (
+          <a className="public-entry" href="/public">查看公开节点状态 →</a>
+        )}
         <div className="sub" style={{ marginTop: 16, color: '#8b98a5', fontSize: 13 }}>
           使用服务端配置的账号登录（<code>-user</code>/<code>-password</code>，首次启动会自动创建
           <code>admin</code>/<code>123456</code>）；若账号绑定了 OTP，需一并填写 6 位动态验证码。

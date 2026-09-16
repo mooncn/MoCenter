@@ -140,7 +140,49 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
     }
+    # 公开状态页的实时推送（免登录）；同样需要 WebSocket 升级头
+    location /api/public/ws {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
 }
+```
+
+### 公开状态页（未登录访客可见的非敏感信息）
+
+未登录访客可访问 `/public` 查看主机**非敏感**运行指标（卡片/列表），点击节点进入
+`/public/node/<节点编号>` 查看该节点信息与历史趋势。**默认关闭**，需在后台
+「展示配置」中开启。
+
+配置项（页面可视化配置，落盘于数据目录 `public-site.json`）：
+
+| 配置 | 说明 |
+|------|------|
+| `public_enabled` | 总开关。关闭时公开页与 `/api/public/*` 对外**不存在**（404） |
+| `hosts_enabled` | 主页是否展示主机条目；关闭后只展示站点级汇总指标 |
+| `catalog_enabled` | 是否展示全部主机；关闭则只公开 `host_ids` 白名单内的主机 |
+| `host_ids` | 公开主机白名单（agent_id） |
+| `fields` | 逐字段开关（备注、CPU/内存/磁盘、地区、系统、公网 IP…），未勾选的字段**数据不下发** |
+
+安全设计（部署前请知悉）：
+
+1. **主机标识不公开**：对外只有服务端派生的节点编号 `n-xxxxxxxx`（SHA-256 前 4 字节），
+   无法反推 `agent_id`、硬件 UUID 或内网地址 —— 这些字段在公开响应结构里根本不存在。
+2. **敏感项默认关闭**：主机名、系统版本、内核版本、公网 IP 默认不可见，可显式开启；
+   公网 IP 即使开启也会做部分掩码（`203.0.*.*`），精确经纬度永不公开。
+3. **独立限流**：公开端点为匿名入口，另有独立于登录的限流（每路由独立计数），
+   避免被扫描器滥用；单次历史趋势最多返回 300 点、回溯窗口上限 30 天。
+4. **审计留痕**：每次修改展示配置都会写入操作审计（分类 `op`）。
+
+对外发布前建议自查：
+
+```bash
+# 应输出 404（未启用）
+curl -si http://your-host/api/public/state | head -1
+# 启用后确认响应中不含 agent_id / uuid / 内网 IP / 经纬度
+curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|"lat"|"lon"'
 ```
 
 ## 五、安全配置

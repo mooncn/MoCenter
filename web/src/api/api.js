@@ -142,6 +142,96 @@ export const Api = {
     const { data } = await api.post('/agents/remark', { agent_id: agentId, remark })
     return data
   },
+
+  // --- 公开展示配置（登录后可改；决定未登录访客能看什么） ---
+
+  // 读取公开展示配置与字段元数据
+  async siteConfig() {
+    const { data } = await api.get('/site/config')
+    return data
+  },
+  // 保存公开展示配置
+  async saveSiteConfig(cfg) {
+    const { data } = await api.post('/site/config', cfg)
+    return data
+  },
+  // 恢复默认（公开页关闭）
+  async resetSiteConfig() {
+    const { data } = await api.post('/site/config/reset')
+    return data
+  },
+  // 可挑选的公开主机（最小字段列表）
+  async siteHosts() {
+    const { data } = await api.get('/site/hosts')
+    return data
+  },
+}
+
+// 公开站点 API（**免登录**）：
+// 不带 Authorization 头，绝不调用带 token 的实例，避免把会话凭据带到匿名页面。
+const publicApi = axios.create({ baseURL: '/api/public', timeout: 10000 })
+
+export const PublicApi = {
+  // 公开页是否已启用（只返回布尔值，供登录页给出入口）
+  async enabled() {
+    try {
+      const { data } = await publicApi.get('/enabled')
+      return !!(data && data.enabled)
+    } catch {
+      return false
+    }
+  },
+  // 公开状态：配置 + 字段元数据 + 节点列表 + 汇总
+  async state() {
+    const { data } = await publicApi.get('/state')
+    return data
+  },
+  // 节点历史趋势（node 为派生节点编号）
+  async samples(node, range) {
+    const { data } = await publicApi.get('/samples', { params: { node, range } })
+    return data
+  },
+}
+
+// 公开站点 WebSocket：免登录实时推送（仅节点列表与汇总）。
+// 与 MCSocket 分开实现：公开页不需要（也不应该）携带 Token 与命令通道。
+export class PublicSocket {
+  constructor({ onData, onStatus } = {}) {
+    this.onData = onData
+    this.onStatus = onStatus
+    this.alive = true
+    this.ws = null
+    this.delay = 1000
+  }
+
+  connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    this.ws = new WebSocket(`${proto}://${location.host}/api/public/ws`)
+    this.ws.onopen = () => {
+      this.delay = 1000
+      this.onStatus?.('connected')
+    }
+    this.ws.onmessage = (ev) => {
+      try {
+        this.onData?.(JSON.parse(ev.data))
+      } catch { /* 忽略非 JSON 帧 */ }
+    }
+    this.ws.onclose = () => {
+      this.onStatus?.('disconnected')
+      if (!this.alive) return
+      // 指数退避重连：服务端被重启或网络抖动时不至于打满连接
+      setTimeout(() => {
+        this.delay = Math.min(this.delay * 2, 30000)
+        this.connect()
+      }, this.delay)
+    }
+    this.ws.onerror = () => this.ws && this.ws.close()
+  }
+
+  close() {
+    this.alive = false
+    this.ws && this.ws.close()
+  }
 }
 
 // WebSocket 客户端：用于接收服务端实时推送（主机状态、命令输出等）。

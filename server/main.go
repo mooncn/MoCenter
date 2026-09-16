@@ -37,6 +37,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/gorilla/websocket"
+
 	"mocenter/server/internal/agentauth"
 	"mocenter/server/internal/auth"
 	"mocenter/server/internal/config"
@@ -45,9 +47,11 @@ import (
 	"mocenter/server/internal/portmap"
 	"mocenter/server/internal/probe"
 	"mocenter/server/internal/protocol"
+	"mocenter/server/internal/publicview"
 	"mocenter/server/internal/remark"
 	"mocenter/server/internal/route"
 	"mocenter/server/internal/session"
+	"mocenter/server/internal/siteconfig"
 	"mocenter/server/internal/storage"
 	"mocenter/server/internal/vnc"
 	"mocenter/server/internal/winapp"
@@ -300,6 +304,11 @@ func main() {
 	store.SetRemarkFn(remarks.Get)
 	// agent_id 变更（同一台机器改配置）时，备注跟随设备一起迁移，避免"备注丢失"
 	store.SetRemarkRenameFn(remarks.Rename)
+	// 公开站点展示配置（Issue #5）：默认**关闭**，升级安装不会因本功能对外暴露主机信息。
+	siteCfg := siteconfig.NewStore(filepath.Join(*dataDir, "public-site.json"))
+	if err := siteCfg.Load(); err != nil {
+		log.Printf("警告: 加载公开站点配置失败（按默认=关闭处理）: %v", err)
+	}
 	authz := auth.NewAuth(wl)
 	authz.SetTokenTTL(*tokenTTL)
 	loginGuard := auth.NewLoginGuard()
@@ -370,13 +379,31 @@ func main() {
 
 	hub := ws.NewHub()
 
+	// --- 公开站点（免登录，Issue #5）---
+	// 注意：这些端点不经过 guard，一切数据都取自 publicview 的脱敏视图，
+	// agent_id / uuid / 内网地址永不出网。
+	pub := &publicSite{
+		store: store,
+		cfg:   siteCfg,
+		guard: auth.NewLoginGuard(),
+		hub:   hub,
+		authz: authz,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 4096,
+			// 公开页可能被嵌在其它站点/内网门户里，允许任意来源；
+			// 数据本身已是脱敏结果，跨站读取不构成越权。
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
+	}
+
 	// WebSocket 收到 Web 消息后的统一处理入口
 	hub.SetMessageHandler(func(operator string, data []byte) {
 		handleWebMessage(operator, data, sess, store, router, hub, ft, pm, pushMgr, vncMgr)
 	})
 
 	// 服务端启动后台任务
-	go heartbeatSweeper(sess, store, hub)
+	go heartbeatSweeper(sess, store, hub, pub)
 	go cleanupSweeper(pm, hub)
 	// 探针历史定期清理（保留 30 天）+ 审计日志留存清理（保留 180 天）
 	go probeHistoryCleaner(db)
@@ -412,6 +439,30 @@ func main() {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
+
+	mux.HandleFunc(publicAPIBase+"/state", pub.stateHandler())
+	mux.HandleFunc(publicAPIBase+"/nodes", pub.nodesHandler())
+	mux.HandleFunc(publicAPIBase+"/samples", pub.samplesHandler())
+	mux.HandleFunc(publicAPIBase+"/ws", pub.publicWSHandler())
+	mux.HandleFunc(publicAPIBase+"/enabled", publicConfigStateHandler(siteCfg))
+	// 后台展示配置（需登录）
+	siteAudit := func(r *http.Request, summary string) {
+		router.Audit(&route.AuditLog{
+			Time:       time.Now().Unix(),
+			Operator:   authz.Operator(r.Header.Get("Authorization")),
+			OperatorIP: auth.LoginIPOf(r.RemoteAddr),
+			Command:    summary, Result: "ok", Category: "op",
+		})
+	}
+	mux.HandleFunc("/api/site/config", siteConfigHandler(siteCfg, authz, siteAudit))
+	mux.HandleFunc("/api/site/config/reset", siteConfigResetHandler(siteCfg, authz, siteAudit))
+	mux.HandleFunc("/api/site/hosts", siteHostOptionsHandler(store, authz))
+
+	if siteCfg.Get().Enabled {
+		log.Printf("[server] 公开站点已启用：%s（字段开关见 后台 → 展示配置）", publicAPIBase)
+	} else {
+		log.Printf("[server] 公开站点未启用（默认关闭）；如需对外展示运行指标，请在 Web 后台「展示配置」中开启")
+	}
 
 	// 可选：托管 Web 前端静态资源（SPA 回退到 index.html）
 	if *webDir != "" {
@@ -508,7 +559,7 @@ func main() {
 				log.Printf("[server] accept error: %v", err)
 				continue
 			}
-			go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir, verifier, *allowAnonAgents)
+			go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir, verifier, *allowAnonAgents, pub)
 		}
 	}
 
@@ -583,7 +634,7 @@ func validAgentID(s string) bool {
 //   - 同名 AgentID 的活跃连接**不允许被顶替**（由 session.Upsert 拒绝）；
 //   - 报文里自带的 AgentID 一律以**连接身份**为准，不一致即丢弃 —— 这是
 //     "身份取自连接而不是取自报文"的关键，否则伪造 AgentID 仍能冒用他人。
-func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, pkgDir string, verifier *agentauth.Verifier, allowAnon bool) {
+func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, pkgDir string, verifier *agentauth.Verifier, allowAnon bool, pub *publicSite) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -649,7 +700,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		store.UpsertAgent(&info)
 		log.Printf("[server] Agent %s 上线（来自 %s%s）", info.AgentID, conn.RemoteAddr(),
 			uuidSuffix(info.UUID))
-		hub.Broadcast(protocol.TypeAgentList, store.All())
+		broadcastAgents(hub, store, pub)
 		registered = true
 		break // 上线后跳出循环，进入主消息循环
 	}
@@ -690,7 +741,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 				continue
 			}
 			store.UpdateProbe(&p)
-			hub.Broadcast(protocol.TypeAgentList, store.All())
+			broadcastAgents(hub, store, pub)
 			_ = sessConn.Write(protocol.TypeProbeDataResp, protocol.ProbeDataResp{
 				ProbeID: fmt.Sprintf("probe-%d", time.Now().UnixNano()), Timestamp: time.Now().Unix(),
 			})
@@ -797,12 +848,12 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		return
 	}
 	store.MarkOffline(sessConn.GetAgentID())
-	hub.Broadcast(protocol.TypeAgentList, store.All())
+	broadcastAgents(hub, store, pub)
 	log.Printf("[server] Agent %s 离线", sessConn.GetAgentID())
 }
 
 // heartbeatSweeper 心跳清扫：超过 3 个心跳周期（默认 90s）视为离线。
-func heartbeatSweeper(sess *session.Manager, store *probe.Store, hub *ws.Hub) {
+func heartbeatSweeper(sess *session.Manager, store *probe.Store, hub *ws.Hub, pub *publicSite) {
 	t := time.NewTicker(10 * time.Second)
 	for range t.C {
 		offline := sess.Tick(90 * time.Second)
@@ -811,7 +862,7 @@ func heartbeatSweeper(sess *session.Manager, store *probe.Store, hub *ws.Hub) {
 			log.Printf("[server] Agent %s 心跳超时离线", id)
 		}
 		if len(offline) > 0 {
-			hub.Broadcast(protocol.TypeAgentList, store.All())
+			broadcastAgents(hub, store, pub)
 		}
 	}
 }
@@ -827,6 +878,31 @@ func cleanupSweeper(pm *portmap.Manager, hub *ws.Hub) {
 		}
 	}
 }
+
+// broadcastAgents 向已登录 Web 与公开页**同时**推送主机列表。
+//
+// 为什么要包一层：服务端有 4 处都会更新主机列表（上线/探针/离线/心跳清扫），
+// 分散写两次 Broadcast 极易漏掉一边，表现为"公开页数据停在某个时刻不刷新"。
+// 公开侧的载荷由 publicview 脱敏后再生成，绝不复用 store.All() 的原始结构。
+func broadcastAgents(hub *ws.Hub, store *probe.Store, pub *publicSite) {
+	hub.Broadcast(protocol.TypeAgentList, store.All())
+	if pub == nil {
+		return
+	}
+	cfg := pub.cfg.Get()
+	if cfg == nil || !cfg.Enabled || !cfg.HostsEnabled {
+		// 未启用/不展示主机：不发任何数据，避免匿名连接收到"空列表"以外的信息。
+		return
+	}
+	nodes := publicview.BuildNodes(store.All(), cfg)
+	hub.BroadcastPublic(map[string]interface{}{
+		"ok":      true,
+		"nodes":   nodes,
+		"summary": publicview.BuildSummary(nodes, time.Now().Unix()),
+	})
+}
+
+// --- REST 处理器 ---
 
 // --- REST 处理器 ---
 
