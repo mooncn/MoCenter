@@ -1,9 +1,11 @@
 package geo
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -284,5 +286,91 @@ func TestLookupCachesSuccess(t *testing.T) {
 	}
 	if hits != 1 {
 		t.Fatalf("第二次查询应命中缓存，实际请求 %d 次", hits)
+	}
+}
+
+// iping 主源不返回国家代码，但返回 as_country / company_country（归属国 ISO）。
+// 这条用例锁定「必须用 as_country 补 country_code」这个行为 ——
+// 丢了它，国土面积/国旗就又得依赖国名反查表，多一次可能失败的归一。
+func TestParseIpingUsesASCountry(t *testing.T) {
+	body := []byte(`{"code":200,"msg":"success","data":{
+		"ip":"1.2.3.4","country":"新加坡","region":"","city":"",
+		"longitude":"103.8","latitude":"1.35",
+		"as_country":"SG","company_country":"SG"}}`)
+	g := (&Resolver{}).parseIping(body)
+	if g == nil {
+		t.Fatal("应解析成功")
+	}
+	if g.CountryCode != "SG" {
+		t.Fatalf("应取 as_country 作为国家代码，实际 %q", g.CountryCode)
+	}
+	ng := normalizeGeo(g)
+	if ng.CountryCode != "SG" {
+		t.Fatalf("归一化后国家代码应为 SG，实际 %q", ng.CountryCode)
+	}
+	// 中文国名应被统一为英文名，避免两个源口径不一致
+	if ng.Country != "Singapore" {
+		t.Fatalf("中文国名应归一为英文名，实际 %q", ng.Country)
+	}
+}
+
+// as_country 缺失时（部分 IP 无 AS 归属）应回退 company_country，
+// 两者都缺失时留空，交由 normalizeGeo 用国名反查表补齐。
+func TestParseIpingCountryCodeFallback(t *testing.T) {
+	r := &Resolver{}
+
+	g := r.parseIping([]byte(`{"code":200,"data":{"country":"日本","as_country":"","company_country":"JP"}}`))
+	if g == nil || g.CountryCode != "JP" {
+		t.Fatalf("as_country 为空时应回退 company_country，实际 %+v", g)
+	}
+
+	g = r.parseIping([]byte(`{"code":200,"data":{"country":"日本","as_country":"","company_country":""}}`))
+	if g == nil || g.CountryCode != "" {
+		t.Fatalf("两者都为空时应留空，实际 %+v", g)
+	}
+	if n := normalizeGeo(g); n.CountryCode != "JP" {
+		t.Fatalf("国名反查表应补齐 JP，实际 %q", n.CountryCode)
+	}
+}
+
+// IPv6 必须跳过 api.iping.cc：该源对 IPv6 恒返回 code=500，
+// 排在前面只会多一次无效往返与一条误导性的错误日志。
+func TestFetchSkipsIpingForIPv6(t *testing.T) {
+	var hitIping, hitIPAPI atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.RawQuery, "iping.example"):
+			hitIping.Add(1)
+			io.WriteString(w, `{"code":200,"data":{"country":"中国"}}`)
+		case strings.Contains(r.URL.RawQuery, "ipapi.example"):
+			hitIPAPI.Add(1)
+			io.WriteString(w, `{"status":"success","country":"美国","countryCode":"US"}`)
+		}
+	}))
+	defer srv.Close()
+
+	r := &Resolver{
+		timeout:       time.Second,
+		ipingEndpoint: srv.URL + "/?target=iping.example&ip=%s",
+		ipapiEndpoint: srv.URL + "/?target=ipapi.example&ip=%s",
+		ipwhoEndpoint: srv.URL + "/?target=ipwho.example&ip=%s",
+	}
+	g := r.fetch("2606:4700::1111")
+	if g == nil || g.CountryCode != "US" {
+		t.Fatalf("IPv6 应直接命中备源，实际 %+v", g)
+	}
+	if n := hitIping.Load(); n != 0 {
+		t.Fatalf("IPv6 不应请求 api.iping.cc，实际请求了 %d 次", n)
+	}
+	if n := hitIPAPI.Load(); n != 1 {
+		t.Fatalf("备源应被请求 1 次，实际 %d", n)
+	}
+
+	// IPv4 仍应优先主源（主源只给国名，国家代码由反查表补齐）
+	if g := r.fetch("1.2.3.4"); g == nil || g.CountryCode != "CN" {
+		t.Fatalf("IPv4 应命中主源并由反查表补码，实际 %+v", g)
+	}
+	if n := hitIping.Load(); n != 1 {
+		t.Fatalf("IPv4 应请求主源 1 次，实际 %d", n)
 	}
 }

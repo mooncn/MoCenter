@@ -583,7 +583,12 @@ button.primary { background: var(--accent); }
   display: flex; align-items: center; gap: 5px; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.public-flag { font-size: 15px; line-height: 1; flex: 0 0 auto; }
+/* 国旗：内置字形（不依赖系统 emoji 字体）+ emoji 兜底。
+   1.15em 让它跟随所在文本的字号 —— 卡片名、列表单元格、详情标题三处
+   字号不同，若写死 px 就会有的偏大有的偏小。 */
+.flag { flex: 0 0 auto; vertical-align: -0.12em; }
+.flag-img { width: 1.15em; height: auto; aspect-ratio: 1 / 1; border-radius: 2px; display: inline-block; }
+.flag-emoji { font-size: 1.05em; line-height: 1; display: inline-block; }
 .public-card-meta {
   display: flex; flex-wrap: wrap; gap: 6px;
   color: var(--muted); font-size: 11.5px; margin: 6px 0 9px;

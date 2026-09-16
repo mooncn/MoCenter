@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { Api } from '../api/api.js'
+import Flag from '../components/Flag.jsx'
 
 // 主机探针信息面板：展示各主机 CPU/内存/磁盘/流量等实时状态与历史趋势
 export default function Dashboard({ agents }) {
@@ -288,15 +289,6 @@ function fmtOffline(a) {
   return `${Math.floor(s / 86400)}天`
 }
 
-// 根据 ISO 国家代码返回国旗 emoji（零依赖，基于区域指示符字符）。
-function countryFlag(code) {
-  if (!code || code.length !== 2) return ''
-  const base = 0x1F1E6
-  const a = 'A'.charCodeAt(0)
-  const upper = code.toUpperCase()
-  return String.fromCodePoint(base + (upper.charCodeAt(0) - a), base + (upper.charCodeAt(1) - a))
-}
-
 // 公网 IP 与地理位置展示单元格。
 function PublicIPCell({ agent }) {
   const ips = [agent.public_ip, agent.public_ipv6].filter(Boolean)
@@ -315,7 +307,7 @@ function PublicIPCell({ agent }) {
       )}
       {geo && geo.country_code && (
         <div style={{ fontSize: 12, color: '#4da3ff', marginTop: 2 }}>
-          <span style={{ marginRight: 4 }}>{countryFlag(geo.country_code)}</span>
+          <Flag code={geo.country_code} style={{ marginRight: 4 }} />
           {[geo.country, geo.region, geo.city].filter(Boolean).join(' · ')}
         </div>
       )}

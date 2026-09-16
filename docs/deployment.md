@@ -194,16 +194,24 @@ Agent 探测公网出口 IP → 上报 → 服务端多源解析 → 公开页�
 
 **服务端解析采用多源降级**（任一源成功即返回，全部失败才放弃）：
 
+**仅 IPv4 走主源**：`api.iping.cc` 对 IPv6 恒返回 `code=500`（"IPv6 数据正在升级优化中"），
+排在前面只会多一次无效往返和一条误导性的错误日志。因此 IPv6 直接从备源开始。
+
 | 顺序 | 数据源 | 说明 |
 |------|--------|------|
-| 1 | `api.iping.cc`（主） | `https://api.iping.cc/v1/query?ip=<ip>&language=zh`，中文国家/省/市名；偶发限流（`code=500`），且**不返回 ISO 国家代码**、IPv6 暂不支持 |
+| 1 | `api.iping.cc`（主，仅 IPv4） | `https://api.iping.cc/v1/query?ip=<ip>&language=zh`，中文国家/省/市名；偶发限流（`code=500` + `msg` 含 `frequent`）；**不返回 IP 所属国家代码**，但返回 `as_country` / `company_country`（归属国 ISO）可作为国家代码 |
 | 2 | `ip-api.com`（备） | `http://ip-api.com/json/<ip>?lang=zh-CN`，带 `countryCode`；免费额度约 45 次/分钟 |
 | 3 | `ipwho.is`（兜底） | `https://ipwho.is/<ip>`，HTTPS，带 `country_code` |
 
-主源没有 ISO 国家代码，而国旗完全由 `country_code` 生成 —— 服务端内置
-**中英文国名 → ISO 代码对照表**（`internal/geo/countries.go`）补齐，并把
+国家代码按优先级确定，**绝不猜测**：
+
+1. 主源的 `as_country` / `company_country`；
+2. 备源 / 兜底源返回的 `countryCode` / `country_code`；
+3. 都没拿到时，用**中英文国名 → ISO 代码对照表**
+   （`internal/geo/countries.go`，覆盖 249 个 ISO 代码）反查。
+
 中文国名统一为英文名（避免同一批节点因两个源口径不同而看起来像两个国家）。
-查不到的国家名保留原值，不会猜错国家。
+三步都查不到时保留上游原值 —— 宁可不显示国旗，也不要把国家写错。
 
 Agent 侧公网 IP 回显服务按国内可达性排序：
 `tool.mooncn.win/ip/?format=json` → `api-ipv4.ip.sb` → `ipv4.icanhazip.com` →
@@ -226,6 +234,37 @@ Agent 侧公网 IP 回显服务按国内可达性排序：
    公开页自然不显示地区 —— 这是正常的，不是故障。
 4. **展示配置里「地区」是否勾选**：`fields.geo` 未开启时，地区字段在服务端
    结构体层面就是零值，JSON 里根本不存在。
+
+### 国旗的渲染方式（为什么不用 emoji）
+
+前端拿到 `country_code` 后**不使用国旗 emoji**，而是渲染内置字形。原因是
+用区域指示符拼出的 🏳 emoji 能不能显示**取决于访客的操作系统字体**：
+
+| 环境 | 区域指示符 emoji 的表现 |
+|------|------------------------|
+| Windows 10 及更早 | Segoe UI Emoji 没有连字，显示成两个方框 |
+| 精简版 Linux 容器 / 无桌面字体 | 完全没有 emoji 字体，显示豆腐块 |
+| 禁用彩色字体回退的浏览器 | 同上 |
+
+症状是"接口里 `country_code` 明明有值，页面上国旗却是空白/方框"，而且
+**只在部分访客的机器上复现**（运维本机正常），极易被误判成后端数据问题。
+
+因此字形被固化进前端资源（`web/src/utils/flagSprite.js`）：
+
+- 覆盖 249 个 ISO 3166-1 代码 + 9 个常用特殊代码（XK / EU / UN 等）；
+- 栅格化为 36×36（覆盖 2× DPI 下 18px 显示尺寸）+ 160 色全局调色板 + deflate，
+  产物约 45 KB（gzip 后约 35 KB），**不请求任何外部 CDN**，内网/离线同样可用；
+- 渲染与宿主字体完全无关；未收录的代码退回 emoji 兜底（此时至少还能看到代码文本）。
+
+相关脚本（都在 `web/`）：
+
+```bash
+npm run gen:flag     # 重新生成字形资源：需联网 + pip3 install cairosvg pillow
+npm run check:flag   # 校验字形数据与解码逻辑是否自洽（无需网络，可在 CI 跑）
+```
+
+生产部署前建议跑一次 `check:flag` —— 字形数据是**生成**的、解码是**手写**的，
+两边脱节的表现就是"国旗又不见了"。
 
 配置项（页面可视化配置，落盘于数据目录 `public-site.json`）：
 

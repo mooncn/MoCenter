@@ -63,6 +63,11 @@ type ipingResponse struct {
 		City    string `json:"city"`
 		Lon     string `json:"longitude"`
 		Lat     string `json:"latitude"`
+		// ASCountry 是**归属国家**的 ISO 代码（as_country / company_country），
+		// 不是"这一跳出口在哪"。与 country（按 IP 注册地解析出的国名）口径一致，
+		// 因此可以直接用来补 country_code —— 主源本身不返回 IP 所属国家代码。
+		ASCountry      string `json:"as_country"`
+		CompanyCountry string `json:"company_country"`
 	} `json:"data"`
 }
 
@@ -217,9 +222,15 @@ func (r *Resolver) pruneLocked() {
 
 // fetch 依次尝试所有解析源，返回首个成功结果。
 //
-// 顺序即优先级：api.iping.cc（中文口径、国内可达）→ ip-api.com → ipwho.is。
+// 顺序即优先级，但**顺序本身是动态的**：
+//
+//   - IPv6 直接跳过 api.iping.cc。该源对 IPv6 恒返回 code=500
+//     （"IPv6 数据正在升级优化中"），排在前面只会白白多一次失败往返、
+//     多一条误导性的错误日志，还拖慢每个 IPv6 节点的首次解析。
+//   - 其余情况按 中文口径 → 备源 → 兜底 排列。
+//
 // 每个源的失败都单独记日志（含原因），这样运维能从日志判断到底是
-// "限流"、"网络不通" 还是 "该 IP 无地理位置数据"。
+// "限流"、"网络不通"、"不支持该地址族" 还是 "该 IP 无地理位置数据"。
 func (r *Resolver) fetch(ip string) *protocol.GeoInfo {
 	client := &http.Client{Timeout: r.timeout}
 	type source struct {
@@ -228,9 +239,12 @@ func (r *Resolver) fetch(ip string) *protocol.GeoInfo {
 		fn   func([]byte) *protocol.GeoInfo
 	}
 	sources := []source{
-		{"api.iping.cc", r.ipingURL(), r.parseIping},
 		{"ip-api.com", r.ipapiURL(), r.parseIPAPI},
 		{"ipwho.is", r.ipwhoURL(), r.parseIPWho},
+	}
+	if !strings.Contains(ip, ":") {
+		// 仅 IPv4 走主源（中文国家/省市口径最好）
+		sources = append([]source{{"api.iping.cc", r.ipingURL(), r.parseIping}}, sources...)
 	}
 	for _, src := range sources {
 		body, status, err := r.get(client, fmt.Sprintf(src.tmpl, ip))
@@ -301,6 +315,9 @@ func (r *Resolver) parseIping(body []byte) *protocol.GeoInfo {
 		return nil
 	}
 	if pr.Code != 200 || pr.Data == nil {
+		// code=500 有两种截然不同的含义，日志必须区分，否则运维会误判：
+		//   - msg 含 "frequent" → 按分钟限流（等一会儿自愈）；
+		//   - msg 含 "IPv6"     → 该源不支持 IPv6（永远查不到，应换源）。
 		log.Printf("[geo] api.iping.cc 未命中: code=%d msg=%s", pr.Code, pr.Msg)
 		return nil
 	}
@@ -309,12 +326,23 @@ func (r *Resolver) parseIping(body []byte) *protocol.GeoInfo {
 		return nil
 	}
 	return &protocol.GeoInfo{
-		Country:   d.Country,
-		Region:    d.Region,
-		City:      d.City,
-		Latitude:  parseFloat(d.Lat),
-		Longitude: parseFloat(d.Lon),
+		Country:     d.Country,
+		CountryCode: firstNonEmpty(d.ASCountry, d.CompanyCountry),
+		Region:      d.Region,
+		City:        d.City,
+		Latitude:    parseFloat(d.Lat),
+		Longitude:   parseFloat(d.Lon),
 	}
+}
+
+// firstNonEmpty 返回第一个非空值（用于可选字段的降级取值）。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if trimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // parseIPAPI 解析 ip-api.com 响应（带 ISO 国家代码）。

@@ -105,6 +105,9 @@ func main() {
 			TOTPSecret: "",
 			PkgDir:     *pkgDir,
 			AgentKey:   *agentKey,
+			ProxyIP:    *proxyIP,
+			WebTLSCert: *webTLSCert,
+			WebTLSKey:  *webTLSKey,
 			TokenTTL:   tokenTTL.String(),
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
@@ -158,6 +161,13 @@ func main() {
 		}
 		if cfg.PkgDir != "" && *pkgDir == "" {
 			*pkgDir = cfg.PkgDir
+		}
+		// ProxyIP 必须回填到 flag：启动时 geo.NewResolverWithProxy(*proxyIP) 用的是
+		// flag 变量，而客户端配置只从 flag/environment 读取。
+		// 不回填的后果是"配置文件里写了 proxy_ip 却不生效"，只能靠命令行或环境变量，
+		// 而安装器/服务模式恰恰不会带命令行参数 —— 表现为"地区一直解析不出来"。
+		if cfg.ProxyIP != "" && *proxyIP == os.Getenv("MOCENTER_PROXY_IP") {
+			*proxyIP = cfg.ProxyIP
 		}
 		if cfg.AgentKey != "" && *agentKey == os.Getenv("MOCENTER_AGENT_KEY") {
 			*agentKey = cfg.AgentKey

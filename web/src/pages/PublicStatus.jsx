@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { PublicApi, PublicSocket } from '../api/api.js'
+import Flag from '../components/Flag.jsx'
 
 // 公开状态页（**免登录**）：展示非敏感运行指标 + 节点详情（历史趋势）。
 //
@@ -522,24 +523,6 @@ function MiniBar({ label, value, sub }) {
       {sub ? <div className="cell-sub">{sub}</div> : null}
     </div>
   )
-}
-
-// 国旗：由 ISO 国家代码生成区域指示符 emoji（零依赖，不请求任何外部资源）。
-// 放在备注右侧，让"这台机器在哪个国家"一眼可辨。
-function Flag({ code }) {
-  const flag = useMemo(() => countryFlag(code), [code])
-  if (!flag) return null
-  return <span className="public-flag" title={code}>{flag}</span>
-}
-
-// 国家代码 -> 国旗 emoji
-function countryFlag(code) {
-  if (!code || code.length !== 2) return ''
-  const upper = code.toUpperCase()
-  if (!/^[A-Z]{2}$/.test(upper)) return ''
-  const base = 0x1F1E6
-  const a = 'A'.charCodeAt(0)
-  return String.fromCodePoint(base + (upper.charCodeAt(0) - a), base + (upper.charCodeAt(1) - a))
 }
 
 // 地区文本（国家 省 市），空字段自动跳过
