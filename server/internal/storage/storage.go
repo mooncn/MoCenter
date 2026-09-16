@@ -101,7 +101,9 @@ func (db *DB) migrate() error {
 			mem_total       INTEGER NOT NULL DEFAULT 0,
 			mem_used        INTEGER NOT NULL DEFAULT 0,
 			disk_total      INTEGER NOT NULL DEFAULT 0,
-			disk_used       INTEGER NOT NULL DEFAULT 0
+			disk_used       INTEGER NOT NULL DEFAULT 0,
+			net_in_delta    INTEGER NOT NULL DEFAULT 0,
+			net_out_delta   INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_probe_agent_time ON probe_history(agent_id, timestamp)`,
 		// 主机信息
@@ -158,6 +160,14 @@ func (db *DB) migrate() error {
 	}
 	// 审计类别（命令执行/运维操作/登录认证），旧库补列并回填默认值
 	if err := db.ensureColumn("audit_logs", "category", "TEXT NOT NULL DEFAULT 'command'"); err != nil {
+		return err
+	}
+	// 采样点流量增量（本次采样相对上一次的收发字节数）。旧库补列后历史行为 0，
+	// 即"该点流量未知"，趋势图会跳过这些点而不是画成 0 流量。
+	if err := db.ensureColumn("probe_history", "net_in_delta", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("probe_history", "net_out_delta", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	// 依赖上述列的索引（放在补列之后执行）

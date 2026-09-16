@@ -219,13 +219,21 @@ export class PublicSocket {
     this.ws.onclose = () => {
       this.onStatus?.('disconnected')
       if (!this.alive) return
+      // 总开关关闭时端点返回 404（对外"不存在"）。这不是网络故障，
+      // 无限重连只会在控制台刷屏并给服务端带来无意义请求 —— 停止重试，
+      // 由页面的 HTTP 拉取结果（enabled=false / 404）驱动界面状态。
+      if (this.gone) return
       // 指数退避重连：服务端被重启或网络抖动时不至于打满连接
       setTimeout(() => {
         this.delay = Math.min(this.delay * 2, 30000)
         this.connect()
       }, this.delay)
     }
-    this.ws.onerror = () => this.ws && this.ws.close()
+    this.ws.onerror = () => {
+      // 握手失败（未启用/服务未就绪）时不再重试，避免"未启用"部署下的控制台噪音
+      this.gone = true
+      this.ws && this.ws.close()
+    }
   }
 
   close() {

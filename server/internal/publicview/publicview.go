@@ -26,6 +26,18 @@ import (
 	"mocenter/server/internal/siteconfig"
 )
 
+// Rate / usage 精度常量（公开页统一保留 1 位小数，避免浮点尾巴）。
+const (
+	// trendCap 趋势序列可携带的最大采样点数（与公开接口的 maxPoints 对齐）。
+	trendCap = 200
+	// byteRateMax 单点速率上限 400Gbit/s（=50GB/s）：超出视为计数器异常
+	// （旧库恢复导致自启动累计被当成单次增量、溢出、时间戳跳变），
+	// 直接丢弃该点而不是画出一根戳穿天花板的假尖峰。
+	// 与 probe.rateLimitBytesPerSec 同口径：服务端写入时已挡一次，这里再挡一次，
+	// 让 publicview（可单测的脱敏层）对内存回退路径的老数据同样免疫。
+	byteRateMax = float64(50_000_000_000)
+)
+
 // Node 公开页的单台主机视图。
 type Node struct {
 	// NodeID 公开节点编号（n-xxxxxxxx），非 agent_id，不可反推
@@ -55,6 +67,15 @@ type Node struct {
 	// PublicIP / PublicIPv6 公网出口 IP（敏感，默认关闭）
 	PublicIP   string `json:"public_ip,omitempty"`
 	PublicIPv6 string `json:"public_ipv6,omitempty"`
+
+	// NetRateIn / NetRateOut 实时下行 / 上行速率（字节/秒），由服务端按相邻探针差值计算
+	NetRateIn  int64 `json:"net_rate_in,omitempty"`
+	NetRateOut int64 `json:"net_rate_out,omitempty"`
+	// NetTotalIn / NetTotalOut 区间累计流量（字节）。
+	// 口径由 siteconfig.TrafficMode 决定：boot=自设备启动以来（网卡累计），
+	// window=历史留存窗口内（各采样点增量的和）。
+	NetTotalIn  int64 `json:"net_total_in,omitempty"`
+	NetTotalOut int64 `json:"net_total_out,omitempty"`
 
 	// CPUUsage CPU 利用率（%）
 	CPUUsage float64 `json:"cpu_usage,omitempty"`
@@ -89,22 +110,32 @@ type Sample struct {
 	CPUUsage  *float64 `json:"cpu_usage,omitempty"`
 	MemUsage  *float64 `json:"mem_usage,omitempty"`
 	DiskUsage *float64 `json:"disk_usage,omitempty"`
+	// NetInBps / NetOutBps 下行 / 上行速率（字节/秒）。
+	// 服务端从相邻采样的**累计字节**差值求得：既避免前端拿到累计量级（可能被
+	// 用于估算主机承载的业务规模），也让 "流量最小的节点" 这类横向对比成立。
+	NetInBps  *float64 `json:"net_in_bps,omitempty"`
+	NetOutBps *float64 `json:"net_out_bps,omitempty"`
 }
 
 // Summary 站点级汇总指标（不含任何主机标识）。
 type Summary struct {
-	Total      int     `json:"total"`
-	Online     int     `json:"online"`
-	Offline    int     `json:"offline"`
-	AvgCPU     float64 `json:"avg_cpu"`
-	AvgMem     float64 `json:"avg_mem"`
-	AvgDisk    float64 `json:"avg_disk"`
-	TotalMem   int64   `json:"total_mem_bytes"`
-	UsedMem    int64   `json:"used_mem_bytes"`
-	TotalDisk  int64   `json:"total_disk_bytes"`
-	UsedDisk   int64   `json:"used_disk_bytes"`
-	UpdatedAt  int64   `json:"updated_at"`
-	ServerTime int64   `json:"server_time"`
+	Total     int     `json:"total"`
+	Online    int     `json:"online"`
+	Offline   int     `json:"offline"`
+	AvgCPU    float64 `json:"avg_cpu"`
+	AvgMem    float64 `json:"avg_mem"`
+	AvgDisk   float64 `json:"avg_disk"`
+	TotalMem  int64   `json:"total_mem_bytes"`
+	UsedMem   int64   `json:"used_mem_bytes"`
+	TotalDisk int64   `json:"total_disk_bytes"`
+	UsedDisk  int64   `json:"used_disk_bytes"`
+	// 站点级流量（仅统计可见节点）：速率是当前值，累计是口径内总和
+	NetRateIn   int64 `json:"net_rate_in,omitempty"`
+	NetRateOut  int64 `json:"net_rate_out,omitempty"`
+	NetTotalIn  int64 `json:"net_total_in,omitempty"`
+	NetTotalOut int64 `json:"net_total_out,omitempty"`
+	UpdatedAt   int64 `json:"updated_at"`
+	ServerTime  int64 `json:"server_time"`
 }
 
 // NodeID 由 agent_id 派生稳定的公开节点编号。
@@ -209,6 +240,12 @@ func BuildNode(a *protocol.AgentInfo, cfg *siteconfig.Config) *Node {
 		}
 	}
 
+	if on("network") {
+		// 负值（计数器回绕/差分异常）不下发，避免前端画出反向尖刺
+		n.NetRateIn = nonNegative(a.NetRateIn)
+		n.NetRateOut = nonNegative(a.NetRateOut)
+	}
+
 	if on("cpu_usage") {
 		n.CPUUsage = round1(a.CPUUsage)
 	}
@@ -237,6 +274,22 @@ func cpuModelText(a *protocol.AgentInfo) string {
 		return a.CPUModel + " @ " + trimFloat(a.CPUMHz/1000) + "GHz"
 	}
 	return a.CPUModel
+}
+
+// AttachTraffic 把流量口径写入节点视图（速率即时可得，累计需查历史）。
+//
+// 为什么不放在 BuildNode 里：单节点裁剪是纯函数（无 IO，可单测脱敏），
+// 而累计流量要读探针历史。这里由调用方显式注入，避免脱敏逻辑与存储耦合。
+func AttachTraffic(n *Node, a *protocol.AgentInfo, cfg *siteconfig.Config) {
+	if n == nil || a == nil || cfg == nil || !cfg.FieldVisible("network") {
+		return
+	}
+	if cfg.TrafficModeOrDefault() == siteconfig.TrafficModeWindow {
+		// 由调用方另行查历史填充（store 内存回退与 SQL 结果口径不同，交给调用方）
+		return
+	}
+	n.NetTotalIn = nonNegative(a.NetInBytes)
+	n.NetTotalOut = nonNegative(a.NetOutBytes)
 }
 
 // BuildNodes 批量裁剪并按「在线优先、备注/主机名」排序，保证公开页顺序稳定
@@ -290,6 +343,10 @@ func BuildSummary(nodes []*Node, updatedAt int64) *Summary {
 		s.UsedMem += n.MemUsedBytes
 		s.TotalDisk += n.DiskTotalBytes
 		s.UsedDisk += n.DiskUsedBytes
+		s.NetRateIn += nonNegative(n.NetRateIn)
+		s.NetRateOut += nonNegative(n.NetRateOut)
+		s.NetTotalIn += nonNegative(n.NetTotalIn)
+		s.NetTotalOut += nonNegative(n.NetTotalOut)
 	}
 	cnt := float64(len(nodes))
 	s.AvgCPU = round1(s.AvgCPU / cnt)
@@ -309,8 +366,13 @@ func BuildSamples(history []*protocol.ProbeDataReq, cfg *siteconfig.Config) []Sa
 	cpu := cfg.FieldVisible("cpu_usage")
 	mem := cfg.FieldVisible("mem_usage")
 	disk := cfg.FieldVisible("disk_usage")
+	net := cfg.FieldVisible("network")
 	out := make([]Sample, 0, len(history))
-	for _, p := range history {
+	var rates *[2][]float64
+	if net {
+		rates = sampleNetRates(history)
+	}
+	for i, p := range history {
 		if p == nil {
 			continue
 		}
@@ -327,9 +389,63 @@ func BuildSamples(history []*protocol.ProbeDataReq, cfg *siteconfig.Config) []Sa
 			v := round1(p.DiskUsage)
 			s.DiskUsage = &v
 		}
+		if net && rates != nil {
+			if v := rates[0][i]; v >= 0 {
+				s.NetInBps = &v
+			}
+			if v := rates[1][i]; v >= 0 {
+				s.NetOutBps = &v
+			}
+		}
 		out = append(out, s)
 	}
 	return out
+}
+
+// sampleNetRates 由**累计字节**序列求各点的速率（字节/秒）。
+//
+// 为什么要在服务端算：Agent 上报的是网卡自启动以来的累计收发字节，
+// 直接下发等于把"这台机器总共跑了多少流量"公开出去；而取相邻点差值/时间差
+// 得到的瞬时速率既满足趋势图需求，也天然过滤了累计量级信息。
+//
+// 首点没有前驱（无法求差），以及时间戳重复/倒退、计数器回绕的点，
+// 统一返回 -1 表示"该点无速率"，前端跳过而不是连成一条假的水平线。
+func sampleNetRates(history []*protocol.ProbeDataReq) *[2][]float64 {
+	in := make([]float64, len(history))
+	out := make([]float64, len(history))
+	for i := range history {
+		in[i], out[i] = -1, -1
+	}
+	for i := 1; i < len(history); i++ {
+		prev, cur := history[i-1], history[i]
+		if prev == nil || cur == nil || cur.Timestamp <= prev.Timestamp {
+			continue
+		}
+		dt := float64(cur.Timestamp - prev.Timestamp)
+		in[i] = rateBetween(prev.NetInBytes, cur.NetInBytes, dt)
+		out[i] = rateBetween(prev.NetOutBytes, cur.NetOutBytes, dt)
+	}
+	return &[2][]float64{in, out}
+}
+
+// rateBetween 计算两点之间的字节速率；计数器回绕/跳变/异常量级时返回 -1。
+func rateBetween(prev, cur int64, dt float64) float64 {
+	if dt <= 0 || cur < prev || prev < 0 || cur < 0 {
+		return -1
+	}
+	rate := float64(cur-prev) / dt
+	if rate > byteRateMax {
+		return -1
+	}
+	return round1(rate)
+}
+
+// nonNegative 负值归零（计数器回绕、差分异常等）。
+func nonNegative(v int64) int64 {
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 // round1 保留 1 位小数，避免公开页出现浮点尾巴。

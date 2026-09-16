@@ -334,3 +334,110 @@ func TestMarkOfflineByAliasUsesCurrentAgentID(t *testing.T) {
 		t.Fatal("按旧别名标离线，同一设备应变离线")
 	}
 }
+
+// TestProbeNetDeltaAndRates 验证增量与速率的派生规则：
+// 首点未知、正常点按差值/时间、计数器回绕视为未知（而不是画出一个负值）。
+func TestProbeNetDeltaAndRates(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "n1", UUID: "UUID-N1", Online: true})
+	base := time.Now().Unix()
+
+	// 首点：没有前驱，增量未知
+	first := &protocol.ProbeDataReq{AgentID: "n1", UUID: "UUID-N1", Timestamp: base, NetInBytes: 1000, NetOutBytes: 2000}
+	s.UpdateProbe(first)
+	if first.NetDeltaKnown {
+		t.Fatal("首点增量应为未知")
+	}
+
+	// 第二点：+2000 字节 / 10 秒 = 200 B/s
+	p2 := &protocol.ProbeDataReq{AgentID: "n1", UUID: "UUID-N1", Timestamp: base + 10, NetInBytes: 3000, NetOutBytes: 6000}
+	s.UpdateProbe(p2)
+	if !p2.NetDeltaKnown {
+		t.Fatal("正常采样点增量应可信")
+	}
+	if p2.NetInDeltaBytes != 2000 || p2.NetOutDeltaBytes != 4000 {
+		t.Fatalf("增量计算错误: in=%d out=%d", p2.NetInDeltaBytes, p2.NetOutDeltaBytes)
+	}
+	if a := s.Get("n1"); a.NetRateIn != 200 || a.NetRateOut != 400 {
+		t.Fatalf("速率计算错误: in=%d out=%d", a.NetRateIn, a.NetRateOut)
+	}
+
+	// 第三点：下行计数器回绕（变小），上行继续增长 -> 下行增量未知而非负数
+	p3 := &protocol.ProbeDataReq{AgentID: "n1", UUID: "UUID-N1", Timestamp: base + 20, NetInBytes: 10, NetOutBytes: 7000}
+	s.UpdateProbe(p3)
+	if p3.NetInDeltaBytes != 0 {
+		t.Fatalf("回绕点下行增量应为 0，实得 %d", p3.NetInDeltaBytes)
+	}
+	if p3.NetOutDeltaBytes != 1000 {
+		t.Fatalf("回绕点上行增量应为 1000，实得 %d", p3.NetOutDeltaBytes)
+	}
+}
+
+// TestNetTotalsSince 验证"窗口内累计流量"口径：只累加已知增量，
+// 且可以按时间窗裁剪。
+func TestNetTotalsSince(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "n2", UUID: "UUID-N2", Online: true})
+
+	// 固定基准时间：用 time.Now() 会在"构造采样"与"断言"之间产生毫秒级漂移，
+	// 使窗口边界的断言偶发失败（测试必须与运行时刻无关）。
+	const base = int64(1_700_000_000)
+
+	// 每 10 秒一次，累计下行 0 -> 1000 -> 3000 -> 6000（相邻增量 1000/2000/3000）
+	for i, in := range []int64{0, 1000, 3000, 6000} {
+		s.UpdateProbe(&protocol.ProbeDataReq{
+			AgentID: "n2", UUID: "UUID-N2", Timestamp: base + int64(i*10),
+			NetInBytes: in, NetOutBytes: in * 2,
+		})
+	}
+	// 全窗口：首点无增量（计数器起点未知），其余 3 点增量求和 = 6000
+	totalIn, totalOut, ok := s.NetTotalsSince("n2", time.Unix(base, 0))
+	if !ok {
+		t.Fatal("窗口内应存在可信增量点")
+	}
+	if totalIn != 6000 || totalOut != 12000 {
+		t.Fatalf("窗口累计错误: in=%d out=%d", totalIn, totalOut)
+	}
+
+	// 只取后半段（第三点起）：窗口内只含最后两段增量 2000+3000=5000
+	totalIn, _, ok = s.NetTotalsSince("n2", time.Unix(base+20, 0))
+	if !ok || totalIn != 5000 {
+		t.Fatalf("裁剪后的窗口累计错误: in=%d ok=%v", totalIn, ok)
+	}
+
+	// 未知主机：known=false（前端据此显示 —，而不是 0B）
+	if _, _, ok := s.NetTotalsSince("nope", time.Unix(base, 0)); ok {
+		t.Fatal("未知主机不应返回可信流量")
+	}
+}
+
+// TestProbeNetDeltaRejectsAbsurdCounterJump 验证计数器异常跳变不污染趋势与累计。
+//
+// 典型场景：从旧库恢复的设备 LastSeen 有值、但累计字节过去未持久化（为 0），
+// 首个采样会把"自启动以来的全部流量"当成这几秒的增量。若照单全收，
+// 公开页会出现一个戳穿天花板的假尖峰，并被窗口累计永久计入。
+func TestProbeNetDeltaRejectsAbsurdCounterJump(t *testing.T) {
+	s := NewStore(nil)
+	// LastSeen 有值（模拟从库恢复），NetInBytes 为 0（旧版未持久化累计值）
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "lj", UUID: "UUID-LJ", Online: true, LastSeen: 1000})
+
+	p := &protocol.ProbeDataReq{
+		AgentID: "lj", UUID: "UUID-LJ", Timestamp: 1010,
+		NetInBytes: 5_000_000_000_000, NetOutBytes: 5_000_000_000_000, // 5TB/10s
+	}
+	s.UpdateProbe(p)
+	if p.NetDeltaKnown {
+		t.Fatalf("异常跳变不应标记为可信增量: %+v", p)
+	}
+	if in, out, known := s.NetTotalsSince("lj", time.Unix(0, 0)); known && (in != 0 || out != 0) {
+		t.Fatalf("异常跳变不应计入窗口累计: in=%d out=%d known=%v", in, out, known)
+	}
+
+	// 正常量级的增量仍然可用（对照组，避免把守卫写死成"永远不可信"）。
+	// 注意基准累计值已被上面的异常点推进到 5TB：这里在同一基准上给出正常增量。
+	p2 := &protocol.ProbeDataReq{AgentID: "lj", UUID: "UUID-LJ", Timestamp: 1020, NetInBytes: 5_000_000_001_000, NetOutBytes: 5_000_000_001_000}
+	s.UpdateProbe(p2)
+	if !p2.NetDeltaKnown || p2.NetInDeltaBytes != 1000 {
+		t.Fatalf("正常增量应被采纳: known=%v delta=%d", p2.NetDeltaKnown, p2.NetInDeltaBytes)
+	}
+}

@@ -431,21 +431,38 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 		a.CPUUsage = p.CPUUsage
 		a.MemUsage = p.MemUsage
 		a.DiskUsage = p.DiskUsage
-		// 计算网络速率（字节/秒）：相邻探针累计值差 / 时间间隔
-		if a.NetInBytes > 0 && p.NetInBytes >= a.NetInBytes && a.LastSeen > 0 {
+		// 计算网络速率（字节/秒）与本次采样增量（字节）：相邻探针累计值差。
+		//
+		// 两种情况视为"增量未知"并把增量标记为 0 + Known=false：
+		//   - 首个采样点（没有前驱）；
+		//   - 计数器回绕 / 换网卡导致累计值变小。
+		// 时间差必须为正，否则会出现除零或把历史间隔当成瞬时速度。
+		// 前置条件：有可信的前一个采样时刻。这里用 LastSeen > 0 而不是
+		// 旧实现的 NetInBytes > 0 —— 后者会让"累计值恰好为 0 的首次上报"
+		// 一直算不出速率；同时下面的 >= 判断已经能挡住计数器回绕。
+		p.NetDeltaKnown = false
+		if a.LastSeen > 0 && p.Timestamp > a.LastSeen {
 			dt := p.Timestamp - a.LastSeen
-			if dt > 0 {
-				a.NetRateIn = (p.NetInBytes - a.NetInBytes) / dt
+			// 异常大增量（超过 100Tbit/s 的瞬时速率）视为"计数器不可信"：
+			// 典型场景是从旧库恢复的设备，NetInBytes 过去未持久化（为 0），
+			// 首个采样会把"自启动以来的全部流量"当成这几秒的增量。
+			// 这种点既不该画进趋势，也不该被窗口累计求和 —— 直接按未知处理。
+			if p.NetInBytes >= a.NetInBytes && rateWithinLimit(p.NetInBytes-a.NetInBytes, dt) {
+				p.NetInDeltaBytes = p.NetInBytes - a.NetInBytes
+				a.NetRateIn = p.NetInDeltaBytes / dt
+			} else {
+				a.NetRateIn = 0
 			}
+			if p.NetOutBytes >= a.NetOutBytes && rateWithinLimit(p.NetOutBytes-a.NetOutBytes, dt) {
+				p.NetOutDeltaBytes = p.NetOutBytes - a.NetOutBytes
+				a.NetRateOut = p.NetOutDeltaBytes / dt
+			} else {
+				a.NetRateOut = 0
+			}
+			// 收发两侧都不可信时整点标记未知，避免用 0 参与窗口求和
+			p.NetDeltaKnown = p.NetInDeltaBytes > 0 || p.NetOutDeltaBytes > 0
 		} else {
 			a.NetRateIn = 0
-		}
-		if a.NetOutBytes > 0 && p.NetOutBytes >= a.NetOutBytes && a.LastSeen > 0 {
-			dt := p.Timestamp - a.LastSeen
-			if dt > 0 {
-				a.NetRateOut = (p.NetOutBytes - a.NetOutBytes) / dt
-			}
-		} else {
 			a.NetRateOut = 0
 		}
 		a.NetInBytes = p.NetInBytes
@@ -575,6 +592,23 @@ func (s *Store) All() []*protocol.AgentInfo {
 	return out
 }
 
+// rateLimitBytesPerSec 速率上限（字节/秒）：400 Gbit/s（=50 GB/s）。
+//
+// 取舍：真实网卡最高约 400GbE，且探针周期通常 5–10 秒，因此 50GB/s 已远超
+// 任何真实主机；同时它足以挡住"旧库恢复导致自启动累计被当成单次增量"
+// 这类异常（那种情况下算出来的速率动辄 TB/s）。
+// 宁可把极端场景判为"未知"（趋势不连线、累计不计入），也不要在公开页
+// 画出一个荒唐的尖峰。
+const rateLimitBytesPerSec = int64(400_000_000_000) / 8
+
+// rateWithinLimit 判断"增量/时间"是否在合理量级内。
+func rateWithinLimit(delta, dt int64) bool {
+	if dt <= 0 || delta < 0 {
+		return false
+	}
+	return delta/dt <= rateLimitBytesPerSec
+}
+
 // firstNonEmpty 返回第一个非空字符串。
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
@@ -583,6 +617,39 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// NetTotalsSince 返回某 Agent 在时间窗内的收发字节总量。
+//
+// 口径（重要）：**按采样增量求和**，即"历史留存窗口内的流量"，而不是
+// 网卡累计计数器（后者是自设备启动以来的总量，会随着运行时间无限增长）。
+// 为什么公开页偏向前者：累计计数器同时暴露了"这台机器总共跑了多少流量"，
+// 对直连连接类节点（HTTPS/流媒体/代理）等于公开业务承载量。
+//
+// 返回的 known 表示窗口内是否至少有一个可信增量点：全为 0 且 known=false
+// 时前端应展示"—"而不是"0B"（否则表现为"没跑流量"的误导）。
+func (s *Store) NetTotalsSince(agentID string, since time.Time) (in, out int64, known bool) {
+	if agentID == "" {
+		return 0, 0, false
+	}
+	if s.db != nil {
+		i, o, err := s.db.ProbeNetTotals(agentID, since.Unix())
+		if err == nil {
+			return i, o, true
+		}
+		log.Printf("[probe] 统计窗口流量失败，回退内存: %v", err)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.history[s.resolveLocked(agentID)] {
+		if p == nil || !p.NetDeltaKnown || time.Unix(p.Timestamp, 0).Before(since) {
+			continue
+		}
+		in += p.NetInDeltaBytes
+		out += p.NetOutDeltaBytes
+		known = true
+	}
+	return in, out, known
 }
 
 // HistoryDownsampled 返回某 Agent 的历史采样，并按需降采样到 maxPoints 个点。
@@ -607,24 +674,26 @@ func (s *Store) HistoryDownsampled(agentID string, since time.Time, maxPoints in
 				out := make([]*protocol.ProbeDataReq, 0, len(rows))
 				for _, r := range rows {
 					out = append(out, &protocol.ProbeDataReq{
-						AgentID:        r.AgentID,
-						Timestamp:      r.Timestamp,
-						CPUUsage:       r.CPUUsage,
-						MemUsage:       r.MemUsage,
-						DiskUsage:      r.DiskUsage,
-						NetInBytes:     r.NetInBytes,
-						NetOutBytes:    r.NetOutBytes,
-						OSType:         r.OSType,
-						KernelVersion:  r.KernelVersion,
-						Uptime:         r.Uptime,
-						PublicIP:       r.PublicIP,
-						OSVersion:      r.OSVersion,
-						CPUModel:       r.CPUModel,
-						CPUMHz:         r.CPUMHz,
-						MemTotalBytes:  r.MemTotal,
-						MemUsedBytes:   r.MemUsed,
-						DiskTotalBytes: r.DiskTotal,
-						DiskUsedBytes:  r.DiskUsed,
+						AgentID:          r.AgentID,
+						Timestamp:        r.Timestamp,
+						CPUUsage:         r.CPUUsage,
+						MemUsage:         r.MemUsage,
+						DiskUsage:        r.DiskUsage,
+						NetInBytes:       r.NetInBytes,
+						NetOutBytes:      r.NetOutBytes,
+						OSType:           r.OSType,
+						KernelVersion:    r.KernelVersion,
+						Uptime:           r.Uptime,
+						PublicIP:         r.PublicIP,
+						OSVersion:        r.OSVersion,
+						CPUModel:         r.CPUModel,
+						CPUMHz:           r.CPUMHz,
+						MemTotalBytes:    r.MemTotal,
+						MemUsedBytes:     r.MemUsed,
+						DiskTotalBytes:   r.DiskTotal,
+						DiskUsedBytes:    r.DiskUsed,
+						NetInDeltaBytes:  r.NetInDelta,
+						NetOutDeltaBytes: r.NetOutDelta,
 					})
 				}
 				return out
@@ -654,24 +723,26 @@ func (s *Store) History(agentID string, since time.Time) []*protocol.ProbeDataRe
 			out := make([]*protocol.ProbeDataReq, 0, len(rows))
 			for _, r := range rows {
 				out = append(out, &protocol.ProbeDataReq{
-					AgentID:        r.AgentID,
-					Timestamp:      r.Timestamp,
-					CPUUsage:       r.CPUUsage,
-					MemUsage:       r.MemUsage,
-					DiskUsage:      r.DiskUsage,
-					NetInBytes:     r.NetInBytes,
-					NetOutBytes:    r.NetOutBytes,
-					OSType:         r.OSType,
-					KernelVersion:  r.KernelVersion,
-					Uptime:         r.Uptime,
-					PublicIP:       r.PublicIP,
-					OSVersion:      r.OSVersion,
-					CPUModel:       r.CPUModel,
-					CPUMHz:         r.CPUMHz,
-					MemTotalBytes:  r.MemTotal,
-					MemUsedBytes:   r.MemUsed,
-					DiskTotalBytes: r.DiskTotal,
-					DiskUsedBytes:  r.DiskUsed,
+					AgentID:          r.AgentID,
+					Timestamp:        r.Timestamp,
+					CPUUsage:         r.CPUUsage,
+					MemUsage:         r.MemUsage,
+					DiskUsage:        r.DiskUsage,
+					NetInBytes:       r.NetInBytes,
+					NetOutBytes:      r.NetOutBytes,
+					OSType:           r.OSType,
+					KernelVersion:    r.KernelVersion,
+					Uptime:           r.Uptime,
+					PublicIP:         r.PublicIP,
+					OSVersion:        r.OSVersion,
+					CPUModel:         r.CPUModel,
+					CPUMHz:           r.CPUMHz,
+					MemTotalBytes:    r.MemTotal,
+					MemUsedBytes:     r.MemUsed,
+					DiskTotalBytes:   r.DiskTotal,
+					DiskUsedBytes:    r.DiskUsed,
+					NetInDeltaBytes:  r.NetInDelta,
+					NetOutDeltaBytes: r.NetOutDelta,
 				})
 			}
 			return out
@@ -684,7 +755,9 @@ func (s *Store) History(agentID string, since time.Time) []*protocol.ProbeDataRe
 	h := s.history[s.resolveLocked(agentID)]
 	var out []*protocol.ProbeDataReq
 	for _, p := range h {
-		if time.Unix(p.Timestamp, 0).After(since) {
+		// 与 SQL 侧 `timestamp >= since` 保持一致：恰好落在窗口起点的采样要计入，
+		// 否则内存回退与数据库查询会给出两种结果（同一部署换路径就变数）。
+		if !time.Unix(p.Timestamp, 0).Before(since) {
 			out = append(out, p)
 		}
 	}
@@ -748,6 +821,8 @@ func (s *Store) persistProbeHistory(p *protocol.ProbeDataReq) {
 		MemUsed:       p.MemUsedBytes,
 		DiskTotal:     p.DiskTotalBytes,
 		DiskUsed:      p.DiskUsedBytes,
+		NetInDelta:    p.NetInDeltaBytes,
+		NetOutDelta:   p.NetOutDeltaBytes,
 	}
 	if err := s.db.InsertProbeHistory(row); err != nil {
 		log.Printf("[probe] 持久化探针历史失败: %v", err)

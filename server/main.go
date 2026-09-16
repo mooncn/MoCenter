@@ -894,7 +894,8 @@ func broadcastAgents(hub *ws.Hub, store *probe.Store, pub *publicSite) {
 		// 未启用/不展示主机：不发任何数据，避免匿名连接收到"空列表"以外的信息。
 		return
 	}
-	nodes := publicview.BuildNodes(store.All(), cfg)
+	// 走 pub.visibleNodes 而非直接 BuildNodes：流量累计值需要按配置口径装配
+	nodes := pub.visibleNodes(cfg)
 	hub.BroadcastPublic(map[string]interface{}{
 		"ok":      true,
 		"nodes":   nodes,

@@ -116,6 +116,13 @@ type ProbeDataReq struct {
 	MemUsedBytes   int64   `json:"mem_used_bytes,omitempty"`
 	DiskTotalBytes int64   `json:"disk_total_bytes,omitempty"`
 	DiskUsedBytes  int64   `json:"disk_used_bytes,omitempty"`
+
+	// 相邻采样之间的收发字节增量（**仅服务端填写**，Agent 上报报文里没有这两个字段）。
+	// 与 NetInBytes（网卡自启动以来的累计值）语义不同：增量用于趋势与公开页流量统计。
+	NetInDeltaBytes  int64 `json:"net_in_delta_bytes,omitempty"`
+	NetOutDeltaBytes int64 `json:"net_out_delta_bytes,omitempty"`
+	// NetDeltaKnown 增量是否可信（首点 / 计数器回绕时为 false，下游应跳过该点）
+	NetDeltaKnown bool `json:"net_delta_known,omitempty"`
 }
 
 // ProbeDataResp Server -> Agent 探针确认

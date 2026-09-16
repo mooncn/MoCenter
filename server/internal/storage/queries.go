@@ -281,7 +281,7 @@ func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step in
 	if step == 1 {
 		rows, err = db.Query(`SELECT agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
 			os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
-			mem_total, mem_used, disk_total, disk_used
+			mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta
 			FROM probe_history WHERE agent_id = ? AND timestamp >= ?
 			ORDER BY timestamp DESC LIMIT ?`, agentID, since, limit)
 	} else {
@@ -289,7 +289,7 @@ func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step in
 		rows, err = db.Query(`SELECT agent_id, MAX(timestamp) AS ts,
 			AVG(cpu_usage), AVG(mem_usage), AVG(disk_usage), MAX(net_in_bytes), MAX(net_out_bytes),
 			MAX(os_type), MAX(kernel_version), MAX(uptime), MAX(public_ip), MAX(os_version), MAX(cpu_model), AVG(cpu_mhz),
-			MAX(mem_total), AVG(mem_used), MAX(disk_total), AVG(disk_used)
+			MAX(mem_total), AVG(mem_used), MAX(disk_total), AVG(disk_used), SUM(net_in_delta), SUM(net_out_delta)
 			FROM probe_history WHERE agent_id = ? AND timestamp >= ?
 			GROUP BY (timestamp / ?) ORDER BY ts DESC LIMIT ?`, agentID, since, step, limit)
 	}
@@ -302,7 +302,7 @@ func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step in
 		var r ProbeHistoryRow
 		if err := rows.Scan(&r.AgentID, &r.Timestamp, &r.CPUUsage, &r.MemUsage, &r.DiskUsage, &r.NetInBytes, &r.NetOutBytes,
 			&r.OSType, &r.KernelVersion, &r.Uptime, &r.PublicIP, &r.OSVersion, &r.CPUModel, &r.CPUMHz,
-			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed); err != nil {
+			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed, &r.NetInDelta, &r.NetOutDelta); err != nil {
 			return nil, err
 		}
 		out = append(out, &r)
@@ -327,6 +327,26 @@ func (db *DB) CountProbeHistory(agentID string, since int64) (int64, error) {
 	return n, nil
 }
 
+// ProbeNetTotals 统计某 Agent 在时间窗内的收发字节增量总和（公开页"历史窗口累计"口径）。
+//
+// 用 SUM(delta) 而不是 MAX(累计)-MIN(累计)：降采样/留存裁剪会让窗口内的
+// 首尾累计值缺失，差值口径会低估；而增量在写入时已算好，求和与步长无关。
+func (db *DB) ProbeNetTotals(agentID string, since int64) (int64, int64, error) {
+	var in, out int64
+	err := db.QueryRow(`SELECT COALESCE(SUM(net_in_delta), 0), COALESCE(SUM(net_out_delta), 0)
+		FROM probe_history WHERE agent_id = ? AND timestamp >= ?`, agentID, since).Scan(&in, &out)
+	if err != nil {
+		return 0, 0, fmt.Errorf("统计窗口流量失败: %w", err)
+	}
+	if in < 0 {
+		in = 0
+	}
+	if out < 0 {
+		out = 0
+	}
+	return in, out, nil
+}
+
 // ProbeHistoryRow 探针历史持久化行。
 type ProbeHistoryRow struct {
 	AgentID       string
@@ -347,6 +367,10 @@ type ProbeHistoryRow struct {
 	MemUsed       int64
 	DiskTotal     int64
 	DiskUsed      int64
+	// NetInDelta / NetOutDelta 本次采样相对上次采样的收发字节增量。
+	// 0 = 未知（计数器回绕、首点、或旧版记录），公开页趋势会跳过该点。
+	NetInDelta  int64
+	NetOutDelta int64
 }
 
 // InsertProbeHistory 插入一条探针历史记录。
@@ -354,11 +378,11 @@ func (db *DB) InsertProbeHistory(p *ProbeHistoryRow) error {
 	_, err := db.Exec(`INSERT INTO probe_history
 		(agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
 		 os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
-		 mem_total, mem_used, disk_total, disk_used)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.AgentID, p.Timestamp, p.CPUUsage, p.MemUsage, p.DiskUsage, p.NetInBytes, p.NetOutBytes,
 		p.OSType, p.KernelVersion, p.Uptime, p.PublicIP, p.OSVersion, p.CPUModel, p.CPUMHz,
-		p.MemTotal, p.MemUsed, p.DiskTotal, p.DiskUsed)
+		p.MemTotal, p.MemUsed, p.DiskTotal, p.DiskUsed, p.NetInDelta, p.NetOutDelta)
 	if err != nil {
 		return fmt.Errorf("插入探针历史失败: %w", err)
 	}
@@ -372,7 +396,7 @@ func (db *DB) QueryProbeHistory(agentID string, since int64, limit int) ([]*Prob
 	}
 	rows, err := db.Query(`SELECT agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
 		os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
-		mem_total, mem_used, disk_total, disk_used
+		mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta
 		FROM probe_history WHERE agent_id = ? AND timestamp >= ?
 		ORDER BY timestamp ASC LIMIT ?`, agentID, since, limit)
 	if err != nil {
@@ -384,7 +408,7 @@ func (db *DB) QueryProbeHistory(agentID string, since int64, limit int) ([]*Prob
 		var r ProbeHistoryRow
 		if err := rows.Scan(&r.AgentID, &r.Timestamp, &r.CPUUsage, &r.MemUsage, &r.DiskUsage, &r.NetInBytes, &r.NetOutBytes,
 			&r.OSType, &r.KernelVersion, &r.Uptime, &r.PublicIP, &r.OSVersion, &r.CPUModel, &r.CPUMHz,
-			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed); err != nil {
+			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed, &r.NetInDelta, &r.NetOutDelta); err != nil {
 			return nil, err
 		}
 		out = append(out, &r)

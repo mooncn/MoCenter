@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
-import { Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom'
+import { Routes, Route, NavLink, Navigate, useLocation, Link } from 'react-router-dom'
 import Dashboard from './pages/Dashboard.jsx'
 import Terminal from './pages/Terminal.jsx'
 import Vnc from './pages/Vnc.jsx'
@@ -123,7 +123,8 @@ function Guard() {
   const location = useLocation()
   const token = localStorage.getItem('mc_token')
   if (!token) {
-    return <Navigate to="/login" state={{ from: location }} replace />
+    // 未登录访问管理页：回登录页并记住原地址；登录后若没指定跳转，也回到公开页
+    return <Navigate to={`/login?redirect=${encodeURIComponent(location.pathname + location.search)}`} replace />
   }
   return <Layout />
 }
@@ -131,11 +132,42 @@ function Guard() {
 export default function App() {
   return (
     <Routes>
-      {/* 公开状态页：**免登录**，必须放在 Guard 之前匹配 */}
+      {/* 首页 = 公开节点状态页（**免登录**）。
+          打开站点默认看到的就是 /public 的内容，而不是登录表单；
+          登录表单只在主动访问 /login 或访问管理页被拦下时出现。
+          /public 与 / 指向同一个组件，两条路径都保留，避免旧书签失效。 */}
+      <Route path="/" element={<PublicStatus />} />
       <Route path="/public" element={<PublicStatus />} />
       <Route path="/public/node/:nodeId" element={<PublicNode />} />
       <Route path="/login" element={<Login />} />
-      <Route path="/*" element={<Guard />} />
+      {/* 管理后台：/admin/* 需要登录；同时保留根级旧路径（见下方 LegacyAdmin） */}
+      <Route path="/admin/*" element={<Guard />} />
+      <Route path="/*" element={<HomeOrAdmin />} />
     </Routes>
   )
+}
+
+// HomeOrAdmin 处理"根级旧路径"（/terminal、/audit …）。
+//
+// 背景：管理页此前挂在根路径（/terminal），现在首页让给公开状态页，
+// 但外部链接/书签/文档里仍有旧地址。这里把它们**原样**交给管理后台渲染，
+// 而不是 404 或重定向丢失路径；真正未登录时 Guard 会带去登录页。
+function HomeOrAdmin() {
+  const location = useLocation()
+  const adminPrefixes = NAV_ITEMS.map((i) => i.to)
+  const isAdminPath = adminPrefixes.some((p) => (p === '/' ? false : location.pathname.startsWith(p)))
+  if (!isAdminPath) {
+    return (
+      <div className="public-shell">
+        <div className="public-empty">
+          <div className="public-empty-icon">🧭</div>
+          <div className="public-empty-title">页面不存在</div>
+          <div className="public-empty-actions">
+            <Link className="public-btn" to="/">返回节点状态页</Link>
+          </div>
+        </div>
+      </div>
+    )
+  }
+  return <Guard />
 }

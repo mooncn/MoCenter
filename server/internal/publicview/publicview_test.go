@@ -218,3 +218,139 @@ func TestRemarkFallback(t *testing.T) {
 		t.Fatalf("备注为空应降级用主机名，实际 %q", node.Remark)
 	}
 }
+
+// 网络流量：开启时输出速率，未开启时速率与累计量都不出现在 JSON 中。
+func TestNetworkFieldGate(t *testing.T) {
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+
+	node := BuildNode(sampleAgent(), cfg)
+	if node.NetRateIn != 1024 || node.NetRateOut != 2048 {
+		t.Fatalf("默认应公开网络速率，实际 in=%d out=%d", node.NetRateIn, node.NetRateOut)
+	}
+	raw, _ := json.Marshal(node)
+	if strings.Contains(string(raw), "net_in_bytes") {
+		t.Fatalf("网卡累计原始计数器不应出现在公开视图: %s", raw)
+	}
+
+	// 关闭 network：速率与累计全部消失
+	cfg.Fields["network"] = false
+	node = BuildNode(sampleAgent(), cfg)
+	raw, _ = json.Marshal(node)
+	var m map[string]interface{}
+	_ = json.Unmarshal(raw, &m)
+	for _, key := range []string{"net_rate_in", "net_rate_out", "net_total_in", "net_total_out"} {
+		if _, ok := m[key]; ok {
+			t.Errorf("network 关闭时 %s 不应出现在 JSON 中", key)
+		}
+	}
+}
+
+// 累计流量口径：boot 取网卡累计，window 交由调用方（此函数不填）。
+func TestAttachTrafficModes(t *testing.T) {
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+	a := sampleAgent()
+	node := BuildNode(a, cfg)
+
+	AttachTraffic(node, a, cfg)
+	if node.NetTotalIn != a.NetInBytes || node.NetTotalOut != a.NetOutBytes {
+		t.Fatalf("boot 口径应取网卡累计: %d/%d", node.NetTotalIn, node.NetTotalOut)
+	}
+
+	cfg.TrafficMode = siteconfig.TrafficModeWindow
+	node = BuildNode(a, cfg)
+	AttachTraffic(node, a, cfg)
+	if node.NetTotalIn != 0 || node.NetTotalOut != 0 {
+		t.Fatal("window 口径不应由 AttachTraffic 填写（需查历史）")
+	}
+}
+
+// 趋势流量：由相邻采样累计值差求得速率，首点与回绕点不输出。
+func TestBuildSamplesNetRates(t *testing.T) {
+	cfg := siteconfig.Default()
+	history := []*protocol.ProbeDataReq{
+		{Timestamp: 1000, NetInBytes: 1000, NetOutBytes: 500},
+		{Timestamp: 1010, NetInBytes: 3000, NetOutBytes: 2500}, // +2000/10s = 200B/s, +2000/10s = 200B/s
+		{Timestamp: 1020, NetInBytes: 10, NetOutBytes: 2600},   // 下行计数器回绕 -> 该点下行不输出
+	}
+	samples := BuildSamples(history, cfg)
+	if len(samples) != 3 {
+		t.Fatalf("采样点数错误: %d", len(samples))
+	}
+	if samples[0].NetInBps != nil || samples[0].NetOutBps != nil {
+		t.Fatal("首点没有前驱，不应输出速率")
+	}
+	if samples[1].NetInBps == nil || *samples[1].NetInBps != 200 {
+		t.Fatalf("下行速率计算错误: %v", samples[1].NetInBps)
+	}
+	if samples[1].NetOutBps == nil || *samples[1].NetOutBps != 200 {
+		t.Fatalf("上行速率计算错误: %v", samples[1].NetOutBps)
+	}
+	if samples[2].NetInBps != nil {
+		t.Fatalf("计数器回绕点不应输出速率: %v", samples[2].NetInBps)
+	}
+
+	// 关闭 network：流量序列整体消失
+	cfg.Fields["network"] = false
+	samples = BuildSamples(history, cfg)
+	raw, _ := json.Marshal(samples)
+	if strings.Contains(string(raw), "net_in_bps") || strings.Contains(string(raw), "net_out_bps") {
+		t.Fatalf("network 关闭时不应输出流量序列: %s", raw)
+	}
+}
+
+// 时间戳重复/倒退的点必须被跳过（否则除零或把历史间隔当作瞬时速度）。
+func TestBuildSamplesNetRatesSkipsBadTimestamps(t *testing.T) {
+	cfg := siteconfig.Default()
+	history := []*protocol.ProbeDataReq{
+		{Timestamp: 2000, NetInBytes: 100},
+		{Timestamp: 2000, NetInBytes: 5000}, // 同一时间戳
+		{Timestamp: 1990, NetInBytes: 9000}, // 时间倒退
+	}
+	samples := BuildSamples(history, cfg)
+	for i, s := range samples[1:] {
+		if s.NetInBps != nil {
+			t.Fatalf("第 %d 个异常时间戳点不应输出速率: %v", i+1, *s.NetInBps)
+		}
+	}
+}
+
+// 汇总流量：只统计可见节点，且负值不计入。
+func TestBuildSummaryTraffic(t *testing.T) {
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+	cfg.CatalogEnabled = false
+	cfg.HostIDs = []string{"c"}
+	agents := []*protocol.AgentInfo{
+		{AgentID: "a", NetRateIn: 999, NetRateOut: 999},
+		{AgentID: "c", NetRateIn: 100, NetRateOut: 200},
+	}
+	nodes := BuildNodes(agents, cfg)
+	if len(nodes) != 1 {
+		t.Fatalf("可见节点数错误: %d", len(nodes))
+	}
+	nodes[0].NetTotalIn = 1000
+	nodes[0].NetTotalOut = 2000
+	s := BuildSummary(nodes, 0)
+	if s.NetRateIn != 100 || s.NetRateOut != 200 {
+		t.Fatalf("速率汇总错误: %+v", s)
+	}
+	if s.NetTotalIn != 1000 || s.NetTotalOut != 2000 {
+		t.Fatalf("累计汇总错误: %+v", s)
+	}
+}
+
+// 异常速率的点不下发：趋势图宁可不连线，也不要戳穿天花板的假尖峰。
+func TestBuildSamplesFiltersAbsurdRates(t *testing.T) {
+	cfg := siteconfig.Default()
+	history := []*protocol.ProbeDataReq{
+		{Timestamp: 1000, NetInBytes: 0},
+		// 10 秒内涨了 5TB -> 500GB/s，超过 50GB/s 上限，应被丢弃
+		{Timestamp: 1010, NetInBytes: 5_000_000_000_000},
+	}
+	s := BuildSamples(history, cfg)
+	if s[1].NetInBps != nil {
+		t.Fatalf("异常速率不应下发: %v", *s[1].NetInBps)
+	}
+}

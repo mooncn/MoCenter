@@ -133,3 +133,41 @@ func TestOnChange(t *testing.T) {
 		t.Fatal("变更回调未收到新配置")
 	}
 }
+
+// 网络流量字段默认可见（README 明确为站点核心指标），且能持久化往返。
+func TestNetworkFieldAndTrafficMode(t *testing.T) {
+	c := Default()
+	if !c.FieldVisible("network") {
+		t.Fatal("network 应默认可见")
+	}
+	if c.TrafficModeOrDefault() != TrafficModeBoot {
+		t.Fatalf("默认流量口径应为 boot，实际 %q", c.TrafficModeOrDefault())
+	}
+
+	// 非法口径回退 boot（有值且无需查库，避免配置写错导致公开页流量整列空白）
+	for _, bad := range []string{"", "  ", "BOOT", "sinceboot", "全部"} {
+		if got := NormalizeTrafficMode(bad); got != TrafficModeBoot {
+			t.Errorf("NormalizeTrafficMode(%q) = %q，应回退 boot", bad, got)
+		}
+	}
+	if got := NormalizeTrafficMode("window"); got != TrafficModeWindow {
+		t.Errorf("window 未被识别: %q", got)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "public-site.json")
+	st := NewStore(path)
+	cfg := Default()
+	cfg.Enabled = true
+	cfg.TrafficMode = TrafficModeWindow
+	if err := st.Set(cfg); err != nil {
+		t.Fatal(err)
+	}
+	re := NewStore(path)
+	if err := re.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if re.Get().TrafficMode != TrafficModeWindow {
+		t.Fatalf("流量口径未持久化: %q", re.Get().TrafficMode)
+	}
+}

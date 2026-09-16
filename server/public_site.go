@@ -25,6 +25,7 @@ import (
 
 	"mocenter/server/internal/auth"
 	"mocenter/server/internal/probe"
+	"mocenter/server/internal/protocol"
 	"mocenter/server/internal/publicview"
 	"mocenter/server/internal/siteconfig"
 	"mocenter/server/internal/ws"
@@ -105,6 +106,7 @@ func (p *publicSite) stateHandler() http.HandlerFunc {
 				"title":         cfg.Title,
 				"description":   cfg.Description,
 				"hosts_enabled": cfg.HostsEnabled,
+				"traffic_mode":  cfg.TrafficModeOrDefault(),
 				"fields":        cfg.Fields,
 			},
 			"fields":  publicFieldCatalog(),
@@ -258,6 +260,7 @@ func writePublicWS(conn *websocket.Conn, cfg *siteconfig.Config, nodes []*public
 			"title":         cfg.Title,
 			"description":   cfg.Description,
 			"hosts_enabled": cfg.HostsEnabled,
+			"traffic_mode":  cfg.TrafficModeOrDefault(),
 			"fields":        cfg.Fields,
 		},
 	})
@@ -267,12 +270,96 @@ func writePublicWS(conn *websocket.Conn, cfg *siteconfig.Config, nodes []*public
 	_ = conn.WriteMessage(websocket.TextMessage, payload)
 }
 
-// visibleNodes 取出当前可公开的主机并脱敏。
+// visibleNodes 取出当前可公开的主机并脱敏（含流量口径装配）。
 func (p *publicSite) visibleNodes(cfg *siteconfig.Config) []*publicview.Node {
 	if cfg == nil || !cfg.Enabled || !cfg.HostsEnabled {
 		return []*publicview.Node{}
 	}
-	return publicview.BuildNodes(p.store.All(), cfg)
+	return p.attachTraffic(publicview.BuildNodes(p.store.All(), cfg), cfg)
+}
+
+// publicTrafficWindow 公开页"窗口累计流量"的回溯窗口（与历史留存一致，30 天）。
+const publicTrafficWindow = 30 * 24 * time.Hour
+
+// attachTraffic 依据配置的流量口径补齐节点流量字段。
+//
+// 两种口径：
+//   - boot：直接用当前探针的网卡累计值（无需查库，且与后台仪表盘口径一致）；
+//   - window：查探针增量历史求和，只暴露"留存窗口内"的流量，避免公开主机
+//     自启动以来的总承载量。
+//
+// 注：BuildNode 已按 network 开关裁剪，未开启时本函数是空操作。
+func (p *publicSite) attachTraffic(nodes []*publicview.Node, cfg *siteconfig.Config) []*publicview.Node {
+	if cfg == nil || !cfg.FieldVisible("network") || len(nodes) == 0 {
+		return nodes
+	}
+	// boot 口径：BuildNode 已带速率，这里只补累计值，避免二次遍历 store
+	if cfg.TrafficModeOrDefault() != siteconfig.TrafficModeWindow {
+		agents := make(map[string]*protocol.AgentInfo)
+		for _, a := range p.store.All() {
+			if a != nil {
+				agents[publicview.NodeID(a.AgentID)] = a
+			}
+		}
+		for _, n := range nodes {
+			if n == nil {
+				continue
+			}
+			n.NetTotalIn = agentNetIn(agents[n.NodeID])
+			n.NetTotalOut = agentNetOut(agents[n.NodeID])
+		}
+		return nodes
+	}
+	// window 口径：按 node_id 反查设备（映射只包含当前可公开主机），再查增量历史
+	nodeIDToAgent := make(map[string]string, len(nodes))
+	agentByNode := make(map[string]*protocol.AgentInfo, len(nodes))
+	for _, a := range p.store.All() {
+		if a == nil || !cfg.HostAllowed(a.AgentID) {
+			continue
+		}
+		id := publicview.NodeID(a.AgentID)
+		nodeIDToAgent[id] = a.AgentID
+		agentByNode[id] = a
+	}
+	since := time.Now().Add(-publicTrafficWindow)
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		agentID := nodeIDToAgent[n.NodeID]
+		if agentID == "" {
+			continue
+		}
+		in, out, known := p.store.NetTotalsSince(agentID, since)
+		if !known {
+			continue
+		}
+		n.NetTotalIn = nonNegative64(in)
+		n.NetTotalOut = nonNegative64(out)
+	}
+	return nodes
+}
+
+// agentNetIn / agentNetOut 取主机的累计收发字节（nil 安全）。
+func agentNetIn(a *protocol.AgentInfo) int64 {
+	if a == nil {
+		return 0
+	}
+	return nonNegative64(a.NetInBytes)
+}
+
+func agentNetOut(a *protocol.AgentInfo) int64 {
+	if a == nil {
+		return 0
+	}
+	return nonNegative64(a.NetOutBytes)
+}
+
+func nonNegative64(v int64) int64 {
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 // publicFieldCatalog 返回字段元数据（不含任何主机数据，登录前后都可安全返回）。

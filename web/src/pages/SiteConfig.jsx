@@ -205,6 +205,49 @@ export default function SiteConfig() {
         )}
       </div>
 
+      {/* 流量口径 */}
+      <div className="card">
+        <h3>流量统计口径</h3>
+        <div className="desc">
+          「网络流量」字段对外展示实时上下行速率 + 累计流量。累计口径有两种，
+          对直连连接类节点（HTTPS / 流媒体 / 代理）建议选择「留存窗口内」，
+          避免公开这台机器**自启动以来**的总承载量。
+        </div>
+        <div className="switch-list">
+          <label className={`radio-item ${!cfg.fields.network ? 'disabled' : ''}`}>
+            <input
+              type="radio"
+              name="traffic_mode"
+              checked={cfg.traffic_mode !== 'window'}
+              onChange={() => patch({ traffic_mode: 'boot' })}
+              disabled={fieldsDisabled || !cfg.fields.network}
+            />
+            <span className="radio-text">
+              <b>自设备启动以来累计</b>
+              <span className="cell-sub">取网卡累计计数器，与后台仪表盘口径一致；数值只增不减。</span>
+            </span>
+          </label>
+          <label className={`radio-item ${!cfg.fields.network ? 'disabled' : ''}`}>
+            <input
+              type="radio"
+              name="traffic_mode"
+              checked={cfg.traffic_mode === 'window'}
+              onChange={() => patch({ traffic_mode: 'window' })}
+              disabled={fieldsDisabled || !cfg.fields.network}
+            />
+            <span className="radio-text">
+              <b>历史留存窗口内累计（推荐对外）</b>
+              <span className="cell-sub">按采样增量求和，只暴露最近 {30} 天窗口的流量，不透露主机总承载量。</span>
+            </span>
+          </label>
+        </div>
+        {!cfg.fields.network && (
+          <div className="cell-sub" style={{ marginTop: 8 }}>
+            提示：需先在下方「展示信息项 → 网络」中勾选「网络流量」本项才生效。
+          </div>
+        )}
+      </div>
+
       {/* 字段开关 */}
       <div className="card">
         <h3>展示信息项</h3>
@@ -258,6 +301,7 @@ export default function SiteConfig() {
         <h3>安全说明</h3>
         <ul className="public-tips">
           <li>公开接口从来不返回主机标识：节点对外只有派生编号（<code>n-xxxxxxxx</code>），无法反推 <code>agent_id</code>、硬件 UUID 与内网地址。</li>
+          <li>网络统计只下发**速率**与**按口径裁剪后的累计量**；网卡累计原始计数器不出现在公开响应中，趋势图的流量由服务端按相邻采样差值计算。</li>
           <li>公网 IP 即使开启也会做部分掩码（<code>203.0.*.*</code>），精确经纬度永不公开。</li>
           <li>公开页的实时推送与查询走独立限流，且总开关关闭时端点直接 404。</li>
           <li>本页的每一次保存都会写入操作审计（分类 <code>op</code>），可在「操作审计」中追溯。</li>
@@ -278,6 +322,7 @@ function normalizeConfig(c) {
     fields: src.fields && typeof src.fields === 'object' ? { ...src.fields } : {},
     title: src.title || '',
     description: src.description || '',
+    traffic_mode: src.traffic_mode === 'window' ? 'window' : 'boot',
   }
 }
 

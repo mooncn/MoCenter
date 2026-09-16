@@ -62,6 +62,7 @@ var FieldCatalog = []Field{
 	{Key: "kernel_version", Label: "内核版本", Group: "系统", Default: false, Sensitive: true, Description: "精确内核版本属于漏洞指纹"},
 
 	{Key: "geo", Label: "地区", Group: "网络", Default: true, Description: "国家 / 省份 / 城市"},
+	{Key: "network", Label: "网络流量", Group: "网络", Default: true, Description: "实时上下行速率与自启动累计流量（README 中的站点核心指标）"},
 	{Key: "public_ip", Label: "公网 IP", Group: "网络", Default: false, Sensitive: true, Description: "公网出口 IP（暴露资产归属）"},
 	{Key: "public_ipv6", Label: "公网 IPv6", Group: "网络", Default: false, Sensitive: true, Description: "公网 IPv6 出口"},
 
@@ -103,6 +104,22 @@ func DefaultFields() map[string]bool {
 	return m
 }
 
+// 流量统计口径。
+const (
+	// TrafficModeBoot 自设备启动以来的累计流量（网卡计数器，来自当前探针）。
+	TrafficModeBoot = "boot"
+	// TrafficModeWindow 历史留存窗口内的累计流量（各采样点增量之和）。
+	TrafficModeWindow = "window"
+)
+
+// NormalizeTrafficMode 归一化流量口径，非法值回退 boot（有值且无需查库）。
+func NormalizeTrafficMode(v string) string {
+	if trimSpace(v) == TrafficModeWindow {
+		return TrafficModeWindow
+	}
+	return TrafficModeBoot
+}
+
 // Config 公开站点展示配置。
 type Config struct {
 	// Enabled 总开关（**默认关闭**）：关闭时公开页 404，接口返回 enabled=false。
@@ -118,6 +135,19 @@ type Config struct {
 	// Title / Description 公开页标题与说明（便于区分"对内部/对外"两种场景）。
 	Title       string `json:"title"`
 	Description string `json:"description"`
+
+	// TrafficMode 流量统计口径：boot（自设备启动） / window（历史留存窗口内）。
+	// 直连连接类主机（HTTPS/流媒体/代理）长期累计流量很大，对外开放时更适合用
+	// window 口径，避免暴露总承载量。
+	TrafficMode string `json:"traffic_mode"`
+}
+
+// TrafficModeOrDefault 返回生效的流量口径（空值按 boot 处理）。
+func (c *Config) TrafficModeOrDefault() string {
+	if c == nil {
+		return TrafficModeBoot
+	}
+	return NormalizeTrafficMode(c.TrafficMode)
 }
 
 // Default 返回默认配置：总开关关闭，字段取目录默认值。
@@ -130,6 +160,7 @@ func Default() *Config {
 		Fields:         DefaultFields(),
 		Title:          "MoCenter 节点状态",
 		Description:    "本页面由 MoCenter 公开站点提供，仅展示非敏感运行指标。",
+		TrafficMode:    TrafficModeBoot,
 	}
 }
 
@@ -158,6 +189,7 @@ func (c *Config) normalize() {
 		}
 	}
 	c.HostIDs = ids
+	c.TrafficMode = NormalizeTrafficMode(c.TrafficMode)
 }
 
 // FieldVisible 判断字段是否对公开页可见。
