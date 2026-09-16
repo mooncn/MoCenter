@@ -34,6 +34,11 @@ api.interceptors.response.use(
 )
 
 export const Api = {
+  // Agent 接入信息（服务端地址/身份指纹/注册密钥），用于生成"一条命令"接入新主机
+  async serverInfo() {
+    const { data } = await api.get('/server-info')
+    return data
+  },
   // 获取全部主机（含离线）
   async agents() {
     const { data } = await api.get('/agents')

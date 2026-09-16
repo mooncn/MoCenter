@@ -318,29 +318,82 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
 1. **设置登录账号**：服务端启动时通过 `-user` / `-password` 指定后台账号，并在 Web「账号设置」里
    绑定 OTP 二次校验。凭证只有一种：用户名 + 密码(+OTP)，**没有全局 API Key**。
 2. **IP 白名单**：通过 `-whitelist 1.2.3.4,10.0.0.0/8` 限制可访问服务端的源 IP。
-3. **TLS/mTLS**：Agent<->Server 支持全链路 TLS 加密，可升级为 mTLS 双向认证。生成自签名证书：
+3. **TLS/mTLS —— 默认已开启，通常无需配置**：
+
+   服务端首次启动会自动生成**部署身份 CA**（`<data>/ca.crt` + `ca.key`，0600），并据此：
+
+   - 自动签发 Agent 通道的服务端证书 → 该通道**开箱即 TLS**；
+   - 自动签发 Web 控制台"当前部署临时证书" → 控制台**默认 HTTPS/WSS**（并附带 HSTS）。
+
+   Agent 只需要服务端的注册密钥，其余全自动：
+
+   ```bash
+   # 服务端（不给任何证书参数）
+   ./mocenter-server -listen :9000 -http :8080 -user admin -password <密码> -web ../web/dist
+
+   # Agent（只给注册密钥；首次连接自动换取客户端证书，之后走 mTLS）
+   ./mocenter-agent -server your.server.com:9000 -agentid host-01 -agent-key <服务端 <data>/agent.key 的内容>
+   ```
+
+   浏览器访问 `https://<总控>:8080` 会提示自签名证书，**接受即可**；若要受信任证书，
+   配 `-web-tls-cert/-web-tls-key`（或前面挂 TLS 反代并加 `-admin-tls-days=0` 关闭自动 HTTPS）。
+
+   需要手工控制证书时（外部 CA / 正式证书 / 预置固定证书）：
 
    ```bash
    bash scripts/gen-cert.sh certs   # 生成 ca.crt / server.crt / client.crt
-   ```
+   # 或：cd scripts/gencerts && go run . all -ip <服务端IP> -dns <域名> -server-config ... -agent-config ...
 
-   **单向 TLS**（加密传输）：
-   ```bash
    # 服务端
-   ./mocenter-server -listen :9000 -http :8080 -user admin -password <密码> -tls-cert certs/server.crt -tls-key certs/server.key
-   # Agent（自签名跳过校验）
-   ./mocenter-agent -server host:9000 -agentid host-01 -tls -insecure
+   ./mocenter-server -listen :9000 -http :8080 -user admin -password <密码> \
+     -tls-cert certs/server.crt -tls-key certs/server.key -ca-cert certs/ca.crt
+   # Agent（携带客户端证书，并用 CA 校验服务端）
+   ./mocenter-agent -server host:9000 -agentid host-01 \
+     -client-cert certs/client.crt -client-key certs/client.key -ca-cert certs/ca.crt
    ```
 
-   **mTLS 双向认证**（服务端校验 Agent 客户端证书）：
+   想避开"自签证书必须匹配 SAN"的老问题（换 IP、加域名、走内网地址都会让校验失败，
+   最终往往被迫改成 `-insecure` 等于关掉校验），用**公钥指纹**代替 CA 文件：
+
    ```bash
-   # 服务端（额外提供 -ca-cert，要求 Agent 携带有效客户端证书）
-   ./mocenter-server -listen :9000 -http :8080 -user admin -password <密码> -tls-cert certs/server.crt -tls-key certs/server.key -ca-cert certs/ca.crt
-   # Agent（携带客户端证书，并用 CA 校验服务端证书）
-   ./mocenter-agent -server host:9000 -agentid host-01 -tls -client-cert certs/client.crt -client-key certs/client.key -ca-cert certs/ca.crt
+   ./mocenter-agent -server host:9000 -agentid host-01 -server-fingerprint <指纹>
    ```
 
-   生产环境建议使用受信任 CA 签发的证书，实现 mTLS 双向认证。Web 端启用 HTTPS/WSS。
+   指纹在服务端启动日志、Web「Agent 接入」页可见（形如 `1f8d 86c9 94fb 5a97`），
+   也可直接取 `<data>/ca.crt` 的公钥指纹。它绑定的是 CA 身份，与服务端地址无关。
+
+   | 参数 | 作用 |
+   |------|------|
+   | `-require-agent-cert`（服务端） | 强制 Agent 必须携带客户端证书（不再接受"先换取"）。**建议在全量 Agent 换取完成后再开启** |
+   | `-allow-unauthenticated-agents`（服务端） | **危险**，迁移期临时关闭注册鉴权 |
+   | `-server-name`（服务端） | 部署身份名，写入 CA，用于区分多套总控 |
+   | `-server-fingerprint`（Agent） | 公钥指纹固定，免 CA 文件、不受服务端换 IP/证书影响 |
+   | `-enroll-secret`（Agent） | 换取证书用的注册密钥（默认取 `agent_key`，换取成功后自动清空） |
+   | `-creds-dir`（Agent） | 客户端证书落盘目录（默认 `<配置目录>/creds`） |
+
+   **信任模型（三类角色各管一件事）**
+
+   | 凭据 | 位置 | 作用 | 生命周期 |
+   |------|------|------|----------|
+   | 注册密钥 `agent.key` | 服务端 `<data>/`，Agent 配置文件 | 让 Agent 被接纳 | 一次性：换取证书后从 Agent 配置清空 |
+   | CA 证书/私钥 `ca.crt`/`ca.key` | 服务端 `<data>/`（0600） | 让双方确认属于同一套总控 | 长期；**变更即需重新换取**，建议备份 |
+   | 客户端证书 `client.crt`/`client.key` | Agent `<配置目录>/creds/`（0600） | 让每次连接可验证 | 自动签发（默认 3650 天），私钥仅存本机 |
+
+   升级/迁移注意：
+
+   - Agent 换取过证书后，配置里 `enrollment_secret` 会被清空，`agent_key` 可保留（便于
+     服务端 CA 重建后重新换取）。要重新换取：删除 `creds/` 并把密钥填回
+     `enroll-secret`（或 `agent_key`）。
+   - 服务端重装/更换 CA 后，Agent 会收到"身份指纹不一致"或链校验失败；此时按上一条重新换取，
+     或把新指纹填进 `server_fingerprint`。**服务端重装前请备份 `<data>/ca.key`。**
+   - 旧版 Agent 无需改动：服务端默认允许"无证书连接先换取"，换取成功后自动收敛为 mTLS。
+   - **`-require-agent-cert` 的正确用法**：它是"新 Agent 的部署前开关"。
+     客户端证书只在 TLS 握手阶段生效；若一上来就强制，新装的 Agent 会在发出换取请求之前
+     被拒绝（表现为 `tls: certificate required`，而服务端没有任何日志，运维很难判断原因）。
+     因此：**先不带该开关完成全量 Agent 的首次换取，再开启**；
+     或对确需提前管控的环境，先给每台 Agent 预置 `client.crt`/`client.key` 再开启。
+     服务端日志会对被拒的连接给出两种区分：
+     "该 Agent 尚未持有证书" / "对端可能出示了非本套 CA 签发的证书"。
 
 4. **命令黑名单**：高危命令（`rm -rf /`、`mkfs`、`sudo` 等）由服务端拦截并记录审计。
 

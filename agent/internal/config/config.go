@@ -43,6 +43,15 @@ type Config struct {
 	// 规格形如 "icmp:1.1.1.1" / "tcp:1.1.1.1:443" / "http:https://example.com"，
 	// 省略 kind 前缀时按 icmp 处理。留空 = 不探测（不影响任何其它功能）。
 	LatencyTargets []string `json:"latency_targets"`
+	// ServerFingerprint 服务端身份公钥指纹（16 位 hex，可带分隔符）。
+	//
+	// 填了它就用"公钥指纹固定"校验服务端，**不需要 CA 文件、也不需要 -insecure**，
+	// 且服务端更换 IP/域名/证书都不必更新。留空则退回标准校验（系统根或 -ca-cert）。
+	ServerFingerprint string `json:"server_fingerprint"`
+	// EnrollmentSecret 首次连接时可用于换取客户端证书的注册密钥。
+	// 换取成功后证书与私钥落盘为 <配置目录>/client.crt|client.key（0600），
+	// 随后本字段会被**自动清空**（不再需要，减少泄露面）。
+	EnrollmentSecret string `json:"enrollment_secret"`
 }
 
 // DefaultPath 返回默认配置文件路径（便携态：与可执行文件同目录）。

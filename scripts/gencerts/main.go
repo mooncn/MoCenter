@@ -18,6 +18,15 @@
 //	  - server 证书的 SAN 会把 -ip / -dns 加入，供 Agent 按真实服务端 IP/域名做 TLS 校验；
 //	  - 重复运行 server/client 会用现有 CA 重签，Agent 侧 client.crt/ca.crt 无需更换，
 //	    仅服务端替换 server.crt/server.key。
+//
+//	**一般不需要本工具**：MoCenter 服务端首次启动会自动生成 CA 与证书，
+//	Agent 也只需服务端数据目录里的 agent.key 就能自动换取客户端证书（"简单模式"）。
+//	本工具适用于以下场景：
+//	  - 想用外部 CA / 正式证书（受信任的 HTTPS、内网 PKI）；
+//	  - 想先把证书预置好再部署（离线、审计要求固定的长期证书）；
+//	  - 需要在多台机器间分发同一套凭证。
+//	只有 SAME CA 签出的证书才能互相通过校验 —— 与服务端内置 CA 混用时，服务端的
+//	ca.crt/ca.key 需要替换为本工具生成的这套。
 package main
 
 import (
@@ -184,12 +193,12 @@ func saveConfig(path string, m map[string]any) error {
 func genCA(dir string) {
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "MoCenter-CA"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().AddDate(10, 0, 0),
-		IsCA:         true,
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "MoCenter-CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
@@ -301,7 +310,9 @@ func dedupeIPs(ips []net.IP) []net.IP {
 	return out
 }
 
-func certPEM(der []byte) []byte { return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}) }
+func certPEM(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
 
 func keyPEM(k *ecdsa.PrivateKey) []byte {
 	der, _ := x509.MarshalECPrivateKey(k)

@@ -42,6 +42,9 @@ func main() {
 	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
 	proxyIP := flag.String("proxy-ip", os.Getenv("MOCENTER_PROXY_IP"), "国内加速代理前缀（用于公网 IP 探测等境外服务，如 http://fa.mooncn.win/?url= ）")
 	agentKey := flag.String("agent-key", os.Getenv("MOCENTER_AGENT_KEY"), "与服务端预共享的注册密钥（服务端 agent.key 的内容）")
+	enrollSecret := flag.String("enroll-secret", os.Getenv("MOCENTER_ENROLL_SECRET"), "首次换取客户端证书用的注册密钥（换取成功后自动清空）")
+	serverFingerprint := flag.String("server-fingerprint", os.Getenv("MOCENTER_SERVER_FINGERPRINT"), "服务端身份公钥指纹（免 CA 文件校验服务端，服务端换地址/证书都不必更新）")
+	credsDir := flag.String("creds-dir", "", "客户端证书落盘目录（默认 <配置目录>/creds）")
 	upgradePubKey := flag.String("upgrade-pubkey", "", "升级包 Ed25519 公钥（hex 或文件路径）；未配置则拒绝升级，除非加 -upgrade-allow-unsigned")
 	upgradeAllowUnsigned := flag.Bool("upgrade-allow-unsigned", false, "允许无签名升级（危险：任何人拿到通道即可让本机执行任意二进制）")
 	latencyTargets := flag.String("latency-targets", "", "延迟探测目标，逗号分隔（如 icmp:1.1.1.1,tcp:1.1.1.1:443,http:https://example.com ）")
@@ -76,6 +79,8 @@ func main() {
 			CACert:               *caCert,
 			ProxyIP:              *proxyIP,
 			AgentKey:             *agentKey,
+			ServerFingerprint:    *serverFingerprint,
+			EnrollmentSecret:     firstNonEmpty(*enrollSecret, *agentKey),
 			UpgradePubKey:        *upgradePubKey,
 			UpgradeAllowUnsigned: *upgradeAllowUnsigned,
 			LatencyTargets:       splitList(*latencyTargets),
@@ -126,6 +131,12 @@ func main() {
 		if cfg.AgentKey != "" && *agentKey == os.Getenv("MOCENTER_AGENT_KEY") {
 			*agentKey = cfg.AgentKey
 		}
+		if cfg.ServerFingerprint != "" && *serverFingerprint == os.Getenv("MOCENTER_SERVER_FINGERPRINT") {
+			*serverFingerprint = cfg.ServerFingerprint
+		}
+		if cfg.EnrollmentSecret != "" && *enrollSecret == os.Getenv("MOCENTER_ENROLL_SECRET") {
+			*enrollSecret = cfg.EnrollmentSecret
+		}
 		if cfg.UpgradePubKey != "" && *upgradePubKey == "" {
 			*upgradePubKey = cfg.UpgradePubKey
 		}
@@ -156,12 +167,14 @@ func main() {
 			"ca-cert":                func() { cfg.CACert = *caCert },
 			"proxy-ip":               func() { cfg.ProxyIP = *proxyIP },
 			"agent-key":              func() { cfg.AgentKey = *agentKey },
+			"enroll-secret":          func() { cfg.EnrollmentSecret = *enrollSecret },
+			"server-fingerprint":     func() { cfg.ServerFingerprint = *serverFingerprint },
 			"upgrade-pubkey":         func() { cfg.UpgradePubKey = *upgradePubKey },
 			"upgrade-allow-unsigned": func() { cfg.UpgradeAllowUnsigned = *upgradeAllowUnsigned },
 			"latency-targets":        func() { cfg.LatencyTargets = splitList(*latencyTargets) },
 		}
 		dirty := false
-		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "upgrade-pubkey", "upgrade-allow-unsigned", "latency-targets"} {
+		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "enroll-secret", "server-fingerprint", "upgrade-pubkey", "upgrade-allow-unsigned", "latency-targets"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -213,6 +226,20 @@ func main() {
 	}
 	defer release()
 
+	// 换取成功后清理：证书路径写回配置、注册密钥清空（一次性使用）。
+	// 这样运维在配置里再也看不到可直接冒充的长期凭据，只有本机 0600 的证书私钥。
+	handleEnrolled := func(cred client.CredentialFiles) {
+		cfg.ClientCert = cred.CertFile
+		cfg.ClientKey = cred.KeyFile
+		if cfg.CACert == "" {
+			cfg.CACert = cred.CAFile
+		}
+		cfg.EnrollmentSecret = ""
+		if err := config.Save(*configPath, cfg); err != nil {
+			log.Printf("警告: 保存换取结果到配置失败: %v", err)
+		}
+	}
+
 	start := func() {
 		// 服务模式：进程级重启交给 SCM（安装器已配置失败恢复动作），但进程内仍需兜住
 		// panic —— 否则 goroutine 静默死掉，服务却仍显示 Running。
@@ -222,7 +249,11 @@ func main() {
 			clientCert: *clientCert, clientKey: *clientKey, caCert: *caCert,
 			proxyIP: *proxyIP, agentKey: *agentKey,
 			upgradePubKey: *upgradePubKey, allowUnsigned: *upgradeAllowUnsigned,
-			latencyTargets: splitList(*latencyTargets),
+			latencyTargets:    splitList(*latencyTargets),
+			serverFingerprint: *serverFingerprint,
+			enrollSecret:      firstNonEmpty(*enrollSecret, *agentKey),
+			onEnrolled:        handleEnrolled,
+			configPath:        *configPath, credsDir: *credsDir,
 		}
 		if *daemonize || winapp.IsWindowsService() {
 			daemon.Supervise(func() { runClient(o) })
@@ -262,6 +293,9 @@ type runOpts struct {
 	agentKey, upgradePubKey                string
 	allowUnsigned                          bool
 	latencyTargets                         []string
+	serverFingerprint, enrollSecret        string
+	configPath, credsDir                   string
+	onEnrolled                             func(client.CredentialFiles)
 }
 
 func runClient(o runOpts) {
@@ -281,7 +315,14 @@ func runClient(o runOpts) {
 		UpgradePubKey:        o.upgradePubKey,
 		UpgradeAllowUnsigned: o.allowUnsigned,
 		LatencyTargets:       o.latencyTargets,
+		ServerFingerprint:    o.serverFingerprint,
+		EnrollmentSecret:     o.enrollSecret,
+		ConfigPath:           o.configPath,
+		CredDir:              o.credsDir,
 	})
+	if o.onEnrolled != nil {
+		c.SetOnEnrolled(o.onEnrolled)
+	}
 	log.Printf("[agent] 启动 %s，Agent %s，目标服务端 %s", version.Full(), o.agentID, o.server)
 	c.Run()
 }
@@ -297,4 +338,14 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// firstNonEmpty 返回第一个非空白字符串。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }

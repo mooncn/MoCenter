@@ -12,6 +12,7 @@ import SiteConfig from './pages/SiteConfig.jsx'
 import Latency from './pages/Latency.jsx'
 import Deploy from './pages/Deploy.jsx'
 import Backup from './pages/Backup.jsx'
+import AgentEnroll from './pages/AgentEnroll.jsx'
 import Login from './pages/Login.jsx'
 import PublicStatus, { PublicNode } from './pages/PublicStatus.jsx'
 import { Api, MCSocket } from './api/api.js'
@@ -34,6 +35,7 @@ export const NAV_ITEMS = [
   { to: `${ADMIN}/audit`, label: '操作审计', icon: '📋' },
   { to: `${ADMIN}/site-config`, label: '展示配置', icon: '🪧' },
   { to: `${ADMIN}/deploy`, label: '部署 Agent', icon: '🚀' },
+  { to: `${ADMIN}/enroll`, label: 'Agent 接入', icon: '🔐' },
   { to: `${ADMIN}/backup`, label: '备份恢复', icon: '💾' },
   { to: `${ADMIN}/account`, label: '账号设置', icon: '⚙️' },
 ]
@@ -124,6 +126,7 @@ function Layout() {
             <Route path="/site-config" element={<SiteConfig />} />
             <Route path="/latency" element={<Latency agents={agents} />} />
             <Route path="/deploy" element={<Deploy />} />
+            <Route path="/enroll" element={<AgentEnroll />} />
             <Route path="/backup" element={<Backup />} />
             <Route path="/account" element={<Account />} />
             {/* 兜底：未知后台路径回到仪表盘，而不是空白页 */}

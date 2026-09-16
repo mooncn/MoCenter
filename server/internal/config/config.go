@@ -50,6 +50,14 @@ type Config struct {
 	// 配置后，节点地区**优先**由本地库解析（无网络、无配额、支持 IPv6），
 	// 未命中再降级到外部 HTTP 接口。留空 = 不启用（行为与从前一致）。
 	MMDBPath string `json:"mmdb_path"`
+	// RequireAgentCert 要求 Agent 必须携带客户端证书。
+	// 默认 false：允许 Agent 先用注册密钥在 TLS 连接上换取证书（"简单模式"），
+	// 换取成功即必须携带证书，故默认配置下依然收敛到 mTLS。
+	RequireAgentCert bool `json:"require_agent_cert"`
+	// AdminTLSDays Web 控制台自动 HTTPS 证书有效期（天）；0 关闭自动 HTTPS。
+	AdminTLSDays int `json:"admin_tls_days"`
+	// ServerName 部署身份名：写入服务端 CA，用于区分多套总控（防止 Agent 连错机器）。
+	ServerName string `json:"server_name"`
 }
 
 // DefaultPath 返回默认配置文件路径（便携态：与可执行文件同目录）。

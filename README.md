@@ -117,37 +117,58 @@ cd server
 ./mocenter-server -listen :9000 -http :8080 -user admin -password your-password
 # 可选: -whitelist 1.2.3.4,10.0.0.0/8   # IP 白名单
 # 可选: -web web/dist                  # 同时托管 Web 前端（单进程部署）
-# 可选: -tls-cert server.crt -tls-key server.key   # Agent 连接启用 TLS 加密
-# 可选: -ca-cert ca.crt                            # 启用 mTLS 双向认证（Agent 须携带客户端证书）
+# 可选: -require-agent-cert            # 强制 Agent 携带客户端证书（默认允许"先换取"）
+# 可选: -admin-tls-days 30             # Web 控制台自动 HTTPS 证书有效期；0 = 关闭（走 TLS 反代时用）
+# 可选: -server-name prod-01            # 部署身份名，区分多套总控
 ```
+
+> **开箱即用的加密**：启动时会自动生成部署身份 CA（`<data>/ca.crt` + `ca.key`，0600）：
+> - **Agent 通道**：自动签发服务端证书，"开箱即 TLS"；
+> - **Web 控制台**：自动签发当前部署临时证书，**默认 HTTPS/WSS**（浏览器会提示自签名，
+>   接受即可；要受信任证书就配 `-web-tls-cert/-web-tls-key`，或 `-admin-tls-days=0` 交给 TLS 反代）。
 
 ### 3. 启动 Agent
 
 ```bash
-# Linux
-./mocenter-agent -server your.server.com:9000 -agentid host-01
+# Linux：只需要服务端地址 + 注册密钥（<data>/agent.key 的内容），无需任何证书文件
+./mocenter-agent -server your.server.com:9000 -agentid host-01 -agent-key <注册密钥>
 # 后台守护 + 崩溃自启
-./mocenter-agent -server your.server.com:9000 -agentid host-01 -daemon
-# 启用 TLS 加密连接（自签名证书用 -insecure 跳过校验）
-./mocenter-agent -server your.server.com:9000 -agentid host-01 -tls -insecure
-# 启用 mTLS 双向认证：携带客户端证书，并用 CA 校验服务端证书
-./mocenter-agent -server your.server.com:9000 -agentid host-01 -tls \
-  -client-cert client.crt -client-key client.key -ca-cert ca.crt
+./mocenter-agent -server your.server.com:9000 -agentid host-01 -agent-key <注册密钥> -daemon
 
 # Windows 交叉编译
 bash agent/build.sh windows   # 生成 mocenter-agent.exe
 ```
+
+首次启动会自动用注册密钥向服务端**换取客户端证书**，之后每次连接都携带证书（mTLS），
+证书落在 `<配置目录>/creds/`（0600），配置里的 `enrollment_secret` 随即被清空。
+
+> **手工证书方式仍可用**（外部 CA / 正式证书 / 预置审计场景）：
+> ```bash
+> ./mocenter-server ... -tls-cert server.crt -tls-key server.key -ca-cert ca.crt
+> ./mocenter-agent ... -client-cert client.crt -client-key client.key -ca-cert ca.crt
+> ```
+> 还可以用**公钥指纹**免掉 CA 文件、也不再受服务端换 IP/证书影响：
+> `./mocenter-agent ... -server-fingerprint <服务端指纹>`（服务端启动日志与 Web 会显示）。
 
 > **设备身份说明**：系统以**硬件 UUID** 作为一台机器的唯一身份，`agent_id` 只是
 > 可变的名字（显示与路由用）。首次启动会自动探测 UUID 并写入配置（`uuid` 字段），
 > 因此**修改 `agent_id`、重装或换配置目录都不会让同一台机器变成两台**，不会产生冗余数据。
 > 也可显式指定：`-agentid host-01 -uuid <硬件UUID>`。
 
-### 4. 生成 TLS/mTLS 证书（可选）
+### 4. 生成 TLS/mTLS 证书（一般不需要）
+
+服务端与 Agent 默认已自动完成证书签发与换取，**不需要手工生成**。
+仅在需要外部 CA / 正式证书 / 预置固定证书时使用：
 
 ```bash
 bash scripts/gen-cert.sh ./certs   # 生成 ca / server / client 三套证书
+# 或用 Go 版（Windows 无需 openssl，可按真实 IP/域名写 SAN、并把路径写进两侧配置）
+cd scripts/gencerts && go run . all -ip <服务端IP> -dns <域名> \
+  -server-config ../../mocenter-server.json -agent-config ../../mocenter-agent.json
 ```
+
+> 想让服务端复用这套 CA（例如要与既有 Agent 共用同一份信任根）：
+> 把 `ca.crt` 与 `ca.key` 放进服务端数据目录，服务端会直接沿用（日志会打印身份名与指纹）。
 
 ### 5. 访问 Web
 
@@ -416,6 +437,38 @@ Agent TCP 通道要求每台 Agent 持有与服务端一致的**预共享密钥*
 - 迁移期如需临时回退旧行为（不校验），可在服务端加
   `-allow-unauthenticated-agents`（**危险**，会打印醒目警告）。
 
+### 证书与信任关系（为什么现在几乎不用配）
+
+需要运维分发的**只有一个内容物：注册密钥（`agent.key`）**。除此之外全自动：
+
+| 环节 | 做法 | 运维要做什么 |
+|------|------|--------------|
+| 服务端身份 | 首次启动自动生成部署身份 CA（`<data>/ca.crt` + `ca.key`，0600） | 无 |
+| Agent 通道加密 | 用内置 CA 现场签发服务端证书 | 无 |
+| Agent 身份 | 首次连接用注册密钥换取客户端证书（换到的证书 CN = `agent_id`） | 只在 `-agent-key` 填密钥 |
+| 服务端校验 Agent | 校验证书链；后续连接必须携带证书 | 无 |
+| Web 控制台 | 自动签发当前部署临时证书，默认 HTTPS/WSS | 无（可用正式证书替换） |
+
+三类角色各管一件事，避免"一个口令管所有事"：
+
+- **注册密钥**（`agent.key`，0600）：**让 Agent 被接纳**，一次性（换取证书后即从配置里清空）；
+- **CA 身份**（`ca.crt`/`ca.key`，0600）：**让双方确认彼此属于同一套总控**，CA 一变指纹就变；
+- **客户端证书**（自动签发、自动轮换，`<配置目录>/creds/`，0600）：**让每次连接可被验证**，
+  私钥由 Agent 本地生成，服务端从不下发、也不保管。
+
+可选增强：
+
+- 想免掉 CA 文件、也不受服务端换 IP/证书影响 → Agent 配 `-server-fingerprint <指纹>`
+  （等价于"记住这台服务器的公钥"，服务端日志与 Web「Agent 接入」页会显示）；
+- 想完全禁掉"先换取"这一跳 → 服务端加 `-require-agent-cert`（此后只接受已持证 Agent）。
+  **注意先换取、再开启**：客户端证书只在握手阶段生效，若一开始就强制，新 Agent 会在发出
+  换取请求前被拒（客户端报 `tls: certificate required`）。先让全部 Agent 完成一次换取，再打开该开关；
+- 想用外部 CA / 正式证书 → 照旧配 `-tls-cert/-tls-key/-ca-cert` 与
+  `-client-cert/-client-key/-ca-cert`，或把自备的 `ca.crt`+`ca.key` 放进服务端数据目录。
+- 服务端 CA 变化（重装、手工替换）后：Agent 会因指纹/链不匹配被拒，此时删除
+  `<配置目录>/creds/` 并把 `agent_key` 填回配置即可重新换取；或把新指纹填进
+  `server_fingerprint`。**服务端重装前建议先备份 `<data>/ca.key`**（`agent.key` 同理）。
+
 ### 修改密码
 
 1. 登录后点击左侧 **「账号设置」**。
@@ -451,7 +504,8 @@ Agent TCP 通道要求每台 Agent 持有与服务端一致的**预共享密钥*
 - ✅ **移动端自适应 UI**：响应式布局（侧边栏抽屉、表格卡片化、栅格表单），支持手机/平板操作
 - ✅ 鉴权（Token）+ IP 白名单 + 速率限制
 - ✅ Agent 断线指数退避重连、进程守护崩溃自启
-- ✅ **TLS/mTLS 加密**：Agent<->Server 可选全链路 TLS 单向加密，或 mTLS 双向认证（客户端证书 + CA 校验）
+- ✅ **零配置 TLS/mTLS**：服务端自动生成部署身份 CA 与证书，Agent 只需注册密钥即可换取客户端证书（mTLS）；Web 控制台默认 HTTPS/WSS + HSTS；也支持外部 CA 与公钥指纹校验
+- ✅ **Agent"简单模式"**：一个 `agent.key` 完成加密 + 双向认证，无需分发 ca.crt / client.crt / client.key
 - ✅ **服务端托管 Web 静态资源**：`-web web/dist` 单进程部署
 - ✅ **Windows 图形安装程序**：向导式安装（选择角色 → 连接与认证 → 高级设置），一键注册为**真正的 Windows 服务**（SCM 握手、失败自动重启），配置与数据固定于 `%ProgramData%\MoCenter\<角色>\`；另附命令行引擎用于静默批量部署；带命名互斥体单实例保护，同时保留便携单文件形态
 - ✅ **远程桌面 (VNC)**：服务端隧道 + noVNC 浏览器渲染，一键安装/启动（Windows **UltraVNC** / Linux **x11vnc**，支持国内加速代理）；**安装包可由服务端托管并经长连接分发**（避免公网慢/被劫持）；Windows 与 Linux 均支持**交互会话模式**与**服务模式**（后者可查看锁屏/登录界面）；连接后右下角悬浮工具栏支持**全屏**、自适应缩放、Ctrl+Alt+Del、**光标大小调节**与**移动端虚拟鼠标**

@@ -40,8 +40,12 @@ type options struct {
 	installDir string // 二进制目录
 	dataRoot   string // 数据根目录
 	extra      string // 追加到服务命令行的额外参数
-	purge      bool   // 卸载时是否删除数据
-	keepBins   bool   // 卸载时保留二进制（由外部安装器负责删除时用）
+	// serverFingerprint 服务端身份公钥指纹（免 CA 文件校验服务端；可选）。
+	serverFingerprint string
+	// serverName 部署身份名（写入服务端 CA，便于区分多套总控；可选）。
+	serverName string
+	purge      bool // 卸载时是否删除数据
+	keepBins   bool // 卸载时保留二进制（由外部安装器负责删除时用）
 }
 
 func main() {
@@ -61,7 +65,9 @@ func main() {
 	flag.StringVar(&o.webDir, "web", "", "Server 托管的 Web 静态资源目录（留空则不托管前端）")
 	flag.StringVar(&o.installDir, "dir", `C:\Program Files\MoCenter`, "安装目录（存放二进制）")
 	flag.StringVar(&o.dataRoot, "data", `C:\ProgramData\MoCenter`, "数据根目录（配置/数据库/日志）")
-	flag.StringVar(&o.extra, "extra", "", "追加到服务命令行的额外参数（如 -tls -ca-cert C:\\ca.crt）")
+	flag.StringVar(&o.extra, "extra", "", "追加到服务命令行的额外参数")
+	flag.StringVar(&o.serverFingerprint, "server-fingerprint", "", "服务端身份公钥指纹（可选；填了就不需要 CA 文件，也不受服务端换 IP/证书影响）")
+	flag.StringVar(&o.serverName, "server-name", "", "部署身份名（可选；写入服务端 CA，用于区分多套总控）")
 	flag.BoolVar(&o.purge, "purge", false, "卸载时同时删除配置与数据（默认保留）")
 	flag.BoolVar(&o.keepBins, "keep-binaries", false, "卸载时保留二进制（由外层安装器负责删除时使用）")
 

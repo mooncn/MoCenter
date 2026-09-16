@@ -187,6 +187,11 @@ func writeConfig(role, path string, o options) error {
 		if o.webDir != "" {
 			obj["web_dir"] = o.webDir
 		}
+		// 服务端默认自动生成 CA 与 Agent 通道证书（零配置 TLS），
+		// 这里只记录身份名，便于多套总控之间区分。
+		if strings.TrimSpace(o.serverName) != "" {
+			obj["server_name"] = strings.TrimSpace(o.serverName)
+		}
 	} else {
 		if strings.TrimSpace(o.agentKey) == "" {
 			return errors.New("安装 Agent 必须指定 -agent-key（取服务端 <data>\\agent.key 的内容）：" +
@@ -196,6 +201,12 @@ func writeConfig(role, path string, o options) error {
 			"server":    o.server,
 			"agent_key": strings.TrimSpace(o.agentKey),
 			"daemon":    true,
+			// 首次启动用注册密钥换取客户端证书（服务端内置 CA 签发），
+			// 换取成功后该字段会被清空、证书落到 creds\ 下 —— 运维无需手工准备证书。
+			"enrollment_secret": strings.TrimSpace(o.agentKey),
+		}
+		if strings.TrimSpace(o.serverFingerprint) != "" {
+			obj["server_fingerprint"] = strings.TrimSpace(o.serverFingerprint)
 		}
 		if o.agentID != "" {
 			obj["agent_id"] = o.agentID

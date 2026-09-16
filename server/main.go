@@ -21,6 +21,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -68,6 +69,7 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "Agent TCP 连接 TLS 证书文件路径")
 	tlsKey := flag.String("tls-key", "", "Agent TCP 连接 TLS 私钥文件路径")
 	caCert := flag.String("ca-cert", "", "mTLS 客户端 CA 证书文件路径（提供后启用双向认证，Agent 需携带客户端证书）")
+	requireAgentCert := flag.Bool("require-agent-cert", false, "要求 Agent 必须携带客户端证书（默认允许无证书连接自行换取，兼容旧版 Agent）")
 	insecure := flag.Bool("insecure", false, "允许非 TLS 的 Agent 连接（未提供证书时自动启用）")
 	// 便携态默认与可执行文件同目录（不随启动方式变化）；安装态由安装器显式传 -data
 	defaultDataDir := config.DefaultDataDir()
@@ -83,6 +85,8 @@ func main() {
 	allowAnonAgents := flag.Bool("allow-unauthenticated-agents", false, "允许 Agent 无凭证注册（危险：任何能连通 :9000 的主机都可注册/冒名）")
 	webTLSCert := flag.String("web-tls-cert", "", "Web 控制台 TLS 证书（不配置则 :8080 为明文 HTTP）")
 	webTLSKey := flag.String("web-tls-key", "", "Web 控制台 TLS 私钥")
+	adminTLSDays := flag.Int("admin-tls-days", 30, "Web 控制台自动 HTTPS 证书有效期（天）；0 表示关闭自动 HTTPS")
+	serverName := flag.String("server-name", "", "部署身份名（写入服务端 CA，用于区分多套总控；留空自动生成）")
 	tokenTTL := flag.Duration("token-ttl", auth.DefaultTokenTTL, "会话 Token 有效期（默认 12h）")
 	flag.Parse()
 
@@ -104,15 +108,18 @@ func main() {
 			DataDir:   *dataDir,
 			User:      *user,
 			// 不落盘明文密码与 TOTP 密钥：账号以哈希持久化到 users.json
-			Password:   "",
-			TOTPSecret: "",
-			PkgDir:     *pkgDir,
-			AgentKey:   *agentKey,
-			ProxyIP:    *proxyIP,
-			MMDBPath:   *mmdbPath,
-			WebTLSCert: *webTLSCert,
-			WebTLSKey:  *webTLSKey,
-			TokenTTL:   tokenTTL.String(),
+			Password:         "",
+			TOTPSecret:       "",
+			PkgDir:           *pkgDir,
+			AgentKey:         *agentKey,
+			ProxyIP:          *proxyIP,
+			MMDBPath:         *mmdbPath,
+			WebTLSCert:       *webTLSCert,
+			WebTLSKey:        *webTLSKey,
+			TokenTTL:         tokenTTL.String(),
+			RequireAgentCert: *requireAgentCert,
+			AdminTLSDays:     *adminTLSDays,
+			ServerName:       *serverName,
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
 			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
@@ -189,6 +196,15 @@ func main() {
 		if cfg.AllowAnonAgents {
 			*allowAnonAgents = true
 		}
+		if cfg.RequireAgentCert {
+			*requireAgentCert = true
+		}
+		if cfg.AdminTLSDays != 0 {
+			*adminTLSDays = cfg.AdminTLSDays
+		}
+		if cfg.ServerName != "" && *serverName == "" {
+			*serverName = cfg.ServerName
+		}
 	}
 
 	// 命令行显式传入的参数（flag.Visit）优先级最高，并自动保存回配置文件，
@@ -198,26 +214,29 @@ func main() {
 		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 		// flag 名 -> (配置字段指针, 命令行变量值)
 		field := map[string]func(){
-			"listen":       func() { cfg.Listen = *addr },
-			"http":         func() { cfg.HTTP = *httpAddr },
-			"whitelist":    func() { cfg.Whitelist = *whitelist },
-			"web":          func() { cfg.WebDir = *webDir },
-			"web-tls-cert": func() { cfg.WebTLSCert = *webTLSCert },
-			"web-tls-key":  func() { cfg.WebTLSKey = *webTLSKey },
-			"tls-cert":     func() { cfg.TLSCert = *tlsCert },
-			"tls-key":      func() { cfg.TLSKey = *tlsKey },
-			"ca-cert":      func() { cfg.CACert = *caCert },
-			"insecure":     func() { cfg.Insecure = *insecure },
-			"data":         func() { cfg.DataDir = *dataDir },
-			"user":         func() { cfg.User = *user },
-			"pkg-dir":      func() { cfg.PkgDir = *pkgDir },
-			"agent-key":    func() { cfg.AgentKey = *agentKey },
-			"proxy-ip":     func() { cfg.ProxyIP = *proxyIP },
-			"mmdb":         func() { cfg.MMDBPath = *mmdbPath },
-			"token-ttl":    func() { cfg.TokenTTL = tokenTTL.String() },
+			"listen":             func() { cfg.Listen = *addr },
+			"http":               func() { cfg.HTTP = *httpAddr },
+			"whitelist":          func() { cfg.Whitelist = *whitelist },
+			"web":                func() { cfg.WebDir = *webDir },
+			"web-tls-cert":       func() { cfg.WebTLSCert = *webTLSCert },
+			"web-tls-key":        func() { cfg.WebTLSKey = *webTLSKey },
+			"tls-cert":           func() { cfg.TLSCert = *tlsCert },
+			"tls-key":            func() { cfg.TLSKey = *tlsKey },
+			"ca-cert":            func() { cfg.CACert = *caCert },
+			"insecure":           func() { cfg.Insecure = *insecure },
+			"data":               func() { cfg.DataDir = *dataDir },
+			"user":               func() { cfg.User = *user },
+			"pkg-dir":            func() { cfg.PkgDir = *pkgDir },
+			"agent-key":          func() { cfg.AgentKey = *agentKey },
+			"proxy-ip":           func() { cfg.ProxyIP = *proxyIP },
+			"mmdb":               func() { cfg.MMDBPath = *mmdbPath },
+			"token-ttl":          func() { cfg.TokenTTL = tokenTTL.String() },
+			"require-agent-cert": func() { cfg.RequireAgentCert = *requireAgentCert },
+			"admin-tls-days":     func() { cfg.AdminTLSDays = *adminTLSDays },
+			"server-name":        func() { cfg.ServerName = *serverName },
 		}
 		dirty := false
-		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl"} {
+		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl", "require-agent-cert", "admin-tls-days", "server-name"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -279,6 +298,29 @@ func main() {
 		log.Printf("[server] 警告: 保存 Agent 注册密钥失败: %v", err)
 	}
 	verifier := agentauth.NewVerifier(agentKeyVal)
+
+	// 内置 CA：Agent 通道/Web 控制台证书的签发者，也是"零配置 TLS"的信任根。
+	// 首次启动自动生成到 <data>/ca.crt + ca.key（0600），之后保持不变 ——
+	// 它一变，所有 Agent 的 pin 都要更新（见 -server-name 与升级说明）。
+	identityName := strings.TrimSpace(*serverName)
+	if identityName == "" {
+		identityName = "MoCenter"
+	}
+	identity, identityCreated, idErr := agentauth.LoadOrCreateIdentity(*dataDir, identityName)
+	if idErr != nil {
+		log.Printf("[server] 警告: 初始化内置 CA 失败: %v（将退回手工证书/明文）", idErr)
+	} else if identityCreated {
+		log.Printf("[server] 已生成部署身份 CA 并写入 %s（权限 0600）；身份名 %q，指纹 %s",
+			filepath.Join(*dataDir, agentauth.CACertFileName), identity.Name(),
+			agentauth.DisplayFingerprint(identity.Fingerprint()))
+	} else {
+		// 身份名以已存在的 CA 为准（改动它会让指纹变化，进而让所有 Agent 需要更新 pin）
+		_ = identityName
+		log.Printf("[server] 部署身份 CA: %s（身份名 %q，指纹 %s）",
+			filepath.Join(*dataDir, agentauth.CACertFileName), identity.Name(),
+			agentauth.DisplayFingerprint(identity.Fingerprint()))
+	}
+
 	if agentKeyCreated {
 		log.Printf("[server] 已生成 Agent 注册密钥并写入 %s（权限 0600）", agentKeyPath)
 	}
@@ -480,6 +522,9 @@ func main() {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Agent 接入信息：让运维不必翻服务器终端就能拿到"一条命令"。
+	// 属于敏感信息（密钥等同于 Agent 身份凭证），因此必须登录后访问。
+	mux.HandleFunc("/api/server-info", serverInfoHandler(authz, identity, verifier, *addr, *dataDir, *requireAgentCert))
 
 	mux.HandleFunc(publicAPIBase+"/state", pub.stateHandler())
 	mux.HandleFunc(publicAPIBase+"/nodes", pub.nodesHandler())
@@ -529,32 +574,36 @@ func main() {
 	// 监听与接收循环封装成函数：被 SCM 拉起时由服务启动回调调用。
 	start := func() {
 		go func() {
-			// Web 控制台 TLS：配置了证书就走 https，否则明文 ——
-			// 明文意味着登录口令与 Token 会上网，必须在前面挂 TLS 反代才能接受。
+			// Web 控制台（Admin：登录口令 + 会话 Token + 远程终端/VNC）**默认走 HTTPS/WSS**：
+			//   - 显式给了 -web-tls-cert/-web-tls-key：用运维提供的证书；
+			//   - 否则用内置 CA 现场签发一张"当前部署临时证书"（内存态、重启即换、不落盘）。
+			// 自签证书会让浏览器提示"不安全"，这不是安全问题而是信任展示问题：
+			// 首次访问点一次"继续"即可，或用 -web-tls-cert 换正式证书 / 前面挂 TLS 反代。
+			// 这样默认部署下口令与 Token 不再明文上网，也就能连带启用 HSTS。
 			if *webTLSCert != "" && *webTLSKey != "" {
 				cert, err := tls.LoadX509KeyPair(*webTLSCert, *webTLSKey)
 				if err != nil {
 					log.Fatalf("[server] 加载 Web TLS 证书失败: %v", err)
 				}
-				webSrv := &http.Server{
-					Addr:    *httpAddr,
-					Handler: securityHeaders(mux),
-					TLSConfig: &tls.Config{
-						Certificates: []tls.Certificate{cert},
-						MinVersion:   tls.VersionTLS12,
-					},
-					ReadHeaderTimeout: 10 * time.Second,
-				}
-				log.Printf("[server] REST API / Web 控制台监听 %s（TLS）", *httpAddr)
-				if err := webSrv.ListenAndServeTLS("", ""); err != nil {
-					log.Fatalf("[server] https error: %v", err)
-				}
+				serveAdminTLS(*httpAddr, securityHeaders(mux), cert, true)
 				return
+			}
+			if identity != nil && *adminTLSDays > 0 {
+				hosts := adminCertHosts(*httpAddr, *serverName)
+				cert, err := identity.NewAdminCert(hosts)
+				if err == nil {
+					log.Printf("[server] Web 控制台使用内置 CA 自动签发的临时证书（%d 天，SAN: %v）；"+
+						"浏览器会提示自签名证书，接受即可；如需受信任证书请配置 -web-tls-cert/-web-tls-key",
+						*adminTLSDays, hosts)
+					serveAdminTLS(*httpAddr, securityHeaders(mux), cert, false)
+					return
+				}
+				log.Printf("[server] 警告: 生成 Web 控制台临时证书失败: %v", err)
 			}
 			log.Printf("[server] REST API / Web 控制台监听 %s（**明文 HTTP**）", *httpAddr)
 			if !isLoopbackAddr(*httpAddr) {
 				log.Printf("[server] 警告: Web 控制台未启用 TLS，登录口令与 Token 将明文传输。" +
-					"请配置 -web-tls-cert/-web-tls-key，或确保服务只通过 TLS 反向代理对外提供")
+					"请去掉 -admin-tls-days=0，或配置 -web-tls-cert/-web-tls-key，或确保只通过 TLS 反向代理提供")
 			}
 			srv := &http.Server{
 				Addr:              *httpAddr,
@@ -571,42 +620,57 @@ func main() {
 			log.Fatalf("[server] listen error: %v", err)
 		}
 
-		// 若提供证书则启用 TLS（全链路加密）。提供 CA 时启用 mTLS 双向认证。
+		// Agent 通道的 TLS 采取"能开就开、开不了才降级"：
+		//   - 显式给了 -tls-cert/-tls-key：用运维提供的证书；
+		//   - 否则用内置 CA 现场签发（CA 首次启动自动生成，无需任何证书文件）；
+		//   - 只有 identity 初始化失败（例如 CA 私钥不可读）才退回明文并告警。
+		// 之所以默认开：明文链路上注册凭证与后续报文都可被嗅探/篡改，
+		// 而"默认不开"正是此前需要手工铺证书、结果大家干脆不铺的原因。
 		var tlsLn net.Listener
-		if *tlsCert != "" && *tlsKey != "" {
-			cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
-			if err != nil {
-				log.Fatalf("[server] 加载 TLS 证书失败: %v", err)
+		agentCert, usingAutoCert, certErr := identity.ServerCertificate(*tlsCert, *tlsKey)
+		if certErr != nil {
+			if *tlsCert != "" || *tlsKey != "" {
+				log.Fatalf("[server] %v", certErr)
 			}
-			tlsCfg := &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS12,
-			}
+			tlsLn = ln
+			log.Printf("[server] 警告: 自动生成 Agent 通道证书失败（%v），该通道为明文传输", certErr)
+		} else {
+			noClientCert := !*requireAgentCert
 			if *caCert != "" {
-				caPEM, err := os.ReadFile(*caCert)
-				if err != nil {
-					log.Fatalf("[server] 读取 CA 证书失败: %v", err)
+				// 手工指定 CA：沿用旧语义（必须携带由该 CA 签发的客户端证书）
+				caPEM, rerr := os.ReadFile(*caCert)
+				if rerr != nil {
+					log.Fatalf("[server] 读取 CA 证书失败: %v", rerr)
 				}
 				pool := x509.NewCertPool()
 				if !pool.AppendCertsFromPEM(caPEM) {
 					log.Fatalf("[server] 解析 CA 证书失败")
 				}
-				tlsCfg.ClientCAs = pool
-				tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
-				log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（校验客户端 CA 证书）")
+				tlsCfg := &tls.Config{
+					Certificates: []tls.Certificate{agentCert},
+					MinVersion:   tls.VersionTLS12,
+					ClientCAs:    pool,
+					ClientAuth:   tls.RequireAndVerifyClientCert,
+				}
+				if identity != nil && identity.Authority() != nil {
+					// 内置 CA 的证书同样被接受（Agent 换取来的证书由内置 CA 签发）
+					pool.AddCert(identity.Authority())
+				}
+				tlsLn = tls.NewListener(ln, tlsCfg)
+				log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（校验客户端证书，CA: %s）", *caCert)
 			} else {
-				log.Printf("[server] Agent TCP 已启用 TLS 加密（单向）")
+				tlsLn = tls.NewListener(ln, identity.CATLSConfig(&agentCert))
+				if noClientCert {
+					log.Printf("[server] Agent TCP 已启用 TLS；允许无证书的 Agent 用注册密钥现场换取证书（换取后必须携带）")
+				} else {
+					log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（内置 CA: %s，指纹 %s）",
+						identity.Name(), agentauth.DisplayFingerprint(identity.Fingerprint()))
+				}
 			}
-			tlsLn = tls.NewListener(ln, tlsCfg)
-		} else {
-			tlsLn = ln
-			if !*insecure {
-				log.Printf("[server] 警告: 未提供 TLS 证书，Agent 连接为明文传输；生产环境请配置证书")
+			if usingAutoCert {
+				log.Printf("[server] Agent 通道使用内置 CA 自动签发的服务端证书（无需运维准备证书）；换用自有证书可加 -tls-cert/-tls-key")
 			}
-			// Agent 通道没有应用层鉴权（握手不校验任何口令）：能连通本端口的主机
-			// 就可以注册为 Agent。唯一可用的身份校验是 mTLS，故在此明确提示。
-			log.Printf("[server] 警告: Agent 通道未启用 mTLS，任何能连通 %s 的主机都可注册为 Agent；"+
-				"如需限制请用 -ca-cert 启用双向认证，或用防火墙/安全组限制来源", *addr)
+			_ = *insecure
 		}
 
 		for {
@@ -615,7 +679,7 @@ func main() {
 				log.Printf("[server] accept error: %v", err)
 				continue
 			}
-			go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir, verifier, *allowAnonAgents, pub)
+			go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir, verifier, *allowAnonAgents, pub, identity, !*requireAgentCert)
 		}
 	}
 
@@ -664,6 +728,123 @@ func uuidSuffix(uuid string) string {
 	return "，设备 UUID " + uuid
 }
 
+// serveAdminTLS 以 HTTPS 提供 Web 控制台。
+//
+// trusted=false 表示用的是"当前部署临时证书"（自签），此时额外加上 HSTS 之外的说明日志；
+// 两者都加 HSTS：Web 侧默认已经不再有明文入口，HSTS 不会把自己锁死。
+func serveAdminTLS(addr string, handler http.Handler, cert tls.Certificate, trusted bool) {
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	webSrv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		TLSConfig:         cfg,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	if trusted {
+		log.Printf("[server] REST API / Web 控制台监听 %s（TLS）", addr)
+	} else {
+		log.Printf("[server] REST API / Web 控制台监听 %s（TLS，自签名证书；浏览器首次访问需确认信任）", addr)
+	}
+	if err := webSrv.ListenAndServeTLS("", ""); err != nil {
+		log.Fatalf("[server] https error: %v", err)
+	}
+}
+
+// adminCertHosts 汇总 Web 控制台临时证书的 SAN：
+// 监听地址的 IP/主机名 + 本机探测到的所有地址 + 可选 -server-name。
+// 证书是内存态、每次启动重签，所以地址变化不需要重签文件。
+func adminCertHosts(listenAddr, serverName string) []string {
+	var hosts []string
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return
+		}
+		for _, h := range hosts {
+			if h == v {
+				return
+			}
+		}
+		hosts = append(hosts, v)
+	}
+	if _, port, err := net.SplitHostPort(listenAddr); err == nil && port != "" {
+		add(listenAddrOf(listenAddr))
+	}
+	add(serverName)
+	if ifaces, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range ifaces {
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP != nil {
+				add(ipnet.IP.String())
+			}
+		}
+	}
+	add("localhost")
+	return hosts
+}
+
+// listenAddrOf 去掉 host:port 的端口部分；空主机视为 0.0.0.0（不作为 SAN，交由地址探测补齐）。
+func listenAddrOf(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "0.0.0.0" || host == "::" || host == "" {
+		return ""
+	}
+	return host
+}
+
+// certPEMChain 把 tls.Certificate 的证书链编码为 PEM 文本。
+func certPEMChain(cert tls.Certificate) string {
+	var b strings.Builder
+	for _, der := range cert.Certificate {
+		b.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	}
+	return b.String()
+}
+
+// mustJSON 序列化协议结构体（失败时返回空 JSON，避免让调用方处理错误分支）。
+func mustJSON(v interface{}) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
+}
+
+// peerCertCN 取出对端客户端证书的 CN（无证书返回 false）。
+func peerCertCN(conn net.Conn) (string, bool) {
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return "", false
+	}
+	_ = tc.SetReadDeadline(time.Time{})
+	state := tc.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return "", false
+	}
+	leaf := state.PeerCertificates[0]
+	if leaf.Subject.CommonName == "" {
+		return "", false
+	}
+	return leaf.Subject.CommonName, true
+}
+
+// tlsInfo 生成日志用的连接描述（含是否加密、对端证书身份）。
+func tlsInfo(conn net.Conn) string {
+	addr := conn.RemoteAddr().String()
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return addr + " 明文"
+	}
+	st := tc.ConnectionState()
+	desc := addr + " TLS"
+	if len(st.PeerCertificates) > 0 {
+		desc += "，客户端证书 CN=" + st.PeerCertificates[0].Subject.CommonName
+	}
+	return desc
+}
+
 // validAgentID 校验 AgentID 是否可用。
 // 允许较宽松（兼容中文主机名 / 硬件 UUID），但禁止空白与控制字符，
 // 防止不可控内容进入日志与审计。
@@ -689,8 +870,14 @@ func validAgentID(s string) bool {
 //   - 注册需携带预共享密钥的 HMAC 证明（verifier），否则拒绝；
 //   - 同名 AgentID 的活跃连接**不允许被顶替**（由 session.Upsert 拒绝）；
 //   - 报文里自带的 AgentID 一律以**连接身份**为准，不一致即丢弃 —— 这是
-//     "身份取自连接而不是取自报文"的关键，否则伪造 AgentID 仍能冒用他人。
-func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, pkgDir string, verifier *agentauth.Verifier, allowAnon bool, pub *publicSite) {
+//     "身份取自连接而不是取自报文"的关键，否则伪造 AgentID 仍能冒用他人；
+//   - "简单模式"：Agent 可在 TLS 上先发 EnrollReq（同一套 HMAC 证明）换取
+//     由内置 CA 签发的客户端证书，之后每次连接都携带证书（收敛为 mTLS），
+//     运维因此不必手工分发 client.crt/client.key/ca.crt。
+//
+// 传输层策略：TLS 连接要求注册报文必须带客户端证书（换取阶段除外）；
+// 明文连接只在 allowNoCert 且服务端确实未能启用 TLS 时放行。
+func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, hub *ws.Hub, router *route.Router, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, pkgDir string, verifier *agentauth.Verifier, allowAnon bool, pub *publicSite, identity *agentauth.Identity, allowNoCert bool) {
 	defer conn.Close()
 	sc := bufio.NewScanner(conn)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -705,6 +892,55 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			log.Printf("[server] decode error from %s: %v", conn.RemoteAddr(), err)
 			continue
 		}
+		// 换取客户端证书：允许在**尚无证书**的 TLS 连接上发起（这正是它的用途）。
+		if env.Type == protocol.TypeEnrollReq {
+			var er protocol.EnrollReq
+			if err := json.Unmarshal(env.Data, &er); err != nil {
+				continue
+			}
+			resp := protocol.EnrollResp{}
+			if !validAgentID(er.AgentID) {
+				resp.Message = "agent_id 非法"
+			} else if err := verifier.Verify(er.AgentID, er.Nonce, er.Proof, er.TS); err != nil {
+				log.Printf("[server] 拒绝 Agent %q 换取证书: %v（来自 %s）", er.AgentID, err, tlsInfo(conn))
+				resp.Message = "注册凭证校验失败: " + err.Error()
+			} else if identity == nil {
+				resp.Message = "服务端未启用内置 CA，无法签发证书"
+			} else if certPEM, cerr := identity.AgentCertPEM(er.AgentID, er.CSR); cerr != nil {
+				resp.Message = "签发证书失败: " + cerr.Error()
+			} else {
+				resp.OK = true
+				resp.Message = "证书已签发"
+				resp.CertPEM = certPEM
+				resp.CAPEM = string(identity.CACertPEM())
+				resp.ServerFingerprint = identity.Fingerprint()
+				resp.Identity = identity.Name()
+				log.Printf("[server] 已为 Agent %q 签发客户端证书（来自 %s）", er.AgentID, tlsInfo(conn))
+			}
+			_ = json.NewEncoder(conn).Encode(protocol.Envelope{Type: protocol.TypeEnrollResp, Data: mustJSON(resp)})
+			if !resp.OK {
+				return
+			}
+			continue
+		}
+		// 客户端证书存在时，身份由证书 CN 提供（换取来的证书 CN 即 agent_id）；
+		// 没有证书的连接只能靠注册报文里的 HMAC 证明 —— 后者是"简单模式"的引导路径。
+		if certCN, ok := peerCertCN(conn); ok {
+			sessConn.CertCN = certCN
+		}
+		if !allowNoCert && sessConn.CertCN == "" {
+			// 注意区分两种情况：对方"没带证书"，还是"带了但被握手阶段拒绝"
+			// （后者在 Go 里表现为客户端证书为空 —— 校验失败不会保留对端证书）。
+			// 后者才是更要紧的：说明有人出示了不属于本套 CA 的证书。
+			hint := "该 Agent 尚未持有证书"
+			if tc, ok := conn.(*tls.Conn); ok && tc.ConnectionState().HandshakeComplete {
+				hint = "对端可能出示了非本套 CA 签发的证书（已在 TLS 握手阶段被拒绝）"
+			}
+			log.Printf("[server] 拒绝未携带有效客户端证书的连接（-require-agent-cert）：%s（来自: %s）。"+
+				"新装 Agent 请先在不带该开关的情况下完成一次证书换取，或为其预置 -client-cert/-client-key",
+				hint, tlsInfo(conn))
+			return
+		}
 		// 注册完成前只接受上线消息，其余一律丢弃（避免未注册连接触碰业务逻辑）
 		if env.Type != protocol.TypeOnline {
 			continue
@@ -715,6 +951,13 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		}
 		if !validAgentID(info.AgentID) {
 			log.Printf("[server] 拒绝注册（agent_id 非法或为空）: %s", conn.RemoteAddr())
+			return
+		}
+		// 身份来自连接的客户端证书（若携带）时，以证书为准；
+		// 否则要求报文里的 HMAC 证明（自报身份 + 持有注册密钥）。
+		if sessConn.CertCN != "" && sessConn.CertCN != info.AgentID {
+			log.Printf("[server] 拒绝 Agent %q 注册: 客户端证书身份为 %q，与自报身份不符（来自 %s）",
+				info.AgentID, sessConn.CertCN, tlsInfo(conn))
 			return
 		}
 		// 应用层注册鉴权：HMAC 证明 + 时间窗 + 防重放
@@ -962,6 +1205,37 @@ func broadcastAgents(hub *ws.Hub, store *probe.Store, pub *publicSite) {
 // --- REST 处理器 ---
 
 // --- REST 处理器 ---
+
+// serverInfoHandler 返回「Agent 接入」所需的信息：服务端地址、身份指纹、注册密钥与
+// 可直接粘贴的安装命令。目的是把"配证书"从手工散落多文件的流程，收敛成一次复制。
+func serverInfoHandler(authz *auth.Auth, identity *agentauth.Identity, verifier *agentauth.Verifier, listenAddr, dataDir string, requireCert bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		agentKey := ""
+		if verifier != nil && verifier.Enabled() {
+			// 显式配置的密钥只存在于内存/环境变量，这里只回传可读文件里的那份
+			if b, err := os.ReadFile(filepath.Join(dataDir, agentauth.KeyFileName)); err == nil {
+				agentKey = strings.TrimSpace(string(b))
+			}
+		}
+		resp := map[string]interface{}{
+			"listen":                listenAddr,
+			"require_agent_cert":    requireCert,
+			"agent_key":             agentKey,
+			"agent_key_configured":  verifier != nil && verifier.Enabled(),
+			"agent_key_fingerprint": verifier.KeyFingerprint(),
+		}
+		if identity != nil {
+			resp["identity"] = identity.Name()
+			resp["fingerprint"] = identity.Fingerprint()
+			resp["fingerprint_display"] = agentauth.DisplayFingerprint(identity.Fingerprint())
+			resp["ca_cert_path"] = filepath.Join(dataDir, agentauth.CACertFileName)
+		}
+		writeJSON(w, resp)
+	}
+}
 
 func agentsHandler(store *probe.Store, authz *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -1982,6 +2256,12 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
+		// Web 控制台默认就是 HTTPS（见 serveAdminTLS），所以可以安全地启用 HSTS：
+		// 它会阻止后续降级到明文，保护 Bearer Token 与远程终端/远程桌面的会话。
+		// 注意：只在 TLS 请求上加，避免反代外的明文态被浏览器记住。
+		if r.TLS != nil {
+			h.Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		next.ServeHTTP(w, r)
 	})
 }

@@ -42,6 +42,8 @@ const (
 	TypeVncInstallResp    = "VncInstallResp"   // Agent->Server VNC 安装/启动结果
 	TypePkgFetchReq       = "PackageFetchReq"  // Agent->Server 请求拉取服务端托管的安装包
 	TypePkgFetchResp      = "PackageFetchResp" // Server->Agent 安装包拉取结果（分片之后回执）
+	TypeEnrollReq         = "EnrollReq"        // Agent->Server 注册凭证交换请求（换取客户端证书）
+	TypeEnrollResp        = "EnrollResp"       // Server->Agent 注册凭证交换结果
 )
 
 // Envelope 是所有消息的通用信封：Type 用于路由，Data 为具体负载。
@@ -433,4 +435,33 @@ type PackageFetchResp struct {
 	OK        bool   `json:"ok"`
 	Message   string `json:"message"`
 	Size      int64  `json:"size"`
+}
+
+// EnrollReq Agent->Server：注册凭证交换请求（"简单模式"：用注册密钥换取客户端证书）。
+//
+// 与 TypeOnline 使用同一套 HMAC 证明算法（agentauth.Proof）。请求到达时连接尚未进入
+// 正常消息循环，服务端在完成校验后立即签发证书并回 EnrollResp。
+// 该报文允许在没有客户端证书的 TLS 连接上发送（兼容尚未持有证书的 Agent）。
+type EnrollReq struct {
+	AgentID string `json:"agent_id"`
+	Nonce   string `json:"nonce"`
+	Proof   string `json:"proof"`
+	TS      int64  `json:"ts"`
+	// CSR Agent 自己生成的密钥对对应的证书请求（PEM，DER 的 base64 亦可）。
+	// 服务端只签发**证书**，私钥永远留在 Agent 本机 —— 服务端不保管、也无法代签。
+	CSR string `json:"csr,omitempty"`
+}
+
+// EnrollResp Server->Agent：注册凭证交换结果。
+type EnrollResp struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
+	// CertPEM 客户端证书链（PEM）。Agent 落盘为 client.crt，后续连接直接复用。
+	CertPEM string `json:"cert_pem,omitempty"`
+	// CAPEM 服务端身份 CA 证书（PEM），Agent 可落盘为 ca.crt 便于排查。
+	CAPEM string `json:"ca_pem,omitempty"`
+	// ServerFingerprint 服务端身份公钥指纹，便于运维核对与写进 Agent 配置。
+	ServerFingerprint string `json:"server_fingerprint,omitempty"`
+	// Identity 部署身份名（安装时生成，可辨识"这台机器连的是哪套总控"）。
+	Identity string `json:"identity,omitempty"`
 }

@@ -820,3 +820,39 @@ button.primary { background: var(--accent); }
   .deploy-actions .btn { width: 100%; }
   .restore-actions input { max-width: none; }
 }
+
+/* ============ Agent 接入页 ============ */
+.kv { width: 100%; border-collapse: collapse; }
+.kv th {
+  text-align: left; font-weight: 600; white-space: nowrap;
+  padding: 8px 14px 8px 0; width: 110px; vertical-align: top;
+}
+.kv td { padding: 8px 0; word-break: break-all; }
+.kv code, .key-box, .cmd-box {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  background: rgba(15, 23, 42, .06);
+  border-radius: 6px;
+  padding: 3px 7px;
+}
+.key-box { display: inline-block; min-width: 240px; max-width: 100%; overflow-wrap: anywhere; }
+.cmd-box {
+  display: block; flex: 1 1 auto; min-width: 0;
+  padding: 9px 11px; overflow-x: auto; white-space: nowrap;
+}
+.row-inline {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 6px 0 10px;
+}
+.btn-mini {
+  padding: 4px 10px; font-size: 12px; border-radius: 6px;
+  border: 1px solid rgba(100, 116, 139, .35);
+  background: transparent; color: inherit; cursor: pointer;
+  white-space: nowrap;
+}
+.btn-mini:hover { border-color: rgba(100, 116, 139, .7); }
+
+@media (max-width: 640px) {
+  .kv th { width: 78px; font-size: 13px; }
+  .cmd-box { white-space: normal; overflow-wrap: anywhere; }
+}

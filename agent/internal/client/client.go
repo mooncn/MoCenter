@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"crypto/md5"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +47,15 @@ type Config struct {
 	UpgradeAllowUnsigned bool
 	// LatencyTargets 延迟探测目标（ICMP/TCP/HTTP）。
 	LatencyTargets []string
+	// ServerFingerprint 服务端身份公钥指纹（可带分隔符）。配置后按指纹校验服务端，
+	// **不需要 CA 文件、也不需要 Insecure**；服务端换 IP/域名/证书都不必更新。
+	ServerFingerprint string
+	// EnrollmentSecret 首次换取客户端证书用的注册密钥；换取成功后由调用方清空配置。
+	EnrollmentSecret string
+	// ConfigPath Agent 配置文件路径（凭证默认落在同目录的 creds/）。
+	ConfigPath string
+	// CredDir 凭证目录（覆盖默认值；主要便于测试）。
+	CredDir string
 }
 
 // Client Agent 客户端。
@@ -70,6 +78,11 @@ type Client struct {
 	// 安装包拉取：commandID -> 结果通道（等待 PackageFetchResp）
 	pkgWait map[string]chan protocol.PackageFetchResp
 	pkgMu   sync.Mutex
+	// cred 换取到的客户端凭证（"简单模式"）；进程内缓存，重启后从磁盘加载。
+	cred *enrollmentCredential
+	// onEnrolled 换取成功后的回调（调用方据此落盘清理注册密钥等）。
+	onEnrolled      func(*enrollmentCredential)
+	onEnrolledFiles func(CredentialFiles)
 }
 
 // New 创建 Agent 客户端。
@@ -113,38 +126,52 @@ func (c *Client) Run() {
 }
 
 // connectAndServe 建立连接并进入消息循环，返回时连接已断开。
+//
+// 传输层策略：**默认就是 TLS**，不在 Agent 侧做"能不能加密"的判断。
+//   - 已持有客户端证书（换取来的或配置指定的）：mTLS 连接；
+//   - 尚无证书、但有注册密钥：Run 里会先换取证书，再带证书连接；
+//   - 服务端是旧版本、根本没监听 TLS 时：退回明文，身份仍由 HMAC 注册凭证保证
+//     （这条路径只为兼容存量部署，日志会明确提示）。
 func (c *Client) connectAndServe() error {
-	var conn net.Conn
-	var err error
-	if c.cfg.TLS {
-		tlsCfg := &tls.Config{InsecureSkipVerify: c.cfg.Insecure}
-		// 指定 CA 时校验服务端证书
-		if c.cfg.CACert != "" {
-			caPEM, err := os.ReadFile(c.cfg.CACert)
-			if err != nil {
-				return fmt.Errorf("读取 CA 证书失败: %v", err)
-			}
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(caPEM) {
-				return fmt.Errorf("解析 CA 证书失败")
-			}
-			tlsCfg.RootCAs = pool
-			tlsCfg.InsecureSkipVerify = false
-		}
-		// mTLS：加载客户端证书
-		if c.cfg.ClientCert != "" && c.cfg.ClientKey != "" {
-			cert, err := tls.LoadX509KeyPair(c.cfg.ClientCert, c.cfg.ClientKey)
-			if err != nil {
-				return fmt.Errorf("加载客户端证书失败: %v", err)
-			}
-			tlsCfg.Certificates = []tls.Certificate{cert}
-		}
-		conn, err = tls.Dial("tcp", c.cfg.ServerAddr, tlsCfg)
-	} else {
-		conn, err = net.Dial("tcp", c.cfg.ServerAddr)
-	}
+	tlsCfg, err := c.baseTLSConfig()
 	if err != nil {
 		return err
+	}
+	if cert := c.clientCert(); cert != nil {
+		tlsCfg.Certificates = []tls.Certificate{*cert}
+	}
+	var conn net.Conn
+	// 还没有客户端证书、但有注册密钥：先换取证书，然后用**同一份配置**
+	// 重新构造 TLS（此时 ca.crt 已落盘，服务端身份可校验）。
+	if c.clientCert() == nil && c.cfg.EnrollmentSecret != "" {
+		cred, eerr := c.tryEnroll()
+		if eerr != nil {
+			return eerr
+		}
+		c.cred = cred
+		tlsCfg, err = c.baseTLSConfig()
+		if err != nil {
+			return err
+		}
+		tlsCfg.Certificates = []tls.Certificate{cred.Cert}
+	}
+	conn, err = tls.Dial("tcp", c.cfg.ServerAddr, tlsCfg)
+	if err != nil {
+		// 明文回退只服务于"服务端还是旧版、根本没有 TLS"这一种情形。
+		// 一旦本机已经持有客户端证书，就**不允许**降级 ——
+		// 否则证书校验失败（例如服务端换了 CA）会被悄悄绕过成明文连接，
+		// 把"双向认证"变成"什么都没认证"。宁可失败并报清楚原因。
+		if c.clientCert() != nil {
+			return fmt.Errorf("TLS 连接失败且本机已持有客户端证书，拒绝降级为明文：%w"+
+				"（若服务端换过 CA，请删除 %s 后重新用注册密钥换取，或更新 server_fingerprint）",
+				err, c.credDir())
+		}
+		plain, perr := net.Dial("tcp", c.cfg.ServerAddr)
+		if perr != nil {
+			return err
+		}
+		conn = plain
+		log.Printf("[agent] 服务端未提供可信 TLS（%v），本次以明文连接（身份由注册密钥保障）", err)
 	}
 	c.mu.Lock()
 	c.conn = conn
@@ -206,6 +233,9 @@ func (c *Client) register() {
 		info["auth_nonce"] = nonce
 		info["auth_time"] = ts
 		info["auth_proof"] = agentauth.Proof(c.cfg.AgentKey, c.cfg.AgentID, nonce, ts)
+	} else if c.clientCert() != nil {
+		// 已持有服务端签发的证书：身份以证书为准，服务端据此放行（无需再传注册密钥）
+		log.Printf("[agent] 已携带客户端证书连接（证书身份即 agent_id）")
 	} else {
 		log.Printf("[agent] 警告: 未配置 -agent-key，无法通过服务端的注册鉴权（若服务端已启用校验将被拒绝连接）")
 	}
@@ -710,4 +740,16 @@ func (c *Client) closeAllTunnels() {
 		_ = conn.Close()
 		delete(c.tunnels, id)
 	}
+}
+
+// CredentialFiles 返回换取到的客户端凭证的落盘路径（供调用方写回配置）。
+type CredentialFiles struct {
+	CertFile string
+	KeyFile  string
+	CAFile   string
+}
+
+// SetOnEnrolled 注册换取成功回调（在证书落盘之后调用）。
+func (c *Client) SetOnEnrolled(fn func(CredentialFiles)) {
+	c.onEnrolledFiles = fn
 }
