@@ -103,7 +103,10 @@ func (db *DB) migrate() error {
 			disk_total      INTEGER NOT NULL DEFAULT 0,
 			disk_used       INTEGER NOT NULL DEFAULT 0,
 			net_in_delta    INTEGER NOT NULL DEFAULT 0,
-			net_out_delta   INTEGER NOT NULL DEFAULT 0
+			net_out_delta   INTEGER NOT NULL DEFAULT 0,
+			load1           REAL    NOT NULL DEFAULT 0,
+			load5           REAL    NOT NULL DEFAULT 0,
+			load15          REAL    NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_probe_agent_time ON probe_history(agent_id, timestamp)`,
 		// 主机信息
@@ -135,6 +138,10 @@ func (db *DB) migrate() error {
 			disk_used       INTEGER NOT NULL DEFAULT 0,
 			net_rate_in     INTEGER NOT NULL DEFAULT 0,
 			net_rate_out    INTEGER NOT NULL DEFAULT 0,
+			load1           REAL    NOT NULL DEFAULT 0,
+			load5           REAL    NOT NULL DEFAULT 0,
+			load15          REAL    NOT NULL DEFAULT 0,
+			load_known      INTEGER NOT NULL DEFAULT 0,
 			updated_at      INTEGER NOT NULL DEFAULT 0
 		)`,
 		// 命令黑名单
@@ -168,6 +175,23 @@ func (db *DB) migrate() error {
 		return err
 	}
 	if err := db.ensureColumn("probe_history", "net_out_delta", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// 系统负载（1/5/15 分钟平均）。旧库补列后历史行为 0，趋势图不会画负载线
+	// （LoadKnown 语义由实时探针携带，历史行按"未知"处理）。
+	for _, col := range []string{"load1", "load5", "load15"} {
+		if err := db.ensureColumn("probe_history", col, "REAL NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	for _, col := range []string{"load1", "load5", "load15"} {
+		if err := db.ensureColumn("agents", col, "REAL NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	// load_known：该设备所在平台是否提供负载（Windows 之外为 1）。
+	// 与"负载恰好为 0"区分开，避免公开页把"无此指标"显示成"负载 0.00"。
+	if err := db.ensureColumn("agents", "load_known", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	// 依赖上述列的索引（放在补列之后执行）

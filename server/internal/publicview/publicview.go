@@ -91,6 +91,13 @@ type Node struct {
 	// DiskUsedBytes / DiskTotalBytes 磁盘已用与总量（字节）
 	DiskUsedBytes  int64 `json:"disk_used_bytes,omitempty"`
 	DiskTotalBytes int64 `json:"disk_total_bytes,omitempty"`
+
+	// Load1 / Load5 / Load15 系统平均负载。
+	// 用指针 + omitempty：LoadKnown=false（平台不提供，如 Windows 未取到队列长度）
+	// 时字段整体从 JSON 消失，前端显示「—」，而不是把 0 当成"完全空闲"。
+	Load1  *float64 `json:"load1,omitempty"`
+	Load5  *float64 `json:"load5,omitempty"`
+	Load15 *float64 `json:"load15,omitempty"`
 }
 
 // Geo 地区信息（刻意不含经纬度）。
@@ -261,6 +268,21 @@ func BuildNode(a *protocol.AgentInfo, cfg *siteconfig.Config) *Node {
 		n.DiskUsage = round1(a.DiskUsage)
 		n.DiskUsedBytes = a.DiskUsedBytes
 		n.DiskTotalBytes = a.DiskTotalBytes
+	}
+	if on("load") && a.Load1 != nil {
+		// 负载保留 2 位小数：1 位会把 0.15 与 0.24 抹成同一个值，
+		// 而负载本身量级就小，精度比百分比指标更重要。
+		// a.Load1 非 nil 才下发 —— 0 是合法的"空闲"负载，必须如实展示。
+		l1 := round2(*a.Load1)
+		n.Load1 = &l1
+		if a.Load5 != nil {
+			l5 := round2(*a.Load5)
+			n.Load5 = &l5
+		}
+		if a.Load15 != nil {
+			l15 := round2(*a.Load15)
+			n.Load15 = &l15
+		}
 	}
 	return n
 }
@@ -446,6 +468,14 @@ func nonNegative(v int64) int64 {
 		return 0
 	}
 	return v
+}
+
+// round2 保留 2 位小数（负载量级小，需要更高精度）。
+func round2(v float64) float64 {
+	if v < 0 {
+		v = 0
+	}
+	return float64(int64(v*100+0.5)) / 100
 }
 
 // round1 保留 1 位小数，避免公开页出现浮点尾巴。

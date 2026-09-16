@@ -467,6 +467,11 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 		}
 		a.NetInBytes = p.NetInBytes
 		a.NetOutBytes = p.NetOutBytes
+		// 负载：仅在 Agent 给出了负载（指针非 nil）时更新。旧版 Agent 不上报、
+		// Windows 未取到队列长度时保持原值，不会把已有数值刷成 0。
+		if p.Load1 != nil {
+			a.Load1, a.Load5, a.Load15 = p.Load1, p.Load5, p.Load15
+		}
 		a.KernelVersion = p.KernelVersion
 		a.OSType = p.OSType
 		a.Uptime = p.Uptime
@@ -609,6 +614,34 @@ func rateWithinLimit(delta, dt int64) bool {
 	return delta/dt <= rateLimitBytesPerSec
 }
 
+// derefFloat 解引用可选负载值；nil 与负值都按 0 处理（历史行/旧库）。
+func derefFloat(v *float64) float64 {
+	if v == nil || *v < 0 {
+		return 0
+	}
+	return *v
+}
+
+// loadPtr 由历史行的负载构造公开用指针。
+//
+// 为什么需要 others：旧库补列后，历史行的负载列一律为 0，无法与"空闲机器"区分。
+// 约定"三个值全为 0 = 未知"（不下发指针 → 前端显示「—」），
+// 只要有一个值大于 0 就认为该行确实记录了负载。
+func loadPtr(v float64, others ...float64) *float64 {
+	if v < 0 {
+		return nil
+	}
+	if v == 0 {
+		for _, o := range others {
+			if o > 0 {
+				return &v
+			}
+		}
+		return nil
+	}
+	return &v
+}
+
 // firstNonEmpty 返回第一个非空字符串。
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
@@ -694,6 +727,9 @@ func (s *Store) HistoryDownsampled(agentID string, since time.Time, maxPoints in
 						DiskUsedBytes:    r.DiskUsed,
 						NetInDeltaBytes:  r.NetInDelta,
 						NetOutDeltaBytes: r.NetOutDelta,
+						Load1:            loadPtr(r.Load1, r.Load5, r.Load15),
+						Load5:            loadPtr(r.Load5, r.Load1, r.Load15),
+						Load15:           loadPtr(r.Load15, r.Load1, r.Load5),
 					})
 				}
 				return out
@@ -743,6 +779,9 @@ func (s *Store) History(agentID string, since time.Time) []*protocol.ProbeDataRe
 					DiskUsedBytes:    r.DiskUsed,
 					NetInDeltaBytes:  r.NetInDelta,
 					NetOutDeltaBytes: r.NetOutDelta,
+					Load1:            loadPtr(r.Load1, r.Load5, r.Load15),
+					Load5:            loadPtr(r.Load5, r.Load1, r.Load15),
+					Load15:           loadPtr(r.Load15, r.Load1, r.Load5),
 				})
 			}
 			return out
@@ -794,6 +833,10 @@ func (s *Store) persistAgent(info *protocol.AgentInfo) {
 		DiskUsed:      info.DiskUsedBytes,
 		NetRateIn:     info.NetRateIn,
 		NetRateOut:    info.NetRateOut,
+		Load1:         derefFloat(info.Load1),
+		Load5:         derefFloat(info.Load5),
+		Load15:        derefFloat(info.Load15),
+		LoadKnown:     info.Load1 != nil,
 	}
 	if err := s.db.UpsertAgent(row); err != nil {
 		log.Printf("[probe] 持久化主机信息失败: %v", err)
@@ -823,6 +866,9 @@ func (s *Store) persistProbeHistory(p *protocol.ProbeDataReq) {
 		DiskUsed:      p.DiskUsedBytes,
 		NetInDelta:    p.NetInDeltaBytes,
 		NetOutDelta:   p.NetOutDeltaBytes,
+		Load1:         derefFloat(p.Load1),
+		Load5:         derefFloat(p.Load5),
+		Load15:        derefFloat(p.Load15),
 	}
 	if err := s.db.InsertProbeHistory(row); err != nil {
 		log.Printf("[probe] 持久化探针历史失败: %v", err)

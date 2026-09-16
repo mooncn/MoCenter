@@ -1,6 +1,17 @@
 // Package geo 提供基于公网 IP 的地理位置解析服务。
 //
-// 使用免费且无需密钥的 ip-api.com（支持 IPv4/IPv6，返回国家/地区/城市与坐标）。
+// 采用**多源解析 + 逐源降级**：
+//
+//  1. api.iping.cc（主源）https://api.iping.cc/v1/query?ip=..&language=zh
+//     —— 返回中文国家/省/市名，偶发限流（code=500）。
+//  2. ip-api.com（备源）http://ip-api.com/json/<ip>?lang=zh-CN —— 主源失败/限流时兜底。
+//  3. ipwho.is（兜底）https://ipwho.is/<ip> —— 主源与备源都不可用时的最后一道。
+//
+// 关键：**主源不返回 ISO 国家代码**（只有中文国名），而前端的国旗完全依赖
+// country_code。早期的实现只看主源，于是"地区正常但国旗不显示/地区为空"。
+// 这里通过「中英文国名表 + 备源返回的 countryCode」补齐国家代码，
+// 并把中文国家名规范化为英文名（两个源口径不一致会让同一批节点看起来像两个国家）。
+//
 // 成功结果缓存 24 小时避免频繁请求；**失败结果只缓存 10 分钟**，因为
 // 免费接口按分钟限流，长时间缓存失败会让"节点地区/国旗"一整天不显示。
 // 请求失败时返回 nil，不影响 Agent 列表展示。
@@ -17,6 +28,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +39,7 @@ import (
 // ipapiResponse ip-api.com 响应结构。
 type ipapiResponse struct {
 	Status      string  `json:"status"`
+	Message     string  `json:"message"`
 	Country     string  `json:"country"`
 	CountryCode string  `json:"countryCode"`
 	Region      string  `json:"regionName"`
@@ -36,6 +49,45 @@ type ipapiResponse struct {
 	Query       string  `json:"query"`
 }
 
+// ipingResponse api.iping.cc 响应结构。
+//
+// 注意：该接口**没有 country_code 字段**（只有中文国名），经纬度是字符串，
+// 且 IPv6 查询会返回 code=500（"数据升级中"）—— 这些都是必须处理的现实差异。
+type ipingResponse struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data *struct {
+		IP      string `json:"ip"`
+		Country string `json:"country"`
+		Region  string `json:"region"`
+		City    string `json:"city"`
+		Lon     string `json:"longitude"`
+		Lat     string `json:"latitude"`
+	} `json:"data"`
+}
+
+// ipwhoResponse ipwho.is 响应结构（兜底源，自带 ISO 国家代码）。
+type ipwhoResponse struct {
+	Success     bool    `json:"success"`
+	Message     string  `json:"message"`
+	Country     string  `json:"country"`
+	CountryCode string  `json:"country_code"`
+	Region      string  `json:"region"`
+	City        string  `json:"city"`
+	Latitude    float64 `json:"latitude"`
+	Longitude   float64 `json:"longitude"`
+}
+
+// 默认查询模板（可在配置/测试中覆盖）。
+const (
+	// defaultIpingEndpoint api.iping.cc 主源：中文国家/省/市，无 ISO 国家代码。
+	defaultIpingEndpoint = "https://api.iping.cc/v1/query?ip=%s&language=zh"
+	// defaultIPAPIEndpoint ip-api.com 备源：带 countryCode，中文（zh-CN）返回中文国名。
+	defaultIPAPIEndpoint = "http://ip-api.com/json/%s?lang=zh-CN&fields=status,message,country,countryCode,regionName,city,lat,lon,query"
+	// defaultIPWhoEndpoint ipwho.is 兜底源：HTTPS，带 country_code。
+	defaultIPWhoEndpoint = "https://ipwho.is/%s"
+)
+
 // Resolver 地理位置解析器。
 type Resolver struct {
 	mu      sync.Mutex
@@ -43,7 +95,12 @@ type Resolver struct {
 	timeout time.Duration
 	// proxy 可选：国内加速代理前缀（形如 http://fa.mooncn.win/?url= ）
 	proxy string
-	// endpoint 查询模板（含一个 %s 占位 IP），仅测试注入用；为空时用 ip-api.com。
+	// ipingEndpoint / ipapiEndpoint / ipwhoEndpoint 各源查询模板（含一个 %s 占位 IP）。
+	// 为空时用内置默认值；测试通过覆盖它们注入 httptest 服务。
+	ipingEndpoint string
+	ipapiEndpoint string
+	ipwhoEndpoint string
+	// 兼容字段：早期的单源测试注入点。设置后作为备源（ip-api 口径）生效。
 	endpoint string
 }
 
@@ -158,37 +215,116 @@ func (r *Resolver) pruneLocked() {
 	}
 }
 
-// fetch 实际请求 ip-api.com。
+// fetch 依次尝试所有解析源，返回首个成功结果。
+//
+// 顺序即优先级：api.iping.cc（中文口径、国内可达）→ ip-api.com → ipwho.is。
+// 每个源的失败都单独记日志（含原因），这样运维能从日志判断到底是
+// "限流"、"网络不通" 还是 "该 IP 无地理位置数据"。
 func (r *Resolver) fetch(ip string) *protocol.GeoInfo {
 	client := &http.Client{Timeout: r.timeout}
-	// http 批量接口免费；ip-api.com 免费版单 IP 查询需 http（避免 https 依赖）
-	tmpl := r.endpoint
-	if tmpl == "" {
-		tmpl = "http://ip-api.com/json/%s?lang=zh-CN&fields=status,country,countryCode,regionName,city,lat,lon,query"
+	type source struct {
+		name string
+		tmpl string
+		fn   func([]byte) *protocol.GeoInfo
 	}
-	url := r.applyProxy(fmt.Sprintf(tmpl, ip))
-	resp, err := client.Get(url)
+	sources := []source{
+		{"api.iping.cc", r.ipingURL(), r.parseIping},
+		{"ip-api.com", r.ipapiURL(), r.parseIPAPI},
+		{"ipwho.is", r.ipwhoURL(), r.parseIPWho},
+	}
+	for _, src := range sources {
+		body, status, err := r.get(client, fmt.Sprintf(src.tmpl, ip))
+		if err != nil {
+			log.Printf("[geo] %s 查询 %s 失败: %v", src.name, ip, err)
+			continue
+		}
+		if status != http.StatusOK {
+			log.Printf("[geo] %s 查询 %s 失败: HTTP %d（免费接口通常按分钟限流）", src.name, ip, status)
+			continue
+		}
+		if g := src.fn(body); g != nil {
+			return normalizeGeo(g)
+		}
+	}
+	return nil
+}
+
+// get 执行一次 GET，并做代理前缀包装。
+func (r *Resolver) get(client *http.Client, rawURL string) ([]byte, int, error) {
+	resp, err := client.Get(r.applyProxy(rawURL))
 	if err != nil {
-		// 解析失败不影响主机列表展示，但必须留下痕迹：
-		// 否则运维只能看到"地区/国旗是空的"，无从判断是限流、断网还是 IP 为空。
-		log.Printf("[geo] 查询 %s 地理位置失败: %v", ip, err)
-		return nil
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[geo] 查询 %s 地理位置失败: HTTP %d（ip-api.com 免费额度约 45 次/分钟，可能被限流）", ip, resp.StatusCode)
-		return nil
-	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return body, resp.StatusCode, nil
+}
+
+// ipingURL / ipapiURL / ipwhoURL 返回各源生效的查询模板。
+func (r *Resolver) ipingURL() string {
+	if r.ipingEndpoint != "" {
+		return r.ipingEndpoint
+	}
+	return defaultIpingEndpoint
+}
+
+func (r *Resolver) ipapiURL() string {
+	// endpoint 是早期的单源注入点（ip-api 口径），保留以兼容既有测试
+	if r.ipapiEndpoint != "" {
+		return r.ipapiEndpoint
+	}
+	if r.endpoint != "" {
+		return r.endpoint
+	}
+	return defaultIPAPIEndpoint
+}
+
+func (r *Resolver) ipwhoURL() string {
+	if r.ipwhoEndpoint != "" {
+		return r.ipwhoEndpoint
+	}
+	return defaultIPWhoEndpoint
+}
+
+// parseIping 解析 api.iping.cc 响应。
+//
+// 现实约束：
+//   - 无 ISO 国家代码 —— 只能给出中文国家名，国家代码交给 normalizeGeo 补；
+//   - 经纬度是字符串，解析失败按 0 处理（公开页本来就不展示经纬度）；
+//   - 限流/不支持 IPv6 时返回 {"code":500,"msg":"..."}，此时返回 nil 交由下一个源。
+func (r *Resolver) parseIping(body []byte) *protocol.GeoInfo {
+	var pr ipingResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
 		return nil
 	}
+	if pr.Code != 200 || pr.Data == nil {
+		log.Printf("[geo] api.iping.cc 未命中: code=%d msg=%s", pr.Code, pr.Msg)
+		return nil
+	}
+	d := pr.Data
+	if d.Country == "" && d.Region == "" && d.City == "" {
+		return nil
+	}
+	return &protocol.GeoInfo{
+		Country:   d.Country,
+		Region:    d.Region,
+		City:      d.City,
+		Latitude:  parseFloat(d.Lat),
+		Longitude: parseFloat(d.Lon),
+	}
+}
+
+// parseIPAPI 解析 ip-api.com 响应（带 ISO 国家代码）。
+func (r *Resolver) parseIPAPI(body []byte) *protocol.GeoInfo {
 	var pr ipapiResponse
 	if err := json.Unmarshal(body, &pr); err != nil {
 		return nil
 	}
 	if pr.Status != "success" {
-		log.Printf("[geo] 查询 %s 地理位置未命中: status=%s（内网/保留地址无法解析）", ip, pr.Status)
+		log.Printf("[geo] ip-api.com 未命中: status=%s message=%s", pr.Status, pr.Message)
 		return nil
 	}
 	return &protocol.GeoInfo{
@@ -199,6 +335,81 @@ func (r *Resolver) fetch(ip string) *protocol.GeoInfo {
 		Latitude:    pr.Lat,
 		Longitude:   pr.Lon,
 	}
+}
+
+// parseIPWho 解析 ipwho.is 响应（带 ISO 国家代码，HTTPS）。
+func (r *Resolver) parseIPWho(body []byte) *protocol.GeoInfo {
+	var pr ipwhoResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
+		return nil
+	}
+	if !pr.Success {
+		log.Printf("[geo] ipwho.is 未命中: %s", pr.Message)
+		return nil
+	}
+	return &protocol.GeoInfo{
+		Country:     pr.Country,
+		CountryCode: pr.CountryCode,
+		Region:      pr.Region,
+		City:        pr.City,
+		Latitude:    pr.Latitude,
+		Longitude:   pr.Longitude,
+	}
+}
+
+// normalizeGeo 统一两个源的输出口径，并补齐国家代码。
+//
+// 为什么必须做：
+//  1. 主源不返回 ISO 国家代码，而前端的国旗完全由 country_code 生成 ——
+//     不补就是"地区有字、国旗空白"，正是此前反馈的问题之一。
+//  2. 两个源的国家名口径不同（"中国" vs "China"、"美国" vs "United States"），
+//     不统一会让同一批节点在页面上看起来像来自不同国家。
+//
+// 处理顺序：优先用英文/中文国名反查 ISO 代码；反查不到时保留原值
+// （宁可只有国家名，也不要把国家写错）。
+func normalizeGeo(g *protocol.GeoInfo) *protocol.GeoInfo {
+	if g == nil {
+		return nil
+	}
+	name := trimSpace(g.Country)
+	code := strings.ToUpper(trimSpace(g.CountryCode))
+
+	if name != "" {
+		if c, en, ok := lookupCountry(name); ok {
+			if code == "" {
+				code = c
+			}
+			// 统一为英文名：前端只需一种口径，也便于与 country_code 对应
+			if en != "" && countryNameIsChinese(name) {
+				g.Country = en
+			} else if en != "" {
+				g.Country = en
+			}
+		}
+	}
+	if len(code) != 2 {
+		code = ""
+	}
+	g.CountryCode = code
+	g.Region = trimSpace(g.Region)
+	g.City = trimSpace(g.City)
+	return g
+}
+
+// countryNameIsChinese 判断国名是否包含中文字符（用于决定是否需要换成英文名）。
+func countryNameIsChinese(s string) bool {
+	for _, r := range s {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return true
+		}
+	}
+	return false
+}
+
+// parseFloat 宽松解析浮点（接口返回的是字符串）。
+func parseFloat(s string) float64 {
+	f, _ := strconv.ParseFloat(trimSpace(s), 64)
+	return f
 }
 
 // applyProxy 按代理前缀包装 URL（格式与 Agent 端一致）。

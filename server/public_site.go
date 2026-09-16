@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -206,14 +207,19 @@ func (p *publicSite) publicWSHandler() http.HandlerFunc {
 		}
 		defer conn.Close()
 		send := make(chan []byte, 8)
+		// 关闭 stop 必须幂等：读循环（对端断开）与函数返回（defer）都会触发一次，
+		// 直接 close 两次会 panic（"close of closed channel"），表现为连接从
+		// 服务端断开时日志里刷 panic 栈。用 sync.Once 包一层。
 		stop := make(chan struct{})
+		var stopOnce sync.Once
+		closeStop := func() { stopOnce.Do(func() { close(stop) }) }
 		p.hub.SubscribePublic(func(payload []byte) {
 			select {
 			case send <- payload:
 			default: // 客户端消费不过来就丢帧，绝不阻塞 hub 广播
 			}
 		}, stop)
-		defer close(stop)
+		defer closeStop()
 
 		// 先推一次当前状态，避免客户端等待第一个探针周期
 		cfg := p.cfg.Get()
@@ -224,7 +230,7 @@ func (p *publicSite) publicWSHandler() http.HandlerFunc {
 		go func() {
 			for {
 				if _, _, err := conn.ReadMessage(); err != nil {
-					close(stop)
+					closeStop()
 					return
 				}
 			}

@@ -354,3 +354,68 @@ func TestBuildSamplesFiltersAbsurdRates(t *testing.T) {
 		t.Fatalf("异常速率不应下发: %v", *s[1].NetInBps)
 	}
 }
+
+// TestLoadFieldGate 负载字段：开关关闭时不出现在 JSON；平台不提供（LoadKnown=false）
+// 时也不出现 —— 后者是为了让前端显示「—」而不是把 0 画成"完全空闲"。
+func TestLoadFieldGate(t *testing.T) {
+	a := sampleAgent()
+	a.Load1, a.Load5, a.Load15 = f64(0.42), f64(0.31), f64(0.25)
+
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+	cfg.Fields["load"] = false
+	if raw, _ := json.Marshal(BuildNode(a, cfg)); strings.Contains(string(raw), "load1") {
+		t.Fatalf("负载开关关闭时不应出现 load1: %s", raw)
+	}
+
+	cfg.Fields["load"] = true
+	node := BuildNode(a, cfg)
+	if node.Load1 == nil || *node.Load1 != 0.42 || node.Load5 == nil || *node.Load5 != 0.31 {
+		t.Fatalf("负载应被下发且保留两位小数: %+v", node)
+	}
+	raw, _ := json.Marshal(node)
+	if !strings.Contains(string(raw), `"load1":0.42`) {
+		t.Fatalf("负载精度应为 2 位小数: %s", raw)
+	}
+
+	// 平台不提供负载：字段整体消失（而不是 0）
+	a.Load1, a.Load5, a.Load15 = nil, nil, nil
+	node2 := BuildNode(a, cfg)
+	raw2, _ := json.Marshal(node2)
+	if strings.Contains(string(raw2), `"load1"`) {
+		t.Fatalf("LoadKnown=false 时不应下发负载: %s", raw2)
+	}
+}
+
+// TestLoadRounded 负载量级小，必须保留 2 位小数（1 位会把 0.15/0.24 抹平）。
+func TestLoadRounded(t *testing.T) {
+	a := sampleAgent()
+	a.Load1, a.Load5, a.Load15 = f64(0.154), f64(1.005), f64(12.999)
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+	cfg.Fields["load"] = true
+	n := BuildNode(a, cfg)
+	if *n.Load1 != 0.15 || *n.Load5 != 1 || *n.Load15 != 13 {
+		t.Fatalf("负载取整异常: %v / %v / %v", *n.Load1, *n.Load5, *n.Load15)
+	}
+}
+
+// TestLoadZeroIsValidValue 负载 0 是"空闲机器"的合法值，必须如实下发，
+// 不能因为 omitempty/零值判断被当成"没有数据"丢掉（那会让前端显示「—」）。
+func TestLoadZeroIsValidValue(t *testing.T) {
+	a := sampleAgent()
+	a.Load1, a.Load5, a.Load15 = f64(0), f64(0), f64(0)
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+	cfg.Fields["load"] = true
+	node := BuildNode(a, cfg)
+	if node.Load1 == nil || *node.Load1 != 0 {
+		t.Fatalf("负载 0 应被下发: %+v", node.Load1)
+	}
+	raw, _ := json.Marshal(node)
+	if !strings.Contains(string(raw), `"load1":0`) {
+		t.Fatalf("负载 0 应出现在 JSON 中: %s", raw)
+	}
+}
+
+func f64(v float64) *float64 { return &v }

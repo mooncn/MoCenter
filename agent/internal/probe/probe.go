@@ -105,6 +105,11 @@ func (c *Collector) Sample() *protocol.ProbeDataReq {
 		DiskTotalBytes: diskTotal,
 		DiskUsedBytes:  diskUsed,
 	}
+	// 系统负载（1/5/15 分钟平均）。平台不提供时保持 nil，
+	// 前端据此显示「—」而不是把 0 当成"空闲"（0 本身是合法负载）。
+	if l1, l5, l15, ok := loadAvg(); ok {
+		p.Load1, p.Load5, p.Load15 = &l1, &l5, &l15
+	}
 	// 内存使用率统一由明细计算（Linux /proc 与 Windows wmic 均适用）
 	if memTotal > 0 {
 		p.MemUsage = float64(memUsed) / float64(memTotal) * 100

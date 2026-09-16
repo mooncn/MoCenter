@@ -1,6 +1,7 @@
 package ip
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,5 +96,48 @@ func TestDetectServiceOrderPrefersDomestic(t *testing.T) {
 	}
 	if idx("https://api-ipv4.ip.sb/ip") >= idx("https://api.ipify.org?format=json") {
 		t.Fatal("国内可达的 ip.sb 回显应排在 ipify 之前")
+	}
+}
+
+// TestParseIPResponseExtended 覆盖新增的回显服务响应格式（tool.mooncn.win 等）。
+func TestParseIPResponseExtended(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`{"ip":"45.40.228.119"}`, "45.40.228.119"},
+		{`{"ident":"45.40.228.119"}`, "45.40.228.119"},
+		{`{"address":"45.40.228.119"}`, "45.40.228.119"},
+		{`{"ip":"1.2.3.4:5678"}`, "1.2.3.4"},
+		{`{"ip":"[2001:db8::1]:5678"}`, "2001:db8::1"},
+	}
+	for _, c := range cases {
+		if got := parseIPResponse([]byte(c.in)); got != c.want {
+			t.Errorf("parseIPResponse(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestAddressFamilyFilter 回显服务可能回错地址族（无 IPv6 出口的机器请求
+// IPv6 回显会拿到 IPv4）。必须按地址族过滤，否则 IPv4 会被写进
+// PublicIPv6，公开页的"地区"就取自它 —— 表现为地区不显示或错乱。
+func TestAddressFamilyFilter(t *testing.T) {
+	if !isIPv4("45.40.228.119") || isIPv4("2001:db8::1") || isIPv4("") || !isIPv4("1.2.3.4:80") {
+		t.Error("isIPv4 判定异常")
+	}
+	if !isIPv6("2001:db8::1") || isIPv6("45.40.228.119") || isIPv6("") {
+		t.Error("isIPv6 判定异常")
+	}
+	// 纯 IPv4 响应不得被当作 IPv6 上报
+	if isIPv6(parseIPResponse([]byte(`{"ip":"45.40.228.119"}`))) {
+		t.Error("IPv4 回显不应通过 IPv6 校验")
+	}
+}
+
+// TestServiceOrderPrefersToolMooncn IPv4 回显服务里 tool.mooncn.win 优先。
+func TestServiceOrderPrefersToolMooncn(t *testing.T) {
+	if !strings.Contains(v4ServiceOrder(), "tool.mooncn.win") {
+		t.Fatal("IPv4 回显服务列表应包含 tool.mooncn.win")
+	}
+	idx := strings.Index(v4ServiceOrder(), "tool.mooncn.win")
+	if idx > strings.Index(v4ServiceOrder(), "api-ipv4.ip.sb/ip") {
+		t.Fatal("tool.mooncn.win 应排在境外回显服务之前")
 	}
 }

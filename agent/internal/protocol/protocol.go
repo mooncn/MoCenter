@@ -101,6 +101,13 @@ type ProbeDataReq struct {
 	MemUsedBytes   int64   `json:"mem_used_bytes,omitempty"`
 	DiskTotalBytes int64   `json:"disk_total_bytes,omitempty"`
 	DiskUsedBytes  int64   `json:"disk_used_bytes,omitempty"`
+	// 系统负载（1/5/15 分钟平均）。Unix 来自 /proc/loadavg 或 sysctl；
+	// Windows 无此概念（取处理器队列长度近似为 1 分钟值）。
+	// 指针语义：nil = 本平台不提供（前端显示「—」），非 nil 时 0 是合法值
+	//（空闲机器）—— 用 float64 + omitempty 会把 0 当成"没有数据"丢掉。
+	Load1  *float64 `json:"load1,omitempty"`
+	Load5  *float64 `json:"load5,omitempty"`
+	Load15 *float64 `json:"load15,omitempty"`
 }
 
 // ProbeDataResp Server -> Agent

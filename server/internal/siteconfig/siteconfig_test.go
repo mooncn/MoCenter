@@ -171,3 +171,22 @@ func TestNetworkFieldAndTrafficMode(t *testing.T) {
 		t.Fatalf("流量口径未持久化: %q", re.Get().TrafficMode)
 	}
 }
+
+// TestLoadFieldInCatalog 负载是性能分组的可配置字段，且默认可见。
+func TestLoadFieldInCatalog(t *testing.T) {
+	f, ok := FieldDef("load")
+	if !ok {
+		t.Fatal("字段目录应包含 load")
+	}
+	if f.Group != "性能" || !f.Default || f.Sensitive {
+		t.Fatalf("负载字段定义异常: %+v", f)
+	}
+	if !DefaultFields()["load"] {
+		t.Fatal("默认配置应包含负载")
+	}
+	// 默认配置经 normalize 后必须显式带上该键（前端据此渲染开关）
+	cfg := Default()
+	if _, ok := cfg.Fields["load"]; !ok {
+		t.Fatal("默认配置缺少 load 键")
+	}
+}

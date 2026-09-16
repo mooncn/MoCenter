@@ -281,7 +281,8 @@ func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step in
 	if step == 1 {
 		rows, err = db.Query(`SELECT agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
 			os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
-			mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta
+			mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta,
+			load1, load5, load15
 			FROM probe_history WHERE agent_id = ? AND timestamp >= ?
 			ORDER BY timestamp DESC LIMIT ?`, agentID, since, limit)
 	} else {
@@ -289,7 +290,8 @@ func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step in
 		rows, err = db.Query(`SELECT agent_id, MAX(timestamp) AS ts,
 			AVG(cpu_usage), AVG(mem_usage), AVG(disk_usage), MAX(net_in_bytes), MAX(net_out_bytes),
 			MAX(os_type), MAX(kernel_version), MAX(uptime), MAX(public_ip), MAX(os_version), MAX(cpu_model), AVG(cpu_mhz),
-			MAX(mem_total), AVG(mem_used), MAX(disk_total), AVG(disk_used), SUM(net_in_delta), SUM(net_out_delta)
+			MAX(mem_total), AVG(mem_used), MAX(disk_total), AVG(disk_used), SUM(net_in_delta), SUM(net_out_delta),
+			AVG(load1), AVG(load5), AVG(load15)
 			FROM probe_history WHERE agent_id = ? AND timestamp >= ?
 			GROUP BY (timestamp / ?) ORDER BY ts DESC LIMIT ?`, agentID, since, step, limit)
 	}
@@ -302,7 +304,8 @@ func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step in
 		var r ProbeHistoryRow
 		if err := rows.Scan(&r.AgentID, &r.Timestamp, &r.CPUUsage, &r.MemUsage, &r.DiskUsage, &r.NetInBytes, &r.NetOutBytes,
 			&r.OSType, &r.KernelVersion, &r.Uptime, &r.PublicIP, &r.OSVersion, &r.CPUModel, &r.CPUMHz,
-			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed, &r.NetInDelta, &r.NetOutDelta); err != nil {
+			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed, &r.NetInDelta, &r.NetOutDelta,
+			&r.Load1, &r.Load5, &r.Load15); err != nil {
 			return nil, err
 		}
 		out = append(out, &r)
@@ -371,6 +374,10 @@ type ProbeHistoryRow struct {
 	// 0 = 未知（计数器回绕、首点、或旧版记录），公开页趋势会跳过该点。
 	NetInDelta  int64
 	NetOutDelta int64
+	// Load1/5/15 系统平均负载；全为 0 表示该平台不提供（Windows）或旧库记录。
+	Load1  float64
+	Load5  float64
+	Load15 float64
 }
 
 // InsertProbeHistory 插入一条探针历史记录。
@@ -378,11 +385,13 @@ func (db *DB) InsertProbeHistory(p *ProbeHistoryRow) error {
 	_, err := db.Exec(`INSERT INTO probe_history
 		(agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
 		 os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
-		 mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta,
+		 load1, load5, load15)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.AgentID, p.Timestamp, p.CPUUsage, p.MemUsage, p.DiskUsage, p.NetInBytes, p.NetOutBytes,
 		p.OSType, p.KernelVersion, p.Uptime, p.PublicIP, p.OSVersion, p.CPUModel, p.CPUMHz,
-		p.MemTotal, p.MemUsed, p.DiskTotal, p.DiskUsed, p.NetInDelta, p.NetOutDelta)
+		p.MemTotal, p.MemUsed, p.DiskTotal, p.DiskUsed, p.NetInDelta, p.NetOutDelta,
+		p.Load1, p.Load5, p.Load15)
 	if err != nil {
 		return fmt.Errorf("插入探针历史失败: %w", err)
 	}
@@ -396,7 +405,8 @@ func (db *DB) QueryProbeHistory(agentID string, since int64, limit int) ([]*Prob
 	}
 	rows, err := db.Query(`SELECT agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
 		os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
-		mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta
+		mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta,
+		load1, load5, load15
 		FROM probe_history WHERE agent_id = ? AND timestamp >= ?
 		ORDER BY timestamp ASC LIMIT ?`, agentID, since, limit)
 	if err != nil {
@@ -408,7 +418,8 @@ func (db *DB) QueryProbeHistory(agentID string, since int64, limit int) ([]*Prob
 		var r ProbeHistoryRow
 		if err := rows.Scan(&r.AgentID, &r.Timestamp, &r.CPUUsage, &r.MemUsage, &r.DiskUsage, &r.NetInBytes, &r.NetOutBytes,
 			&r.OSType, &r.KernelVersion, &r.Uptime, &r.PublicIP, &r.OSVersion, &r.CPUModel, &r.CPUMHz,
-			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed, &r.NetInDelta, &r.NetOutDelta); err != nil {
+			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed, &r.NetInDelta, &r.NetOutDelta,
+			&r.Load1, &r.Load5, &r.Load15); err != nil {
 			return nil, err
 		}
 		out = append(out, &r)
@@ -456,6 +467,11 @@ type AgentRow struct {
 	DiskUsed      int64
 	NetRateIn     int64
 	NetRateOut    int64
+	// Load1/5/15 系统平均负载；LoadKnown=false 表示该平台不提供负载指标
+	Load1     float64
+	Load5     float64
+	Load15    float64
+	LoadKnown bool
 }
 
 // UpsertAgent 插入或更新主机信息。
@@ -480,12 +496,16 @@ func (db *DB) UpsertAgent(a *AgentRow) error {
 			return err
 		}
 	}
+	loadKnown := 0
+	if a.LoadKnown {
+		loadKnown = 1
+	}
 	_, err := db.Exec(`INSERT INTO agents
 		(agent_id, uuid, hostname, os_type, arch, kernel_version, online, last_seen, last_offline_at,
 		 uptime, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes, remote_addr,
 		 public_ip, public_ipv6, os_version, cpu_model, cpu_mhz, mem_total, mem_used,
-		 disk_total, disk_used, net_rate_in, net_rate_out, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 disk_total, disk_used, net_rate_in, net_rate_out, load1, load5, load15, load_known, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(agent_id) DO UPDATE SET
 			uuid = excluded.uuid, hostname = excluded.hostname, os_type = excluded.os_type,
 			arch = excluded.arch, kernel_version = excluded.kernel_version, online = excluded.online,
@@ -498,11 +518,14 @@ func (db *DB) UpsertAgent(a *AgentRow) error {
 			mem_total = excluded.mem_total, mem_used = excluded.mem_used,
 			disk_total = excluded.disk_total, disk_used = excluded.disk_used,
 			net_rate_in = excluded.net_rate_in, net_rate_out = excluded.net_rate_out,
+			load1 = excluded.load1, load5 = excluded.load5, load15 = excluded.load15,
+			load_known = excluded.load_known,
 			updated_at = excluded.updated_at`,
 		a.AgentID, uuid, a.Hostname, a.OSType, a.Arch, a.KernelVersion, online, a.LastSeen, a.LastOfflineAt,
 		a.Uptime, a.CPUUsage, a.MemUsage, a.DiskUsage, a.NetInBytes, a.NetOutBytes, a.RemoteAddr,
 		a.PublicIP, a.PublicIPv6, a.OSVersion, a.CPUModel, a.CPUMHz, a.MemTotal, a.MemUsed,
-		a.DiskTotal, a.DiskUsed, a.NetRateIn, a.NetRateOut, time.Now().Unix())
+		a.DiskTotal, a.DiskUsed, a.NetRateIn, a.NetRateOut,
+		a.Load1, a.Load5, a.Load15, loadKnown, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("保存主机信息失败: %w", err)
 	}
@@ -547,7 +570,7 @@ func (db *DB) LoadAgents() ([]*AgentRow, error) {
 	rows, err := db.Query(`SELECT agent_id, uuid, hostname, os_type, arch, kernel_version, online, last_seen, last_offline_at,
 		uptime, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes, remote_addr,
 		public_ip, public_ipv6, os_version, cpu_model, cpu_mhz, mem_total, mem_used,
-		disk_total, disk_used, net_rate_in, net_rate_out
+		disk_total, disk_used, net_rate_in, net_rate_out, load1, load5, load15, load_known
 		FROM agents ORDER BY last_seen DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("查询主机信息失败: %w", err)
@@ -556,14 +579,16 @@ func (db *DB) LoadAgents() ([]*AgentRow, error) {
 	var out []*AgentRow
 	for rows.Next() {
 		var a AgentRow
-		var online int
+		var online, loadKnown int
 		if err := rows.Scan(&a.AgentID, &a.UUID, &a.Hostname, &a.OSType, &a.Arch, &a.KernelVersion, &online, &a.LastSeen, &a.LastOfflineAt,
 			&a.Uptime, &a.CPUUsage, &a.MemUsage, &a.DiskUsage, &a.NetInBytes, &a.NetOutBytes, &a.RemoteAddr,
 			&a.PublicIP, &a.PublicIPv6, &a.OSVersion, &a.CPUModel, &a.CPUMHz, &a.MemTotal, &a.MemUsed,
-			&a.DiskTotal, &a.DiskUsed, &a.NetRateIn, &a.NetRateOut); err != nil {
+			&a.DiskTotal, &a.DiskUsed, &a.NetRateIn, &a.NetRateOut,
+			&a.Load1, &a.Load5, &a.Load15, &loadKnown); err != nil {
 			return nil, err
 		}
 		a.Online = online == 1
+		a.LoadKnown = loadKnown == 1
 		out = append(out, &a)
 	}
 	return out, rows.Err()
@@ -616,16 +641,17 @@ func (db *DB) UpdateAgentIdentity(oldID, newID, uuid string) error {
 // LoadAgent 加载单个主机信息。
 func (db *DB) LoadAgent(agentID string) (*AgentRow, error) {
 	var a AgentRow
-	var online int
+	var online, loadKnown int
 	err := db.QueryRow(`SELECT agent_id, uuid, hostname, os_type, arch, kernel_version, online, last_seen, last_offline_at,
 		uptime, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes, remote_addr,
 		public_ip, public_ipv6, os_version, cpu_model, cpu_mhz, mem_total, mem_used,
-		disk_total, disk_used, net_rate_in, net_rate_out
+		disk_total, disk_used, net_rate_in, net_rate_out, load1, load5, load15, load_known
 		FROM agents WHERE agent_id = ?`, agentID).Scan(
 		&a.AgentID, &a.UUID, &a.Hostname, &a.OSType, &a.Arch, &a.KernelVersion, &online, &a.LastSeen, &a.LastOfflineAt,
 		&a.Uptime, &a.CPUUsage, &a.MemUsage, &a.DiskUsage, &a.NetInBytes, &a.NetOutBytes, &a.RemoteAddr,
 		&a.PublicIP, &a.PublicIPv6, &a.OSVersion, &a.CPUModel, &a.CPUMHz, &a.MemTotal, &a.MemUsed,
-		&a.DiskTotal, &a.DiskUsed, &a.NetRateIn, &a.NetRateOut)
+		&a.DiskTotal, &a.DiskUsed, &a.NetRateIn, &a.NetRateOut,
+		&a.Load1, &a.Load5, &a.Load15, &loadKnown)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -633,6 +659,7 @@ func (db *DB) LoadAgent(agentID string) (*AgentRow, error) {
 		return nil, fmt.Errorf("查询主机信息失败: %w", err)
 	}
 	a.Online = online == 1
+	a.LoadKnown = loadKnown == 1
 	return &a, nil
 }
 

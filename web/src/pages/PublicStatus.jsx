@@ -116,9 +116,23 @@ export default function PublicStatus() {
   }
 
   const summary = snapshot?.summary || {}
-  const netEnabled = !!config.fields?.network
+  // 字段可见性：由服务端下发的 fields 开关驱动（等价于后台「展示配置 → 展示信息项」）。
+  // 注意这里只用于**决定渲染哪些项**：未开启的字段在接口响应里本就不存在，
+  // 所以即使这里判断错了，也不会泄露数据。
+  const visible = (key) => !!config.fields?.[key]
+  const netEnabled = visible('network')
+
   return (
     <div className="public-shell">
+      {/* 顶部悬浮汇总条：页面滚动时始终可见（sticky），一眼能看到站点整体状态。
+          按需求把节点统计从卡片区抽出来集中展示，卡片因此更小巧。 */}
+      <SummaryBar
+        summary={summary}
+        netEnabled={netEnabled}
+        trafficMode={config.traffic_mode}
+        live
+      />
+
       <header className="public-head">
         <div className="public-head-main">
           <h1>
@@ -155,8 +169,6 @@ export default function PublicStatus() {
         </div>
       </header>
 
-      <SummaryBar summary={summary} netEnabled={netEnabled} trafficMode={config.traffic_mode} />
-
       {config.hosts_enabled === false ? (
         <div className="public-empty">站点仅公开汇总指标，主机明细未开放。</div>
       ) : nodes.length === 0 ? (
@@ -169,8 +181,8 @@ export default function PublicStatus() {
             共 {filtered.length} 个节点{keyword ? `（已筛选，总 ${nodes.length} 个）` : ''}
           </div>
           {view === 'card'
-            ? <NodeCards nodes={filtered} />
-            : <NodeTable nodes={filtered} />}
+            ? <NodeCards nodes={filtered} visible={visible} />
+            : <NodeTable nodes={filtered} visible={visible} />}
         </>
       )}
 
@@ -186,150 +198,314 @@ function LiveDot() {
   return <span className="live-dot" title="实时刷新中" />
 }
 
-// 站点级汇总（不含任何主机标识）
+// 站点级汇总（不含任何主机标识）—— 顶部悬浮指标条。
+//
+// 内容固定为运维最关心的六项：节点总数 / 在线 / 离线 / 上行速率 / 下行速率 / 累计流量。
+// 「平均 CPU / 内存 / 磁盘」不在条上展示：这三项按主机逐台看才有意义，
+// 站点均值反而容易掩盖问题主机（卡片上本来就有逐台数值）。
 function SummaryBar({ summary, netEnabled, trafficMode }) {
+  const offline = summary.offline ?? 0
   const items = [
-    { label: '节点总数', value: summary.total ?? 0 },
-    { label: '在线', value: summary.online ?? 0, tone: 'ok' },
-    { label: '离线', value: summary.offline ?? 0, tone: (summary.offline ?? 0) > 0 ? 'bad' : '' },
-    { label: '平均 CPU', value: `${summary.avg_cpu ?? 0}%` },
-    { label: '平均内存', value: `${summary.avg_mem ?? 0}%` },
-    { label: '平均磁盘', value: `${summary.avg_disk ?? 0}%` },
+    { key: 'total', label: '节点总数', value: summary.total ?? 0, unit: '台' },
+    { key: 'online', label: '在线节点', value: summary.online ?? 0, unit: '台', tone: 'ok' },
+    { key: 'offline', label: '离线节点', value: offline, unit: '台', tone: offline > 0 ? 'bad' : '' },
   ]
   if (netEnabled) {
     items.push(
-      { label: '下行速率', value: fmtRate(summary.net_rate_in), sub: '站点合计', tone: 'net' },
-      { label: '上行速率', value: fmtRate(summary.net_rate_out), sub: '站点合计', tone: 'net' },
+      { key: 'up', label: '上行总网速', value: fmtRate(summary.net_rate_out), tone: 'up' },
+      { key: 'down', label: '下行总网速', value: fmtRate(summary.net_rate_in), tone: 'down' },
       {
-        label: trafficMode === 'window' ? '窗口累计流量' : '累计流量',
+        key: 'traffic',
+        label: trafficMode === 'window' ? '累计流量 · 留存窗口' : '累计流量 · 自启动',
         value: fmtBytes((summary.net_total_in || 0) + (summary.net_total_out || 0)),
-        sub: `↓${fmtBytes(summary.net_total_in)} ↑${fmtBytes(summary.net_total_out)}`,
-        tone: 'net',
-        wide: true,
+        sub: `↓ ${fmtBytes(summary.net_total_in)} · ↑ ${fmtBytes(summary.net_total_out)}`,
       },
     )
   }
   return (
-    <div className="public-metrics">
-      {items.map((it) => (
-        <div className={`public-metric ${it.tone || ''} ${it.wide ? 'wide' : ''}`} key={it.label}>
-          <div className="v">{it.value}</div>
-          <div className="l">{it.label}</div>
-          {it.sub ? <div className="s">{it.sub}</div> : null}
-        </div>
-      ))}
+    <div className="public-summary" role="status" aria-label="站点汇总">
+      <div className="public-summary-inner">
+        {items.map((it) => (
+          <div className={`sm-item ${it.tone || ''}`} key={it.key}>
+            <span className="sm-v">{it.value}<i className="sm-u">{it.unit || ''}</i></span>
+            <span className="sm-l">{it.label}</span>
+            {it.sub ? <span className="sm-s">{it.sub}</span> : null}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
 
 // 卡片视图（移动端友好）。
-// 交互：整张卡片就是一个按钮，**点击直接进入历史趋势** —— 不再需要额外按钮，
-// 卡片底部也不再挂"查看历史趋势"提示（多一个入口反而让卡片显得啰嗦）。
-function NodeCards({ nodes }) {
+//
+// 按需求精简为六项：名称（+国旗/状态点）/ 系统 / CPU / RAM / 磁盘 / 负载。
+// 站点的整体统计移到顶部悬浮条，流量移到列表视图 —— 卡片只回答"这台机器现在怎么样"，
+// 因此尺寸可以做小（<= 236px 宽即可排两列），一屏能看到更多机器。
+//
+// 交互：整张卡片就是按钮，点按直接进入历史趋势。
+function NodeCards({ nodes, visible }) {
   const nav = useNavigate()
+  const osOn = visible('os_type')
+  const cpuOn = visible('cpu_usage')
+  const memOn = visible('mem_usage')
+  const diskOn = visible('disk_usage')
+  const loadOn = visible('load')
   return (
     <div className="public-cards">
-      {nodes.map((n) => (
-        <button
-          className={`public-card ${n.online ? '' : 'offline'}`}
-          key={n.node_id}
-          onClick={() => nav(`/public/node/${n.node_id}`)}
-          title="点击查看历史趋势"
-        >
-          <div className="public-card-head">
-            <span className="public-card-name">{n.remark || n.node_id}</span>
-            <span className="public-card-head-right">
-              {n.geo?.country_code && <Flag code={n.geo.country_code} />}
-              {n.online !== undefined && (
-                <span className={`badge ${n.online ? 'online' : 'offline'}`}>{n.online ? '在线' : '离线'}</span>
-              )}
-            </span>
-          </div>
-          <div className="public-card-meta">
-            {n.os_type && <span>{n.os_type}{n.arch ? ` · ${n.arch}` : ''}</span>}
-            {geoText(n) && <span className="public-geo">{geoText(n)}</span>}
-          </div>
-          <MiniBar label="CPU" value={n.cpu_usage} />
-          <MiniBar label="内存" value={n.mem_usage} sub={bytesPair(n.mem_used_bytes, n.mem_total_bytes)} />
-          <MiniBar label="磁盘" value={n.disk_usage} sub={bytesPair(n.disk_used_bytes, n.disk_total_bytes)} />
-          {hasNet(n) && (
-            <div className="public-net">
-              <span className="down">↓ {fmtRate(n.net_rate_in)}</span>
-              <span className="up">↑ {fmtRate(n.net_rate_out)}</span>
-              <span className="total" title="累计流量">合计 {fmtBytes((n.net_total_in || 0) + (n.net_total_out || 0))}</span>
+      {nodes.map((n) => {
+        const hasMeta = osOn && (n.os_type || n.arch)
+        const hasBars = cpuOn || memOn || diskOn || loadOn
+        return (
+          <button
+            className={`public-card ${n.online === false ? 'offline' : ''}`}
+            key={n.node_id}
+            onClick={() => nav(`/public/node/${n.node_id}`)}
+            title="点击查看历史趋势"
+          >
+            <div className="public-card-head">
+              <span className="public-card-name" title={n.remark || n.node_id}>
+                {visible('geo') && n.geo?.country_code ? <Flag code={n.geo.country_code} /> : null}
+                {n.remark || n.node_id}
+              </span>
+              <span className="public-card-head-right">
+                {n.online !== undefined && (
+                  <span className={`dot ${n.online ? 'online' : 'offline'}`} title={n.online ? '在线' : '离线'} />
+                )}
+              </span>
             </div>
-          )}
-        </button>
-      ))}
+
+            {hasMeta && (
+              <div className="public-card-meta">
+                <span className="tag-os">{osText(n)}</span>
+                {visible('geo') && geoText(n) && <span className="tag-geo">{geoText(n)}</span>}
+              </div>
+            )}
+
+            {hasBars && (
+              <div className="public-card-bars">
+                {cpuOn && <MiniBar label="CPU" value={n.cpu_usage} />}
+                {memOn && <MiniBar label="RAM" value={n.mem_usage} />}
+                {diskOn && <MiniBar label="磁盘" value={n.disk_usage} />}
+                {loadOn && <LoadLine node={n} />}
+              </div>
+            )}
+          </button>
+        )
+      })}
     </div>
   )
 }
 
-// 列表视图（信息密度高）
-function NodeTable({ nodes }) {
+// 负载一行：Load1 为主，括号内带 5/15 分钟值；服务端未下发时显示「—」。
+function LoadLine({ node }) {
+  const has = typeof node.load1 === 'number'
+  const busy = has && node.load1 >= 1
+  return (
+    <div className="public-mini public-load">
+      <div className="public-mini-row">
+        <span className="k">负载</span>
+        <span className={`v ${busy ? 'warn' : ''}`}>
+          {has ? node.load1.toFixed(2) : '—'}
+          {has && typeof node.load5 === 'number' && (
+            <em className="load-more">{node.load5.toFixed(2)} / {(node.load15 ?? 0).toFixed(2)}</em>
+          )}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// 列表视图（信息密度高）。
+//
+// 列：节点名称 / 状态 / 系统类型 / 系统版本 / 地区 / CPU / 内存 / 磁盘 / 网速 / 流量 / 负载。
+// 每一列都受后台「展示配置 → 展示信息项」门控：未开启的列不渲染，
+// 服务端也不会下发对应字段（双重保证）。
+//
+// 排序：只允许按**非动态字段**排序（名称/系统/地区/磁盘容量等），
+// 因为这些值在一次快照内是稳定的；按 CPU/网速等每 5 秒变化的字段排序会让
+// 行序不停跳动，反而看不清。默认「在线优先 + 名称」。
+function NodeTable({ nodes, visible }) {
   const nav = useNavigate()
+  // sortKey='default' 表示"在线优先 + 名称"；其余为列 key。
+  // sortDir 只在可排序列上生效：第一次点击升序，再点切换降序，第三次恢复默认。
+  const [sortKey, setSortKey] = useState('default')
+  const [sortDir, setSortDir] = useState('asc')
+  const clickSort = (key) => {
+    if (!SORTABLE.has(key)) return
+    if (sortKey !== key) { setSortKey(key); setSortDir('asc'); return }
+    if (sortDir === 'asc') { setSortDir('desc'); return }
+    setSortKey('default'); setSortDir('asc')
+  }
+
+  const columns = useMemo(() => [
+    visible('remark') || visible('hostname') ? { key: 'name', label: '节点名称' } : null,
+    visible('online') ? { key: 'online', label: '状态' } : null,
+    visible('os_type') ? { key: 'os', label: '系统类型' } : null,
+    visible('os_version') ? { key: 'osver', label: '系统版本' } : null,
+    visible('geo') ? { key: 'geo', label: '地区' } : null,
+    visible('cpu_usage') ? { key: 'cpu', label: 'CPU' } : null,
+    visible('mem_usage') ? { key: 'mem', label: '内存' } : null,
+    visible('disk_usage') ? { key: 'disk', label: '磁盘' } : null,
+    visible('network') ? { key: 'rate', label: '网速' } : null,
+    visible('network') ? { key: 'traffic', label: '流量' } : null,
+    visible('load') ? { key: 'load', label: '负载' } : null,
+  ].filter(Boolean), [visible])
+
+  const sorted = useMemo(() => sortNodes(nodes, sortKey, sortDir), [nodes, sortKey, sortDir])
+
   return (
     <div className="card public-table-card">
       <div className="table-scroll">
-        <table className="table-stack">
+        <table className="table-stack public-table">
           <thead>
             <tr>
-              <th>节点</th>
-              <th>状态</th>
-              <th>系统 / 地区</th>
-              <th>CPU</th>
-              <th>内存</th>
-              <th>磁盘</th>
-              <th>网络</th>
+              {columns.map((c) => (
+                <th key={c.key} className={SORTABLE.has(c.key) ? 'sortable' : ''}
+                  onClick={() => clickSort(c.key)}
+                  title={SORTABLE.has(c.key) ? '点击排序 / 再点切换升降序 / 第三次恢复默认（仅非动态字段）' : undefined}
+                >
+                  {c.label}
+                  {SORTABLE.has(c.key) && (
+                    <span className={`sort-mark ${sortKey === c.key ? 'on' : ''}`}>
+                      {sortKey === c.key ? (sortDir === 'asc' ? '▲' : '▼') : '↕'}
+                    </span>
+                  )}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
-            {nodes.map((n) => (
+            {sorted.map((n) => (
               <tr key={n.node_id} className="public-row" onClick={() => nav(`/public/node/${n.node_id}`)}>
-                <td data-label="节点">
-                  <b>{n.remark || n.node_id}</b>
-                  {n.hostname ? <div className="cell-sub">{n.hostname}</div> : null}
-                </td>
-                <td data-label="状态">
-                  {n.online !== undefined ? (
-                    <span className={`badge ${n.online ? 'online' : 'offline'}`}>{n.online ? '在线' : '离线'}</span>
-                  ) : '-'}
-                </td>
-                <td data-label="系统/地区">
-                  <div style={{ fontSize: 12 }}>
-                    {[n.os_type, n.os_version, n.arch].filter(Boolean).join(' · ') || '-'}
-                  </div>
-                  {geoText(n) && (
-                    <div className="cell-sub">
-                      {n.geo?.country_code ? <Flag code={n.geo.country_code} /> : null} {geoText(n)}
-                    </div>
-                  )}
-                </td>
-                <td data-label="CPU">{n.cpu_usage !== undefined ? `${n.cpu_usage}%` : '-'}</td>
-                <td data-label="内存">
-                  {n.mem_usage !== undefined ? `${n.mem_usage}%` : '-'}
-                  <div className="cell-sub">{bytesPair(n.mem_used_bytes, n.mem_total_bytes)}</div>
-                </td>
-                <td data-label="磁盘">
-                  {n.disk_usage !== undefined ? `${n.disk_usage}%` : '-'}
-                  <div className="cell-sub">{bytesPair(n.disk_used_bytes, n.disk_total_bytes)}</div>
-                </td>
-                <td data-label="网络">
-                  {hasNet(n) ? (
-                    <>
-                      <div style={{ color: 'var(--net-down)', fontSize: 12 }}>↓ {fmtRate(n.net_rate_in)}</div>
-                      <div style={{ color: 'var(--net-up)', fontSize: 12 }}>↑ {fmtRate(n.net_rate_out)}</div>
-                      <div className="cell-sub">合计 {fmtBytes((n.net_total_in || 0) + (n.net_total_out || 0))}</div>
-                    </>
-                  ) : '-'}
-                </td>
+                {columns.map((c) => <td key={c.key} data-label={c.label}>{cell(c.key, n, visible)}</td>)}
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+      {sortKey !== 'default' && (
+        <div className="cell-sub sort-hint">
+          已按「{columns.find((c) => c.key === sortKey)?.label}」{sortDir === 'asc' ? '升序' : '降序'}排列 ·
+          再点一次切换方向，第三次恢复默认（在线优先）
+        </div>
+      )}
     </div>
   )
+}
+
+// SORTABLE 允许排序的列：全部是**非动态字段**（不随探针周期变化）。
+const SORTABLE = new Set(['name', 'online', 'os', 'osver', 'geo', 'disk'])
+
+// sortNodes 按非动态字段排序；default = 在线优先 + 名称。
+//
+// dir='asc' 升序 / 'desc' 降序。每种排序都以「名称」作为并列时的次级键，
+// 保证同值行的顺序稳定（不会随服务端 map 遍历顺序抖动）。
+function sortNodes(list, key, dir = 'asc') {
+  const arr = [...list]
+  const sign = dir === 'desc' ? -1 : 1
+  const byName = (a, b) => nameOf(a).localeCompare(nameOf(b), 'zh-Hans-CN')
+  if (key === 'default') {
+    return arr.sort((a, b) => {
+      if (a.online !== b.online) return a.online ? -1 : 1
+      return byName(a, b)
+    })
+  }
+  const cmp = {
+    name: byName,
+    // 在线始终排在前面（"谁在线"是这张表的第一信息），方向只影响名称次序
+    online: (a, b) => (Number(b.online) || 0) - (Number(a.online) || 0) || sign * byName(a, b),
+    os: (a, b) => sign * (String(a.os_type || '').localeCompare(String(b.os_type || '')) || 0) || byName(a, b),
+    osver: (a, b) => sign * (String(a.os_version || '').localeCompare(String(b.os_version || '')) || 0) || byName(a, b),
+    geo: (a, b) => sign * (geoText(a).localeCompare(geoText(b), 'zh-Hans-CN') || 0) || byName(a, b),
+    // 磁盘按**容量**排序比按百分比更有意义（直接看出谁是盘小的机器）；
+    // 升序 = 容量小的在前，降序 = 容量大的在前。
+    disk: (a, b) => sign * ((a.disk_total_bytes || 0) - (b.disk_total_bytes || 0)) || byName(a, b),
+  }
+  const fn = key === 'name' ? ((a, b) => sign * byName(a, b)) : cmp[key]
+  return arr.sort(fn || byName)
+}
+
+// nameOf 排序用显示名（备注优先，其次主机名，最后节点编号）。
+function nameOf(n) {
+  return n.remark || n.hostname || n.node_id || ''
+}
+
+// cell 渲染单列内容。所有取值都做缺省处理：字段未开启时显示「-」而不是空白。
+function cell(key, n, visible) {
+  switch (key) {
+    case 'name':
+      return (
+        <>
+          <b className="row-name">
+            {visible('geo') && n.geo?.country_code ? <Flag code={n.geo.country_code} /> : null}
+            {n.remark || n.hostname || n.node_id}
+          </b>
+          {visible('node_id') && n.remark && n.node_id ? <div className="cell-sub">{n.node_id}</div> : null}
+        </>
+      )
+    case 'online':
+      return n.online === undefined
+        ? '-'
+        : <span className={`badge ${n.online ? 'online' : 'offline'}`}>{n.online ? '在线' : '离线'}</span>
+    case 'os':
+      return <span className="tag-os">{osText(n) || '-'}</span>
+    case 'osver':
+      return <span title={n.os_version || ''}>{n.os_version || '-'}</span>
+    case 'geo':
+      return geoText(n) || '-'
+    case 'cpu':
+      return n.cpu_usage === undefined ? '-' : <Pct value={n.cpu_usage} />
+    case 'mem':
+      return n.mem_usage === undefined ? '-' : (
+        <>
+          <Pct value={n.mem_usage} />
+          <div className="cell-sub">{bytesPair(n.mem_used_bytes, n.mem_total_bytes)}</div>
+        </>
+      )
+    case 'disk':
+      return n.disk_usage === undefined ? '-' : (
+        <>
+          <Pct value={n.disk_usage} />
+          <div className="cell-sub">{bytesPair(n.disk_used_bytes, n.disk_total_bytes)}</div>
+        </>
+      )
+    case 'rate':
+      if (!hasNet(n)) return '-'
+      return (
+        <>
+          <div className="rate-down">↓ {fmtRate(n.net_rate_in)}</div>
+          <div className="rate-up">↑ {fmtRate(n.net_rate_out)}</div>
+        </>
+      )
+    case 'traffic':
+      if (!hasTraffic(n)) return '-'
+      return <span title={`↓ ${fmtBytes(n.net_total_in)} / ↑ ${fmtBytes(n.net_total_out)}`}>
+        {fmtBytes((n.net_total_in || 0) + (n.net_total_out || 0))}
+      </span>
+    case 'load':
+      if (typeof n.load1 !== 'number') return '-'
+      return (
+        <span title="1 / 5 / 15 分钟平均负载">
+          {n.load1.toFixed(2)}
+          <div className="cell-sub">{(n.load5 ?? 0).toFixed(2)} / {(n.load15 ?? 0).toFixed(2)}</div>
+        </span>
+      )
+    default:
+      return '-'
+  }
+}
+
+// Pct 百分比文本（>85 标红，>60 标黄，与卡片进度条同口径）。
+function Pct({ value }) {
+  const v = Number(value) || 0
+  const cls = v > 85 ? 'danger' : v > 60 ? 'warn' : ''
+  return <span className={`pct ${cls}`}>{v.toFixed(1)}%</span>
+}
+
+// osText 系统类型文本：类型 + 架构（如 linux · amd64）。
+function osText(n) {
+  return [n.os_type, n.arch].filter(Boolean).join(' · ')
 }
 
 function MiniBar({ label, value, sub }) {
@@ -372,10 +548,22 @@ function geoText(n) {
   return [n.geo.country, n.geo.region, n.geo.city].filter(Boolean).join(' ')
 }
 
-// 是否有可展示的网络数据
+// 是否有可展示的网络速率数据
 function hasNet(n) {
   return n.net_rate_in !== undefined || n.net_rate_out !== undefined
     || n.net_total_in !== undefined || n.net_total_out !== undefined
+}
+
+// 是否有可展示的累计流量（速率有值但累计未知时不该显示成 0B）
+function hasTraffic(n) {
+  return typeof n.net_total_in === 'number' || typeof n.net_total_out === 'number'
+}
+
+// 负载文本：服务端未下发（平台不提供）时返回空串
+function loadText(n) {
+  if (typeof n?.load1 !== 'number') return ''
+  const parts = [n.load1, n.load5, n.load15].filter((v) => typeof v === 'number')
+  return parts.map((v) => v.toFixed(2)).join(' / ')
 }
 
 // 节点详情页：展示公开字段明细 + 历史趋势（历史数据统计）
@@ -453,6 +641,7 @@ export function PublicNode() {
           <div className="public-desc">
             {node ? ([node.os_type, node.os_version, node.arch].filter(Boolean).join(' · ') || node.node_id) : ''}
             {node && geoText(node) ? ` · ${geoText(node)}` : ''}
+            {node && loadText(node) ? ` · 负载 ${loadText(node)}` : ''}
           </div>
         </div>
         <div className="public-head-actions">
@@ -503,6 +692,7 @@ function NodeFacts({ node }) {
     push('公网 IPv6', node.public_ipv6)
     push('CPU 型号', node.cpu_model)
     push('CPU 利用率', node.cpu_usage !== undefined ? `${node.cpu_usage}%` : '')
+    push('系统负载', loadText(node) ? `${loadText(node)}（1 / 5 / 15 分钟）` : '')
     push('内存', node.mem_usage !== undefined
       ? `${node.mem_usage}%（${bytesPair(node.mem_used_bytes, node.mem_total_bytes) || '—'}）`
       : '')

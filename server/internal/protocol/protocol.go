@@ -116,6 +116,15 @@ type ProbeDataReq struct {
 	MemUsedBytes   int64   `json:"mem_used_bytes,omitempty"`
 	DiskTotalBytes int64   `json:"disk_total_bytes,omitempty"`
 	DiskUsedBytes  int64   `json:"disk_used_bytes,omitempty"`
+	// 系统负载（1/5/15 分钟平均）。Unix 来自 /proc/loadavg 或 sysctl；
+	// Windows 无此概念（取处理器队列长度近似），LoadKnown=false 表示平台不提供，
+	// 前端应显示「—」而不是 0.00。
+	// 用指针 + omitempty：0.00 是**合法负载**（空闲机器），不能因 omitempty 被丢弃，
+	// 否则公开页会把"负载 0.00"显示成"—"（看起来像不支持该指标）。
+	// nil = 平台不提供（Windows 未取到队列长度）或旧版 Agent 未上报。
+	Load1  *float64 `json:"load1,omitempty"`
+	Load5  *float64 `json:"load5,omitempty"`
+	Load15 *float64 `json:"load15,omitempty"`
 
 	// 相邻采样之间的收发字节增量（**仅服务端填写**，Agent 上报报文里没有这两个字段）。
 	// 与 NetInBytes（网卡自启动以来的累计值）语义不同：增量用于趋势与公开页流量统计。
@@ -165,6 +174,12 @@ type AgentInfo struct {
 	// 网络速率（字节/秒），由服务端根据相邻探针累计值差计算
 	NetRateIn  int64 `json:"net_rate_in,omitempty"`
 	NetRateOut int64 `json:"net_rate_out,omitempty"`
+	// 系统负载（1/5/15 分钟平均）。用指针：nil = 平台不提供（如 Windows 未取到
+	// 队列长度）；非 nil 时 0 是合法值（空闲机器），必须如实下发给前端 ——
+	// 用 float64 + omitempty 会把 0 当成"没有数据"丢掉，前端只能显示「—」。
+	Load1  *float64 `json:"load1,omitempty"`
+	Load5  *float64 `json:"load5,omitempty"`
+	Load15 *float64 `json:"load15,omitempty"`
 
 	// 注册鉴权（应用层，见 internal/agentauth）：proof = HMAC-SHA256(key, agentID|nonce|ts)
 	// 服务端据此确认对端持有预共享密钥，防止未授权主机注册与身份冒用。
