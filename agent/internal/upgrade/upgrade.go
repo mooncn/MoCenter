@@ -30,11 +30,12 @@ import (
 	"mocenter/agent/internal/version"
 )
 
-// Version 当前 Agent 版本（引用统一的版本包，避免"升级模块以为自己还是 1.0.0"
-// 而实际上报已是 1.0.1"这类不一致）。
+// Version 返回当前 Agent 版本（转发到 version 包，避免"升级模块以为自己还是
+// 1.0.0 而实际上报已是 1.0.1"这类不一致）。
 //
-// 保留这个常量是为了不破坏既有调用方（含测试）的引用路径。
-const Version = version.Version
+// 这里用函数而不是常量别名：version.Version 是 var（为了支持构建期
+// -ldflags 注入），无法在编译期折叠成常量。
+func Version() string { return version.Version }
 
 // Policy 升级校验策略。
 type Policy struct {
@@ -76,13 +77,13 @@ func loadPubKey(spec string) (ed25519.PublicKey, error) {
 
 // Perform 执行一次升级。pol 给出签名校验策略。
 func Perform(req *protocol.UpgradeReq, pol Policy, report func(*protocol.UpgradeResp)) {
-	resp := &protocol.UpgradeResp{UpgradeID: req.UpgradeID, Version: Version}
+	resp := &protocol.UpgradeResp{UpgradeID: req.UpgradeID, Version: Version()}
 	defer report(resp)
 
 	// 1) 校验版本
-	if req.Version != "" && req.Version == Version && !req.Force {
+	if req.Version != "" && req.Version == Version() && !req.Force {
 		resp.OK = true
-		resp.Message = "已是最新版本 " + Version
+		resp.Message = "已是最新版本 " + Version()
 		return
 	}
 

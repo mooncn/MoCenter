@@ -178,6 +178,41 @@ npm run dev     # 开发模式 (代理到 :8080)
 > Go / npm 缺失时，一键脚本会打印 `!! ... 跳过 ...` 并**继续构建其余部分**（不中断）。
 > 因此看到跳过提示不等于构建失败，请以最终产物为准。
 
+### 版本号速查
+
+三套版本号**互相独立**，不需要保持一致，也不存在跨端一致性校验：
+
+| 版本号 | 定义位置 | 作用 | 覆盖方式 |
+|--------|----------|------|----------|
+| Server 版本 | `server/internal/version/version.go` | 服务端自身版本（/api/version、备份清单口径） | 改常量（仅发版时） |
+| **Agent 版本** | `agent/internal/version/version.go` | **仅**标记 Agent 功能迭代代际 | 改常量，或构建时 `MOCENTER_AGENT_VERSION` |
+| 安装包版本 | `installer\setup.iss` 的 `AppVersion`、`MOCENTER_VERSION` | 安装包文件名与注册表版本 | 环境变量 |
+
+```bat
+REM 只影响 Agent 二进制内嵌的版本号，不影响服务端
+set MOCENTER_AGENT_VERSION=1.2.0
+scripts\build-all.bat
+```
+
+### 构建报错 `zip: not a valid zip file`
+
+Go 模块缓存（`go env GOMODCACHE`）里存在**被截断或写坏的模块压缩包**时，
+Go 会报 `zip: not a valid zip file`，随后**所有**从该模块解析进来的包都会编译失败
+（例如 `golang.org/x/sys`、`winapp_windows.go`）—— 看起来像源码坏了，实际只是本地下载产物损坏。
+
+`scripts\build-all.bat` 已内置自愈：先正常 `go mod download` + `go build`，
+失败就 `go clean -modcache` 后切到镜像代理（`https://goproxy.cn`）重下一次再重试。
+手工处理等价于：
+
+```bat
+go clean -modcache
+set GOPROXY=https://goproxy.cn,direct
+scripts\build-all.bat
+```
+
+> 也可以直接删缓存目录后重跑：`rmdir /s /q "%USERPROFILE%\go\pkg\mod"`。
+> 脚本**不会**设置 `GOFLAGS=-mod=mod`：第三方代码必须继续以 `go.sum` 为准。
+
 ### 脚本总览
 
 | 脚本 | 平台 | 作用 | 产物 |
@@ -253,9 +288,11 @@ bash scripts/packaging/build-linux-pkg.sh rpm amd64
 MOCENTER_VERSION=1.2.3 bash scripts/packaging/build-linux-pkg.sh all amd64   # 指定版本号
 ```
 
-`build-linux-pkg.sh` 参数为 `[deb|rpm|all] [arch]`。版本号来源优先级：
+`build-linux-pkg.sh` 参数为 `[deb|rpm|all] [arch]`。**安装包版本**来源优先级：
 环境变量 `MOCENTER_VERSION` > 从 `agent/internal/version/version.go` 自动读取 > 兜底值。
 自动读取是为了避免"二进制里是 1.0.1、包名却是 1.0.0"这类版本漂移。
+二进制内嵌的 **Agent 版本**由 `MOCENTER_AGENT_VERSION` 单独覆盖（缺省跟随安装包版本）；
+两者允许不一致，例如「安装包 1.2.0 里装的 Agent 仍标记 1.0.1」是合法组合。
 生成的安装包内置 systemd 单元：安装后自动注册 `mocenter-agent.service`、设置开机自启，
 二进制落在 `/usr/local/bin/mocenter-agent`，配置文件为 `/etc/mocenter/mocenter-agent.conf`（**安装后请修改服务端地址**）。
 
@@ -285,11 +322,12 @@ set INNO_SETUP_ISCC=D:\Tools\Inno Setup 6\ISCC.exe
 scripts\packaging\build-setup.bat
 ```
 
-> 改版本号：本系统 **server 与 agent 共用同一版本号**，发版时需同时修改
-> `server/internal/version/version.go`、`agent/internal/version/version.go` 与
-> `installer\setup.iss` 的 `#define AppVersion`。两处 Go 常量的一致性由
-> `server/internal/version` 的单元测试守护（会读取 agent 侧源码比对），漏改会直接测试失败。
-> **版本号只在明确发版时修改**，服务端不提供运行时改版本的开关（避免线上跑着一个"版本号被临时改过"的二进制导致升级判定错乱）。
+> 改版本号：**Server 版本与 Agent 版本互相独立**，各自修改自己的常量 ——
+> Server 改 `server/internal/version/version.go`，Agent 改 `agent/internal/version/version.go`，
+> 两者**不需要保持一致**，也不存在跨端一致性校验。
+> 打包/安装包版本另由 `installer\setup.iss` 的 `#define AppVersion` 与
+> 构建脚本的 `MOCENTER_VERSION` / `MOCENTER_AGENT_VERSION` 决定。
+> **版本号只在明确发版时修改**，两端都不提供运行时改版本的开关（避免线上跑着一个"版本号被临时改过"的二进制导致升级判定错乱）。
 > 安装包**无需维护文件清单**：向导只负责收集参数与摆放文件，服务注册、配置落盘、单实例保护
 > 都交给随包安装的 `mocenter-deploy.exe`（其失败原因会写入安装目录下的 `mocenter-deploy.log`）。
 
@@ -421,7 +459,7 @@ Agent TCP 通道要求每台 Agent 持有与服务端一致的**预共享密钥*
 - ✅ **离线本地 GeoIP**：支持 MaxMind DB 格式离线库（GeoLite2-Country / City、DB-IP、IPinfo），配置 `-mmdb` / `mmdb_path` 后**本地优先解析**，未命中再降级到外部接口；解决无外网部署、免费接口按分钟限流（批量上线互相挤额度）、以及主源不支持 IPv6 三类问题
 - ✅ **备份 / 恢复**：一键导出数据目录为单个 zip（含 manifest 清单与每个文件的 SHA-256），恢复前可查看包内明细；SQLite 走 `VACUUM INTO` 在线一致快照（WAL 下直接拷文件会丢未 checkpoint 的事务）；恢复端做白名单 + 路径穿越校验 + 体积上限 + 摘要校验，覆盖前自动留存 `*.before-restore`
 - ✅ **后台一键部署 Agent（Linux）**：在 Web 后台填目标机地址与账号/密码（或私钥），SSH 登录后自动上传 Agent、写入配置（服务端地址 / Agent 名称 / 注册密钥 / 延迟目标）并注册为 systemd 服务；支持"先探测再安装"（仅探测连通性、架构、权限，不做任何改动）；凭证不落盘、不入日志，所有拼进 shell 的变量都经过引号转义与白名单校验
-- ✅ **统一版本号管理**：server 与 agent 共用同一版本号（`internal/version`，当前 `1.0.1`），仅在发版时修改；`AgentInfo.AgentVersion` 随注册上报，`/api/version` 给出各主机版本与"是否需要升级"判定；升级包的 version 必须等于服务端版本（不填则自动取），打包脚本与 Inno Setup 版本号同步；一致性由单元测试守护（含对 agent 源码的比对）
+- ✅ **版本号独立管理**：Server（`server/internal/version`）与 Agent（`agent/internal/version`）各自维护版本号，**互相独立、不做一致性校验** —— Agent 只按自身功能迭代节奏发版，服务端发版不会牵动全网 Agent，反之亦然；`AgentInfo.AgentVersion` 随注册上报并由 `/api/version` 展示；升级包的 version 只表示"本次要升到哪个版本"（不填则默认取服务端版本），与当前服务端版本不同也能下发；打包脚本与 Inno Setup 版本号同步
 - ✅ **多架构打包**：Windows x86/x86_64/ARM/ARM64、Linux amd64/arm64/arm/386 二进制，及 .deb/.rpm 安装包
 - ✅ **系统服务注册**：Agent 一键注册为 Windows 服务 / Linux systemd 服务，开机自启
 

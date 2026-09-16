@@ -2,21 +2,23 @@
 //
 // 为什么要有这个包（而不是散落的字符串常量）：
 //
-//   - 服务端与 Agent 的版本号必须**统一**：前端「关于」页、/api/version、
-//     Agent 上线时上报的版本、升级包校验都要用同一个数。散着写必然出现
-//     "服务端 1.0.1 而 Agent 还认为自己是 1.0.0"，升级判定的行为随调用点而异。
+//   - 服务端版本号会出现在备份清单、/api/version、「关于」页等对外口径上，
+//     散着写必然出现不同页面显示不同版本号的问题。
+//   - 它同时决定安装包文件名与注册表版本（installer/setup.iss 的 AppVersion），
+//     集中一处便于发版时同步。
 //   - 版本号是**发布纪律**，不是运行时的一个配置项：只在明确发版时修改，
 //     因此这里没有 -version 命令行参数、没有环境变量覆盖 —— 免得线上跑着
 //     一个"版本号被临时改过"的二进制，导致升级判定错乱。
 //
-// 升级方式：改 Version 常量 + 同步 agent/internal/version 下的同名常量。
-// 两处一致性由 server/internal/version 的单元测试守护（读取 agent 源码比对）。
+// 与 Agent 版本号的关系：**两者互相独立，不做一致性校验**。
+// Agent 版本由 agent/internal/version 单独维护，表达"Agent 功能迭代到哪一代"；
+// 服务端只把它当展示字段（AgentInfo.AgentVersion），
+// 版本高于或低于服务端都属于正常状态。
 package version
 
-// Version 当前 MoCenter 版本号（服务端与 Agent 共用同一版本号）。
+// Version 当前 MoCenter 服务端版本号（独立于 Agent 版本号）。
 //
-// 发布纪律：**只有在明确发版时才修改此值**，且必须与
-// agent/internal/version.Version 保持一致。
+// 发布纪律：**只有在明确发版时才修改此值**。
 const Version = "1.0.1"
 
 // Name 产品名（用于「关于」页与 User-Agent 等展示）。

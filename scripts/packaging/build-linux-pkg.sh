@@ -35,8 +35,15 @@ esac
 # 为什么要从源码读：版本号在 Go 侧是唯一事实来源（internal/version），
 # 打包脚本里再写一份硬编码，发版时必然出现"二进制里是 1.0.1、包名却是 1.0.0"。
 # 这里自动读取，只有读不到（例如只拷了脚本）才用兜底值。
+#
+# 注意：Agent 版本与服务端版本互相独立，所以这里读的是 **agent 侧** 的常量，
+# 与 server/internal/version 无关；安装包版本跟随 Agent 版本是刻意选择
+# （包名叫 mocenter-agent，里面的二进制就是那个版本的 Agent）。
 SRC_VERSION="$(sed -n 's/^\s*const\s\+Version\s*=\s*"\([^"]*\)".*/\1/p' "${AGENT_DIR}/internal/version/version.go" 2>/dev/null | head -1)"
 VERSION="${MOCENTER_VERSION:-${SRC_VERSION:-1.0.1}}"
+# 二进制内嵌的 Agent 版本：正常等于 VERSION；只有在"新包名 + 旧 Agent 版本号"
+# 这类刻意组合下才用 MOCENTER_AGENT_VERSION 单独覆盖。
+AGENT_VERSION="${MOCENTER_AGENT_VERSION:-${VERSION}}"
 PKG_NAME="mocenter-agent"
 STAGE="${OUT_DIR}/stage"
 
@@ -52,7 +59,9 @@ rm -rf "${STAGE}"
 
 # 1. 构建 Agent 二进制
 echo "[1/3] 构建 Agent (linux/${GOARCH}) ..."
-(cd "${AGENT_DIR}" && GOOS=linux GOARCH="${GOARCH}" CGO_ENABLED=0 go build -ldflags "-s -w" -o "${STAGE}/mocenter-agent" .)
+(cd "${AGENT_DIR}" && GOOS=linux GOARCH="${GOARCH}" CGO_ENABLED=0 \
+  go build -ldflags "-s -w -X mocenter/agent/internal/version.Version=${AGENT_VERSION}" \
+  -o "${STAGE}/mocenter-agent" .)
 
 # 2. 组装目录结构
 echo "[2/3] 组装文件树 ..."

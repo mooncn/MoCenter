@@ -1221,8 +1221,14 @@ func splitLatencySpec(s string) (kind, addr string) {
 
 // versionHandler GET /api/version
 //
-// 返回服务端版本 + 每个 Agent 的版本与"是否需要升级"判定。
+// 返回服务端版本 + 每个 Agent 上报的版本。
 // 前端「关于」页与主机列表都读它，避免版本口径在不同页面各写一遍。
+//
+// 关于 "outdated"：Agent 版本与服务端版本**互相独立**，因此不能把
+// "与 server_version 不同" 直接说成"需要升级" —— 那会把正常状态误报成异常
+// （Agent 走在服务端前面、或服务端刚发版而 Agent 尚未跟进，都是常态）。
+// 这里返回的 outdated 只表示"该 Agent 版本号与服务端当前版本号不同"，
+// 是否需要升级由运维自行判断；字段名保留是为了兼容既有前端。
 func versionHandler(store *probe.Store, resolver *geo.Resolver, authz *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
@@ -1236,16 +1242,16 @@ func versionHandler(store *probe.Store, resolver *geo.Resolver, authz *auth.Auth
 				continue
 			}
 			cur := strings.TrimSpace(a.AgentVersion)
-			// 空版本 = 旧版 Agent 未上报，一律视为"需升级"：
-			// 它一定不是当前版本，这是保守且正确的判断。
-			need := cur != version.Version
-			if need {
+			// 只做"版本号是否与服务端当前版本不同"的事实陈述，不代表升级建议：
+			// Agent 独立发版，版本不同属正常。空版本 = 旧版 Agent 未上报。
+			differs := cur != version.Version
+			if differs {
 				outdated++
 			}
 			items = append(items, map[string]interface{}{
 				"agent_id": a.AgentID, "remark": a.Remark, "hostname": a.Hostname,
 				"online": a.Online, "agent_version": cur,
-				"outdated": need, "version_known": cur != "",
+				"outdated": differs, "version_known": cur != "",
 			})
 		}
 		// 离线 GeoIP 库状态：部署后无法只看日志确认"是否真的生效"，
@@ -1263,8 +1269,9 @@ func versionHandler(store *probe.Store, resolver *geo.Resolver, authz *auth.Auth
 			"agent_total":        len(items),
 			"agent_outdated":     outdated,
 			"agents":             items,
-			"upgrade_rule":       "升级包的 version 需与 server_version 一致；服务端与 Agent 统一使用同一版本号",
-			"release_discipline": "版本号仅在明确发版时修改（见 internal/version）",
+			"upgrade_rule":       "升级包的 version 表示本次要升到的版本，与 server_version 无关（不填则默认取 server_version）",
+			"version_policy":     "Agent 版本与 Server 版本互相独立：两者不做一致性校验，版本高低都属于正常状态",
+			"release_discipline": "版本号仅在明确发版时修改（见各自的 internal/version）",
 		})
 	}
 }
@@ -1588,18 +1595,20 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
 			return
 		}
-		// 版本号纪律：本系统的 server 与 agent **共用同一版本号**，
-		// 因此升级包声明的版本必须等于当前服务端版本 —— 否则会出现
-		// "server 1.0.1 却把 agent 升到 1.0.2"这类版本漂移，
-		// 而版本号正是"这台机器是否需要升级"的判断依据。
-		// 未填写时自动补当前版本（前端不必硬编码）。
+		// Agent 版本与 Server 版本互相独立：这里**不做**"升级包版本必须等于
+		// 服务端版本"之类的强制校验。Agent 的发布节奏可以与服务端不同步，
+		// 运维也经常需要灰度「先把一部分 Agent 升到 x.y.z」——强制对齐只会挡路。
+		//
+		// 这个字段的含义仅是"本次要升到哪个版本"，由 Agent 侧用于判断是否跳过：
+		// Agent 只比较它与自身版本是否相等，相等则跳过（除非 force）。
+		// 因此它可以是任何合法版本号，与当前服务端版本没有关系。
+		//
+		// 未填写时自动补当前服务端版本，仅作为"顺手给个默认值"，方便只改 Agent
+		// 且与服务端同步发版的场景；它不代表任何约束。
 		if v := strings.TrimSpace(body.Version); v == "" {
 			body.Version = version.Version
-		} else if v != version.Version {
-			writeJSON(w, map[string]interface{}{"ok": false,
-				"msg": fmt.Sprintf("升级包版本 %s 与当前服务端版本 %s 不一致：本系统 server/agent 共用同一版本号，"+
-					"请使用同一版本号发布（不填则自动取服务端版本）", v, version.Version)})
-			return
+		} else {
+			body.Version = v
 		}
 		// 服务端侧先做一次校验，尽早把错误反馈给操作者（Agent 侧还会再校验一次）
 		if strings.TrimSpace(body.SHA256) == "" {

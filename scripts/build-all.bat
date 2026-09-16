@@ -25,11 +25,10 @@ echo(
 echo [1/4] Building Server ...
 where go >nul 2>nul
 if %errorlevel%==0 (
-  pushd "%ROOT_DIR%\server"
-  go mod download
-  go build -ldflags "-s -w" -o "%OUT_DIR%\mocenter-server.exe" .
-  popd
-  echo   -^> %OUT_DIR%\mocenter-server.exe
+  set "GOOS="
+  set "GOARCH="
+  set "CGO_ENABLED=0"
+  call :build_module "%ROOT_DIR%\server" "%OUT_DIR%\mocenter-server.exe"
 ) else (
   echo   !! Go not found, skip Server build
 )
@@ -38,14 +37,12 @@ echo(
 echo [2/4] Building Agent (Windows amd64) ...
 where go >nul 2>nul
 if %errorlevel%==0 (
-  pushd "%ROOT_DIR%\agent"
-  set GOOS=windows
-  set GOARCH=amd64
-  set CGO_ENABLED=0
-  go mod download
-  go build -ldflags "-s -w" -o "%OUT_DIR%\mocenter-agent.exe" .
-  popd
-  echo   -^> %OUT_DIR%\mocenter-agent.exe
+  set "GOOS=windows"
+  set "GOARCH=amd64"
+  set "CGO_ENABLED=0"
+  call :build_module "%ROOT_DIR%\agent" "%OUT_DIR%\mocenter-agent.exe"
+  set "GOOS="
+  set "GOARCH="
 ) else (
   echo   !! Go not found, skip Agent build
 )
@@ -81,3 +78,55 @@ echo  Build finished. Artifacts in: %OUT_DIR%
 dir /b "%OUT_DIR%"
 echo ==========================================
 endlocal
+
+goto :eof
+
+REM =============================================================
+REM :build_module <module dir> <output file>
+REM
+REM Go build with a self-healing module cache. A truncated or corrupted entry in
+REM %GOMODCACHE% makes go print "zip: not a valid zip file" and then fail EVERY
+REM import resolved from that module (golang.org/x/sys, winapp_windows.go, ...):
+REM it looks like a broken source tree but is purely a bad local download.
+REM
+REM Recovery: clear the cache and retry once through the mirror proxy
+REM (goproxy.cn mirrors proxy.golang.org completely).
+REM
+REM GOFLAGS=-mod=mod is deliberately NOT set anywhere: go.sum must stay the
+REM source of truth for third-party code in a remote-control product.
+REM =============================================================
+:build_module
+set "MOD_DIR=%~1"
+set "MOD_OUT=%~2"
+echo   [go] downloading modules in %MOD_DIR% ...
+pushd "%MOD_DIR%"
+go mod download
+if errorlevel 1 (
+  echo   !! go mod download failed - clearing module cache and retrying via mirror proxy
+  go clean -modcache
+  set "GOPROXY=https://goproxy.cn,direct"
+  go mod download
+  if errorlevel 1 (
+    popd
+    echo   ** module download still failing. Check the network, or set GOPROXY
+    echo      manually ^(set GOPROXY=https://goproxy.cn,direct^) and re-run.
+    exit /b 1
+  )
+)
+echo   [go] building %MOD_OUT% ...
+go build -ldflags "-s -w" -o "%MOD_OUT%" .
+set "BUILD_RC=%errorlevel%"
+if not "%BUILD_RC%"=="0" (
+  echo   !! build failed - clearing module cache and retrying via mirror proxy
+  go clean -modcache
+  set "GOPROXY=https://goproxy.cn,direct"
+  go build -ldflags "-s -w" -o "%MOD_OUT%" .
+  set "BUILD_RC=%errorlevel%"
+)
+popd
+if not "%BUILD_RC%"=="0" (
+  echo   ** build failed for %MOD_DIR%
+  exit /b 1
+)
+echo   -^> %MOD_OUT%
+exit /b 0

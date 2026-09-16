@@ -558,19 +558,30 @@ systemd 可用性探测，**不做任何改动**。建议先探测确认，再�
 
 ## 十一、版本号管理
 
-**server 与 agent 共用同一版本号**，集中定义在：
+**Server 版本与 Agent 版本互相独立**，各自定义、各自发版，集中定义在：
 
-- `server/internal/version/version.go` → `Version`
-- `agent/internal/version/version.go` → `Version`
+- Server：`server/internal/version/version.go` → `Version`
+- Agent：`agent/internal/version/version.go` → `Version`
+
+### 为什么独立
+
+Agent 版本表达的是「**Agent 自身功能迭代到哪一代**」，由 Agent 的发布节奏决定：
+
+- 只改服务端时可以只发服务端，不必牵动全网 Agent 的版本号；
+- 只改 Agent 时也不需要动服务端版本，避免一次「没有任何实际改动」的服务端发布；
+- 运维可以灰度「先把一部分 Agent 升到 x.y.z」，此时服务端版本本来就不该变。
+
+因此**服务端不做任何版本一致性校验**：Agent 版本高于或低于服务端都属于正常状态。
 
 ### 发布纪律
 
-- **只有在明确发版时才修改版本号**。服务端**不提供**运行时改版本的命令行参数或环境变量 ——
-  避免线上跑着一个"版本号被临时改过"的二进制，导致升级判定错乱。
-- 改版本号时**必须同时修改两处**，且同步 `installer/setup.iss` 的 `#define AppVersion`。
-  两处 Go 常量的一致性由 `server/internal/version` 的单元测试守护（会读取 agent 侧源码比对），漏改会直接测试失败。
-- `scripts/packaging/build-linux-pkg.sh` 的版本号自动从 agent 源码读取，
-  只有读不到时才用兜底值；仍可用 `MOCENTER_VERSION` 显式覆盖。
+- **只有在明确发版时才修改版本号**。两边都**不提供**运行时改版本的命令行参数或
+  环境变量 —— 避免线上跑着一个"版本号被临时改过"的二进制，导致升级判定错乱。
+- 服务端发版时同步 `installer/setup.iss` 的 `#define AppVersion`（决定安装包文件名与注册表版本）。
+- `scripts/packaging/build-linux-pkg.sh` 的**安装包/Agent 版本**自动从
+  `agent/internal/version` 读取（包名叫 `mocenter-agent`，里面就是那个版本的 Agent），
+  读不到才用兜底值；可用 `MOCENTER_VERSION` 覆盖，用 `MOCENTER_AGENT_VERSION`
+  单独覆盖二进制内嵌的 Agent 版本。
 
 ### 运行时可观测
 
@@ -586,8 +597,12 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/version
 Agent 在注册时把版本号写入 `AgentInfo.AgentVersion` 并落库，仪表盘「版本」列展示；
 **空版本**表示旧版 Agent 未上报，前端显示「未知」，升级判定按"需升级"处理（它一定不是当前版本）。
 
-远程升级时，升级包声明的 `version` **必须等于当前服务端版本**（不填则自动取服务端版本），
-否则接口直接拒绝 —— 防止出现"server 1.0.1 却把 agent 升到 1.0.2"的版本漂移。
+远程升级时，升级包声明的 `version` 表示「本次要升到哪个版本」，**与当前服务端版本无关**：
+可以高于、等于或低于服务端版本，接口不会因此拒绝。
+不填时自动取服务端版本，只是为"服务端与 Agent 同步发版"这一常见场景顺手给个默认值。
+
+Agent 侧的判定逻辑很简单：目标版本 == 自身版本则跳过（除非勾选强制），否则执行升级。
+因此这个字段只需要在**同一台机器的历史序列**里有意义，不需要跨端对齐。
 
 ## 十二、常见故障处理
 

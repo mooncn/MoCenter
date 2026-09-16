@@ -10,6 +10,10 @@ set -e
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${ROOT_DIR}/build"
 PLATFORM="${1:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
+# Agent 版本：从 agent 源码的 internal/version 读取（唯一事实来源），
+# 可用 MOCENTER_AGENT_VERSION 覆盖。它与 Server 版本互相独立，无需保持一致。
+AGENT_VERSION="${MOCENTER_AGENT_VERSION:-$(sed -n 's/^\s*const\s\+Version\s*=\s*"\([^"]*\)".*/\1/p' "${ROOT_DIR}/agent/internal/version/version.go" 2>/dev/null | head -1)}"
+AGENT_VERSION="${AGENT_VERSION:-1.0.1}"
 
 echo "=========================================="
 echo " MoCenter 构建开始"
@@ -42,8 +46,10 @@ if command -v go >/dev/null 2>&1; then
     *) GOOS=linux GOARCH=amd64 ;;
   esac
   export GOOS GOARCH CGO_ENABLED=0
-  (cd "${ROOT_DIR}/agent" && go mod download && go build -ldflags "-s -w" -o "${OUT_DIR}/${AGENT_OUT}" .)
-  echo "  -> ${OUT_DIR}/${AGENT_OUT}  (GOOS=${GOOS} GOARCH=${GOARCH})"
+  (cd "${ROOT_DIR}/agent" && go mod download && \
+    go build -ldflags "-s -w -X mocenter/agent/internal/version.Version=${AGENT_VERSION}" \
+    -o "${OUT_DIR}/${AGENT_OUT}" .)
+  echo "  -> ${OUT_DIR}/${AGENT_OUT}  (GOOS=${GOOS} GOARCH=${GOARCH} agent_version=${AGENT_VERSION})"
 else
   echo "  !! 未安装 Go，跳过 Agent 构建"
 fi

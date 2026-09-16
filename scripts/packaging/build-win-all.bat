@@ -25,6 +25,11 @@ if %errorlevel% neq 0 (
   exit /b 1
 )
 
+REM Agent version: independent from the server version (see internal/version).
+REM Override with: set MOCENTER_AGENT_VERSION=1.2.0
+if not defined MOCENTER_AGENT_VERSION set "MOCENTER_AGENT_VERSION=1.0.1"
+set "AGENT_LDFLAGS=-s -w -X mocenter/agent/internal/version.Version=%MOCENTER_AGENT_VERSION%"
+
 pushd "%AGENT_DIR%"
 go mod download
 
@@ -33,26 +38,26 @@ echo [1/4] 构建 x86_64 (amd64) ...
 set GOOS=windows
 set GOARCH=amd64
 set CGO_ENABLED=0
-go build -ldflags "-s -w" -o "%OUT_DIR%\mocenter-agent-amd64.exe" .
+go build -ldflags "%AGENT_LDFLAGS%" -o "%OUT_DIR%\mocenter-agent-amd64.exe" .
 echo   -^> %OUT_DIR%\mocenter-agent-amd64.exe
 
 REM ---- x86 (386) ----
 echo [2/4] 构建 x86 (386) ...
 set GOARCH=386
-go build -ldflags "-s -w" -o "%OUT_DIR%\mocenter-agent-386.exe" .
+go build -ldflags "%AGENT_LDFLAGS%" -o "%OUT_DIR%\mocenter-agent-386.exe" .
 echo   -^> %OUT_DIR%\mocenter-agent-386.exe
 
 REM ---- ARM64 ----
 echo [3/4] 构建 ARM64 (arm64) ...
 set GOARCH=arm64
-go build -ldflags "-s -w" -o "%OUT_DIR%\mocenter-agent-arm64.exe" .
+go build -ldflags "%AGENT_LDFLAGS%" -o "%OUT_DIR%\mocenter-agent-arm64.exe" .
 echo   -^> %OUT_DIR%\mocenter-agent-arm64.exe
 
 REM ---- ARM ----
 echo [4/4] 构建 ARM (arm) ...
 set GOARCH=arm
 set GOARM=7
-go build -ldflags "-s -w" -o "%OUT_DIR%\mocenter-agent-arm.exe" .
+go build -ldflags "%AGENT_LDFLAGS%" -o "%OUT_DIR%\mocenter-agent-arm.exe" .
 echo   -^> %OUT_DIR%\mocenter-agent-arm.exe
 
 REM 复制安装脚本

@@ -78,9 +78,13 @@ echo [1/3] Building agent / server / deploy engine ...
 set GOOS=windows
 set GOARCH=amd64
 set CGO_ENABLED=0
+REM Agent version: independent from the server version (see internal/version).
+REM Override with: set MOCENTER_AGENT_VERSION=1.2.0
+if not defined MOCENTER_AGENT_VERSION set "MOCENTER_AGENT_VERSION=1.0.1"
+set "AGENT_LDFLAGS=-s -w -X mocenter/agent/internal/version.Version=%MOCENTER_AGENT_VERSION%"
 
 pushd "%ROOT_DIR%\agent"
-go build -ldflags "-s -w" -o "%PAYLOAD%\mocenter-agent.exe" .
+go build -ldflags "%AGENT_LDFLAGS%" -o "%PAYLOAD%\mocenter-agent.exe" .
 if errorlevel 1 (
   popd
   echo ** agent build failed.
