@@ -812,6 +812,49 @@ func mustJSON(v interface{}) []byte {
 	return b
 }
 
+// sendEnrollRequired 告知对端"你的客户端证书不被本套 CA 认可，请重新换取"。
+//
+// 带上当前部署身份指纹与身份名，客户端据此可以：
+//   - 判断这是"服务端换过 CA"（而不是网络问题）；
+//   - 在获得运维授权（server_fingerprint 一致）时自动完成重新换取。
+//
+// 这是唯一会在"尚未通过注册鉴权"的连接上下发的消息，内容全部可公开（不含任何密钥）。
+func sendEnrollRequired(conn net.Conn, identity *agentauth.Identity) {
+	resp := protocol.EnrollRequiredResp{
+		Reason:      "客户端证书不被本套 CA 认可",
+		Hint:        "删除本地 creds/ 后用注册密钥重新换取，或更新 server_fingerprint",
+		Identity:    identityNameOf(identity),
+		Fingerprint: identity.Fingerprint(),
+	}
+	if err := json.NewEncoder(conn).Encode(protocol.Envelope{
+		Type: protocol.TypeEnrollRequired, Data: mustJSON(resp),
+	}); err != nil {
+		log.Printf("[server] 通知 %s 重新换取证书失败: %v", conn.RemoteAddr(), err)
+	}
+}
+
+// peerCert 取出对端客户端证书（无证书返回 nil）。
+func peerCert(conn net.Conn) *x509.Certificate {
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return nil
+	}
+	_ = tc.SetReadDeadline(time.Time{})
+	state := tc.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return nil
+	}
+	return state.PeerCertificates[0]
+}
+
+// identityNameOf 取部署身份名（用于日志）。
+func identityNameOf(id *agentauth.Identity) string {
+	if id == nil {
+		return "（未启用）"
+	}
+	return id.Name()
+}
+
 // peerCertCN 取出对端客户端证书的 CN（无证书返回 false）。
 func peerCertCN(conn net.Conn) (string, bool) {
 	tc, ok := conn.(*tls.Conn)
@@ -843,6 +886,31 @@ func tlsInfo(conn net.Conn) string {
 		desc += "，客户端证书 CN=" + st.PeerCertificates[0].Subject.CommonName
 	}
 	return desc
+}
+
+// unregisteredHint 给出"连接已建立但未完成注册"的可能原因（拼到日志尾部）。
+//
+// 三种典型情形：
+//   - 握手阶段就失败：对端出示的客户端证书不被本机 CA 认可（最常见：服务端换过
+//     CA / Agent 未清掉旧 creds）或根本没带证书但服务端要求强制；
+//   - 握手成功但没走到上线消息：对端连上后在等待/发别的东西（换取证书失败等）；
+//   - 其它：保持沉默。
+func unregisteredHint(conn net.Conn) string {
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return ""
+	}
+	st := tc.ConnectionState()
+	if !st.HandshakeComplete {
+		return "；TLS 握手未完成 —— 通常是客户端证书不被本机 CA 认可（服务端换过 CA？" +
+			"让 Agent 删除 creds/ 重新用注册密钥换取，或把新指纹填进 Agent 的 server_fingerprint），" +
+			"也可能是端口收到了非 TLS 流量（例如 HTTP 探测）"
+	}
+	if len(st.PeerCertificates) == 0 {
+		return "；连接未携带客户端证书（Agent 尚未换取证书，或换取失败）"
+	}
+	return "；已携带客户端证书 CN=" + st.PeerCertificates[0].Subject.CommonName +
+		"，但未发送上线消息（注册鉴权被拒？详见上方 [server] 拒绝 Agent 日志）"
 }
 
 // validAgentID 校验 AgentID 是否可用。
@@ -925,20 +993,34 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		}
 		// 客户端证书存在时，身份由证书 CN 提供（换取来的证书 CN 即 agent_id）；
 		// 没有证书的连接只能靠注册报文里的 HMAC 证明 —— 后者是"简单模式"的引导路径。
-		if certCN, ok := peerCertCN(conn); ok {
-			sessConn.CertCN = certCN
+		//
+		// **必须验链**：Agent 通道用的是 tls.RequestClientCert（为兼容新 Agent 首次换取），
+		// 这种模式下 Go 不会在握手阶段校验客户端证书，只要能被解析就会出现在
+		// PeerCertificates 里。旧实现直接取 CN 当身份，于是：
+		//   · 服务端换过 CA 后，Agent 交上来的旧证书会被当成"已验证身份"；
+		//   · 任何自签一张 CN=<主机名> 的证书都能冒充该主机（比"没带证书"更危险，
+		//     因为它看起来是"已认证"的，日志里也不会出现任何拒绝记录）。
+		// 因此这里显式校验签发链，只认可本套 CA 签发的证书。
+		if peer := peerCert(conn); peer != nil {
+			if identity != nil && identity.CertSignedByThisCA(peer) {
+				sessConn.CertCN = peer.Subject.CommonName
+			} else {
+				log.Printf("[server] 拒绝来自 %s 的连接：客户端证书 CN=%q 不是本套 CA（%s）签发的"+
+					"（服务端换过 CA？请让该 Agent 删除 creds/ 后用注册密钥重新换取，"+
+					"或把新指纹填进它的 server_fingerprint）",
+					conn.RemoteAddr(), peer.Subject.CommonName, identityNameOf(identity))
+				// 主动告知原因再关闭：否则客户端只会看到"连上又断开、"
+				// 服务端只留下一行"未完成注册"，两边日志对不上，运维只能人肉猜。
+				// 更重要的是：客户端据此可以**自动**丢弃旧证书并重新换取，
+				// 而不用登录每台被控机删 creds/。
+				sendEnrollRequired(conn, identity)
+				return
+			}
 		}
 		if !allowNoCert && sessConn.CertCN == "" {
-			// 注意区分两种情况：对方"没带证书"，还是"带了但被握手阶段拒绝"
-			// （后者在 Go 里表现为客户端证书为空 —— 校验失败不会保留对端证书）。
-			// 后者才是更要紧的：说明有人出示了不属于本套 CA 的证书。
-			hint := "该 Agent 尚未持有证书"
-			if tc, ok := conn.(*tls.Conn); ok && tc.ConnectionState().HandshakeComplete {
-				hint = "对端可能出示了非本套 CA 签发的证书（已在 TLS 握手阶段被拒绝）"
-			}
 			log.Printf("[server] 拒绝未携带有效客户端证书的连接（-require-agent-cert）：%s（来自: %s）。"+
 				"新装 Agent 请先在不带该开关的情况下完成一次证书换取，或为其预置 -client-cert/-client-key",
-				hint, tlsInfo(conn))
+				"该 Agent 尚未持有证书", tlsInfo(conn))
 			return
 		}
 		// 注册完成前只接受上线消息，其余一律丢弃（避免未注册连接触碰业务逻辑）
@@ -1004,7 +1086,12 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		break // 上线后跳出循环，进入主消息循环
 	}
 	if !registered || sessConn.GetAgentID() == "" {
-		log.Printf("[server] Agent 连接未完成注册，关闭: %s", conn.RemoteAddr())
+		// 这条日志以前只说"未完成注册"，运维看不出到底是什么问题 ——
+		// 而线上最常见的成因是**服务端换过 CA（重装/换机器）后，Agent 还拿着旧
+		// 客户端证书**：TLS 握手失败的那一侧只有客户端有明确报错，服务端这边
+		// 往往只剩"连接建立又断开"，于是双方日志对不上、只能人肉猜。
+		// 这里补上"对端证书是谁签的/有没有握手失败痕迹"，让一行日志就能定性。
+		log.Printf("[server] Agent 连接未完成注册，关闭: %s%s", conn.RemoteAddr(), unregisteredHint(conn))
 		return
 	}
 

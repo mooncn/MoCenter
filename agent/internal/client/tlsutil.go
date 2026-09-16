@@ -18,6 +18,8 @@ import (
 //  1. Insecure=true：跳过校验（仅自签名调试，会打警告）；
 //  2. 配置了 ServerFingerprint：**公钥指纹固定** —— 不需要 CA 文件、不需要域名/IP 匹配，
 //     服务端换地址/换证书都不必更新（自签部署里 SAN 不匹配是运维最常见的踩坑点）；
+//     指纹比对覆盖**整条链**（叶子或其签发 CA），因此填"部署身份 CA 指纹"（服务端
+//     启动日志 / Web「Agent 接入」页显示的那个）即可长期有效，不受服务端重启换证书影响；
 //  3. 配置了 CACert：用该 CA 做标准校验；
 //  4. 都没有：用系统根（正式证书场景，如 Let's Encrypt）。
 //
@@ -32,21 +34,41 @@ func (c *Client) baseTLSConfig() (*tls.Config, error) {
 	pin := normFingerprint(c.cfg.ServerFingerprint)
 	if pin != "" {
 		// 固定指纹：跳过标准链校验（自签 CA 不在系统根里），改由回调校验公钥指纹。
+		//
+		// 关键语义：**指纹绑定的是"部署身份"（CA），不是服务端那张叶子证书**。
+		// 这一点必须讲清楚，否则会踩到下面这个坑（线上真实故障）：
+		// 服务端每次启动都会**重新签发**一张 Agent 通道监听证书（新密钥、新有效期），
+		// 而部署身份指纹（`<data>/ca.crt` 的公钥指纹，也是 Web「Agent 接入」页与
+		// 服务端启动日志里显示的那个"身份指纹"）是稳定不变的。
+		// 若拿 pin 去比对**叶子证书**的公钥指纹，那么：
+		//   · 运维按界面提示填的 CA 指纹永远对不上 → 每次连接都报"身份指纹不一致"；
+		//   · 服务端每重启一次，即便 CA 没变，pin 也会失效。
+		// 于是"用指纹免掉 CA 文件"这个卖点实际不可用，运维只能退回 -insecure（=不校验）。
+		//
+		// 因此校验规则为：pin == 链上任一证书的公钥指纹（叶子或签发它的 CA）即通过。
+		// 这既不比原实现弱（叶子仍在校验集合内），又让 CA 指纹成为稳定、可长期使用
+		// 的锚点 —— 与服务端换 IP、换证书、重启全都无关。
 		cfg.InsecureSkipVerify = true
 		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
 				return fmt.Errorf("服务端未提供证书")
 			}
-			leaf, err := x509.ParseCertificate(rawCerts[0])
-			if err != nil {
-				return err
+			var leafFP string
+			for i, raw := range rawCerts {
+				cert, err := x509.ParseCertificate(raw)
+				if err != nil {
+					return err
+				}
+				if i == 0 {
+					leafFP = spkiFingerprint(cert)
+				}
+				if spkiFingerprint(cert) == pin {
+					return nil
+				}
 			}
-			got := spkiFingerprint(leaf)
-			if got != pin {
-				return fmt.Errorf("服务端身份指纹不一致：期望 %s，实际 %s（服务端换过 CA？请向管理员索取新指纹）",
-					pin, got)
-			}
-			return nil
+			return fmt.Errorf("服务端身份指纹不一致：期望 %s（部署身份 CA 指纹），实际服务端证书 %s"+
+				"（服务端换过部署身份？请向管理员索取新指纹，或核对 Agent 配置里的 server_fingerprint）",
+				pin, leafFP)
 		}
 		return cfg, nil
 	}

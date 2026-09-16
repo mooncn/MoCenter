@@ -214,6 +214,15 @@ func genServer(dir string, ips, dnss []string) {
 	dnsNames := []string{"mocenter-server"}
 	dnsNames = append(dnsNames, dnss...)
 	ipList := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("0.0.0.0")}
+	// 本机所有地址一并写进 SAN。
+	//
+	// 为什么必须这么做：SAN 里只有 127.0.0.1 时，Agent 从「本机自己的 LAN 地址」
+	// （例如 192.168.117.1）连过来会直接报
+	//   x509: certificate is valid for 127.0.0.1, ::1, not 192.168.117.1
+	// 而这一跳是**没有用的**：既然 Agent 连的是本机地址，它就是同一台主机，
+	// 服务端证书自带的本机身份足以通过校验。少写这几个 IP 只会逼运维改成
+	// -insecure（等于彻底关掉校验），反而更不安全。
+	ipList = append(ipList, localIPs()...)
 	for _, s := range ips {
 		ipList = append(ipList, net.ParseIP(s))
 	}
@@ -256,6 +265,28 @@ func firstNonEmpty(in []string) string {
 		}
 	}
 	return ""
+}
+
+// localIPs 返回本机所有非环回、非链路本地地址（含 IPv6）。
+// 取不到时返回空，不影响主流程。
+func localIPs() []net.IP {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var out []net.IP
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipnet.IP
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			continue
+		}
+		out = append(out, ip)
+	}
+	return out
 }
 
 func genClient(dir string) {

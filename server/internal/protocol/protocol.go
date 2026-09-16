@@ -44,6 +44,7 @@ const (
 	TypePkgFetchResp      = "PackageFetchResp" // Server->Agent 安装包拉取结果（分片之后回执）
 	TypeEnrollReq         = "EnrollReq"        // Agent->Server 注册凭证交换请求（换取客户端证书）
 	TypeEnrollResp        = "EnrollResp"       // Server->Agent 注册凭证交换结果
+	TypeEnrollRequired    = "EnrollRequired"   // Server->Agent 需重新换取证书（现有证书不被认可）
 )
 
 // Envelope 是所有消息的通用信封：Type 用于路由，Data 为具体负载。
@@ -450,6 +451,20 @@ type EnrollReq struct {
 	// CSR Agent 自己生成的密钥对对应的证书请求（PEM，DER 的 base64 亦可）。
 	// 服务端只签发**证书**，私钥永远留在 Agent 本机 —— 服务端不保管、也无法代签。
 	CSR string `json:"csr,omitempty"`
+}
+
+// EnrollRequiredResp Server->Agent：要求 Agent 重新换取客户端证书。
+//
+// 用在应用层拒绝连接之前 —— Agent 通道的客户端证书是"请求但不强制"，
+// 证书不被认可时**握手本身不会失败**，客户端只会看到"连上立刻断开"。
+// 显式下发这条消息，客户端才能把"服务端换过 CA / 证书过期"与"网络故障"区分开，
+// 并在获得运维授权时自动重新换取证书（否则只能登录每台被控机手工删 creds/）。
+type EnrollRequiredResp struct {
+	Reason string `json:"reason,omitempty"`
+	Hint   string `json:"hint,omitempty"`
+	// Identity / Fingerprint：服务端当前部署身份，供 Agent 比对与运维核对。
+	Identity    string `json:"identity,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // EnrollResp Server->Agent：注册凭证交换结果。

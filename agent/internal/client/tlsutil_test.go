@@ -153,3 +153,52 @@ func writeDummyClientCert(t *testing.T, dir string) {
 		t.Fatal(err)
 	}
 }
+
+// TestMayFallbackPlaintextOnlyWithoutCert 回归：明文降级只在"本机还没有证书"时允许。
+//
+// 这是双向认证的底线：已持证时若允许降级，"服务端换过 CA → 校验失败 → 悄悄走明文"
+// 就会把唯一的身份校验环节绕过，而运维在日志里只看到一句不起眼的提示。
+func TestMayFallbackPlaintextOnlyWithoutCert(t *testing.T) {
+	dir := t.TempDir()
+	noCert := &Client{cfg: Config{CredDir: dir}}
+	if !noCert.mayFallbackPlaintext() {
+		t.Fatal("本机没有证书时应允许明文降级（兼容旧版服务端）")
+	}
+	writeDummyClientCert(t, dir)
+	withCert := &Client{cfg: Config{CredDir: dir}}
+	if withCert.mayFallbackPlaintext() {
+		t.Fatal("本机已持有证书时不得允许明文降级")
+	}
+	// 手工指定证书（外部 CA 场景）同样不得降级
+	manual := &Client{cfg: Config{CredDir: t.TempDir(), ClientCert: "/x/c.crt", ClientKey: "/x/c.key"}}
+	if manual.mayFallbackPlaintext() {
+		t.Fatal("配置了手工证书时不得允许明文降级")
+	}
+}
+
+// TestPinAcceptsCAInChain 回归 pin 的语义：填"部署身份 CA 指纹"必须可用。
+//
+// 服务端每次启动都会重新签发监听证书（新密钥），因此拿 pin 去比对**叶子**指纹
+// 会导致"每次重启都报身份指纹不一致"，运维只能退回 -insecure（等于关掉校验）。
+// 正确口径是按整条链比对。
+func TestPinAcceptsCAInChain(t *testing.T) {
+	served, _ := makeCATestPair(t, "srv")
+	dir := t.TempDir()
+	c := &Client{cfg: Config{CredDir: dir, ServerFingerprint: served.caFP}}
+	cfg, err := c.baseTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VerifyPeerCertificate == nil {
+		t.Fatal("配置指纹时必须设置校验回调")
+	}
+	// 模拟服务端发来的链：[leaf, CA]
+	if err := cfg.VerifyPeerCertificate(served.chainDER, nil); err != nil {
+		t.Fatalf("填 CA 指纹时应通过链校验: %v", err)
+	}
+	// 另一套 CA 的链必须被拒
+	other, _ := makeCATestPair(t, "other")
+	if err := cfg.VerifyPeerCertificate(other.chainDER, nil); err == nil {
+		t.Fatal("非本套 CA 的链必须被拒绝")
+	}
+}

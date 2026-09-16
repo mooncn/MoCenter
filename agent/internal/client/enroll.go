@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -55,10 +56,18 @@ type enrollmentCredential struct {
 }
 
 // tryEnroll 用注册密钥换取客户端证书并落盘。返回的凭证供后续连接直接使用。
+//
+// 密钥来源：enrollment_secret 优先，其次 agent_key。
+// 两者都要认的理由：换取成功后 enrollment_secret 会被清空（一次性凭据），
+// 而 agent_key 是运维留在配置里的长期值。若只看前者，"服务端换过 CA 后自动
+// 重新换取"就永远走不通 —— 那正是"必须先人肉删 creds/ 才能恢复"的根因之一。
 func (c *Client) tryEnroll() (*enrollmentCredential, error) {
 	secret := strings.TrimSpace(c.cfg.EnrollmentSecret)
 	if secret == "" {
-		return nil, fmt.Errorf("未配置 enrollment_secret")
+		secret = strings.TrimSpace(c.cfg.AgentKey)
+	}
+	if secret == "" {
+		return nil, fmt.Errorf("未配置注册密钥（enrollment_secret / agent_key 均为空），无法换取客户端证书")
 	}
 	// 本地生成密钥对：私钥永不离开本机
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -119,6 +128,13 @@ func (c *Client) tryEnroll() (*enrollmentCredential, error) {
 		if !resp.OK || resp.CertPEM == "" {
 			return nil, fmt.Errorf("服务端拒绝签发证书: %s", resp.Message)
 		}
+		// 身份连续性：先确认"回应我们的确实是本机认可的那套总控"，再落地任何东西。
+		// 这一步顺序很关键 —— 先查后写，才算真正"不信任陌生人"。
+		respFP := normFingerprint(resp.ServerFingerprint)
+		caFP := caFingerprintFromPEM([]byte(resp.CAPEM))
+		if err := c.verifyEnrollServer(respFP, caFP); err != nil {
+			return nil, err
+		}
 		keyPEM, err := x509.MarshalECPrivateKey(key)
 		if err != nil {
 			return nil, err
@@ -129,19 +145,90 @@ func (c *Client) tryEnroll() (*enrollmentCredential, error) {
 			return nil, fmt.Errorf("解析服务端签发的证书失败: %w", err)
 		}
 		cred := &enrollmentCredential{
-			Cert: cert, Identity: resp.Identity, Fingerprt: resp.ServerFingerprint,
+			Cert: cert, Identity: resp.Identity, Fingerprt: respFP,
 		}
 		if err := c.saveCredential(cred, resp.CertPEM, resp.CAPEM, keyPEMText); err != nil {
 			return nil, err
 		}
-		logf("[agent] 已从服务端换取客户端证书（身份 %s，服务端指纹 %s）；证书已保存，后续连接直接携带",
-			resp.Identity, DisplayFingerprint(resp.ServerFingerprint))
+		if caFP != "" {
+			logf("[agent] 已从服务端换取客户端证书（身份 %s，服务端指纹 %s）；证书已保存，后续连接直接携带",
+				resp.Identity, DisplayFingerprint(caFP))
+		} else {
+			logf("[agent] 已从服务端换取客户端证书（身份 %s）；证书已保存，后续连接直接携带", resp.Identity)
+		}
 		return cred, nil
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
 	return nil, fmt.Errorf("服务端未返回换取结果")
+}
+
+// verifyEnrollServer 在落地新证书之前校验服务端身份。
+//
+// 判定规则（新指纹 respFP 取自 EnrollResp.server_fingerprint，caFP 取自响应里的 ca_pem）：
+//
+//  1. 运维显式填写了 server_fingerprint → 必须以之为准；不一致直接拒绝（这是 pin 的本意）；
+//  2. 新指纹与本机已记下的（creds/ca.crt 或 -ca-cert）一致 → 同一套总控，正常；
+//  3. 本机此前**没有任何 CA 记录**（首次接入）→ 信任引导，放行（信任根是注册密钥）；
+//  4. 本机有记录、但两次都拿不到可用的比较值 → 无法判断，拒绝并要求重新获取；
+//  5. 本机有记录、且确实不同 → 服务端换过 CA（重装/换机器）。默认**拒绝**，
+//     除非服务端指纹或 CA 指纹与本机配置里的 server_fingerprint 一致 ——
+//     那说明运维已经明确授权了这套新身份，可以自动丢弃旧证书重换。
+//
+// 之所以第 5 条默认拒绝：换取请求里带着注册密钥的 HMAC 证明，无条件重换等于
+// "只要能把 Agent 的地址指向我，就能拿走它的注册凭据"，把证书锁定彻底架空。
+func (c *Client) verifyEnrollServer(respFP, caFP string) error {
+	pinned, known := c.knownServerFingerprints()
+
+	// 1) 显式 pin：只认它，别的都要拒绝
+	if len(pinned) > 0 {
+		if respFP != "" && respFP != pinned[0] {
+			return errors.New("服务端与配置的 server_fingerprint 不一致：" + trustNewCAError(pinned[0], respFP, c.hasEnrollSecret()).Error())
+		}
+		if caFP != "" && caFP != pinned[0] {
+			return errors.New(trustNewCAError(pinned[0], caFP, c.hasEnrollSecret()).Error())
+		}
+		if respFP == "" && caFP == "" {
+			return errors.New("服务端未返回身份指纹，无法与配置的 server_fingerprint 比对（请升级服务端）")
+		}
+		return nil
+	}
+
+	// 4) 有旧记录但新响应完全没给身份信息：无法判断是否换过，宁可拒绝
+	if len(known) > 0 && respFP == "" && caFP == "" {
+		return errors.New("服务端未返回身份指纹（登录身份 CA 未启用？），无法确认它是否就是本机记下的那套总控")
+	}
+
+	// 2) 同一套总控 / 3) 首次接入
+	matched := false
+	for _, fp := range known {
+		if fp == respFP || (caFP != "" && fp == caFP) {
+			matched = true
+			break
+		}
+	}
+	if matched || len(known) == 0 {
+		return nil
+	}
+
+	// 5) 身份发生了变化
+	old := known[0]
+	return trustNewCAError(old, firstNonEmptyStr(caFP, respFP), c.hasEnrollSecret())
+}
+
+// hasEnrollSecret 本机是否还持有可用于重新换取的注册密钥。
+func (c *Client) hasEnrollSecret() bool {
+	return strings.TrimSpace(c.cfg.EnrollmentSecret) != "" || strings.TrimSpace(c.cfg.AgentKey) != ""
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // dialForEnroll 拨号：优先 TLS；TLS 握手因**证书校验**失败时，改用"只加密不验签"再试一次
@@ -168,14 +255,36 @@ func dialForEnroll(addr string, tlsCfg *tls.Config) (net.Conn, error) {
 	return nil, err
 }
 
-// isCertVerifyFailure 判断是否为证书校验类错误（而非网络不可达）。
+// isCertVerifyFailure 判断是否为**证书校验类**错误（而非网络不可达）。
+//
+// 这里刻意不只看 Go 的英文错误串。原因：Agent 自己产生的校验错误是中文的
+// （例如"服务端身份指纹不一致……"），那时的错误里**一个 "certificate" 都没有**，
+// 于是一旦走指纹校验，换取/降级判断就会全部失配 —— 表现为
+// "服务端换过 CA 后既不会自动重换、还会退化成明文再被拒"，
+// 而报错只留下一句"拒绝在明文链路上换取证书"，运维完全看不出是证书的事。
+//
+// 因此判定口径改成三类：
+//  1. Go 的 x509/tls 层错误（英文）；
+//  2. 本包的指纹/身份类错误（errors.As 识别 trustError）；
+//  3. 兜底：消息里出现"指纹/证书/校验"等中文关键词。
 func isCertVerifyFailure(err error) bool {
 	if err == nil {
 		return false
 	}
+	var te *trustError
+	if errors.As(err, &te) {
+		return true
+	}
 	msg := err.Error()
-	return strings.Contains(msg, "certificate") || strings.Contains(msg, "x509") ||
-		strings.Contains(msg, "tls:")
+	for _, kw := range []string{
+		"certificate", "x509", "tls:", "record header",
+		"指纹", "证书", "校验失败",
+	} {
+		if strings.Contains(msg, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func isEncrypted(conn net.Conn) bool {

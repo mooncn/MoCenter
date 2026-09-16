@@ -246,6 +246,40 @@ func NewIdentity(name string) (*Identity, error) {
 	return &Identity{caCert: cert, caKey: key}, nil
 }
 
+// CertSignedByThisCA 判断一张客户端证书是否由**本套 CA** 签发。
+//
+// 为什么需要它：Agent 通道刻意用 tls.RequestClientCert（请求但不强制）——
+// 为了让新装的 Agent 能在"还没有证书"的状态下完成一次换取。代价是
+// **Go 不会在握手阶段校验证书链**：只要证书能被解析，它就会出现在
+// PeerCertificates 里。因此"对端带了证书"这件事本身**不能**作为身份依据，
+// 应用层必须自己验链。
+//
+// 不验的后果（线上真实触发）：服务端换过 CA 后，Agent 还拿着旧 CA 签的证书连上来，
+// 服务端读到 CN = "某主机名" 就直接认作该主机 —— 等于任何自签证书都能冒充任意 Agent。
+//
+// 这里除了验链，还要求 ExtKeyUsage 含 ClientAuth：防止拿服务端证书当客户端证书使。
+func (id *Identity) CertSignedByThisCA(cert *x509.Certificate) bool {
+	if id == nil || id.caCert == nil || cert == nil {
+		return false
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(id.caCert)
+	_, err := cert.Verify(x509.VerifyOptions{
+		Roots:     pool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	})
+	return err == nil
+}
+
+// ParseCertOf 解析单张 DER 证书（失败返回 nil）。
+func ParseCertOf(der []byte) *x509.Certificate {
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil
+	}
+	return cert
+}
+
 // Save 把 CA 写入 dir（目录 0700，私钥 0600）。
 func (id *Identity) Save(dir string) error {
 	if id == nil || id.caCert == nil || id.caKey == nil {

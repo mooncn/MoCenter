@@ -149,8 +149,11 @@ export default function AgentEnroll() {
       <div className="card">
         <h3>常见问题</h3>
         <ul className="muted" style={{ fontSize: 13, lineHeight: 1.9 }}>
-          <li><strong>Agent 报"身份指纹不一致"</strong>：服务端重装或换过 CA。删除被控机上的
-            <code> creds/</code> 目录并把注册密钥填回配置（<code>enroll-secret</code> 或 <code>agent_key</code>）即可重新换取。</li>
+          <li><strong>Agent 报"身份指纹不一致" / "服务端部署身份 CA 已变化"</strong>：服务端重装或换过 CA。
+            把本页显示的<strong>新指纹</strong>填进被控机的 <code>server_fingerprint</code>（写在
+            <code>mocenter-agent.json</code> 里远程下发即可），Agent 会<strong>自动</strong>重新换取证书，无需登录被控机。
+            没填指纹时 Agent 会拒绝自动重换并给出新旧指纹 —— 这是刻意设计：避免把注册密钥交给陌生对端。
+            也仍可手工恢复：删除被控机 <code>creds/</code> 并把注册密钥填回 <code>agent_key</code>。</li>
           <li><strong>想彻底禁掉"先换取"</strong>：服务端加 <code>-require-agent-cert</code>，此后只接受已持证 Agent。</li>
           <li><strong>浏览器提示证书不受信任</strong>：Web 控制台默认用自动签发的临时证书（自签名）。
             接受即可，或给服务端配 <code>-web-tls-cert/-web-tls-key</code>，前面挂 TLS 反代并加 <code>-admin-tls-days=0</code>。</li>
