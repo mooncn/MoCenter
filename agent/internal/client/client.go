@@ -21,6 +21,7 @@ import (
 	"mocenter/agent/internal/probe"
 	"mocenter/agent/internal/protocol"
 	"mocenter/agent/internal/upgrade"
+	"mocenter/agent/internal/version"
 )
 
 // Config Agent 配置。
@@ -45,6 +46,8 @@ type Config struct {
 	UpgradePubKey string
 	// UpgradeAllowUnsigned 显式允许无签名升级（危险，仅迁移期使用）。
 	UpgradeAllowUnsigned bool
+	// LatencyTargets 延迟探测目标（ICMP/TCP/HTTP）。
+	LatencyTargets []string
 }
 
 // Client Agent 客户端。
@@ -85,6 +88,9 @@ func New(cfg Config) *Client {
 		tunnels:     make(map[string]net.Conn),
 		pushFiles:   make(map[string]*os.File),
 		pkgWait:     make(map[string]chan protocol.PackageFetchResp),
+	}
+	if len(cfg.LatencyTargets) > 0 {
+		c.collect.SetLatencyTargets(cfg.LatencyTargets)
 	}
 	return c
 }
@@ -191,6 +197,8 @@ func (c *Client) register() {
 		"remote_addr": "",
 		"public_ip":   ips.IPv4,
 		"public_ipv6": ips.IPv6,
+		// 版本号：服务端据此判断该主机是否需要升级，前端展示在线版本
+		"agent_version": version.Version,
 	}
 	if c.cfg.AgentKey != "" {
 		nonce := agentauth.NewNonce()

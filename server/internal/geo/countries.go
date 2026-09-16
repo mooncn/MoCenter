@@ -329,14 +329,43 @@ var countryIndex = func() map[string]countryEntry {
 	return m
 }()
 
-// byCode 按 ISO 代码查对照行。
+// countryEnglishByCode 按 ISO 代码返回英文国名（无此代码时返回空串）。
+// 供 MMDB 离线库使用：部分库只存 iso_code 不存国家名。
+func countryEnglishByCode(code string) string {
+	if e, ok := byCode(trimSpace(code)); ok {
+		return e.EN
+	}
+	return ""
+}
+
+// byCode 按 ISO 代码查对照行（大小写不敏感：各数据源的写法并不一致）。
 func byCode(code string) (countryEntry, bool) {
+	want := upperASCII(trimSpace(code))
+	if want == "" {
+		return countryEntry{}, false
+	}
 	for _, c := range countries {
-		if c.Code == code {
+		if c.Code == want {
 			return c, true
 		}
 	}
 	return countryEntry{}, false
+}
+
+// upperASCII 仅对 a-z 做大写转换。
+//
+// 刻意不 import strings：本文件是一张**纯数据表**，保持零依赖可以让它在
+// 任何构建标签/最小化构建下都能被编译；ASCII 代码大写也无需 Unicode 处理。
+func upperASCII(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b >= 'a' && b <= 'z' {
+			b -= 'a' - 'A'
+		}
+		out = append(out, b)
+	}
+	return string(out)
 }
 
 // lookupCountry 按国家名（英文或中文）反查 ISO 代码与统一英文名。

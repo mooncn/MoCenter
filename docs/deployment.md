@@ -393,13 +393,203 @@ Agent 会**优先通过它与服务端之间既有的长连接**拉取（该通�
 服务端会校验包名以防目录穿越；Agent 会校验可执行文件魔数（`MZ`/`ELF`），
 拒绝执行错误页或被替换的内容；安装包拉取属于内部行为，不会出现在「文件分发」列表中。
 
-## 七、备份与恢复
+## 七、延迟监测（ICMP / TCP / HTTP）
 
-- **审计日志**：默认保留 180 天，建议定期导出归档（`/api/audits`）。
-- **探针趋势**：服务端聚合存储默认 90 天。
-- **配置备份**：备份服务端启动参数、证书文件、映射规则配置。
+Agent 按**按主机下发**的目标列表探测往返延迟，服务端存历史并在后台「延迟监测」页出曲线。
 
-## 八、常见故障处理
+### 目标格式
+
+| 写法 | 探测方式 | 实现 |
+|------|----------|------|
+| `icmp:1.1.1.1` | ICMP | 调用系统 `ping` 并解析往返时间（Linux `-c 1 -W <秒>` / Windows `-n 1 -w <毫秒>` / macOS `-W <毫秒>`） |
+| `tcp:1.1.1.1:443` | TCP | 建立 TCP 连接并测量握手耗时；地址缺端口时默认 443 |
+| `http:https://example.com` | HTTP | 发起 HEAD 请求并测量首字节往返；缺 scheme 时按 https 处理 |
+
+省略 `kind:` 前缀时按 ICMP 处理（例如 `8.8.8.8`）。单机最多 **8 个**目标。
+
+> **为什么 ICMP 用系统 ping 而不是原生 socket**：原生 ICMP 需要 `CAP_NET_RAW`/root，
+> 还要自己拼 ICMP 包、处理校验和与 IPv4/IPv6 双栈。系统 ping 在三大平台都内置且输出格式稳定，
+> 引入的复杂度远大于收益。代价是目标机若没有 ping 命令（极简容器），ICMP 探测会失败 ——
+> 表现为该目标**恒定超时**（而不是 0ms），属于可观测的正常降级。
+
+### 两个必须知道的口径
+
+1. **超时点画成断点，不是 0**。探测失败的目标不出现在上报数据里，接口返回的每个点带 `ok` 标记，
+   前端的折线会**断开**。若把失败写成 0，"完全不通"的机器会看起来比谁都快 —— 这是监控系统里
+   最危险的一类显示错误，因此这条约束贯穿 agent（不上报）、服务端（`ok=false` 落库）、
+   前端（分段绘制）三层。
+2. **HTTP 的 4xx/5xx 仍算"可达"**。这条链路测的是"网络是否可达、往返多久"，不是"业务是否正常"。
+   把 403 当成探测失败，会让"有防火墙但链路正常"的机器显示成超时。
+
+### 可用率与丢包率
+
+每次探测（含失败）都会落 `latency_history` 表（一行一个"时间+目标"），因此后台能算出
+**丢包率**。配置目标但当前无数据 = 该目标本轮超时，仪表盘会显示"N 个超时"。
+
+### 配置方式
+
+- **后台**：`延迟监测` 页选择主机 → 下方「探测目标」填目标（每行一个）→ 保存，下一个采集周期（默认 10 秒）生效。
+- **Agent 侧**：`-latency-targets 'icmp:1.1.1.1,tcp:1.1.1.1:443'`，或配置文件字段 `latency_targets`。
+
+留存：延迟历史与探针历史同口径，均保留 **30 天**（每 6 小时清理一次）。
+
+## 八、离线 GeoIP（可选）
+
+节点地区默认由三个外部接口降级解析（api.iping.cc → ip-api.com → ipwho.is）。配置离线库后
+**本地优先解析**，未命中才走外部接口。
+
+```bash
+# 把 GeoLite2-Country.mmdb 放到数据目录，并配置路径
+./mocenter-server -mmdb /var/lib/mocenter/GeoLite2-Country.mmdb
+# 或写入配置文件字段 mmdb_path，或环境变量 MOCENTER_MMDB
+```
+
+### 为什么建议配
+
+| 问题 | 未配离线库 | 配了离线库 |
+|------|-----------|-----------|
+| 服务端无外网出口（纯内网 / 白名单出网） | **全站节点地区都是空的** | 正常解析 |
+| 一批 Agent 同时上线 | 免费接口按分钟限流，互相挤掉额度，表现为"某时间点之后新上线的机器都没地区" | 不走网络，无额度概念 |
+| IPv6 节点 | 主源 api.iping.cc 对 IPv6 恒返回 `code=500` | 本地库直接支持 |
+| 解析耗时 | 每台首次解析一次 HTTP 往返（数十~数百 ms） | 本地文件查询，微秒级 |
+
+### 支持的库与获取
+
+兼容 **MaxMind DB 格式**：`GeoLite2-Country.mmdb`、`GeoLite2-City.mmdb`、
+DB-IP / IPinfo 的 Country / City 库均可（字段名兼容）。GeoLite2 可从 MaxMind 免费账号下载。
+
+库文件更新后**无需重启服务端**：`Resolver.ReloadMMDB(path)` 即可热重载
+（当前 REST 层未开放热重载端点，可用配置变更后重启，或按需扩展）。
+
+### 校验是否生效
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/version | jq '{mmdb_loaded, mmdb_path}'
+```
+
+启动日志也会明确打印：加载成功打印库路径与数据库类型；未配置则提示"地区解析走外部接口"
+并给出配置指引；配置了但加载失败会告警并**自动降级**（不会让服务端起不来）。
+
+## 九、备份与恢复
+
+后台「备份恢复」页可直接操作，也可用 REST API。
+
+### 备份内容
+
+| 文件 | 说明 | 是否含凭据 |
+|------|------|-----------|
+| `mocenter.db` | SQLite：主机、探针/延迟历史、端口映射、审计日志、黑名单 | 是 |
+| `users.json` | 账号与口令哈希、OTP 密钥 | 是 |
+| `remarks.json` | 主机备注（用户输入的唯一副本） | — |
+| `public-site.json` | 公开展示配置 | — |
+| `agent.key` | Agent 注册预共享密钥（丢了所有 Agent 都连不上） | 是 |
+
+**刻意不备份**：`packages/`（安装包，可从上游重下，动辄上百 MB）、`uploads/`（临时文件）、
+日志、SQLite 的 `-wal`/`-shm`。
+
+> 备份包**含凭据**。请按"等同口令文件"对待，不要随意外发。
+
+### 关键实现细节
+
+- **SQLite 用 `VACUUM INTO` 而不是直接拷文件**。默认 WAL 模式下未 checkpoint 的事务在 `-wal` 里，
+  直接拷主库会丢这部分数据 —— 恢复出来表现为"最近一段时间的审计/探针记录莫名消失"。
+  `VACUUM INTO` 产出一份事务一致、已 compact 的完整副本。
+- **包内带 manifest.json**：格式版本、生成时间、服务端版本、来源主机、每个文件的大小与 SHA-256。
+  恢复前可先 `inspect` 查看，恢复时逐条校验摘要（不一致直接失败，而不是"先恢复了再说"）。
+- **恢复的多重防护**：条目名必须在白名单内、必须是纯文件名（拒绝 `/`、`\`、`..`）、
+  落盘前再校验绝对路径仍在数据目录内（防 zip-slip）、解压总体积有上限（防 zip bomb）。
+- **恢复前自动留存**：被覆盖的文件另存为 `<文件名>.before-restore`，恢复失败时提示可手工回退。
+- **恢复后需重启服务端**才能让配置与账号生效。
+
+### REST API
+
+```bash
+# 创建备份
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/backup
+# 列表 / 查看清单 / 恢复 / 删除
+curl -H  "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/backup
+curl -X POST -H "Authorization: Bearer $TOKEN"   "http://127.0.0.1:8080/api/backup?action=inspect&file=mocenter-backup-20260101-120000.zip"
+curl -X POST -H "Authorization: Bearer $TOKEN"   "http://127.0.0.1:8080/api/backup?action=restore&file=mocenter-backup-20260101-120000.zip"
+curl -X DELETE -H "Authorization: Bearer $TOKEN"   "http://127.0.0.1:8080/api/backup?file=mocenter-backup-20260101-120000.zip"
+```
+
+备份文件存放在数据目录的 `backups/` 下。`?download=` / `?file=` 只接受**纯文件名**，
+不做任意路径读取（否则这里就是个任意文件下载漏洞）。
+
+## 十、后台一键部署 Agent（Linux）
+
+后台「部署 Agent」页：填目标机地址 + 账号/密码（或私钥），服务端通过 SSH 登录后
+上传 Agent、写入配置、注册为 systemd 服务。
+
+### 前置条件
+
+- 目标机可 SSH 登录，且具备 **root 权限或免密 sudo**（`sudo -n true` 可用）；
+- 服务端数据目录的 `packages/` 下有**匹配目标架构**的 Agent 二进制
+  （`mocenter-agent-amd64` / `-arm64` / `-arm` / `-386`；也可用 `?binary=` 指定，支持 `.exe` 后缀）；
+- 没有 systemd 的环境（容器）会退化为"后台进程 + 进程守护"，**不提供开机自启**，步骤里会明确告知。
+
+### 支持"先探测再安装"
+
+「测试连接与探测环境」按钮走 `probe_only=true`：只做 SSH 连通性、认证、架构、权限与
+systemd 可用性探测，**不做任何改动**。建议先探测确认，再点部署。
+
+### 部署流程与回传
+
+每一步都会回传状态与原始输出（前端按顺序展示，失败时能直接看到卡在哪一步）：
+
+1. SSH 连接与认证（密码 / 键盘交互 / 私钥 / 私钥+passphrase）
+2. 探测目标机环境（`uname -m` → GOARCH、`/etc/os-release`、`id -u`、`sudo -n`、是否 systemd）
+3. 上传 Agent 二进制（走 stdin 的 `cat > file`，不依赖目标机是否启用 sftp 子系统）
+4. 写入 Agent 配置（服务端地址、Agent 名称、注册密钥、代理、延迟目标，权限 0600）
+5. 安装为 systemd 服务并启动（配置与二进制分离：`/etc/mocenter/mocenter-agent.json` + `/usr/local/bin/mocenter-agent`）
+6. 回读状态确认（`is-active` / `is-enabled` / `-version`）
+
+### 安全约束
+
+- **凭证不落盘、不入日志**。密码/私钥只在单次请求内存中存在；审计日志只记"谁在何时部署了哪个地址"。
+- **命令注入防护（纵深防御）**：AgentID 过白名单（`[A-Za-z0-9._-]{1,64}`）、安装目录与服务名过格式校验、
+  所有拼进 shell 的变量经 POSIX 单引号转义。即使上游校验有疏漏，也不会因一个引号变成命令注入。
+- **上传体积上限** 200 MB；安装包文件名拒绝目录成分。
+- 接口需登录（与其它后台接口同一套 Token + IP 白名单 + 限流）。
+
+> **Windows 未实现**：OpenSSH for Windows 虽然存在，但凭证、服务注册与权限模型与 Linux 差异大，
+> 按需求"没有类似方案则略过"。Windows 侧请继续用图形安装程序（`MoCenter-Setup-<版本>.exe`）或
+> `scripts\packaging\install-windows.bat`。
+
+## 十一、版本号管理
+
+**server 与 agent 共用同一版本号**，集中定义在：
+
+- `server/internal/version/version.go` → `Version`
+- `agent/internal/version/version.go` → `Version`
+
+### 发布纪律
+
+- **只有在明确发版时才修改版本号**。服务端**不提供**运行时改版本的命令行参数或环境变量 ——
+  避免线上跑着一个"版本号被临时改过"的二进制，导致升级判定错乱。
+- 改版本号时**必须同时修改两处**，且同步 `installer/setup.iss` 的 `#define AppVersion`。
+  两处 Go 常量的一致性由 `server/internal/version` 的单元测试守护（会读取 agent 侧源码比对），漏改会直接测试失败。
+- `scripts/packaging/build-linux-pkg.sh` 的版本号自动从 agent 源码读取，
+  只有读不到时才用兜底值；仍可用 `MOCENTER_VERSION` 显式覆盖。
+
+### 运行时可观测
+
+```bash
+# 打印版本号后退出（不读配置、不连服务端）
+./mocenter-agent -version
+./mocenter-server -version
+
+# 服务端版本 + 各 Agent 版本与"是否需要升级"判定 + 离线 GeoIP 状态
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/version
+```
+
+Agent 在注册时把版本号写入 `AgentInfo.AgentVersion` 并落库，仪表盘「版本」列展示；
+**空版本**表示旧版 Agent 未上报，前端显示「未知」，升级判定按"需升级"处理（它一定不是当前版本）。
+
+远程升级时，升级包声明的 `version` **必须等于当前服务端版本**（不填则自动取服务端版本），
+否则接口直接拒绝 —— 防止出现"server 1.0.1 却把 agent 升到 1.0.2"的版本漂移。
+
+## 十二、常见故障处理
 
 | 现象 | 排查方法 |
 |------|----------|
@@ -408,7 +598,12 @@ Agent 会**优先通过它与服务端之间既有的长连接**拉取（该通�
 | 命令执行超时 | 调整 `CommandReq.timeout`；检查命令自身是否阻塞 |
 | Web 连接断开 | 确认 Token 有效、WebSocket 代理配置正确（Upgrade 头） |
 | 端口映射不通 | 确认映射规则已启用、Agent 在线、目标内网服务可达 |
+| 节点地区/国旗不显示 | ① 是否有外网出口；无外网请配 `-mmdb` 离线库。② 看日志里的 `[geo]` 行（会区分"限流 / 网络不通 / 不支持该地址族 / 该 IP 无数据"）。③ 后台「展示配置」总开关是否开、地区字段是否勾选。④ 直连 ip-api.com 不稳时配 `-proxy-ip` |
+| 延迟目标一直显示"超时" | ICMP 依赖目标机的 `ping` 命令（极简容器可能没有），换 `tcp:` 目标验证链路；`http:` 目标缺 scheme 时按 https 处理，自签证书不受影响（探测忽略证书校验） |
+| 一键部署报 `sudo: not found` | 已修复：当前用户是 root 时不再使用 sudo。若版本较旧请升级服务端 |
+| 一键部署报服务启动成功但 Agent 不上线 | 检查写入的注册密钥是否与服务端一致（`/etc/mocenter/mocenter-agent.json` 的 `agent_key`）、服务端地址是否从目标机可达；`systemctl status mocenter-agent` 看日志 |
+| 恢复备份后数据没变 | 恢复后需**重启服务端**；被覆盖的旧文件在 `<文件名>.before-restore` |
 
-## 九、远程升级 Agent
+## 十三、远程升级 Agent
 
 服务端发布新版本 → Agent 检测到新版本 → 下载升级包 → 校验签名 → 停止旧进程 → 替换二进制 → 重启新进程 → 上报版本信息。支持差分升级、失败自动回滚、灰度升级（规划书 12.4）。

@@ -45,6 +45,11 @@ type Config struct {
 	WebTLSKey  string `json:"web_tls_key"`
 	// AllowAnonAgents 允许 Agent 无凭证注册（危险，仅迁移期使用）。
 	AllowAnonAgents bool `json:"allow_anon_agents"`
+	// MMDBPath 离线 GeoIP 库路径（MaxMind DB 格式，如 GeoLite2-Country.mmdb）。
+	//
+	// 配置后，节点地区**优先**由本地库解析（无网络、无配额、支持 IPv6），
+	// 未命中再降级到外部 HTTP 接口。留空 = 不启用（行为与从前一致）。
+	MMDBPath string `json:"mmdb_path"`
 }
 
 // DefaultPath 返回默认配置文件路径（便携态：与可执行文件同目录）。

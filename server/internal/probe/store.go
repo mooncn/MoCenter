@@ -117,6 +117,7 @@ func (s *Store) loadAgentsFromDB() {
 			DiskUsedBytes:  row.DiskUsed,
 			NetRateIn:      row.NetRateIn,
 			NetRateOut:     row.NetRateOut,
+			AgentVersion:   row.AgentVersion,
 		}
 		// 同一设备已存在（UUID 相同）：保留更「新」的一条作为主记录，其余作别名
 		if old, ok := s.devices[key]; ok {
@@ -491,6 +492,15 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 			a.DiskTotalBytes, a.DiskUsedBytes = p.DiskTotalBytes, p.DiskUsedBytes
 		}
 	}
+	// 延迟（ICMP/TCP/HTTP）：整表覆盖而不是合并。
+	// 合并会让"上一轮通了、这一轮超时"的目标继续显示旧延迟值 ——
+	// 监控里这会直接导致故障被掩盖，因此本轮没探到的目标必须消失。
+	if len(p.LatencyTargets) > 0 || len(p.LatencyMS) > 0 {
+		if a != nil {
+			a.Latency = p.LatencyMS
+			a.LatencyTargets = p.LatencyTargets
+		}
+	}
 	h := s.history[key]
 	// 历史采样里的 agent_id 统一写成设备当前 agent_id，保证趋势图/查询口径一致
 	p.AgentID = s.deviceAgentIDLocked(key, p.AgentID)
@@ -504,7 +514,104 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 	// 异步写入探针历史到 SQLite
 	if s.db != nil {
 		go s.persistProbeHistory(p)
+		go s.persistLatency(p)
 	}
+}
+
+// persistLatency 把本轮延迟探测结果落库（一行一个目标）。
+//
+// 只落"本轮实际探过的目标"：Agent 未配置延迟探测时不写任何行，
+// 也就不会在历史里产生大片 0ms 的假数据。
+func (s *Store) persistLatency(p *protocol.ProbeDataReq) {
+	if s.db == nil || len(p.LatencyTargets) == 0 {
+		return
+	}
+	rows := make([]*storage.LatencyRow, 0, len(p.LatencyTargets))
+	for _, target := range p.LatencyTargets {
+		if strings.TrimSpace(target) == "" {
+			continue
+		}
+		ms, ok := p.LatencyMS[target]
+		rows = append(rows, &storage.LatencyRow{
+			AgentID:   p.AgentID,
+			Timestamp: p.Timestamp,
+			Target:    target,
+			Kind:      latencyKind(target),
+			LatencyMS: ms,
+			OK:        ok,
+		})
+	}
+	if err := s.db.InsertLatencyHistory(rows); err != nil {
+		log.Printf("[probe] 持久化延迟历史失败: %v", err)
+	}
+}
+
+// latencyKind 从目标标识 "kind:addr" 中取出探测方式。
+func latencyKind(target string) string {
+	if i := strings.Index(target, ":"); i > 0 {
+		k := strings.ToLower(target[:i])
+		if k == "icmp" || k == "tcp" || k == "http" {
+			return k
+		}
+	}
+	return "icmp"
+}
+
+// LatencyTargets 返回某主机当前生效的延迟探测目标（按设备解析 agent_id）。
+func (s *Store) LatencyTargets(agentID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.devices[s.resolveLocked(agentID)]
+	if !ok || a == nil {
+		return nil
+	}
+	return append([]string(nil), a.LatencyTargets...)
+}
+
+// SetLatencyTargets 在服务端记录某主机"应探测的目标"。
+//
+// 用途：服务端下发目标后立即写内存，前端不必等 Agent 下一轮上报才能
+// 看到新目标（否则配置后界面会"卡"一个采集周期）。
+func (s *Store) SetLatencyTargets(agentID string, targets []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.devices[s.resolveLocked(agentID)]
+	if !ok || a == nil {
+		return
+	}
+	a.LatencyTargets = append([]string(nil), targets...)
+}
+
+// LatencyHistory 返回某主机的延迟历史（优先查库，无库时回退"当前值"单点）。
+func (s *Store) LatencyHistory(agentID string, since time.Time, target string, limit int) []*storage.LatencyRow {
+	if agentID == "" {
+		return []*storage.LatencyRow{}
+	}
+	if s.db != nil {
+		rows, err := s.db.QueryLatencyHistory(agentID, since.Unix(), target, limit)
+		if err == nil {
+			return rows
+		}
+		log.Printf("[probe] 查询延迟历史失败，回退内存: %v", err)
+	}
+	// 无数据库（内存模式）：只能给出当前一个点，避免前端完全空白
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.devices[s.resolveLocked(agentID)]
+	if !ok || a == nil || len(a.Latency) == 0 {
+		return []*storage.LatencyRow{}
+	}
+	out := make([]*storage.LatencyRow, 0, len(a.Latency))
+	for k, v := range a.Latency {
+		if target != "" && k != target {
+			continue
+		}
+		out = append(out, &storage.LatencyRow{
+			AgentID: agentID, Timestamp: a.LastSeen, Target: k,
+			Kind: latencyKind(k), LatencyMS: v, OK: true,
+		})
+	}
+	return out
 }
 
 // deviceAgentIDLocked 返回设备当前对外使用的 agent_id（调用方须持有锁）。
@@ -837,6 +944,7 @@ func (s *Store) persistAgent(info *protocol.AgentInfo) {
 		Load5:         derefFloat(info.Load5),
 		Load15:        derefFloat(info.Load15),
 		LoadKnown:     info.Load1 != nil,
+		AgentVersion:  info.AgentVersion,
 	}
 	if err := s.db.UpsertAgent(row); err != nil {
 		log.Printf("[probe] 持久化主机信息失败: %v", err)

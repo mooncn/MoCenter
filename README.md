@@ -253,7 +253,9 @@ bash scripts/packaging/build-linux-pkg.sh rpm amd64
 MOCENTER_VERSION=1.2.3 bash scripts/packaging/build-linux-pkg.sh all amd64   # 指定版本号
 ```
 
-`build-linux-pkg.sh` 参数为 `[deb|rpm|all] [arch]`，版本号取自环境变量 `MOCENTER_VERSION`（默认 `1.0.0`）。
+`build-linux-pkg.sh` 参数为 `[deb|rpm|all] [arch]`。版本号来源优先级：
+环境变量 `MOCENTER_VERSION` > 从 `agent/internal/version/version.go` 自动读取 > 兜底值。
+自动读取是为了避免"二进制里是 1.0.1、包名却是 1.0.0"这类版本漂移。
 生成的安装包内置 systemd 单元：安装后自动注册 `mocenter-agent.service`、设置开机自启，
 二进制落在 `/usr/local/bin/mocenter-agent`，配置文件为 `/etc/mocenter/mocenter-agent.conf`（**安装后请修改服务端地址**）。
 
@@ -283,7 +285,11 @@ set INNO_SETUP_ISCC=D:\Tools\Inno Setup 6\ISCC.exe
 scripts\packaging\build-setup.bat
 ```
 
-> 改版本号：编辑 `installer\setup.iss` 里的 `#define AppVersion` —— 它同时决定输出文件名与注册表版本。
+> 改版本号：本系统 **server 与 agent 共用同一版本号**，发版时需同时修改
+> `server/internal/version/version.go`、`agent/internal/version/version.go` 与
+> `installer\setup.iss` 的 `#define AppVersion`。两处 Go 常量的一致性由
+> `server/internal/version` 的单元测试守护（会读取 agent 侧源码比对），漏改会直接测试失败。
+> **版本号只在明确发版时修改**，服务端不提供运行时改版本的开关（避免线上跑着一个"版本号被临时改过"的二进制导致升级判定错乱）。
 > 安装包**无需维护文件清单**：向导只负责收集参数与摆放文件，服务注册、配置落盘、单实例保护
 > 都交给随包安装的 `mocenter-deploy.exe`（其失败原因会写入安装目录下的 `mocenter-deploy.log`）。
 
@@ -411,6 +417,11 @@ Agent TCP 通道要求每台 Agent 持有与服务端一致的**预共享密钥*
 - ✅ **服务端托管 Web 静态资源**：`-web web/dist` 单进程部署
 - ✅ **Windows 图形安装程序**：向导式安装（选择角色 → 连接与认证 → 高级设置），一键注册为**真正的 Windows 服务**（SCM 握手、失败自动重启），配置与数据固定于 `%ProgramData%\MoCenter\<角色>\`；另附命令行引擎用于静默批量部署；带命名互斥体单实例保护，同时保留便携单文件形态
 - ✅ **远程桌面 (VNC)**：服务端隧道 + noVNC 浏览器渲染，一键安装/启动（Windows **UltraVNC** / Linux **x11vnc**，支持国内加速代理）；**安装包可由服务端托管并经长连接分发**（避免公网慢/被劫持）；Windows 与 Linux 均支持**交互会话模式**与**服务模式**（后者可查看锁屏/登录界面）；连接后右下角悬浮工具栏支持**全屏**、自适应缩放、Ctrl+Alt+Del、**光标大小调节**与**移动端虚拟鼠标**
+- ✅ **延迟监测（ICMP / TCP / HTTP + 历史曲线）**：Agent 侧按目标探测往返延迟（ICMP 走系统 ping、TCP 测握手、HTTP 测首字节），服务端存历史并按时间窗出曲线；**超时点画成断点而不是 0**（否则完全不通的机器会看起来"最快"），逐目标统计平均/最小/最大与丢包率；目标可按主机下发（每行一个，最多 8 个）
+- ✅ **离线本地 GeoIP**：支持 MaxMind DB 格式离线库（GeoLite2-Country / City、DB-IP、IPinfo），配置 `-mmdb` / `mmdb_path` 后**本地优先解析**，未命中再降级到外部接口；解决无外网部署、免费接口按分钟限流（批量上线互相挤额度）、以及主源不支持 IPv6 三类问题
+- ✅ **备份 / 恢复**：一键导出数据目录为单个 zip（含 manifest 清单与每个文件的 SHA-256），恢复前可查看包内明细；SQLite 走 `VACUUM INTO` 在线一致快照（WAL 下直接拷文件会丢未 checkpoint 的事务）；恢复端做白名单 + 路径穿越校验 + 体积上限 + 摘要校验，覆盖前自动留存 `*.before-restore`
+- ✅ **后台一键部署 Agent（Linux）**：在 Web 后台填目标机地址与账号/密码（或私钥），SSH 登录后自动上传 Agent、写入配置（服务端地址 / Agent 名称 / 注册密钥 / 延迟目标）并注册为 systemd 服务；支持"先探测再安装"（仅探测连通性、架构、权限，不做任何改动）；凭证不落盘、不入日志，所有拼进 shell 的变量都经过引号转义与白名单校验
+- ✅ **统一版本号管理**：server 与 agent 共用同一版本号（`internal/version`，当前 `1.0.1`），仅在发版时修改；`AgentInfo.AgentVersion` 随注册上报，`/api/version` 给出各主机版本与"是否需要升级"判定；升级包的 version 必须等于服务端版本（不填则自动取），打包脚本与 Inno Setup 版本号同步；一致性由单元测试守护（含对 agent 源码的比对）
 - ✅ **多架构打包**：Windows x86/x86_64/ARM/ARM64、Linux amd64/arm64/arm/386 二进制，及 .deb/.rpm 安装包
 - ✅ **系统服务注册**：Agent 一键注册为 Windows 服务 / Linux systemd 服务，开机自启
 

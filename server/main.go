@@ -40,6 +40,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"mocenter/server/internal/agentauth"
+	"mocenter/server/internal/agentdeploy"
 	"mocenter/server/internal/auth"
 	"mocenter/server/internal/config"
 	"mocenter/server/internal/filetransfer"
@@ -53,6 +54,7 @@ import (
 	"mocenter/server/internal/session"
 	"mocenter/server/internal/siteconfig"
 	"mocenter/server/internal/storage"
+	"mocenter/server/internal/version"
 	"mocenter/server/internal/vnc"
 	"mocenter/server/internal/winapp"
 	"mocenter/server/internal/ws"
@@ -77,6 +79,7 @@ func main() {
 	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
 	agentKey := flag.String("agent-key", os.Getenv("MOCENTER_AGENT_KEY"), "Agent 注册预共享密钥（留空则自动生成并写到 <data>/agent.key）")
 	proxyIP := flag.String("proxy-ip", os.Getenv("MOCENTER_PROXY_IP"), "国内加速代理前缀（如 http://fa.mooncn.win/?url= ），用于节点地理位置的境外接口 ip-api.com")
+	mmdbPath := flag.String("mmdb", os.Getenv("MOCENTER_MMDB"), "离线 GeoIP 库路径（MaxMind DB 格式，如 GeoLite2-Country.mmdb）；配置后优先本地解析，避免外部接口限流与无外网环境失效")
 	allowAnonAgents := flag.Bool("allow-unauthenticated-agents", false, "允许 Agent 无凭证注册（危险：任何能连通 :9000 的主机都可注册/冒名）")
 	webTLSCert := flag.String("web-tls-cert", "", "Web 控制台 TLS 证书（不配置则 :8080 为明文 HTTP）")
 	webTLSKey := flag.String("web-tls-key", "", "Web 控制台 TLS 私钥")
@@ -106,6 +109,7 @@ func main() {
 			PkgDir:     *pkgDir,
 			AgentKey:   *agentKey,
 			ProxyIP:    *proxyIP,
+			MMDBPath:   *mmdbPath,
 			WebTLSCert: *webTLSCert,
 			WebTLSKey:  *webTLSKey,
 			TokenTTL:   tokenTTL.String(),
@@ -169,6 +173,11 @@ func main() {
 		if cfg.ProxyIP != "" && *proxyIP == os.Getenv("MOCENTER_PROXY_IP") {
 			*proxyIP = cfg.ProxyIP
 		}
+		// MMDB 路径同样必须回填到 flag（与 ProxyIP 同理：安装器/服务模式
+		// 不带命令行参数，配置文件是唯一的来源）。
+		if cfg.MMDBPath != "" && *mmdbPath == os.Getenv("MOCENTER_MMDB") {
+			*mmdbPath = cfg.MMDBPath
+		}
 		if cfg.AgentKey != "" && *agentKey == os.Getenv("MOCENTER_AGENT_KEY") {
 			*agentKey = cfg.AgentKey
 		}
@@ -204,10 +213,11 @@ func main() {
 			"pkg-dir":      func() { cfg.PkgDir = *pkgDir },
 			"agent-key":    func() { cfg.AgentKey = *agentKey },
 			"proxy-ip":     func() { cfg.ProxyIP = *proxyIP },
+			"mmdb":         func() { cfg.MMDBPath = *mmdbPath },
 			"token-ttl":    func() { cfg.TokenTTL = tokenTTL.String() },
 		}
 		dirty := false
-		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "pkg-dir", "agent-key", "proxy-ip", "token-ttl"} {
+		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -237,6 +247,8 @@ func main() {
 			}
 		}
 	}
+
+	log.Printf("[server] %s 启动中（数据目录 %s）", version.Full(), *dataDir)
 
 	// 安装包托管目录：默认 <data>/packages。
 	// Agent 一键安装 VNC 时会优先通过既有长连接从这里拉取安装包，
@@ -310,6 +322,18 @@ func main() {
 	sess := session.NewManager()
 	store := probe.NewStore(db)
 	geoResolver := geo.NewResolverWithProxy(*proxyIP)
+	// 离线 GeoIP 库（可选）：配置了就用本地库优先解析，解掉外部接口限流与
+	// 无外网部署下的"地区全空"问题。加载失败只告警并降级，不影响启动。
+	if strings.TrimSpace(*mmdbPath) != "" {
+		if err := geoResolver.SetMMDB(*mmdbPath); err != nil {
+			log.Printf("[geo] 离线 GeoIP 库加载失败（将降级使用外部接口）: %v", err)
+		} else if geoResolver.MMDBLoaded() {
+			log.Printf("[geo] 离线 GeoIP 已启用: %s（本地解析优先，未命中才走外部接口）", geoResolver.MMDBPath())
+		}
+	} else {
+		log.Printf("[geo] 未配置离线 GeoIP 库（-mmdb / 配置项 mmdb_path）；地区解析走外部接口，" +
+			"无外网或接口限流时可能出现「地区不显示」。可下载 GeoLite2-Country.mmdb 后配置该项")
+	}
 	store.SetGeoResolver(geoResolver)
 	remarks := remark.NewStore(*dataDir)
 	remarks.Load()
@@ -437,6 +461,11 @@ func main() {
 	mux.HandleFunc("/api/vnc/status", vncStatusHandler(vncMgr, authz))
 	mux.HandleFunc("/api/agents", agentsHandler(store, authz))
 	mux.HandleFunc("/api/agents/history", historyHandler(store, authz))
+	// 延迟监测（ICMP/TCP/HTTP）：查询历史曲线 + 下发/查看探测目标
+	mux.HandleFunc("/api/latency", latencyHandler(store, authz))
+	mux.HandleFunc("/api/latency/targets", latencyTargetsHandler(store, authz))
+	// 版本信息（服务端版本 + 各 Agent 在线版本与升级判定）
+	mux.HandleFunc("/api/version", versionHandler(store, geoResolver, authz))
 	mux.HandleFunc("/api/agents/remark", setRemarkHandler(remarks, authz))
 	mux.HandleFunc("/api/audits", auditsHandler(router, authz))
 	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
@@ -469,6 +498,21 @@ func main() {
 	mux.HandleFunc("/api/site/config", siteConfigHandler(siteCfg, authz, siteAudit))
 	mux.HandleFunc("/api/site/config/reset", siteConfigResetHandler(siteCfg, authz, siteAudit))
 	mux.HandleFunc("/api/site/hosts", siteHostOptionsHandler(store, authz))
+
+	// 备份 / 恢复（P1）：导出数据目录为 zip、查看包内清单、从包恢复
+	mux.HandleFunc("/api/backup", backupHandler(*dataDir, authz, siteAudit))
+	// 一键部署 Agent：SSH 登录目标机并安装 Agent、写入对应配置（Linux）
+	mux.HandleFunc("/api/agents/deploy", deployHandler(agentdeploy.New(agentdeploy.Options{
+		DataDir:    *dataDir,
+		PkgDir:     *pkgDir,
+		ServerAddr: *addr,
+		AgentKey:   agentKeyVal,
+		ProxyIP:    *proxyIP,
+		TLSCert:    *tlsCert,
+		TLSKey:     *tlsKey,
+		CACert:     *caCert,
+		MMDBPath:   *mmdbPath,
+	}), authz, siteAudit))
 
 	if siteCfg.Get().Enabled {
 		log.Printf("[server] 公开站点已启用：%s（字段开关见 后台 → 展示配置）", publicAPIBase)
@@ -954,6 +998,277 @@ func historyHandler(store *probe.Store, authz *auth.Auth) http.HandlerFunc {
 }
 
 // setRemarkHandler 设置/更新指定主机的备注（POST 或 PUT）。
+// latencyHandler GET /api/latency?agent=<id>&range=24h&target=<目标ID>
+//
+// 返回某主机的延迟历史曲线。响应结构对每个目标给出：
+//
+//	{ target, kind, points: [{ts, ms, ok}] }
+//
+// 失败的探测点**保留在序列里**（ok=false, ms=0），由前端画成断点/超时标记 ——
+// 若直接丢弃失败点，曲线会把"这段时间一直超时"画成"没有采样"，
+// 而这两者在运维判断上完全不同（前者是故障，后者是 Agent 没上报）。
+func latencyHandler(store *probe.Store, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		agentID := strings.TrimSpace(r.URL.Query().Get("agent"))
+		if agentID == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if store.Get(agentID) == nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "主机不存在"})
+			return
+		}
+		window := parseLatencyRange(r.URL.Query().Get("range"))
+		target := strings.TrimSpace(r.URL.Query().Get("target"))
+		limit := 2000
+		if v, err := strconv.Atoi(r.URL.Query().Get("max")); err == nil && v > 0 && v <= 5000 {
+			limit = v
+		}
+		rows := store.LatencyHistory(agentID, time.Now().Add(-window), target, limit)
+		series := map[string]*latencySeries{}
+		order := []string{}
+		for _, row := range rows {
+			if row == nil {
+				continue
+			}
+			ser, ok := series[row.Target]
+			if !ok {
+				ser = &latencySeries{Target: row.Target, Kind: row.Kind, Points: []latencyPoint{}}
+				series[row.Target] = ser
+				order = append(order, row.Target)
+			}
+			ser.Points = append(ser.Points, latencyPoint{TS: row.Timestamp, MS: roundMS(row.LatencyMS), OK: row.OK})
+		}
+		out := make([]*latencySeries, 0, len(order))
+		for _, t := range order {
+			out = append(out, series[t])
+		}
+		writeJSON(w, map[string]interface{}{
+			"ok":      true,
+			"agent":   agentID,
+			"targets": store.LatencyTargets(agentID),
+			"series":  out,
+		})
+	}
+}
+
+// latencyPoint 单个延迟采样点。
+type latencyPoint struct {
+	TS int64   `json:"ts"`
+	MS float64 `json:"ms"`
+	// OK=false 表示本次探测失败/超时（ms 无意义，前端应画断点）
+	OK bool `json:"ok"`
+}
+
+// latencySeries 一个目标的延迟序列。
+type latencySeries struct {
+	Target string         `json:"target"`
+	Kind   string         `json:"kind"`
+	Points []latencyPoint `json:"points"`
+}
+
+// roundMS 延迟保留 1 位小数。
+func roundMS(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	return float64(int64(v*10+0.5)) / 10
+}
+
+// parseLatencyRange 解析延迟趋势时间窗（形如 1h/6h/24h/7d），非法值回退 24h。
+// 上限 30 天，与历史留存窗口一致 —— 请求更长的窗口只会扫到空数据。
+func parseLatencyRange(v string) time.Duration {
+	v = strings.TrimSpace(strings.ToLower(v))
+	def := 24 * time.Hour
+	max := 30 * 24 * time.Hour
+	if v == "" {
+		return def
+	}
+	unit := v[len(v)-1]
+	num, err := strconv.Atoi(v[:len(v)-1])
+	if err != nil || num <= 0 {
+		return def
+	}
+	var d time.Duration
+	switch unit {
+	case 'h':
+		d = time.Duration(num) * time.Hour
+	case 'd':
+		d = time.Duration(num) * 24 * time.Hour
+	case 'm':
+		d = time.Duration(num) * time.Minute
+	default:
+		return def
+	}
+	if d > max {
+		return max
+	}
+	return d
+}
+
+// latencyTargetsHandler GET/POST /api/latency/targets
+//
+//	GET  ?agent=<id>          查看该主机当前生效的目标
+//	POST { agent_id, targets } 下发目标（写入内存 + 转发给在线的 Agent）
+//
+// 目标格式为 "icmp:1.1.1.1" / "tcp:1.1.1.1:443" / "http:https://example.com"。
+// 校验放在服务端：非法格式在这里被拦住，否则 Agent 侧只能整条忽略，
+// 运维看到的是"配了但没生效"且无从排查。
+func latencyTargetsHandler(store *probe.Store, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			agentID := strings.TrimSpace(r.URL.Query().Get("agent"))
+			if agentID == "" {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, map[string]interface{}{
+				"ok": true, "agent": agentID, "targets": store.LatencyTargets(agentID),
+			})
+		case http.MethodPost, http.MethodPut:
+			var body struct {
+				AgentID string   `json:"agent_id"`
+				Targets []string `json:"targets"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			agentID := strings.TrimSpace(body.AgentID)
+			if agentID == "" {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+				return
+			}
+			if store.Get(agentID) == nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "主机不存在"})
+				return
+			}
+			cleaned, verr := normalizeLatencyTargets(body.Targets)
+			if verr != nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": verr.Error()})
+				return
+			}
+			store.SetLatencyTargets(agentID, cleaned)
+			// 在线主机：等下一轮探针上报即可（Agent 会在采集时读配置）。
+			// 这里不做实时下发（那需要新增协议消息），因为延迟探测本身就是
+			// 周期性指标，等一个采集周期（默认 10s）是符合预期的。
+			writeJSON(w, map[string]interface{}{
+				"ok": true, "agent": agentID, "targets": cleaned,
+				"msg": "目标已保存，将在 Agent 下一个采集周期（默认 10 秒）生效",
+			})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+// maxLatencyTargets 单机延迟目标上限（与 agent 侧 latency.maxTargets 同口径）。
+const maxLatencyTargets = 8
+
+// normalizeLatencyTargets 校验并归一化延迟目标。
+func normalizeLatencyTargets(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, raw := range in {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if len(raw) > 512 {
+			return nil, fmt.Errorf("目标超长（最长 512 字符）: %.64s…", raw)
+		}
+		kind, addr := splitLatencySpec(raw)
+		if addr == "" {
+			return nil, fmt.Errorf("目标缺少地址: %s", raw)
+		}
+		if strings.ContainsAny(addr, " \t\r\n") {
+			return nil, fmt.Errorf("目标地址含空白字符: %s", raw)
+		}
+		id := kind + ":" + addr
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+		if len(out) > maxLatencyTargets {
+			return nil, fmt.Errorf("延迟目标最多 %d 个", maxLatencyTargets)
+		}
+	}
+	return out, nil
+}
+
+// splitLatencySpec 拆分 "kind:addr"，只在前缀是已知 kind 时按 kind 拆分
+// （http/https 目标自身含冒号，不能简单按第一个冒号切）。
+func splitLatencySpec(s string) (kind, addr string) {
+	if i := strings.Index(s, ":"); i > 0 {
+		p := strings.ToLower(s[:i])
+		if p == "icmp" || p == "tcp" || p == "http" {
+			if p == "http" {
+				p = "http"
+			}
+			return p, strings.TrimSpace(s[i+1:])
+		}
+	}
+	return "icmp", strings.TrimSpace(s)
+}
+
+// versionHandler GET /api/version
+//
+// 返回服务端版本 + 每个 Agent 的版本与"是否需要升级"判定。
+// 前端「关于」页与主机列表都读它，避免版本口径在不同页面各写一遍。
+func versionHandler(store *probe.Store, resolver *geo.Resolver, authz *auth.Auth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		agents := store.All()
+		items := make([]map[string]interface{}, 0, len(agents))
+		outdated := 0
+		for _, a := range agents {
+			if a == nil {
+				continue
+			}
+			cur := strings.TrimSpace(a.AgentVersion)
+			// 空版本 = 旧版 Agent 未上报，一律视为"需升级"：
+			// 它一定不是当前版本，这是保守且正确的判断。
+			need := cur != version.Version
+			if need {
+				outdated++
+			}
+			items = append(items, map[string]interface{}{
+				"agent_id": a.AgentID, "remark": a.Remark, "hostname": a.Hostname,
+				"online": a.Online, "agent_version": cur,
+				"outdated": need, "version_known": cur != "",
+			})
+		}
+		// 离线 GeoIP 库状态：部署后无法只看日志确认"是否真的生效"，
+		// 这里给出可查询的状态（是否加载 / 库文件路径）。
+		mmdbLoaded, mmdbPath := false, ""
+		if resolver != nil {
+			mmdbLoaded, mmdbPath = resolver.MMDBLoaded(), resolver.MMDBPath()
+		}
+		writeJSON(w, map[string]interface{}{
+			"ok":                 true,
+			"server_version":     version.Version,
+			"mmdb_loaded":        mmdbLoaded,
+			"mmdb_path":          mmdbPath,
+			"product":            version.Name,
+			"agent_total":        len(items),
+			"agent_outdated":     outdated,
+			"agents":             items,
+			"upgrade_rule":       "升级包的 version 需与 server_version 一致；服务端与 Agent 统一使用同一版本号",
+			"release_discipline": "版本号仅在明确发版时修改（见 internal/version）",
+		})
+	}
+}
+
 func setRemarkHandler(remarks *remark.Store, authz *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
@@ -1271,6 +1586,19 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 		}
 		if body.AgentID == "" {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+			return
+		}
+		// 版本号纪律：本系统的 server 与 agent **共用同一版本号**，
+		// 因此升级包声明的版本必须等于当前服务端版本 —— 否则会出现
+		// "server 1.0.1 却把 agent 升到 1.0.2"这类版本漂移，
+		// 而版本号正是"这台机器是否需要升级"的判断依据。
+		// 未填写时自动补当前版本（前端不必硬编码）。
+		if v := strings.TrimSpace(body.Version); v == "" {
+			body.Version = version.Version
+		} else if v != version.Version {
+			writeJSON(w, map[string]interface{}{"ok": false,
+				"msg": fmt.Sprintf("升级包版本 %s 与当前服务端版本 %s 不一致：本系统 server/agent 共用同一版本号，"+
+					"请使用同一版本号发布（不填则自动取服务端版本）", v, version.Version)})
 			return
 		}
 		// 服务端侧先做一次校验，尽早把错误反馈给操作者（Agent 侧还会再校验一次）
@@ -1908,7 +2236,7 @@ func auditRetentionCleaner(db *storage.DB) {
 	}
 }
 
-// probeHistoryCleaner 定期清理超过 30 天的探针历史数据。
+// probeHistoryCleaner 定期清理超过 30 天的探针 / 延迟历史数据。
 func probeHistoryCleaner(db *storage.DB) {
 	ticker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
@@ -1918,6 +2246,14 @@ func probeHistoryCleaner(db *storage.DB) {
 			log.Printf("[server] 清理探针历史失败: %v", err)
 		} else if n > 0 {
 			log.Printf("[server] 清理了 %d 条过期探针历史", n)
+		}
+		// 延迟历史与探针历史同口径（30 天）：都是趋势数据，留存窗口不一致
+		// 会导致"趋势图有数据、延迟曲线却空了一段"这种口径错位。
+		m, lerr := db.CleanupOldLatencyHistory(30)
+		if lerr != nil {
+			log.Printf("[server] 清理延迟历史失败: %v", lerr)
+		} else if m > 0 {
+			log.Printf("[server] 清理了 %d 条过期延迟历史", m)
 		}
 	}
 }

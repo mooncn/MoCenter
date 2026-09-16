@@ -27,10 +27,14 @@ import (
 	"time"
 
 	"mocenter/agent/internal/protocol"
+	"mocenter/agent/internal/version"
 )
 
-// Version 当前 Agent 版本。
-const Version = "1.0.0"
+// Version 当前 Agent 版本（引用统一的版本包，避免"升级模块以为自己还是 1.0.0"
+// 而实际上报已是 1.0.1"这类不一致）。
+//
+// 保留这个常量是为了不破坏既有调用方（含测试）的引用路径。
+const Version = version.Version
 
 // Policy 升级校验策略。
 type Policy struct {

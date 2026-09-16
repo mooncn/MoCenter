@@ -167,6 +167,79 @@ export const Api = {
     const { data } = await api.get('/site/hosts')
     return data
   },
+
+  // --- 延迟监测（ICMP/TCP/HTTP） ---
+
+  // 主机延迟历史曲线：返回 { ok, agent, targets, series:[{target,kind,points:[{ts,ms,ok}]}] }
+  // 失败的探测点也在 points 里（ok=false），前端画断点而不是丢弃
+  async latency(agent, range, target) {
+    const { data } = await api.get('/latency', { params: { agent, range, target } })
+    return data
+  },
+  // 读取某主机的延迟探测目标
+  async latencyTargets(agent) {
+    const { data } = await api.get('/latency/targets', { params: { agent } })
+    return data
+  },
+  // 下发延迟探测目标（形如 icmp:1.1.1.1 / tcp:1.1.1.1:443 / http:https://x）
+  async saveLatencyTargets(agentId, targets) {
+    const { data } = await api.post('/latency/targets', { agent_id: agentId, targets })
+    return data
+  },
+
+  // --- 版本与升级 ---
+
+  // 服务端版本 + 各 Agent 版本与升级判定（含离线 GeoIP 库状态）
+  async version() {
+    const { data } = await api.get('/version')
+    return data
+  },
+
+  // --- 备份 / 恢复 ---
+
+  // 列出已有备份包（含包内清单摘要）
+  async backups() {
+    const { data } = await api.get('/backup')
+    return data
+  },
+  // 创建备份
+  async createBackup() {
+    const { data } = await api.post('/backup', null, { timeout: 300000 })
+    return data
+  },
+  // 查看备份包清单（恢复前确认）
+  async inspectBackup(file) {
+    const { data } = await api.post('/backup', null, { params: { action: 'inspect', file } })
+    return data
+  },
+  // 从备份恢复（不可逆，前端需二次确认）
+  async restoreBackup(file) {
+    const { data } = await api.post('/backup', null, { params: { action: 'restore', file }, timeout: 300000 })
+    return data
+  },
+  // 删除备份包
+  async deleteBackup(file) {
+    const { data } = await api.delete('/backup', { params: { file } })
+    return data
+  },
+  // 下载备份包（走浏览器原生下载，带 Authorization 头）
+  async downloadBackup(file) {
+    const { data } = await api.get('/backup', { params: { download: file }, responseType: 'blob', timeout: 300000 })
+    return data
+  },
+
+  // --- 一键部署 Agent ---
+
+  // 可下发的 Agent 安装包
+  async deployPackages() {
+    const { data } = await api.get('/agents/deploy')
+    return data
+  },
+  // 执行部署；probe_only=true 时仅做连通性与环境探测，不做任何改动
+  async deployAgent(payload) {
+    const { data } = await api.post('/agents/deploy', payload, { timeout: 180000 })
+    return data
+  },
 }
 
 // 公开站点 API（**免登录**）：

@@ -19,7 +19,10 @@
 ; =============================================================
 
 #define AppName "MoCenter"
-#define AppVersion "1.0.0"
+; 版本号在本文件与 Go 源码 internal/version 中**必须一致**。
+; 发布纪律：只在明确发版时修改，且 server / agent 共用同一版本号。
+; 一致性由 server/internal/version 的单元测试守护（含对 agent 源码的比对）。
+#define AppVersion "1.0.1"
 #define AppPublisher "MoCenter"
 
 [Setup]

@@ -93,6 +93,12 @@ type ProbeDataReq struct {
 	Arch          string  `json:"arch"`
 	PublicIP      string  `json:"public_ip"`
 	PublicIPv6    string  `json:"public_ipv6"`
+	// 延迟监测（ICMP/TCP/HTTP）：每个目标的往返延迟（毫秒）。
+	// 未探测/探测失败的目标不在 map 中 —— "没有数据"与"延迟为 0"必须区分开，
+	// 否则前端会把超时画成 0ms（看起来比谁都快）。
+	LatencyMS map[string]float64 `json:"latency_ms,omitempty"`
+	// LatencyTargets 本机当前生效的延迟探测目标（供服务端回显与前端展示）。
+	LatencyTargets []string `json:"latency_targets,omitempty"`
 	// 扩展指标：系统版本 / CPU 型号与主频 / 内存与磁盘 已用+总量 / 网络累计
 	OSVersion      string  `json:"os_version,omitempty"`
 	CPUModel       string  `json:"cpu_model,omitempty"`

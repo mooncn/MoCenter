@@ -9,6 +9,9 @@ import Audit from './pages/Audit.jsx'
 import Ops from './pages/Ops.jsx'
 import Account from './pages/Account.jsx'
 import SiteConfig from './pages/SiteConfig.jsx'
+import Latency from './pages/Latency.jsx'
+import Deploy from './pages/Deploy.jsx'
+import Backup from './pages/Backup.jsx'
 import Login from './pages/Login.jsx'
 import PublicStatus, { PublicNode } from './pages/PublicStatus.jsx'
 import { Api, MCSocket } from './api/api.js'
@@ -23,12 +26,15 @@ const ADMIN = '/admin'
 export const NAV_ITEMS = [
   { to: `${ADMIN}`, label: '仪表盘', icon: '📊', end: true },
   { to: `${ADMIN}/terminal`, label: '远程终端', icon: '💻' },
+  { to: `${ADMIN}/latency`, label: '延迟监测', icon: '📶' },
   { to: `${ADMIN}/vnc`, label: '远程桌面', icon: '🖥' },
   { to: `${ADMIN}/portmap`, label: '端口映射', icon: '🔀' },
   { to: `${ADMIN}/ops`, label: '运维操作', icon: '🛠' },
   { to: `${ADMIN}/offline`, label: '离线机器', icon: '📴' },
   { to: `${ADMIN}/audit`, label: '操作审计', icon: '📋' },
   { to: `${ADMIN}/site-config`, label: '展示配置', icon: '🪧' },
+  { to: `${ADMIN}/deploy`, label: '部署 Agent', icon: '🚀' },
+  { to: `${ADMIN}/backup`, label: '备份恢复', icon: '💾' },
   { to: `${ADMIN}/account`, label: '账号设置', icon: '⚙️' },
 ]
 // 后台入口：登录成功后的默认落地页。
@@ -116,6 +122,9 @@ function Layout() {
             <Route path="/offline" element={<Offline agents={agents} />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/site-config" element={<SiteConfig />} />
+            <Route path="/latency" element={<Latency agents={agents} />} />
+            <Route path="/deploy" element={<Deploy />} />
+            <Route path="/backup" element={<Backup />} />
             <Route path="/account" element={<Account />} />
             {/* 兜底：未知后台路径回到仪表盘，而不是空白页 */}
             <Route path="*" element={<Navigate to={ADMIN} replace />} />
@@ -172,6 +181,7 @@ function LegacyRedirect() {
   const location = useLocation()
   const legacy = [
     '/terminal', '/vnc', '/portmap', '/ops', '/offline', '/audit', '/site-config', '/account',
+    '/latency', '/deploy', '/backup',
   ]
   const hit = legacy.find((p) => location.pathname === p || location.pathname.startsWith(p + '/'))
   if (hit) {

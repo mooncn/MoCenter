@@ -1,11 +1,19 @@
 // Package geo 提供基于公网 IP 的地理位置解析服务。
 //
-// 采用**多源解析 + 逐源降级**：
+// 采用**多源解析 + 逐源降级**，顺序即优先级：
 //
+//  0. **本地离线 MMDB**（可选，配置 mmdb_path 后启用）
+//     —— GeoLite2 / DB-IP / IPinfo 等 MaxMind DB 格式，本地文件查询，
+//     微秒级、无网络、无配额限制。放在最前是因为它同时解决三个真实问题：
+//     服务端无外网出口、免费接口按分钟限流（批量上线时互相挤额度）、
+//     以及 api.iping.cc 对 IPv6 恒返回 500。
 //  1. api.iping.cc（主源）https://api.iping.cc/v1/query?ip=..&language=zh
 //     —— 返回中文国家/省/市名，偶发限流（code=500）。
 //  2. ip-api.com（备源）http://ip-api.com/json/<ip>?lang=zh-CN —— 主源失败/限流时兜底。
 //  3. ipwho.is（兜底）https://ipwho.is/<ip> —— 主源与备源都不可用时的最后一道。
+//
+// **未配置离线库时行为与从前完全一致**（三源降级），离线库是纯增强：
+// 它是可选的，缺了不会让服务端起不来，也不会改变既有解析语义。
 //
 // 关键：**主源不返回 ISO 国家代码**（只有中文国名），而前端的国旗完全依赖
 // country_code。早期的实现只看主源，于是"地区正常但国旗不显示/地区为空"。
@@ -107,6 +115,8 @@ type Resolver struct {
 	ipwhoEndpoint string
 	// 兼容字段：早期的单源测试注入点。设置后作为备源（ip-api 口径）生效。
 	endpoint string
+	// mmdb 可选离线地理库（nil 或未加载 = 未启用，直接跳过该源）。
+	mmdb *MMDBProvider
 }
 
 // 缓存时长。
@@ -132,7 +142,40 @@ func NewResolver() *Resolver {
 	return &Resolver{
 		cache:   make(map[string]*cacheEntry),
 		timeout: 5 * time.Second,
+		mmdb:    &MMDBProvider{},
 	}
+}
+
+// SetMMDB 挂载离线地理库（path 为空表示不启用）。
+//
+// 返回错误仅用于**日志提示**（配置了但加载失败），不阻断启动：
+// 离线库加载失败时自动降级到外部 HTTP 源，服务端照常可用。
+func (r *Resolver) SetMMDB(path string) error {
+	if r.mmdb == nil {
+		r.mmdb = &MMDBProvider{}
+	}
+	if trimSpace(path) == "" {
+		return nil
+	}
+	return r.mmdb.Reopen(path)
+}
+
+// MMDBLoaded 离线库是否已生效（供启动日志与 /api/version 展示）。
+func (r *Resolver) MMDBLoaded() bool {
+	return r.mmdb != nil && r.mmdb.Loaded()
+}
+
+// MMDBPath 当前生效的离线库路径（未启用时为空）。
+func (r *Resolver) MMDBPath() string {
+	if r.mmdb == nil {
+		return ""
+	}
+	return r.mmdb.Path()
+}
+
+// ReloadMMDB 热重载离线库（更新数据文件后无需重启服务端）。
+func (r *Resolver) ReloadMMDB(path string) error {
+	return r.SetMMDB(path)
 }
 
 // NewResolverWithProxy 创建带国内加速代理的解析器。
@@ -232,6 +275,13 @@ func (r *Resolver) pruneLocked() {
 // 每个源的失败都单独记日志（含原因），这样运维能从日志判断到底是
 // "限流"、"网络不通"、"不支持该地址族" 还是 "该 IP 无地理位置数据"。
 func (r *Resolver) fetch(ip string) *protocol.GeoInfo {
+	// 离线库优先：本地文件查询无网络、无配额，能命中就不必打外部接口。
+	// 这也顺带避免了"批量上线打爆免费额度"——有库的部署几乎不会走 HTTP 源。
+	if r.mmdb != nil && r.mmdb.Loaded() {
+		if g := r.mmdb.Lookup(ip); g != nil {
+			return g
+		}
+	}
 	client := &http.Client{Timeout: r.timeout}
 	type source struct {
 		name string

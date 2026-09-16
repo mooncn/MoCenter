@@ -132,6 +132,12 @@ type ProbeDataReq struct {
 	NetOutDeltaBytes int64 `json:"net_out_delta_bytes,omitempty"`
 	// NetDeltaKnown 增量是否可信（首点 / 计数器回绕时为 false，下游应跳过该点）
 	NetDeltaKnown bool `json:"net_delta_known,omitempty"`
+
+	// LatencyMS 各延迟目标的往返延迟（毫秒），key 为 "ICMP:1.1.1.1" 形式的目标标识。
+	// 缺失的 key 表示"本次未探测或探测失败"——不能当成 0。
+	LatencyMS map[string]float64 `json:"latency_ms,omitempty"`
+	// LatencyTargets 本机生效的延迟探测目标（服务端据此知道该上报哪些目标）。
+	LatencyTargets []string `json:"latency_targets,omitempty"`
 }
 
 // ProbeDataResp Server -> Agent 探针确认
@@ -174,6 +180,16 @@ type AgentInfo struct {
 	// 网络速率（字节/秒），由服务端根据相邻探针累计值差计算
 	NetRateIn  int64 `json:"net_rate_in,omitempty"`
 	NetRateOut int64 `json:"net_rate_out,omitempty"`
+	// Latency 各探测目标的最新延迟（毫秒），key 为目标标识。
+	// 缺失的 key 表示"未探测/失败"，前端显示「超时」而不是 0ms。
+	Latency map[string]float64 `json:"latency,omitempty"`
+	// LatencyTargets 生效的探测目标列表（用于前端按固定顺序渲染，避免列跳动）。
+	LatencyTargets []string `json:"latency_targets,omitempty"`
+	// AgentVersion Agent 自报的版本号（如 "1.0.1"）。
+	// 服务端用它判断"该主机是否需要升级"，前端在主机详情里展示。
+	// 旧版 Agent 不上报此字段，为空串表示"未知版本"（前端显示「—」，
+	// 升级判定时按"需升级"处理 —— 未知版本一定不是当前版本）。
+	AgentVersion string `json:"agent_version,omitempty"`
 	// 系统负载（1/5/15 分钟平均）。用指针：nil = 平台不提供（如 Windows 未取到
 	// 队列长度）；非 nil 时 0 是合法值（空闲机器），必须如实下发给前端 ——
 	// 用 float64 + omitempty 会把 0 当成"没有数据"丢掉，前端只能显示「—」。

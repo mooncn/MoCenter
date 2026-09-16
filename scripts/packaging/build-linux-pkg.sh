@@ -30,7 +30,13 @@ case "${ARCH}" in
   *) echo "不支持的架构: ${ARCH}（可用 amd64/arm64/arm/386）"; exit 1 ;;
 esac
 
-VERSION="${MOCENTER_VERSION:-1.0.0}"
+# 版本号来源优先级：环境变量 MOCENTER_VERSION > agent 源码里的 internal/version > 兜底值。
+#
+# 为什么要从源码读：版本号在 Go 侧是唯一事实来源（internal/version），
+# 打包脚本里再写一份硬编码，发版时必然出现"二进制里是 1.0.1、包名却是 1.0.0"。
+# 这里自动读取，只有读不到（例如只拷了脚本）才用兜底值。
+SRC_VERSION="$(sed -n 's/^\s*const\s\+Version\s*=\s*"\([^"]*\)".*/\1/p' "${AGENT_DIR}/internal/version/version.go" 2>/dev/null | head -1)"
+VERSION="${MOCENTER_VERSION:-${SRC_VERSION:-1.0.1}}"
 PKG_NAME="mocenter-agent"
 STAGE="${OUT_DIR}/stage"
 

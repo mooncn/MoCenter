@@ -99,6 +99,8 @@ export default function Dashboard({ agents }) {
               <th>内存</th>
               <th>磁盘</th>
               <th>网络(累计↓↑ / 速率↓↑)</th>
+              <th>延迟</th>
+              <th>版本</th>
               <th>最后在线</th>
               <th>趋势</th>
             </tr>
@@ -155,6 +157,12 @@ export default function Dashboard({ agents }) {
                   <div style={{ color: '#52c41a', fontSize: 10 }}>
                     {fmtSpeed(a.net_rate_in)} / {fmtSpeed(a.net_rate_out)}
                   </div>
+                </td>
+                <td data-label="延迟">
+                  <LatencyCell agent={a} />
+                </td>
+                <td data-label="版本">
+                  <AgentVersionCell agent={a} />
                 </td>
                 <td data-label="最后在线">{a.online ? fmtTime(a.last_seen) : `离线 ${fmtOffline(a)}`}</td>
                 <td data-label="趋势">
@@ -287,6 +295,47 @@ function fmtOffline(a) {
   if (s < 3600) return `${Math.floor(s / 60)}分`
   if (s < 86400) return `${Math.floor(s / 3600)}时`
   return `${Math.floor(s / 86400)}天`
+}
+
+// LatencyCell 主机延迟概览：只显示"最快目标"与最差目标，避免表格里塞一长串。
+//
+// 为什么显示范围而不是平均值：平均延迟会掩盖抖动（1ms 与 500ms 各半 -> 平均 250ms），
+// 而运维真正关心的是"抖动大不大"。
+function LatencyCell({ agent }) {
+  const entries = Object.entries(agent.latency || {})
+  if (entries.length === 0) {
+    return <span style={{ color: '#6b7280', fontSize: 11 }}>—</span>
+  }
+  const vals = entries.map(([, v]) => v)
+  const best = Math.min(...vals)
+  const worst = Math.max(...vals)
+  // 已配置但本机没探到的目标 = 本轮超时，单独标出来（不能当成 0）
+  const total = (agent.latency_targets || []).length
+  const lost = Math.max(0, total - entries.length)
+  return (
+    <div style={{ fontSize: 11, whiteSpace: 'nowrap' }}>
+      <div>{round1(best)} ~ {round1(worst)} ms</div>
+      <div style={{ color: '#8b98a5', fontSize: 10 }}>
+        {entries.length} 个目标{lost > 0 ? ` · ${lost} 个超时` : ''}
+      </div>
+    </div>
+  )
+}
+
+// AgentVersionCell 展示 Agent 版本，并标出与当前服务端版本不一致的情况。
+//
+// 空版本（旧版 Agent 未上报）单独显示为「未知」—— 它一定不是当前版本，
+// 但不能显示成"不匹配某个具体版本"，否则运维会以为有明确的版本号。
+function AgentVersionCell({ agent }) {
+  const v = (agent.agent_version || '').trim()
+  if (!v) {
+    return <span style={{ color: '#8b98a5', fontSize: 11 }} title="该 Agent 未上报版本号（旧版本）">未知</span>
+  }
+  return <span style={{ fontSize: 11 }}>{v}</span>
+}
+
+function round1(v) {
+  return Math.round(v * 10) / 10
 }
 
 // 公网 IP 与地理位置展示单元格。

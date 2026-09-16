@@ -4,22 +4,26 @@
 // 上报探针数据、接收并执行远程命令。
 //
 // 用法：
-//   首次：./agent -server host:port -agentid <id> [-hb 30] [-probe 10]
-//         （首次运行会自动把参数写入配置文件 mocenter-agent.json）
-//   后续：./agent（自动读取配置文件；命令行显式参数优先级更高）
+//
+//	首次：./agent -server host:port -agentid <id> [-hb 30] [-probe 10]
+//	      （首次运行会自动把参数写入配置文件 mocenter-agent.json）
+//	后续：./agent（自动读取配置文件；命令行显式参数优先级更高）
 package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"mocenter/agent/internal/client"
 	"mocenter/agent/internal/config"
 	"mocenter/agent/internal/daemon"
 	probepkg "mocenter/agent/internal/probe"
+	"mocenter/agent/internal/version"
 	"mocenter/agent/internal/winapp"
 )
 
@@ -40,7 +44,16 @@ func main() {
 	agentKey := flag.String("agent-key", os.Getenv("MOCENTER_AGENT_KEY"), "与服务端预共享的注册密钥（服务端 agent.key 的内容）")
 	upgradePubKey := flag.String("upgrade-pubkey", "", "升级包 Ed25519 公钥（hex 或文件路径）；未配置则拒绝升级，除非加 -upgrade-allow-unsigned")
 	upgradeAllowUnsigned := flag.Bool("upgrade-allow-unsigned", false, "允许无签名升级（危险：任何人拿到通道即可让本机执行任意二进制）")
+	latencyTargets := flag.String("latency-targets", "", "延迟探测目标，逗号分隔（如 icmp:1.1.1.1,tcp:1.1.1.1:443,http:https://example.com ）")
+	showVersion := flag.Bool("version", false, "打印版本号并退出")
 	flag.Parse()
+
+	// -version：打印后立即退出，不读配置文件、不探测硬件、不连服务端。
+	// 放在最前面是为了让打包脚本能快速取版本，也不会因环境缺配置而失败。
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
 	cfg, err := config.Load(*configPath)
@@ -50,21 +63,22 @@ func main() {
 	if cfg == nil {
 		// 首次启动：用当前参数生成配置
 		cfg = &config.Config{
-			Server:     *server,
-			AgentID:    *agentID,
-			UUID:       *agentUUID,
-			Heartbeat:  *hb,
-			ProbeEvery: *probe,
-			TLS:        *tlsEnabled,
-			Insecure:   *insecure,
-			Daemon:     *daemonize,
-			ClientCert: *clientCert,
-			ClientKey:  *clientKey,
-			CACert:     *caCert,
-			ProxyIP:    *proxyIP,
-			AgentKey:   *agentKey,
+			Server:               *server,
+			AgentID:              *agentID,
+			UUID:                 *agentUUID,
+			Heartbeat:            *hb,
+			ProbeEvery:           *probe,
+			TLS:                  *tlsEnabled,
+			Insecure:             *insecure,
+			Daemon:               *daemonize,
+			ClientCert:           *clientCert,
+			ClientKey:            *clientKey,
+			CACert:               *caCert,
+			ProxyIP:              *proxyIP,
+			AgentKey:             *agentKey,
 			UpgradePubKey:        *upgradePubKey,
 			UpgradeAllowUnsigned: *upgradeAllowUnsigned,
+			LatencyTargets:       splitList(*latencyTargets),
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
 			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
@@ -118,6 +132,9 @@ func main() {
 		if cfg.UpgradeAllowUnsigned && !*upgradeAllowUnsigned {
 			*upgradeAllowUnsigned = true
 		}
+		if len(cfg.LatencyTargets) > 0 && strings.TrimSpace(*latencyTargets) == "" {
+			*latencyTargets = strings.Join(cfg.LatencyTargets, ",")
+		}
 	}
 
 	// 命令行显式传入的参数（flag.Visit）优先级最高，并自动保存回配置文件，
@@ -126,24 +143,25 @@ func main() {
 		explicit := map[string]bool{}
 		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 		field := map[string]func(){
-			"server":      func() { cfg.Server = *server },
-			"agentid":     func() { cfg.AgentID = *agentID },
-			"uuid":        func() { cfg.UUID = *agentUUID },
-			"hb":          func() { cfg.Heartbeat = *hb },
-			"probe":       func() { cfg.ProbeEvery = *probe },
-			"tls":         func() { cfg.TLS = *tlsEnabled },
-			"insecure":    func() { cfg.Insecure = *insecure },
-			"daemon":      func() { cfg.Daemon = *daemonize },
-			"client-cert": func() { cfg.ClientCert = *clientCert },
-			"client-key":  func() { cfg.ClientKey = *clientKey },
-			"ca-cert":     func() { cfg.CACert = *caCert },
-			"proxy-ip":    func() { cfg.ProxyIP = *proxyIP },
-			"agent-key":   func() { cfg.AgentKey = *agentKey },
+			"server":                 func() { cfg.Server = *server },
+			"agentid":                func() { cfg.AgentID = *agentID },
+			"uuid":                   func() { cfg.UUID = *agentUUID },
+			"hb":                     func() { cfg.Heartbeat = *hb },
+			"probe":                  func() { cfg.ProbeEvery = *probe },
+			"tls":                    func() { cfg.TLS = *tlsEnabled },
+			"insecure":               func() { cfg.Insecure = *insecure },
+			"daemon":                 func() { cfg.Daemon = *daemonize },
+			"client-cert":            func() { cfg.ClientCert = *clientCert },
+			"client-key":             func() { cfg.ClientKey = *clientKey },
+			"ca-cert":                func() { cfg.CACert = *caCert },
+			"proxy-ip":               func() { cfg.ProxyIP = *proxyIP },
+			"agent-key":              func() { cfg.AgentKey = *agentKey },
 			"upgrade-pubkey":         func() { cfg.UpgradePubKey = *upgradePubKey },
 			"upgrade-allow-unsigned": func() { cfg.UpgradeAllowUnsigned = *upgradeAllowUnsigned },
+			"latency-targets":        func() { cfg.LatencyTargets = splitList(*latencyTargets) },
 		}
 		dirty := false
-		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "upgrade-pubkey", "upgrade-allow-unsigned"} {
+		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "upgrade-pubkey", "upgrade-allow-unsigned", "latency-targets"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -204,6 +222,7 @@ func main() {
 			clientCert: *clientCert, clientKey: *clientKey, caCert: *caCert,
 			proxyIP: *proxyIP, agentKey: *agentKey,
 			upgradePubKey: *upgradePubKey, allowUnsigned: *upgradeAllowUnsigned,
+			latencyTargets: splitList(*latencyTargets),
 		}
 		if *daemonize || winapp.IsWindowsService() {
 			daemon.Supervise(func() { runClient(o) })
@@ -236,33 +255,46 @@ const agentServiceName = "MoCenterAgent"
 
 // runOpts 收敛 runClient 的入参，避免继续往位置参数上堆字段时错位。
 type runOpts struct {
-	server, agentID, agentUUID               string
-	hb, probe                               int
-	tls, insecure                           bool
-	clientCert, clientKey, caCert, proxyIP  string
-	agentKey, upgradePubKey                 string
-	allowUnsigned                           bool
+	server, agentID, agentUUID             string
+	hb, probe                              int
+	tls, insecure                          bool
+	clientCert, clientKey, caCert, proxyIP string
+	agentKey, upgradePubKey                string
+	allowUnsigned                          bool
+	latencyTargets                         []string
 }
 
 func runClient(o runOpts) {
 	c := client.New(client.Config{
-		ServerAddr: o.server,
-		AgentID:    o.agentID,
-		UUID:       o.agentUUID,
-		Heartbeat:  seconds(o.hb),
-		ProbeEvery: seconds(o.probe),
-		TLS:        o.tls,
-		Insecure:   o.insecure,
-		ClientCert: o.clientCert,
-		ClientKey:  o.clientKey,
-		CACert:     o.caCert,
-		ProxyIP:    o.proxyIP,
-		AgentKey:   o.agentKey,
+		ServerAddr:           o.server,
+		AgentID:              o.agentID,
+		UUID:                 o.agentUUID,
+		Heartbeat:            seconds(o.hb),
+		ProbeEvery:           seconds(o.probe),
+		TLS:                  o.tls,
+		Insecure:             o.insecure,
+		ClientCert:           o.clientCert,
+		ClientKey:            o.clientKey,
+		CACert:               o.caCert,
+		ProxyIP:              o.proxyIP,
+		AgentKey:             o.agentKey,
 		UpgradePubKey:        o.upgradePubKey,
 		UpgradeAllowUnsigned: o.allowUnsigned,
+		LatencyTargets:       o.latencyTargets,
 	})
-	log.Printf("[agent] 启动 Agent %s，目标服务端 %s", o.agentID, o.server)
+	log.Printf("[agent] 启动 %s，Agent %s，目标服务端 %s", version.Full(), o.agentID, o.server)
 	c.Run()
 }
 
 func seconds(n int) time.Duration { return time.Duration(n) * time.Second }
+
+// splitList 拆分逗号分隔的列表并去除空白项。
+func splitList(s string) []string {
+	out := []string{}
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
