@@ -5,6 +5,12 @@
 # 目标：把「参数解析 / 版本推导 / 架构映射 / 打印 / 依赖自愈」收敛到一处，
 #       避免此前每个脚本各写一份、口径逐渐走偏（例如 Agent 版本号在 4 个脚本里
 #       各抄一遍 1.0.1，加一种架构要改 5 个文件）。
+#
+# 加载方式（两种都支持）：
+#   bash   : bash scripts/xxx.sh          # 脚本内 `. lib/common.sh` —— 推荐
+#   POSIX  : sh    scripts/xxx.sh          # 也可，前提是调用方别依赖 Bash 数组等扩展
+# 本库只用 POSIX 兼容语法（除函数内的局部变量），因此被 dash 等 /bin/sh 加载也不会
+# 解析失败；同理，调用方请勿在 source 前后依赖 Bash 独有语法。
 # =============================================================
 
 # ---------- 常量：支持的取值（唯一事实来源） ----------
@@ -191,8 +197,17 @@ mc_go_build() {
   # mc_go_build <模块目录> <输出文件> <GOOS> <GOARCH> [额外 ldflags]
   local dir="$1" out="$2" goos="$3" goarch="$4" extra="${5:-}" rc=0
   mc_assert_platform_supported "$goos" "$goarch"
-  local -a envs=(GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0)
-  [ "$goarch" = "arm" ] && envs+=(GOARM=7)
+  # 注意：这里刻意不用 bash 数组（local -a envs=(...)）。
+  # 数组是 Bash 扩展，若本库被 /bin/sh（Debian/Ubuntu 上是 dash）加载，
+  # 会在解析期直接报 Syntax error: "(" unexpected 并让调用方以退出码 2 终止
+  # ——CI 的 PR 阶段就用 `. scripts/lib/common.sh` 触发过这个坑。
+  # 改为用「换行分隔的字符串」承接，展开时靠词拆分（GOOS/GOARCH 值不含空格，
+  # 不会被二次拆分），语法在 POSIX sh 与 Bash 下都成立。
+  envs="GOOS=$goos
+GOARCH=$goarch
+CGO_ENABLED=0"
+  [ "$goarch" = "arm" ] && envs="$envs
+GOARM=7"
   # 输出路径转成绝对路径：下面会 cd 进模块目录，相对路径会被解析成相对模块，
   # 于是二进制落到 agent/installer/payload/ 这类意外位置（且后续查找必然失败）。
   case "$out" in
@@ -200,14 +215,14 @@ mc_go_build() {
     *)  out="$(pwd)/$out" ;;
   esac
   mkdir -p "$(dirname "$out")"
-  ( cd "$dir" && env "${envs[@]}" go mod download ) || true
-  ( cd "$dir" && env "${envs[@]}" go build -ldflags "-s -w $extra" -o "$out" . ) || rc=$?
+  ( cd "$dir" && env $envs go mod download ) || true
+  ( cd "$dir" && env $envs go build -ldflags "-s -w $extra" -o "$out" . ) || rc=$?
   if [ "$rc" != 0 ]; then
     warn "构建失败，清理模块缓存后经镜像代理重试：$dir"
     go clean -modcache >/dev/null 2>&1 || true
     local mirror="${GOPROXY_MIRROR:-https://goproxy.cn,direct}" mrc=0
-    ( cd "$dir" && GOPROXY="$mirror" env "${envs[@]}" go mod download ) || true
-    ( cd "$dir" && GOPROXY="$mirror" env "${envs[@]}" go build -ldflags "-s -w $extra" -o "$out" . ) || mrc=$?
+    ( cd "$dir" && GOPROXY="$mirror" env $envs go mod download ) || true
+    ( cd "$dir" && GOPROXY="$mirror" env $envs go build -ldflags "-s -w $extra" -o "$out" . ) || mrc=$?
     [ "$mrc" = 0 ] || die "构建失败：$dir（可手动执行 GOPROXY=$mirror go build 排查）"
   fi
 }
@@ -271,7 +286,9 @@ mc_verify_zip() {
 
 # ---------- 可变参数模式匹配 ----------
 # 把 "amd64,arm64" / "amd64 arm64" 统一成数组，并校验取值。
-mc_split_list() { tr ',' ' ' <<<"$1" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'; }
+# 用 printf | tr 代替 here-string（<<< 是 Bash 扩展，dash 会报
+# "Syntax error: redirection unexpected"；而本库的解析期错误会直接带崩调用方）。
+mc_split_list() { printf '%s' "$1" | tr ',' ' ' | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'; }
 mc_in_list() {
   # mc_in_list <值> <空格分隔的候选串>
   case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac

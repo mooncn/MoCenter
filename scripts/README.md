@@ -7,12 +7,24 @@
 | `build-linux-all.sh` | 统一构建/打包入口（Linux/macOS 构建机）。Server/Agent/Web + `.deb`/`.rpm`/`zip` |
 | `build-all.bat` | 统一构建入口（Windows 构建机）。Server/Agent/Web + 免安装 zip + 图形安装程序 |
 | `build-windows-installer.bat` | 被 `build-all.bat --type=installer` 调用；也可单独运行（需 Inno Setup 6） |
-| `lib/common.sh` | 公共库：参数校验、版本读取、架构映射、打包工具探测、zip 打包/校验 |
+| `lib/common.sh` | 公共库：参数校验、版本读取、架构映射、打包工具探测、zip 打包/校验。**只用 POSIX 语法**，可被 `sh`(dash) 加载 |
 | `deploy/` | **部署期**资产：systemd 单元与配置模板、Linux/Windows 服务注册脚本 |
 | `gen-cert.sh` | 生成 CA / 服务端 / 客户端证书（需 openssl） |
 | `gencerts/` | 证书生成的 Go 实现（**Windows 无需 openssl**） |
 | `fetch-packages.sh` | 把 VNC 安装包放进服务端托管目录 |
 | `mcmd/` | 远程命令调试工具（REST + WebSocket） |
+
+## 公共库的语法约束（重要）
+
+`lib/common.sh` **不使用** bash 独有语法（数组、`local -a`、`<<<` here-string 等）：
+
+- CI 的 PR 阶段会用 `/bin/sh`（Debian 镜像上是 **dash**）执行 `. scripts/lib/common.sh` 做自检；
+- dash 遇到 bashism 会在**解析期**直接报 `Syntax error: "(" unexpected` 并让调用方以退出码 2 终止，
+  后果是整个流水线红掉，且 `bash -n` 检查不出来。
+
+因此：给本库加代码时请用 POSIX 写法。`scripts/*.sh` 入口脚本不受此限（它们由 shebang 指定 `bash` 执行，
+从不被 source），但**不要从 sh 上下文 source 它们**。CI 的 `script-guard` 已加入 `sh -n` 与
+`sh -e -c '. scripts/lib/common.sh'` 两道检查，回归会被拦住。
 
 ## 为什么这样分
 

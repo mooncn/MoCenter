@@ -71,11 +71,22 @@ $:
           # 报 "go: unsupported GOOS/GOARCH pair windows/arm"），只会在正式发布
           # 出包时才暴露，代价很大。这里在 PR 阶段就拦住。
           script: |
+            # 说明：CI 各 step 的 script 由 /bin/sh（Debian 镜像上是 dash）解释执行。
+            # 只做 `bash -n` 是不够的 —— 本库曾被 dash 加载时报
+            #   scripts/lib/common.sh: Syntax error: "(" unexpected
+            # 这种解析期错误只在「用 dash 解析」时才出现，bash -n 一律放过。
+            # 故这里对公共库/纯 POSIX 脚本同时做 sh 语法检查，再在 sh 里真正 source 一次。
             echo "=== shell 语法检查 ==="
             for f in scripts/*.sh scripts/lib/*.sh scripts/deploy/*.sh; do
-              bash -n "$f" && echo "OK  $f"
+              bash -n "$f" && echo "OK(bash)  $f"
             done
-            echo "=== 脚本公共库的架构矩阵自检 ==="
+            for f in scripts/lib/*.sh; do
+              sh -n "$f" && echo "OK(sh)    $f" \
+                || { echo "!! $f 在 /bin/sh(dash) 下无法解析（公共库必须保持 POSIX 兼容）"; exit 1; }
+            done
+            echo "=== 脚本公共库的架构矩阵自检（在 sh 中加载，模拟 CI 执行环境）==="
+            sh -e -c '. scripts/lib/common.sh' \
+              || { echo "!! 在 /bin/sh 下加载 scripts/lib/common.sh 失败"; exit 1; }
             . scripts/lib/common.sh
             for pair in $(for a in $MOCENTER_ARCHS_LINUX; do echo "linux/$a"; done) \
                         $(for a in $MOCENTER_ARCHS_WINDOWS; do echo "windows/$a"; done); do
