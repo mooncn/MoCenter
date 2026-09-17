@@ -227,7 +227,9 @@ func TestPickBinaryEmptyDir(t *testing.T) {
 	if err == nil {
 		t.Fatal("空目录应报错")
 	}
-	if !strings.Contains(err.Error(), "build-all") {
+	// 提示里要给出统一的构建入口（scripts/build-linux-all.sh），
+	// 但不锁定具体参数写法 —— 否则调一次参数就会把这条用例打挂。
+	if !strings.Contains(err.Error(), "build-linux-all") {
 		t.Fatalf("错误信息应提示构建方式，实际: %v", err)
 	}
 }

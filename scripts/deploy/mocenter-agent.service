@@ -1,0 +1,17 @@
+# MoCenter Agent systemd 服务单元（打包时装入 /lib/systemd/system/）
+# 由 scripts/build-linux-all.sh 与 scripts/deploy/install-linux.sh 共用，避免两处各写一份。
+[Unit]
+Description=MoCenter Agent (集中式主机远控管理被控端)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/mocenter/mocenter-agent.conf
+ExecStart=/usr/local/bin/mocenter-agent -server ${MOCENTER_SERVER} -agentid ${MOCENTER_AGENT_ID} -proxy-ip ${MOCENTER_PROXY_IP} -daemon
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

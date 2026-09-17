@@ -126,7 +126,7 @@ export default function Deploy() {
             </select>
             {packages.length === 0 && (
               <span className="cell-sub">
-                服务端安装包目录为空：请先构建 Agent（scripts/build-all.sh）并把
+                服务端安装包目录为空：请先构建 Agent（scripts/build-linux-all.sh --type=agent）并把
                 mocenter-agent-&lt;arch&gt; 放进数据目录的 packages/ 下。
               </span>
             )}

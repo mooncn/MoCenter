@@ -2,8 +2,8 @@
 ; MoCenter Windows 图形安装向导（Inno Setup 6）
 ;
 ; 构建前置：
-;   1) 运行 scripts\build-all.bat
-;      —— 它会编译 agent / server / 安装引擎，并复制到 installer\payload\
+;   1) 运行 scripts\build-all.bat --type=installer
+;      —— 它会编译 agent / server / 安装引擎到 installer\payload\，再调用本脚本
 ;   2) 编译本脚本：
 ;        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\setup.iss
 ;      产物：build\MoCenter-Setup-<版本>.exe

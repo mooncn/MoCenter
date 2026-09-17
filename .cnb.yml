@@ -42,7 +42,8 @@ main:
             echo "=== [package] 构建 Linux amd64 二进制 ==="
             cd agent && CGO_ENABLED=0 go build -ldflags "-s -w -X mocenter/agent/internal/version.Version=${MOCENTER_AGENT_VERSION:-1.0.1}" -o mocenter-agent .
             echo "=== [package] 生成 .deb 安装包（含 systemd 服务） ==="
-            bash scripts/packaging/build-linux-pkg.sh deb amd64 || echo "deb 打包需在构建机安装 dpkg-deb"
+            bash scripts/build-linux-all.sh --type=agent --package=deb --arch=amd64 --binary=0 \
+              || echo "deb 打包需在构建机安装 dpkg-deb"
     - name: build-web
       docker:
         image: node:20

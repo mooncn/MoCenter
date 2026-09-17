@@ -1,0 +1,26 @@
+# MoCenter Server systemd 服务单元（打包时装入 /lib/systemd/system/）
+# 由 scripts/build-linux-all.sh 与 scripts/deploy/install-linux.sh 共用，避免两处各写一份。
+[Unit]
+Description=MoCenter Server (集中式主机远控管理总控服务端)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/mocenter
+EnvironmentFile=-/etc/mocenter/mocenter-server.conf
+ExecStart=/usr/local/bin/mocenter-server \
+  -listen ${MOCENTER_LISTEN} \
+  -http ${MOCENTER_HTTP} \
+  -user ${MOCENTER_USER} \
+  -password ${MOCENTER_PASSWORD} \
+  -data ${MOCENTER_DATA} \
+  -config ${MOCENTER_CONFIG} \
+  -pkg-dir /var/lib/mocenter/packages \
+  -web ${MOCENTER_WEB_DIR}
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

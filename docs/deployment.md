@@ -51,24 +51,40 @@ cd ../server && bash build.sh
 ./mocenter-server -listen :9000 -http :8080 -user admin -password your-password -web ../web/dist
 ```
 
-### 方式三：Linux Server 一键构建 + systemd 服务（推荐）
+### 方式三：Linux 一键构建 + 安装包（推荐）
 
-仓库提供了 Linux 侧的 Server 构建 / 打包 / 服务注册脚本（此前仅有一键脚本，
-其 Server 产物只适用于本机平台；Windows 侧由 `build-setup.bat` 产出图形安装程序）。
+构建与打包统一由 **`scripts/build-linux-all.sh`** 完成（`scripts/packaging/` 下的零碎脚本已合并进它），
+产物按平台分类落到 `build/`：
 
 ```bash
-# 1) 多架构二进制：amd64 / arm64 / arm / 386 -> build/server/linux/
-bash scripts/packaging/build-linux-server.sh
-bash scripts/packaging/build-linux-server.sh amd64
+# 默认：全部类型 + 全部平台 + 全部架构 + 全部安装包
+bash scripts/build-linux-all.sh
 
-# 2) 生成 .deb / .rpm（内置 systemd 单元；web/dist 存在时会一并装入并托管）
-bash scripts/packaging/build-linux-server-pkg.sh all amd64
+# 只出服务端多架构二进制（amd64/arm64/arm/386 -> build/linux/binaries/server/linux/）
+bash scripts/build-linux-all.sh --type=server --package=none
 
-# 3) 或一步到位：Server + Agent 全架构 + Web 前端 + 两类安装包
-bash scripts/packaging/build-linux-server-all.sh all amd64
+# 只出 .deb（amd64）：会自动先构建需要的 linux 二进制
+bash scripts/build-linux-all.sh --type=server --package=deb --arch=amd64
+
+# Server + Agent + Web + 两类安装包，一步到位
+bash scripts/build-linux-all.sh --type=server,agent,web --package=all --arch=amd64
+
+# Windows 免安装 zip（在 Linux 上用交叉编译产出）
+bash scripts/build-linux-all.sh --type=agent,server --platform=windows --package=zip
 ```
 
-安装包（或安装脚本）注册服务后的落盘位置：
+产物布局：
+
+| 产物 | 路径 |
+|------|------|
+| 服务端二进制 | `build/linux/binaries/server/linux/mocenter-server-<arch>` |
+| Agent 二进制 | `build/linux/binaries/agent/<linux\|windows>/mocenter-agent-<arch>[.exe]` |
+| Web 前端 | `build/linux/web/` |
+| `.deb` / `.rpm` | `build/linux/packages/{deb,rpm}/` |
+| Windows zip | `build/windows/packages/zip/` |
+| Windows 图形安装程序 | `build/windows/installer/`（需在 Windows 上编译） |
+
+安装包注册服务后的落盘位置：
 
 | 项目 | 位置 |
 |------|------|
@@ -81,103 +97,24 @@ bash scripts/packaging/build-linux-server-all.sh all amd64
 | 装卸说明 | `/etc/mocenter/README.server` |
 | 日志 | `journalctl -u mocenter-server -f` |
 
-不打包时也可直接用安装脚本注册（需 root，第二个参数为二进制路径）：
+不打安装包、直接用脚本注册（需 root）：
 
 ```bash
-bash scripts/packaging/build-linux-server.sh amd64
-sudo bash scripts/packaging/install-linux-server.sh install ./build/server/linux/mocenter-server-amd64
-sudo bash scripts/packaging/install-linux-server.sh status
-sudo bash scripts/packaging/install-linux-server.sh uninstall
-
-# 覆盖默认占位口令（默认 admin / change-me，注册后请立即修改）
-sudo MOCENTER_PASSWORD='强口令' bash scripts/packaging/install-linux-server.sh install ./mocenter-server
+bash scripts/build-linux-all.sh --type=server --package=none
+sudo bash scripts/deploy/install-linux.sh --role=server \
+     --bin=build/linux/binaries/server/linux/mocenter-server-amd64 \
+     --user=admin --password='强口令'
+sudo bash scripts/deploy/install-linux.sh --role=all status
+sudo bash scripts/deploy/install-linux.sh --role=server uninstall      # 加 --purge 连配置数据一起删
 ```
 
+> 安装脚本注册的 systemd 单元与安装包内的是**同一份模板**（`scripts/deploy/mocenter-*.service`），
+> 不会再出现"打包脚本改了、安装脚本忘改"。
 > 服务只监听 `:9000`（Agent 长连接）与 `:8080`（Web 控制台 / REST API）。
 > 生产环境请配置 TLS 证书（`MOCENTER_TLS_CERT` / `MOCENTER_TLS_KEY`，并可用
 > `MOCENTER_CA_CERT` 启用 mTLS）、设置 `MOCENTER_WHITELIST`，并用防火墙限制来源网段。
-> 证书生成见 `bash scripts/gen-cert.sh ./certs`。
-
-## 三、Agent 部署
-
-```bash
-# 交叉编译 Linux / Windows Agent
-bash agent/build.sh linux
-bash agent/build.sh windows   # 生成 .exe
-
-# 分发到各内网主机并启动
-./mocenter-agent -server your.server.com:9000 -agentid host-01
-```
-
-### Linux 开机自启（systemd）
-
-```ini
-# /etc/systemd/system/mocenter-agent.service
-[Unit]
-Description=MoCenter Agent
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/opt/mocenter/mocenter-agent -server your.server.com:9000 -agentid %H -daemon
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-systemctl daemon-reload
-systemctl enable --now mocenter-agent
-```
-
-### Windows 开机自启
-
-**推荐：图形安装程序** —— 双击 `MoCenter-Setup-<版本>.exe`，按向导走：
-
-1. **选择角色**：Agent（被控端）/ Server（总控端）/ 两者
-2. **连接与认证**：服务端地址、Agent 注册密钥（装 Agent 必填）、后台登录用户名与密码（装 Server 必填）
-3. **高级设置**：数据目录、监听端口、代理前缀、TLS 参数（均有默认值）
-
-> **Agent 注册密钥**在总控机的数据目录下（`agent.key`，权限 0600；首次启动自动生成，
-> 也可用 `-agent-key` 显式指定）。Agent 注册时用 HMAC 证明持有该密钥，
-> 没有它连接会被服务端拒绝 —— 这是 :9000 通道唯一的应用层身份凭证。
-
-安装后：
-
-| 项目 | 位置 |
-|------|------|
-| 二进制 | `%ProgramFiles%\MoCenter\` |
-| 配置与数据 | `%ProgramData%\MoCenter\<角色>\`（与二进制分离，升级不覆盖） |
-| 服务 | `MoCenterAgent` / `MoCenterServer`（开机自启 + 失败自动重启） |
-| 日志 | `%ProgramData%\MoCenter\<角色>\logs\`（服务模式 stdout 无去处，故落文件） |
-
-卸载走控制面板「应用和功能」，服务会被停止并移除，**配置与数据默认保留**。
-
-**批量/静默部署**用随包安装的命令行引擎（参数与向导一致）：
-
-```bat
-mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key <注册密钥>
-mocenter-deploy.exe install -role server -user admin -password <登录密码>
-mocenter-deploy.exe status -role all      REM 无需管理员
-mocenter-deploy.exe uninstall -role all   REM 默认保留配置与数据
-```
-
-**手动注册**（服务名必须与程序内置的一致，并用 `-config` 指向固定位置的配置）：
-
-```bat
-sc create MoCenterAgent binPath= "\"C:\Program Files\MoCenter\mocenter-agent.exe\" -config C:\ProgramData\MoCenter\agent\mocenter-agent.json" start= auto
-sc start MoCenterAgent
-```
-
-> 程序通过 `svc.IsWindowsService()` 自动识别"被 SCM 拉起"，**不需要 NSSM 之类的包装器**，
-> 也不需要 `-daemon` 开关。早前用 `-daemon` 注册的方式没有 SCM 握手，SCM 会报 1053
-> 且 `sc stop` 管不住它，现已修正。
->
-> 便携形态仍然可用：直接运行 `mocenter-agent.exe` 即可，配置落在 **exe 同目录**。
->
-> 打包安装程序：`scripts\packaging\build-setup.bat`（需先装 Inno Setup 6）。
+> 证书生成：`bash scripts/build-linux-all.sh --help` 中的 `gen-certs`，或
+> `bash scripts/gen-cert.sh ./certs`（需 openssl）、`cd scripts/gencerts && go run . all -ip <服务端IP>`。
 
 ## 四、Web 前端部署
 
@@ -695,7 +632,7 @@ systemd 可用性探测，**不做任何改动**。建议先探测确认，再�
 
 > **Windows 未实现**：OpenSSH for Windows 虽然存在，但凭证、服务注册与权限模型与 Linux 差异大，
 > 按需求"没有类似方案则略过"。Windows 侧请继续用图形安装程序（`MoCenter-Setup-<版本>.exe`）或
-> `scripts\packaging\install-windows.bat`。
+> `scripts\deploy\install-windows.bat`。
 
 ## 十一、版本号管理
 
@@ -719,10 +656,10 @@ Agent 版本表达的是「**Agent 自身功能迭代到哪一代**」，由 Age
 - **只有在明确发版时才修改版本号**。两边都**不提供**运行时改版本的命令行参数或
   环境变量 —— 避免线上跑着一个"版本号被临时改过"的二进制，导致升级判定错乱。
 - 服务端发版时同步 `installer/setup.iss` 的 `#define AppVersion`（决定安装包文件名与注册表版本）。
-- `scripts/packaging/build-linux-pkg.sh` 的**安装包/Agent 版本**自动从
-  `agent/internal/version` 读取（包名叫 `mocenter-agent`，里面就是那个版本的 Agent），
-  读不到才用兜底值；可用 `MOCENTER_VERSION` 覆盖，用 `MOCENTER_AGENT_VERSION`
-  单独覆盖二进制内嵌的 Agent 版本。
+- `scripts/build-linux-all.sh` / `scripts/build-all.bat` 的**服务端 / Agent 版本**自动从
+  `server/internal/version`、`agent/internal/version` 读取（各自唯一的事实来源），
+  读不到才用兜底值；可用 `--version=` / `--agent-version=`（或环境变量
+  `MOCENTER_SERVER_VERSION` / `MOCENTER_AGENT_VERSION`，旧名 `MOCENTER_VERSION` 仍兼容）覆盖。
 
 ### 运行时可观测
 

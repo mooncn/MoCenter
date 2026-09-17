@@ -1,4 +1,4 @@
-# 构建产物
+# 构建产物（scripts/build-linux-all.sh 与 scripts/build-all.bat 统一输出到这里）
 build/
 dist/
 *.exe
@@ -7,7 +7,7 @@ mocenter-agent
 mocenter-server.exe
 mocenter-agent.exe
 
-# 安装程序打包产物（由 scripts/packaging/build-setup.bat 生成）
+# 安装程序打包产物（由 scripts/build-windows-installer.bat 生成）
 # payload/ 下的二进制与 web/ 都是可再生成的；该目录只有 README.md 是手写源文件。
 installer/installer
 installer/payload/*

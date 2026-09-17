@@ -503,7 +503,7 @@ func (d *Deployer) pickBinary(explicit, goarch string) (string, error) {
 	}
 	if len(candidates) == 0 {
 		return "", fmt.Errorf("安装包目录 %s 中没有可用的 Agent 二进制。"+
-			"请先用 scripts/build-all.sh 构建，或把 mocenter-agent-<arch> 放进该目录", dir)
+			"请先用 scripts/build-linux-all.sh --type=agent --package=none 构建，或把 mocenter-agent-<arch> 放进该目录", dir)
 	}
 	// 精确匹配架构
 	for _, c := range candidates {
