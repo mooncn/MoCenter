@@ -114,3 +114,98 @@ func TestParseCertificatePEM(t *testing.T) {
 		t.Fatalf("PEM 链解析失败: %v", err)
 	}
 }
+
+// TestServerCertIncludesRequestedHosts 守住「自动签发的服务端证书要带上本机真实地址」。
+//
+// 这是线上最常踩的坑：服务端证书只含 127.0.0.1 时，公网部署的 Agent 一连接就报
+//
+//	x509: certificate is valid for 127.0.0.1, ::1, not <公网IP>
+//
+// 修复方式是把探测到的地址传进 ServerCertificate（此前调用点传的是空列表）。
+func TestServerCertIncludesRequestedHosts(t *testing.T) {
+	id, _ := NewIdentity("Acme")
+	cert, auto, err := id.ServerCertificate("", "",
+		"82.156.7.85", "10.0.0.5", "mocenter.example.com", "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !auto {
+		t.Fatal("未提供证书文件时应自动签发")
+	}
+
+	ips := map[string]bool{}
+	for _, ip := range cert.Leaf.IPAddresses {
+		ips[ip.String()] = true
+	}
+	dnss := map[string]bool{}
+	for _, d := range cert.Leaf.DNSNames {
+		dnss[d] = true
+	}
+
+	for _, want := range []string{"82.156.7.85", "10.0.0.5", "127.0.0.1"} {
+		if !ips[want] {
+			t.Errorf("SAN 缺少 IP %s（实际 %v）", want, ips)
+		}
+	}
+	if !dnss["mocenter.example.com"] {
+		t.Errorf("SAN 缺少域名 mocenter.example.com（实际 %v）", dnss)
+	}
+	// 通配监听地址不是可用于校验的地址，始终不该出现
+	if ips["0.0.0.0"] {
+		t.Error("0.0.0.0 不应写入 SAN")
+	}
+}
+
+// TestServerCertSANIsDeduplicated 去重：本地网卡地址常与传入地址重叠，
+// 重复项会让每份证书白白变大，也让 SAN 日志更难读。
+func TestServerCertSANIsDeduplicated(t *testing.T) {
+	id, _ := NewIdentity("Acme")
+	cert, _, err := id.ServerCertificate("", "",
+		"127.0.0.1", "127.0.0.1", "localhost", "localhost", "::1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenIP := map[string]int{}
+	for _, ip := range cert.Leaf.IPAddresses {
+		seenIP[ip.String()]++
+	}
+	seenDNS := map[string]int{}
+	for _, d := range cert.Leaf.DNSNames {
+		seenDNS[d]++
+	}
+	for ip, n := range seenIP {
+		if n > 1 {
+			t.Errorf("SAN 中 IP %s 重复出现 %d 次", ip, n)
+		}
+	}
+	for d, n := range seenDNS {
+		if n > 1 {
+			t.Errorf("SAN 中域名 %s 重复出现 %d 次", d, n)
+		}
+	}
+}
+
+// TestServerCertIgnoresWildcardListenAddr 传入的通配地址必须被忽略，
+// 否则证书里出现 "0.0.0.0" 会让人误以为已覆盖所有地址。
+func TestServerCertIgnoresWildcardListenAddr(t *testing.T) {
+	id, _ := NewIdentity("Acme")
+	cert, _, err := id.ServerCertificate("", "", "0.0.0.0", "::", "  ", "1.2.3.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ip := range cert.Leaf.IPAddresses {
+		switch ip.String() {
+		case "0.0.0.0", "::":
+			t.Errorf("通配地址 %s 不应写入 SAN", ip)
+		}
+	}
+	found := false
+	for _, ip := range cert.Leaf.IPAddresses {
+		if ip.String() == "1.2.3.4" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("合法地址 1.2.3.4 应写入 SAN")
+	}
+}

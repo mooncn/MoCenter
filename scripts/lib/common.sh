@@ -11,8 +11,13 @@
 # 构建目标类型
 MOCENTER_TYPES="agent server web installer all"
 # 二进制产出架构（按平台）
+# 注意 windows 不含 arm：windows/arm（32 位 ARM）不是 Go 支持的目标 ——
+# 它在 cmd/dist 的 broken ports 表里（go.dev/issue/68552），也不出现在
+# `go tool dist list` 中。部分 Go 工具链会直接报
+#   go: unsupported GOOS/GOARCH pair windows/arm
+# 并中断整批构建；即使侥幸编出来，产物也无人维护。ARM Windows 请用 arm64。
 MOCENTER_ARCHS_LINUX="amd64 arm64 arm 386"
-MOCENTER_ARCHS_WINDOWS="amd64 386 arm64 arm"
+MOCENTER_ARCHS_WINDOWS="amd64 386 arm64"
 # 安装包格式 -> 适用平台（.deb/.rpm 仅 Linux；zip 双平台，Windows 的另一条产出线）
 MOCENTER_PACKAGES_LINUX="deb rpm"
 MOCENTER_PACKAGES_WINDOWS="zip"
@@ -114,6 +119,28 @@ mc_check_arch() {
   esac
 }
 
+# 某平台支持的架构列表。
+mc_platform_archs() {
+  case "$1" in
+    linux)   echo "$MOCENTER_ARCHS_LINUX" ;;
+    windows) echo "$MOCENTER_ARCHS_WINDOWS" ;;
+    *)       echo "" ;;
+  esac
+}
+
+# 把"请求的架构列表"按平台过滤成"该平台真正支持的架构"。
+#   mc_platform_archs_filtered <平台> <空格分隔的架构>
+# 用途：--arch=all 是两平台架构的并集（含 arm，但 arm 只在 Linux 侧成立），
+# 直接用并集去构建 Windows 会撞上不受支持的 windows/arm。
+mc_platform_archs_filtered() {
+  local plat="$1" want="$2" support out="" a
+  support="$(mc_platform_archs "$plat")"
+  for a in $want; do
+    case " $support " in *" $a "*) out="$out $a" ;; esac
+  done
+  echo "${out# }"
+}
+
 # ---------- 依赖检查 ----------
 mc_require_go() {
   command -v go >/dev/null 2>&1 || die "未找到 go。请安装 Go 1.25+（server/agent go.mod 要求），或把它加入 PATH 后重试。"
@@ -138,6 +165,24 @@ mc_pkg_tool_rpm() {
 mc_clean() { rm -rf "$@"; }
 mc_reset_dir() { rm -rf "$1"; mkdir -p "$1"; }
 
+# ---------- 平台支持预检 ----------
+# 某些 GOOS/GOARCH 组合不被 Go 支持（典型：windows/arm，broken port，
+# go.dev/issue/68552）。这类错误与"依赖下不下来"无关，走模块缓存自愈只会
+# 把原始错误淹没成 "构建失败：agent"，故在构建前单独拦下并说清原因。
+mc_unsupported_platform_reason() {
+  # mc_unsupported_platform_reason <GOOS> <GOARCH>；支持则无输出
+  case "$1/$2" in
+    windows/arm)
+      printf '%s' "windows/arm 不是 Go 支持的目标（broken port，见 go.dev/issue/68552；'go tool dist list' 中无此组合）。32 位 ARM Windows 请改用 arm64。" ;;
+  esac
+}
+
+mc_assert_platform_supported() {
+  local goos="$1" goarch="$2" reason
+  reason="$(mc_unsupported_platform_reason "$goos" "$goarch")"
+  [ -z "$reason" ] || die "不支持的构建目标 ${goos}/${goarch}：${reason}"
+}
+
 # ---------- Go 构建（含模块缓存自愈） ----------
 # 一个损坏的 GOMODCACHE 条目会让 go 报 "zip: not a valid zip file" 并连带
 # 所有依赖它的 import 全部失败，看起来像源码坏了，其实只是本地下载残破。
@@ -145,6 +190,7 @@ mc_reset_dir() { rm -rf "$1"; mkdir -p "$1"; }
 mc_go_build() {
   # mc_go_build <模块目录> <输出文件> <GOOS> <GOARCH> [额外 ldflags]
   local dir="$1" out="$2" goos="$3" goarch="$4" extra="${5:-}" rc=0
+  mc_assert_platform_supported "$goos" "$goarch"
   local -a envs=(GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0)
   [ "$goarch" = "arm" ] && envs+=(GOARM=7)
   # 输出路径转成绝对路径：下面会 cd 进模块目录，相对路径会被解析成相对模块，

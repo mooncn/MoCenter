@@ -22,7 +22,7 @@ REM Options:
 REM   --type=     agent ^| server ^| web ^| installer ^| none ^| all
 REM   --package=  zip ^| none ^| all        (Windows side produces zip)
 REM   --platform= windows ^| all           (Linux targets: build-linux-all.sh)
-REM   --arch=     amd64 ^| 386 ^| arm64 ^| arm ^| all
+REM   --arch=     amd64 ^| 386 ^| arm64 ^| all   (windows/arm is NOT supported by Go)
 REM   --binary=   1 ^| 0
 REM   --web=      1 ^| 0 ^| auto
 REM   --outdir=   directory                default ^<repo^>\build
@@ -173,15 +173,24 @@ if /i "%OPT_TYPE%"=="all" (
 if "%WANT_WEB%"=="1" set "OPT_WEB=1"
 
 REM --arch -> ARCH_LIST
-if /i "%OPT_ARCH%"=="all" set "OPT_ARCH=amd64,386,arm64,arm"
+REM NOTE: windows/arm (32-bit ARM) is deliberately NOT included -- it is not a
+REM supported Go target (broken port, see go.dev/issue/68552; there is no
+REM windows/arm entry in "go tool dist list"), and some toolchains fail outright
+REM with: go: unsupported GOOS/GOARCH pair windows/arm
+REM Use arm64 for ARM Windows devices.
+if /i "%OPT_ARCH%"=="all" set "OPT_ARCH=amd64,386,arm64"
 set "ARCH_LIST="
 for %%A in (%OPT_ARCH:,= %) do (
   if /i "%%A"=="amd64" set "ARCH_LIST=!ARCH_LIST! amd64"
   if /i "%%A"=="386"   set "ARCH_LIST=!ARCH_LIST! 386"
   if /i "%%A"=="arm64" set "ARCH_LIST=!ARCH_LIST! arm64"
-  if /i "%%A"=="arm"   set "ARCH_LIST=!ARCH_LIST! arm"
-  if /i not "%%A"=="amd64" if /i not "%%A"=="386" if /i not "%%A"=="arm64" if /i not "%%A"=="arm" (
-    echo ** --arch=%%A is not supported: amd64 ^| 386 ^| arm64 ^| arm ^| all
+  if /i "%%A"=="arm" (
+    echo ** windows/arm is not supported by Go ^(broken port, go.dev/issue/68552^).
+    echo    Use --arch=arm64 for ARM Windows devices.
+    exit /b 1
+  )
+  if /i not "%%A"=="amd64" if /i not "%%A"=="386" if /i not "%%A"=="arm64" (
+    echo ** --arch=%%A is not supported: amd64 ^| 386 ^| arm64 ^| all
     exit /b 1
   )
 )
@@ -362,7 +371,8 @@ set "MOD_LD=%~4"
 set "GOOS=windows"
 set "GOARCH=%MOD_ARCH%"
 set "CGO_ENABLED=0"
-if /i "%MOD_ARCH%"=="arm" set "GOARM=7"
+REM GOARM is not set on purpose: windows/arm is rejected during argument parsing,
+REM so only amd64/386/arm64 ever reach here.
 if not exist "%~dp3" mkdir "%~dp3"
 echo   [go] %MOD_OUT% (GOOS=%GOOS% GOARCH=%GOARCH%)
 pushd "%MOD_DIR%"
@@ -476,7 +486,7 @@ echo Allowed values on Windows:
 echo   --type      agent ^| server ^| web ^| installer ^| none ^| all
 echo   --package   zip ^| none ^| all
 echo   --platform  windows ^| all
-echo   --arch      amd64 ^| 386 ^| arm64 ^| arm ^| all
+echo   --arch      amd64 ^| 386 ^| arm64 ^| all
 echo   --binary    1 ^| 0
 echo   --web       1 ^| 0 ^| auto
 echo.
@@ -503,7 +513,7 @@ echo Options:
 echo   --type=     agent ^| server ^| web ^| installer ^| none ^| all
 echo   --package=  zip ^| none ^| all        ^(Windows side produces zip^)
 echo   --platform= windows ^| all           ^(Linux targets: build-linux-all.sh^)
-echo   --arch=     amd64 ^| 386 ^| arm64 ^| arm ^| all
+echo   --arch=     amd64 ^| 386 ^| arm64 ^| all
 echo   --binary=   1 ^| 0
 echo   --web=      1 ^| 0 ^| auto
 echo   --outdir=   directory                default ^<repo^>\build

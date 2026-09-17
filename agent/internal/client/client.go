@@ -487,14 +487,39 @@ func (c *Client) mayFallbackPlaintext() bool {
 }
 
 // tlsFailure 组装 TLS 失败时的错误信息（说明原因与恢复办法）。
+//
+// 两类原因要分开讲，否则运维只能对着 x509 报错猜：
+//  1. 服务端换过部署身份 CA —— 本机旧证书不被认可，填新指纹或删 creds 即可自动重换；
+//  2. 证书 SAN 不匹配（手工 CA 场景特有）—— 报 "certificate is valid for ..., not <地址>"，
+//     必须在**服务端**按 Agent 实际使用的地址重签证书。这条与 Agent 侧配置无关，
+//     只靠在被控机上改配置是修不好的，所以要明确指向服务端。
 func (c *Client) tlsFailure(cause error) error {
+	hint := ""
+	if isSANMismatch(cause) {
+		hint = "；该错误表示服务端证书的 SAN 不含本机连接用的地址，" +
+			"请在服务端按实际地址重签服务端证书（cd scripts/signcert && go run . 会按公网 IP 自动写入 SAN），" +
+			"或给本机配 -server-fingerprint 改为按部署身份指纹校验（免 CA 与 SAN）"
+	}
 	if c.clientCert() != nil {
 		return fmt.Errorf("TLS 连接失败且本机已持有客户端证书，拒绝降级为明文：%w"+
 			"（若服务端换过部署身份 CA，请把新指纹填进 server_fingerprint 后重启，"+
-			"Agent 会自动重新换取；或删除 %s 后重启）",
-			cause, c.credDir())
+			"Agent 会自动重新换取；或删除 %s 后重启）%s",
+			cause, c.credDir(), hint)
 	}
-	return cause
+	return fmt.Errorf("%w%s", cause, hint)
+}
+
+// isSANMismatch 判断错误是否为「证书地址不匹配」。
+//
+// 判据是 Go 的固定文案 —— 这里只是决定要不要附排查提示，判断错了顶多多/少一句
+// 提示，不影响错误本身与重试行为，因此用字符串匹配足够，不必引入错误码。
+func isSANMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "certificate is valid for") ||
+		strings.Contains(msg, "x509: cannot validate certificate")
 }
 
 func firstOf(list []string) string {

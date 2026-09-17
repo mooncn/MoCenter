@@ -114,7 +114,10 @@ sudo bash scripts/deploy/install-linux.sh --role=server uninstall      # 加 --p
 > 生产环境请配置 TLS 证书（`MOCENTER_TLS_CERT` / `MOCENTER_TLS_KEY`，并可用
 > `MOCENTER_CA_CERT` 启用 mTLS）、设置 `MOCENTER_WHITELIST`，并用防火墙限制来源网段。
 > 证书生成：`bash scripts/build-linux-all.sh --help` 中的 `gen-certs`，或
-> `bash scripts/gen-cert.sh ./certs`（需 openssl）、`cd scripts/gencerts && go run . all -ip <服务端IP>`。
+> `bash scripts/gen-cert.sh ./certs`（需 openssl）、`cd scripts/gencerts && go run . all`
+> （默认按本机公网 IP 写入 SAN）。
+> 服务端换过 IP / 证书 SAN 不含 Agent 所用地址导致连不上时，用
+> `cd scripts/signcert && go run .` 按实际地址重签（详见「TLS 证书 SAN 不匹配」）。
 
 ## 四、Web 前端部署
 
@@ -696,6 +699,43 @@ Agent 侧的判定逻辑很简单：目标版本 == 自身版本则跳过（除�
 | 一键部署报 `sudo: not found` | 已修复：当前用户是 root 时不再使用 sudo。若版本较旧请升级服务端 |
 | 一键部署报服务启动成功但 Agent 不上线 | 检查写入的注册密钥是否与服务端一致（`/etc/mocenter/mocenter-agent.json` 的 `agent_key`）、服务端地址是否从目标机可达；`systemctl status mocenter-agent` 看日志 |
 | 恢复备份后数据没变 | 恢复后需**重启服务端**；被覆盖的旧文件在 `<文件名>.before-restore` |
+| Agent 报 `x509: certificate is valid for 127.0.0.1, ::1, not <IP>` | 服务端证书 SAN 不含 Agent 连接用的地址。见下方「TLS 证书 SAN 不匹配」 |
+| Agent 报 `remote error: tls: certificate required` | 服务端启用了 mTLS（`-ca-cert`）但 Agent 未带客户端证书；用 `-agent-key` 走自动换取，或补 `-client-cert`/`-client-key` |
+| 换了新证书仍报旧 SAN | 证书只在服务端**启动时**加载，替换文件后必须重启服务端进程 |
+
+### TLS 证书 SAN 不匹配
+
+Agent 报：
+
+```
+[agent] 连接断开: TLS 连接失败且本机已持有客户端证书，拒绝降级为明文：
+        tls: failed to verify certificate: x509: certificate is valid for 127.0.0.1, ::1, not 82.156.7.85
+```
+
+说明服务端证书的 SAN 里没有 Agent 正在连接的那个地址。**只在手工铺证书时才会遇到**
+（默认的自动换取证书走"证书链"校验，不看地址），修复步骤：
+
+```bash
+# 1) 在服务端所在机器上按「Agent 实际使用的地址」重签（默认自动探测公网 IP）
+cd scripts/signcert
+go run . -server-config ../../mocenter-server.json   # 自动按公网 IP + 本机地址写入 SAN
+# 也可以显式指定，IP 与域名一次都写上最稳
+go run . -ip 82.156.7.85 -dns mocenter.example.com -server-config ../../mocenter-server.json
+
+# 2) 重启服务端（证书只在启动时加载）
+systemctl restart mocenter-server
+```
+
+也可用 `scripts/gencerts`（`cd scripts/gencerts && go run . server`，同样默认探测公网 IP）。
+
+要点与替代方案：
+
+- 同一 CA 重签时 Agent 侧 `client.crt`/`ca.crt` **无需更换**，只换服务端 `server.crt`/`server.key`。
+- 服务端启动时会把证书 SAN 与「本机实际地址」比对，不一致会打印告警并给出重签命令；
+  手工证书的 SAN 也会直接打印在日志里，便于核对。
+- **更省事的做法**：改用 `-agent-key` 自动换取（默认路径，不看 SAN），
+  或给 Agent 配 `-server-fingerprint <部署身份指纹>`（按指纹校验，服务端换 IP/换证书都不受影响）。
+- Agent 侧日志在识别到这类错误时会直接附上上述排查指引。
 
 ## 十三、远程升级 Agent
 

@@ -20,6 +20,7 @@
 #   --package=  deb|rpm|zip|none|all                     默认 all（按平台过滤：deb/rpm→Linux，zip→Windows）
 #   --platform= linux|windows|all                        默认 all（决定产出哪个平台的产物）
 #   --arch=     amd64|386|arm64|arm|all                  默认 all
+#               （arm 仅 Linux 侧有效；windows/arm 不是 Go 支持的目标，会被自动过滤）
 #   --binary=   1|0                                      默认 1，是否输出二进制
 #   --web=      1|0|auto                                 默认 auto（有 npm 才构建；type 含 web 时强制 1）
 #   --outdir=   目录                                      默认 <项目目录>/build
@@ -119,6 +120,7 @@ mc_list_values() {
   --package    deb | rpm | zip | none | all
   --platform   linux | windows | all
   --arch       amd64 | 386 | arm64 | arm | all
+               （arm 仅 Linux；windows/arm 不受 Go 支持，构建时按平台自动过滤）
   --binary     1 | 0
   --web        1 | 0 | auto
 
@@ -272,14 +274,20 @@ build_binaries() {
 
   if [ "$do_agent" = 1 ]; then
     for p in $PLATFORMS; do
+      # --arch=all 取的是"两个平台架构的并集"，但并非每个架构在两边都受支持：
+      # windows/arm（32 位 ARM）不是 Go 支持的目标（broken port，go.dev/issue/68552），
+      # 按并集直接构建会报 "go: unsupported GOOS/GOARCH pair windows/arm" 并中断整批。
+      # 因此这里按平台取交集，只构建该平台真正支持的架构。
+      local archs; archs="$(mc_platform_archs_filtered "$p" "$ARCHS")"
+      [ -n "$archs" ] || { info "  $p 没有任何可构建架构（请求：$ARCHS），跳过"; continue; }
       step "构建 Agent 二进制（$p，版本 ${OPT_AGENT_VERSION}）"
       local out_dir="$OUT/$p/binaries/agent/$p"
       local outs=()
-      for a in $ARCHS; do
+      for a in $archs; do
         local name="mocenter-agent-${a}"; [ "$p" = "windows" ] && name="${name}.exe"
         outs+=("$out_dir/$name")
       done
-      run_go_batch agent "$p" "$ARCHS" "-X mocenter/agent/internal/version.Version=${OPT_AGENT_VERSION}" "${outs[@]}"
+      run_go_batch agent "$p" "$archs" "-X mocenter/agent/internal/version.Version=${OPT_AGENT_VERSION}" "${outs[@]}"
     done
   fi
 
@@ -682,12 +690,15 @@ build_windows_zip() {
   mc_in_list "server" "${TYPES[*]:-}" && roles="$roles server"
   [ -n "$roles" ] || { info "  --type 不含 agent/server，无需打包"; return 0; }
 
-  step "生成 Windows 免安装 zip（架构：$ARCHS）"
+  # 只打包该平台实际构建出来的架构：--arch=all 的并集里含 arm，
+  # 但 windows/arm 不受 Go 支持（见 mc_platform_archs_filtered 的说明），
+  # 二进制阶段已按平台过滤，这里同步过滤，避免刷"缺少文件"的噪声。
+  local win_archs; win_archs="$(mc_platform_archs_filtered windows "$ARCHS")"
+  step "生成 Windows 免安装 zip（架构：${win_archs:-无}）"
   local role arch src stage zip
   for role in $roles; do
-    for arch in $ARCHS; do
-      # Windows Server 只产出 amd64/386（与二进制构建阶段的过滤保持一致），
-      # 因此这两类架构之外不再尝试打包，避免刷一堆"缺少文件"的噪声。
+    for arch in $win_archs; do
+      # Windows Server 只产出 amd64/386（与二进制构建阶段的过滤保持一致）。
       if [ "$role" = "server" ]; then
         case "$arch" in amd64|386) ;; *) continue ;; esac
       fi

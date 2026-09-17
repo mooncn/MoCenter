@@ -18,6 +18,14 @@ installer/payload/*
 *.out
 vendor/
 
+# scripts/ 下的工具就地 go build 产生的同名二进制
+scripts/gencerts/gencerts
+scripts/gencerts/gencerts.exe
+scripts/mcmd/mcmd
+scripts/mcmd/mcmd.exe
+scripts/signcert/signcert
+scripts/signcert/signcert.exe
+
 # 安全：私钥/证书（测试生成）
 certs/
 *.key

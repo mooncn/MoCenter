@@ -65,6 +65,27 @@ $:
           script: |
             cd server && go build ./... && echo "server build OK"
             cd ../agent && go build ./... && echo "agent build OK"
+        - name: script-guard
+          # 构建/打包脚本的静态检查。
+          # 这些脚本一旦写错目标平台（典型：windows/arm 并非 Go 支持的目标，
+          # 报 "go: unsupported GOOS/GOARCH pair windows/arm"），只会在正式发布
+          # 出包时才暴露，代价很大。这里在 PR 阶段就拦住。
+          script: |
+            echo "=== shell 语法检查 ==="
+            for f in scripts/*.sh scripts/lib/*.sh scripts/deploy/*.sh; do
+              bash -n "$f" && echo "OK  $f"
+            done
+            echo "=== 脚本公共库的架构矩阵自检 ==="
+            . scripts/lib/common.sh
+            for pair in $(for a in $MOCENTER_ARCHS_LINUX; do echo "linux/$a"; done) \
+                        $(for a in $MOCENTER_ARCHS_WINDOWS; do echo "windows/$a"; done); do
+              go tool dist list | grep -qx "$pair" \
+                && echo "OK  $pair 受当前 Go 支持" \
+                || { echo "!! $pair 不被当前 Go 支持，却在构建矩阵里（会构建失败）"; exit 1; }
+            done
+            echo "=== 证书工具编译与测试 ==="
+            (cd scripts/gencerts && go build ./... && go vet ./... && echo "OK  scripts/gencerts")
+            (cd scripts/signcert && go build ./... && go vet ./... && go test ./... && echo "OK  scripts/signcert")
         - name: web-build
           image: node:20
           script: |

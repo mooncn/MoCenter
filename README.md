@@ -82,7 +82,8 @@ MoCenter/
 │   ├── gen-cert.sh                 # 生成 TLS/mTLS 证书（需 openssl）
 │   ├── fetch-packages.sh           # 拉取 VNC 安装包到服务端托管目录
 │   ├── mcmd/                       # 远程命令调试工具（REST + WebSocket）
-│   └── gencerts/                   # 证书生成的 Go 实现（Windows 无需 openssl）
+│   ├── gencerts/                   # 证书生成的 Go 实现（Windows 无需 openssl）
+│   └── signcert/                   # 按实际地址（默认公网 IP）签发服务端证书
 └── docs/                  # 部署与运维手册
 ```
 
@@ -122,7 +123,7 @@ scripts\build-all.bat --outdir=D:\mocenter-build
 | `--type=` | `agent`\|`server`\|`web`\|`installer`\|`none`\|`all` | `all` | 构建哪些角色，可逗号组合 |
 | `--package=` | `deb`\|`rpm`\|`zip`\|`none`\|`all` | `all` | 生成哪些安装包；按平台自动过滤（`deb`/`rpm`→Linux，`zip`→Windows） |
 | `--platform=` | `linux`\|`windows`\|`all` | `all`（Linux 脚本） | 产出哪些平台的产物 |
-| `--arch=` | `amd64`\|`386`\|`arm64`\|`arm`\|`all` | `all` | 目标架构，可逗号组合 |
+| `--arch=` | `amd64`\|`386`\|`arm64`\|`arm`\|`all` | `all` | 目标架构，可逗号组合（`arm` 仅 Linux；`windows/arm` 不是 Go 支持的目标，见下） |
 | `--binary=` | `1`\|`0` | `1` | 是否输出二进制（`0` 表示只打包，复用已有二进制） |
 | `--web=` | `1`\|`0`\|`auto` | `auto` | `auto` = 已有 `web/dist` 就复用，否则构建 |
 | `--outdir=` | 目录 | `<项目>/build` | 输出根目录 |
@@ -221,7 +222,15 @@ bash scripts/gen-cert.sh ./certs   # 生成 ca / server / client 三套证书
 # 或用 Go 版（Windows 无需 openssl，可按真实 IP/域名写 SAN、并把路径写进两侧配置）
 cd scripts/gencerts && go run . all -ip <服务端IP> -dns <域名> \
   -server-config ../../mocenter-server.json -agent-config ../../mocenter-agent.json
+# 只重签服务端证书（换过公网 IP / 换域名后）：默认自动按本机公网 IP 写入 SAN
+cd scripts/signcert && go run .
 ```
+
+> **服务端证书的 SAN 必须包含 Agent 连接时使用的地址。** 少一个地址，Agent 用 `-ca-cert`
+> 校验时就会报 `x509: certificate is valid for 127.0.0.1, ::1, not <公网IP>`。
+> 服务器公网 IP 往往部署后才知道，所以两个工具都支持**自动探测公网 IP 写入 SAN**；
+> 服务端自动签发证书时也会把本机地址 + 探测到的公网 IP 一并写入（启动日志会打印 SAN）。
+> 用 `-server-fingerprint` 校验部署身份指纹时不受 SAN 影响（推荐路径）。
 
 > 想让服务端复用这套 CA（例如要与既有 Agent 共用同一份信任根）：
 > 把 `ca.crt` 与 `ca.key` 放进服务端数据目录，服务端会直接沿用（日志会打印身份名与指纹）。
@@ -305,7 +314,8 @@ scripts\build-all.bat
 | `server/build.sh` · `server/build.bat` | 跨平台 | 单独构建 Server（模块内调试用） | `server/mocenter-server[.exe]` |
 | `web/build.sh` · `web/build.bat` | 跨平台 | 单独构建前端 | `web/dist/` |
 | `scripts/gen-cert.sh` | Linux/macOS | 生成 CA / 服务端 / 客户端证书（需 openssl） | 指定目录（默认 `certs/`） |
-| `scripts/gencerts/` | 跨平台 | 证书生成的 Go 实现（**Windows 无需 openssl**） | 指定目录 |
+| `scripts/gencerts/` | 跨平台 | 证书生成的 Go 实现（**Windows 无需 openssl**，服务端证书默认按公网 IP 签发） | 指定目录 |
+| `scripts/signcert/` | 跨平台 | **按实际地址重签服务端证书**（默认自动探测公网 IP 写入 SAN） | 指定目录（默认 `certs/`） |
 | `scripts/fetch-packages.sh` | Linux/macOS | 拉取 VNC 安装包到服务端托管目录 | 指定目录 |
 | `scripts/mcmd/` | 跨平台 | 远程命令调试（REST + WebSocket） | — |
 | `server/Dockerfile` | Docker | 构建 Server 容器镜像 | `mocenter-server:latest` |
@@ -375,6 +385,12 @@ bash scripts/build-linux-all.sh --type=agent,server --package=all --arch=amd64,a
 bash scripts/build-linux-all.sh --type=agent,server --platform=windows --package=zip
 # -> build/windows/packages/zip/mocenter-<role>-<版本>-windows-<arch>.zip
 ```
+
+> **Windows 架构只支持 amd64 / 386 / arm64。** 32 位 ARM Windows（`windows/arm`）不是
+> Go 支持的目标 —— 它在 Go 的 broken ports 表里（[go.dev/issue/68552](https://go.dev/issue/68552)），
+> 也不出现在 `go tool dist list` 中。部分 Go 工具链会直接报
+> `go: unsupported GOOS/GOARCH pair windows/arm` 并中断整批构建，因此已从构建矩阵中移除。
+> ARM Windows 设备请使用 `arm64`。
 
 版本号来源优先级：`--version=` / `--agent-version=` > 环境变量
 `MOCENTER_SERVER_VERSION` / `MOCENTER_AGENT_VERSION`（旧名 `MOCENTER_VERSION` 仍兼容）
@@ -488,6 +504,9 @@ go run . -agent <agent_id> -cmd "ipconfig" -server http://127.0.0.1:8088 -shell 
 - `fetch-packages.sh` 用法为 `[目标目录] [win|linux|all]`；目标目录需与服务端 `-pkg-dir` 一致
   （未指定时为 `<数据目录>/packages`）。启动日志会打印 `[pkg] 安装包目录 ... 已托管: ...` 以便确认。
 - `scripts/gencerts/` 是证书生成的 Go 实现，用法见其 `README.md`。
+- `scripts/signcert/` 专门解决「服务端换过 IP / 证书 SAN 不含 Agent 用的地址」导致连不上的问题：
+  默认自动探测本机公网 IP 写入 SAN，重签后只需重启服务端（同一 CA，Agent 侧无需改动）。
+  用法见 `scripts/signcert/README.md`。
 
 ## 登录认证
 
@@ -619,7 +638,7 @@ Agent TCP 通道要求每台 Agent 持有与服务端一致的**预共享密钥*
 - ✅ **备份 / 恢复**：一键导出数据目录为单个 zip（含 manifest 清单与每个文件的 SHA-256），恢复前可查看包内明细；SQLite 走 `VACUUM INTO` 在线一致快照（WAL 下直接拷文件会丢未 checkpoint 的事务）；恢复端做白名单 + 路径穿越校验 + 体积上限 + 摘要校验，覆盖前自动留存 `*.before-restore`
 - ✅ **后台一键部署 Agent（Linux）**：在 Web 后台填目标机地址与账号/密码（或私钥），SSH 登录后自动上传 Agent、写入配置（服务端地址 / Agent 名称 / 注册密钥 / 延迟目标）并注册为 systemd 服务；支持"先探测再安装"（仅探测连通性、架构、权限，不做任何改动）；凭证不落盘、不入日志，所有拼进 shell 的变量都经过引号转义与白名单校验
 - ✅ **版本号独立管理**：Server（`server/internal/version`）与 Agent（`agent/internal/version`）各自维护版本号，**互相独立、不做一致性校验** —— Agent 只按自身功能迭代节奏发版，服务端发版不会牵动全网 Agent，反之亦然；`AgentInfo.AgentVersion` 随注册上报并由 `/api/version` 展示；升级包的 version 只表示"本次要升到哪个版本"（不填则默认取服务端版本），与当前服务端版本不同也能下发；打包脚本与 Inno Setup 版本号同步
-- ✅ **多架构打包**：Windows x86/x86_64/ARM/ARM64、Linux amd64/arm64/arm/386 二进制，及 .deb/.rpm 安装包
+- ✅ **多架构打包**：Windows x86/x86_64/ARM64、Linux amd64/arm64/arm/386 二进制，及 .deb/.rpm 安装包
 - ✅ **系统服务注册**：Agent 一键注册为 Windows 服务 / Linux systemd 服务，开机自启
 
 > 说明：核心链路（Agent 上线→探针→命令执行→结果回传→Web 展示）已端到端打通，并在此基础上实现了交互式终端、文件断点续传、端口映射、批量命令、远程升级、TLS 加密等生产级能力。
@@ -704,7 +723,7 @@ bash scripts/fetch-packages.sh ./packages
 | 平台 | 命令 | 产物目录 |
 |------|------|----------|
 | Linux（amd64 / arm64 / arm / 386） | `bash scripts/build-linux-all.sh --type=agent --package=none` | `build/linux/binaries/agent/linux/` |
-| Windows（x86_64 / x86 / arm64 / arm） | `scripts\build-all.bat --type=agent --package=none` | `build\windows\binaries\agent\windows\` |
+| Windows（x86_64 / x86 / arm64） | `scripts\build-all.bat --type=agent --package=none` | `build\windows\binaries\agent\windows\` |
 
 Windows 产物会同时打包成免安装 zip（`--package=zip`，默认包含在内），
 zip 内自带 `install-windows.bat` / `uninstall-windows.bat` 与配置模板，解压即用。

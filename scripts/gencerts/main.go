@@ -16,6 +16,8 @@
 //
 //	说明：
 //	  - server 证书的 SAN 会把 -ip / -dns 加入，供 Agent 按真实服务端 IP/域名做 TLS 校验；
+//	    未指定 -ip 时自动探测公网 IP；本机网卡地址与回环地址始终写入
+//	    （genServer 的既有行为，保证同机/内网直连也能通过校验）；
 //	  - 重复运行 server/client 会用现有 CA 重签，Agent 侧 client.crt/ca.crt 无需更换，
 //	    仅服务端替换 server.crt/server.key。
 //
@@ -52,8 +54,9 @@ const defaultDir = "certs"
 func main() {
 	fs := flag.NewFlagSet("gencerts", flag.ExitOnError)
 	dir := fs.String("dir", defaultDir, "证书输出目录")
-	ip := fs.String("ip", "127.0.0.1", "服务端 IP（逗号分隔，server / all 用，加入 SAN）")
+	ip := fs.String("ip", "", "服务端 IP（逗号分隔，server / all 用，加入 SAN）；留空=自动探测本机公网 IP")
 	dns := fs.String("dns", "", "服务端域名（逗号分隔，server / all 用，加入 SAN）")
+	noAuto := fs.Bool("no-auto", false, "不自动探测公网 IP（仅用 -ip/-dns 指定的地址）")
 	serverCfg := fs.String("server-config", "", "生成后把证书路径写入服务端配置文件")
 	agentCfg := fs.String("agent-config", "", "生成后把证书路径写入 Agent 配置文件")
 	fs.Parse(os.Args[2:]) // 跳过子命令
@@ -63,16 +66,43 @@ func main() {
 	}
 	_ = os.MkdirAll(*dir, 0700)
 
+	ips := splitList(*ip)
+	dnss := splitList(*dns)
+	// 服务端证书必须按「Agent 实际连接的地址」签发。手工敲 -ip 很容易漏
+	// （服务器公网 IP 往往部署后才知道），默认改为自动探测公网 IP，
+	// 并补上本机网卡 / 回环地址。
+	if cmd == "server" || cmd == "all" {
+		if len(ips) == 0 && !*noAuto {
+			if v4, v6 := detectPublicIPs(); v4 != "" || v6 != "" {
+				if v4 != "" {
+					fmt.Println("[ip] 探测到公网 IPv4:", v4)
+					ips = append(ips, v4)
+				}
+				if v6 != "" {
+					fmt.Println("[ip] 探测到公网 IPv6:", v6)
+					ips = append(ips, v6)
+				}
+			} else {
+				fmt.Fprintln(os.Stderr, "[提示] 未能探测到公网 IP，将仅使用本机网卡地址；"+
+					"若 Agent 走公网连接，请显式指定: -ip <服务端公网IP>")
+			}
+		}
+		if len(ips) == 0 {
+			fmt.Fprintln(os.Stderr, "[提示] 未解析到任何服务端 IP。证书可能无法通过 Agent 校验；"+
+				"请用 -ip <公网IP> 或 -dns <域名> 明确指定。")
+		}
+	}
+
 	switch cmd {
 	case "ca":
 		genCA(*dir)
 	case "server":
-		genServer(*dir, splitList(*ip), splitList(*dns))
+		genServer(*dir, ips, dnss)
 	case "client":
 		genClient(*dir)
 	case "all":
 		genCA(*dir)
-		genServer(*dir, splitList(*ip), splitList(*dns))
+		genServer(*dir, ips, dnss)
 		genClient(*dir)
 	case "-h", "help", "--help":
 		usage()
@@ -90,9 +120,12 @@ func main() {
 func usage() {
 	fmt.Print(`用法:
   go run . ca                            [-dir 目录]
-  go run . server -ip 1.2.3.4 [-dns a.com] [-dir 目录]
-  go run . client                        [-dir 目录]
-  go run . all -ip 1.2.3.4 [-dns a.com]  [-dir 目录]
+  go run . server [-ip 1.2.3.4] [-dns a.com] [-dir 目录]
+  go run . client                             [-dir 目录]
+  go run . all    [-ip 1.2.3.4] [-dns a.com]  [-dir 目录]
+
+服务端证书 SAN：-ip 留空时会自动探测本机公网 IP（本机网卡地址与回环地址始终写入）。
+可用 -no-auto 关闭公网探测。
 
 可选配置写入:
   -server-config <server.json>   生成后把 tls_cert/tls_key/ca_cert 写入服务端配置

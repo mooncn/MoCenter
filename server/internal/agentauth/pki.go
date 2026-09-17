@@ -320,7 +320,16 @@ func (id *Identity) NewAdminCert(hosts []string) (tls.Certificate, error) {
 
 // ServerCertificate 返回服务端（Agent 通道）证书：
 // 端口上显式配置了证书就复用；否则用内置 CA 现场签发（有效期 CertValidDays 天）。
-func (id *Identity) ServerCertificate(existingCertFile, existingKeyFile string) (tls.Certificate, bool, error) {
+//
+// hosts 是**要写入 SAN 的额外地址**（本机公网 IP、内网 IP、域名等，由调用方探测）。
+// 之所以必须传：Agent 若用 `-ca-cert`（或公钥指纹之外的方式）校验服务端证书，
+// 就会校验「证书 SAN 是否包含它连接的地址」。早期版本这里传空，签出的证书只有
+// localhost/127.0.0.1/::1，公网部署的 Agent 一连接就报：
+//
+//	x509: certificate is valid for 127.0.0.1, ::1, not 82.156.7.85
+//
+// 用指纹校验（-server-fingerprint，推荐路径）不受此影响，但手工 CA 路径必须靠 SAN。
+func (id *Identity) ServerCertificate(existingCertFile, existingKeyFile string, hosts ...string) (tls.Certificate, bool, error) {
 	if existingCertFile != "" && existingKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(existingCertFile, existingKeyFile)
 		if err != nil {
@@ -328,11 +337,15 @@ func (id *Identity) ServerCertificate(existingCertFile, existingKeyFile string) 
 		}
 		return cert, false, nil
 	}
-	cert, err := id.issueServerCert(nil)
+	cert, err := id.issueServerCert(hosts)
 	return cert, true, err
 }
 
-// issueServerCert 用 CA 签发一张服务端证书（服务端通道可指定真实 IP/域名；Admin 传空）。
+// issueServerCert 用 CA 签发一张服务端证书。
+//
+// hosts 为要加入 SAN 的地址（IP 或域名）：非空即生效，重复项会自动去重
+// （本地网卡地址常与 hosts 重叠）。始终保留 localhost/127.0.0.1/::1，
+// 便于本机与同机 Agent 直连调试。
 func (id *Identity) issueServerCert(hosts []string) (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -354,12 +367,15 @@ func (id *Identity) issueServerCert(hosts []string) (tls.Certificate, error) {
 	}
 	for _, h := range hosts {
 		h = trimSpace(h)
+		// 通配监听地址不是可用于校验的地址，写进 SAN 只会让人误以为已覆盖
 		if h == "" || h == "0.0.0.0" || h == "::" {
 			continue
 		}
 		if ip := net.ParseIP(h); ip != nil {
-			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
-		} else {
+			if !containsIP(tmpl.IPAddresses, ip) {
+				tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+			}
+		} else if !containsStr(tmpl.DNSNames, h) {
 			tmpl.DNSNames = append(tmpl.DNSNames, h)
 		}
 	}
@@ -487,4 +503,25 @@ func trimSpace(s string) string {
 		s = s[:len(s)-1]
 	}
 	return s
+}
+
+// containsIP 判断 SAN 列表里是否已有该 IP（net.IP 不能直接用 == 比较，
+// IPv4 解析结果可能是 4 字节或 16 字节表示）。
+func containsIP(list []net.IP, ip net.IP) bool {
+	for _, got := range list {
+		if got.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsStr 判断字符串列表是否已含该项。
+func containsStr(list []string, v string) bool {
+	for _, got := range list {
+		if got == v {
+			return true
+		}
+	}
+	return false
 }

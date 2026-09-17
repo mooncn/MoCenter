@@ -32,6 +32,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -627,7 +628,16 @@ func main() {
 		// 之所以默认开：明文链路上注册凭证与后续报文都可被嗅探/篡改，
 		// 而"默认不开"正是此前需要手工铺证书、结果大家干脆不铺的原因。
 		var tlsLn net.Listener
-		agentCert, usingAutoCert, certErr := identity.ServerCertificate(*tlsCert, *tlsKey)
+		// 自动签发的服务端证书必须带上「本机真实地址」，否则 Agent 用 -ca-cert 校验时
+		// 会报 x509: certificate is valid for 127.0.0.1, ::1, not <公网IP>。
+		// 这里复用 Web 控制台的地址汇总（监听地址 + 本机所有网卡 + -server-name），
+		// 并把探测到的公网 IP 一并写入 —— 它是 Agent 最常使用的连接地址。
+		agentCertHosts := adminCertHosts(*addr, *serverName)
+		if publicIP := detectPublicIP(); publicIP != "" {
+			agentCertHosts = append(agentCertHosts, publicIP)
+			log.Printf("[server] 探针到本机公网 IP %s，已加入服务端证书 SAN", publicIP)
+		}
+		agentCert, usingAutoCert, certErr := identity.ServerCertificate(*tlsCert, *tlsKey, agentCertHosts...)
 		if certErr != nil {
 			if *tlsCert != "" || *tlsKey != "" {
 				log.Fatalf("[server] %v", certErr)
@@ -668,7 +678,13 @@ func main() {
 				}
 			}
 			if usingAutoCert {
-				log.Printf("[server] Agent 通道使用内置 CA 自动签发的服务端证书（无需运维准备证书）；换用自有证书可加 -tls-cert/-tls-key")
+				log.Printf("[server] Agent 通道使用内置 CA 自动签发的服务端证书（SAN: %v）；无需运维准备证书，换用自有证书可加 -tls-cert/-tls-key",
+					agentCertHosts)
+			} else {
+				// 运维用 -tls-cert 提供的证书：其 SAN 决定 Agent 能否用 -ca-cert 校验通过。
+				// 部署后换过公网 IP / 用域名连接是最常见的连不上原因，这里在启动时
+				// 就把"证书里的地址"打出来，免得排障时只能靠 Agent 侧报错反推。
+				logCertSANWarning(agentCert, *addr, agentCertHosts)
 			}
 			_ = *insecure
 		}
@@ -780,6 +796,121 @@ func adminCertHosts(listenAddr, serverName string) []string {
 	}
 	add("localhost")
 	return hosts
+}
+
+// logCertSANWarning 打印手工证书的 SAN，并在"证书地址与本机实际地址不一致"时告警。
+//
+// 场景：运维用 -tls-cert 指定自有证书，之后服务器换了公网 IP（或 Agent 改用域名连接），
+// 证书里的旧 SAN 不再匹配 —— 此时 Agent 会报
+//
+//	x509: certificate is valid for 127.0.0.1, ::1, not 82.156.7.85
+//
+// 与其等对方来问，不如启动时主动提示"怎么重签"。
+func logCertSANWarning(cert tls.Certificate, listenAddr string, hosts []string) {
+	if len(cert.Certificate) == 0 {
+		return
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return
+	}
+	have := map[string]bool{}
+	for _, d := range leaf.DNSNames {
+		have[d] = true
+	}
+	for _, ip := range leaf.IPAddresses {
+		have[ip.String()] = true
+	}
+	san := make([]string, 0, len(have))
+	for _, d := range leaf.DNSNames {
+		san = append(san, d)
+	}
+	for _, ip := range leaf.IPAddresses {
+		san = append(san, ip.String())
+	}
+	log.Printf("[server] Agent 通道使用手工指定的证书（SAN: %v）", san)
+
+	// 只在"证书里的地址"完全覆盖不到本机实际地址"时告警：说明 Agent 用这些地址
+	// 连接（含 -ca-cert 校验）必然失败。
+	local := map[string]bool{}
+	if h := listenAddrOf(listenAddr); h != "" {
+		local[h] = true
+	}
+	for _, h := range hosts {
+		if h = strings.TrimSpace(h); h != "" && h != "0.0.0.0" && h != "::" {
+			local[h] = true
+		}
+	}
+	var missing []string
+	for h := range local {
+		if !have[h] {
+			missing = append(missing, h)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	sort.Strings(missing)
+	log.Printf("[server] 警告: 该证书的 SAN 不含本机地址 %v。"+
+		"Agent 若用这些地址连接并用 -ca-cert 校验服务端证书，会报 "+
+		"\"x509: certificate is valid for ..., not <地址>\"。重签方式（自动按本机公网 IP 写入 SAN）: "+
+		"cd scripts/signcert && go run . -ip %s -server-config <服务端配置文件>；或给 Agent 配 server_fingerprint 免 CA 校验",
+		missing, strings.Join(missing, ","))
+}
+
+// detectPublicIP 探测本机公网出口 IPv4，用于写进服务端证书 SAN。
+//
+// 为什么值得探测：部署在云主机上时，"Agent 该连哪个地址"往往只有出口 IP 说了算，
+// 而证书里若没有它就必然校验失败（这正是"服务端换了 IP 就连不上"的成因）。
+// 探测失败（内网机器 / 出口被拦 / 启动太早）不是错误：返回空串，调用方照常签发，
+// 由本机网卡地址与 -server-name 兜底。
+func detectPublicIP() string {
+	client := &http.Client{Timeout: 4 * time.Second}
+	urls := []string{
+		"https://api.ipify.org?format=json",
+		"https://ipv4.ident.me/",
+		"https://api.ip.sb/ip",
+	}
+	for _, u := range urls {
+		resp, err := client.Get(u)
+		if err != nil {
+			continue
+		}
+		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+		if rerr != nil {
+			continue
+		}
+		if ip := publicIPFromEcho(string(body)); ip != "" {
+			return ip
+		}
+	}
+	return ""
+}
+
+// publicIPFromEcho 从回显服务响应里取出公网 IP（支持 JSON 与纯文本），
+// 并滤掉私网/回环/非法值 —— 误把 10.x 写进 SAN 比不写更糟（看着"配了"其实没用）。
+func publicIPFromEcho(body string) string {
+	text := strings.TrimSpace(body)
+	candidates := []string{}
+	// JSON: {"ip":"1.2.3.4"} / {"query":"1.2.3.4"}
+	var m map[string]interface{}
+	if json.Unmarshal([]byte(text), &m) == nil {
+		for _, k := range []string{"ip", "query", "IPv4"} {
+			if v, ok := m[k].(string); ok {
+				candidates = append(candidates, v)
+			}
+		}
+	}
+	candidates = append(candidates, strings.Fields(text)...)
+	for _, c := range candidates {
+		ip := net.ParseIP(strings.Trim(strings.TrimSpace(c), `"',[]`))
+		if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() {
+			continue
+		}
+		return ip.String()
+	}
+	return ""
 }
 
 // listenAddrOf 去掉 host:port 的端口部分；空主机视为 0.0.0.0（不作为 SAN，交由地址探测补齐）。
