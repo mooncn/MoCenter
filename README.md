@@ -259,7 +259,8 @@ npm run dev     # 开发模式 (代理到 :8080)
 | Node.js + npm | 18+ | 构建 Web 前端 |
 | [Inno Setup 6](https://jrsoftware.org/isdl.php) | 6.x | **仅**编译 Windows 图形安装程序 |
 | OpenSSL | — | **仅**生成 TLS/mTLS 证书 |
-| `dpkg-deb` 或 `fpm` | — | **仅**生成 Linux `.deb`（Agent 与 Server 均适用；`.rpm` 需 `fpm`） |
+| `dpkg-deb` 或 `fpm` | — | **仅**生成 Linux `.deb`（Agent 与 Server 均适用） |
+| `fpm` 或 `rpmbuild`+`file` | — | **仅**生成 Linux `.rpm`（走 `rpmbuild` 分支时 `file(1)` 为必需项） |
 
 > Go / npm 缺失时，一键脚本会打印 `!! ... 跳过 ...` 并**继续构建其余部分**（不中断）。
 > 因此看到跳过提示不等于构建失败，请以最终产物为准。
@@ -753,6 +754,44 @@ sudo bash scripts/deploy/install-linux.sh --role=agent \
 > 打包依赖：`.deb` 需 `dpkg-deb`（Debian/Ubuntu）或 `fpm`；
 > `.rpm` 优先用 `fpm`，没有 `fpm` 时回退到 `rpmbuild`（两者都没有才跳过，并给出提示）。
 > 缺少工具时只跳过对应格式，**不影响其它产物**。
+>
+> ⚠️ 走 `rpmbuild` 分支时必须装 `file(1)`：`rpmbuild` 的 debuginfo 阶段用 `file`
+> 识别 ELF，缺了它 `.rpm` 会以一句**与源码无关**的
+> `error: Empty %files file .../debugfiles.list` 失败（详见下节）。
+
+#### `.rpm` 报 `Empty %files file .../debugfiles.list`
+
+这是**环境/工具链问题，不是代码问题**。发行版的 `rpm` 默认已定义 `debug_package`
+宏（rpm ≥ 4.14 中自带 `%ifnarch noarch`，Fedora/CentOS/openSUSE 均默认生效），
+它让 `rpmbuild` 额外生成一个 `-debuginfo` 子包，文件清单由 `find-debuginfo` 写入
+`debugfiles.list`。而该脚本只收录 `file` 判定为「ELF 且 **not stripped**」的文件：
+
+```sh
+find "$RPM_BUILD_ROOT" -perm -0111 -type f | file -N -f - |
+  sed -n 's/^\(.*\):.*ELF.*, not stripped.*/\1/p'
+```
+
+本项目二进制在构建期就被 strip（`--ldflags "-s -w"`），`file` 输出为 `... stripped`，
+清单恒为空 → 报错。同一条 `find` 还依赖 `file`，所以**缺 `file` 时也会以同一个错收尾**。
+
+构建脚本已默认显式关闭 debuginfo 子包：
+
+```sh
+rpmbuild ... --define 'debug_package %{nil}' -bb <spec>
+```
+
+`Empty %files` 报错因此不再出现。需要随包产出 `-debuginfo` 子包时用
+`MOCENTER_RPM_DEBUGINFO=1` 打开（此时 `file` 是硬依赖）。
+
+```sh
+# 缺工具时的修复
+sudo apt-get install -y rpm file        # Debian / Ubuntu
+sudo dnf install -y rpm-build file      # Fedora / RHEL / openSUSE
+```
+
+> 历史背景：该报错曾长期存在，日志里 `Processing files: mocenter-server-debuginfo-...`
+> 与主体包 `Wrote:` 并存，容易被误读成「源码编译失败」。实际主包已构建成功，
+> 停在 `-debuginfo` 子包上。
 
 ### Windows 图形安装程序（推荐）
 

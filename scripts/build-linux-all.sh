@@ -46,6 +46,8 @@
 #   MOCENTER_SERVER_VERSION / MOCENTER_AGENT_VERSION / MOCENTER_VERSION(兼容旧名)
 #   DEBEMAIL / DEBFULLNAME / MOCENTER_PKG_MAINTAINER   .deb 维护者信息（dpkg-deb 分支需要）
 #   MOCENTER_DEB_DEPENDS / MOCENTER_RPM_DEPENDS        包依赖声明覆盖
+#   MOCENTER_RPM_DEBUGINFO=1                           允许随包产出 -debuginfo 子包
+#                                                      （默认 0，见 build_rpm_with_rpmbuild 注释）
 # =============================================================
 set -euo pipefail
 
@@ -612,15 +614,57 @@ PY
   # 否则报 "No compatible architectures found for build"。
   # rpm_arch_of_target 把 Go 的 arm64/arm/386 映射成 rpm 认识的 aarch64/armv7hl/i686。
   local rpmmacro_arch; rpmmacro_arch="$(mc_rpm_target_arch "$pkgarch")"
+  # ── 关闭 debuginfo 子包（否则整批 .rpm 必失败）────────────────────────
+  # 发行版的 rpm 默认已定义 debug_package 宏（rpm>=4.14 中该宏自带
+  # %ifnarch noarch，Fedora/CentOS/openSUSE 均默认生效）。它会让 rpmbuild 多出
+  # 一个 -debuginfo 子包，其文件清单来自 %__debug_install_post 调用的
+  # find-debuginfo 所生成的 debugfiles.list。
+  #
+  # 而 find-debuginfo 只把「file 判定为 ELF 且 not stripped」的可执行文件写进清单：
+  #     find "$RPM_BUILD_ROOT" -perm -0111 -type f | file -N -f - |
+  #       sed -n 's/^\(.*\):.*ELF.*, not stripped.*/\1/p'
+  # 本项目的二进制在构建期（--binary=1）或 --ldflags "-s -w"（CI）下已被 strip，
+  # file 输出为 "... stripped"，清单因此恒为空，报：
+  #     error: Empty %files file .../debugfiles.list
+  # 这是本仓库 .rpm 长期构建失败的真实原因，与代码/依赖无关。
+  #
+  # 即使把 file 装上，带 debug info 的二进制也只会额外产出一个本包不需要的
+  # -debuginfo 子包（里面只有 /usr/lib/debug 下的符号）。本包是「已 strip 的
+  # 发布二进制 + 服务单元 + 配置」的交付包，不需要调试符号，所以默认明确关闭。
+  # 需要调试符号时用 MOCENTER_RPM_DEBUGINFO=1 打开。
+  local -a rpmdebug_define=()
+  if ! mc_is_true "${MOCENTER_RPM_DEBUGINFO:-0}"; then
+    rpmdebug_define=(--define "debug_package %{nil}")
+  fi
+  # 注意：本函数只拿到 pkgarch（rpm 风格架构名），Go 风格的 "$arch" 在此作用域内
+  # 并不存在。日志里曾写 "$pkg/$arch"，在 set -u 下会直接以
+  #   bash: arch: unbound variable
+  # 终止 —— rpmbuild 的真实报错被完全盖住，且是「整批中断」而非「跳过单个包」。
   if ! rpmbuild --define "_topdir $top" --define "_rpmdir $top/RPMS" \
+      "${rpmdebug_define[@]}" \
       --target "$rpmmacro_arch" \
       -bb "$top/SPECS/${pkg}.spec" >"$top/build.log" 2>&1; then
-    warn "rpmbuild 失败（$pkg/$arch），日志尾部："
+    warn "rpmbuild 失败（$pkg/$pkgarch），日志尾部："
     tail -20 "$top/build.log" >&2 || true
+    # 最常见的一类失败是「环境缺工具」而非本项目的 spec 有问题：rpmbuild 的
+    # find-debuginfo 依赖 file(1)，缺失时只会在日志里留下 "file: not found"，
+    # 与源码毫无关系。这类信息必须显式提示，否则会被当成代码问题排查半天。
+    if grep -qE "^(RPM build errors:)?[[:space:]]*(Empty %files file .*debugfiles.list|.*: file: not found|.*find-debuginfo: command not found)" "$top/build.log"; then
+      warn "  上述报错来自 rpmbuild 的 debuginfo 阶段（非本项目代码）："
+      warn "   · 缺 file(1) 时 rpmbuild 的 find-debuginfo 无法识别 ELF，转而报 Empty %files"
+      warn "   · 本脚本已默认关闭 debuginfo 子包（--define 'debug_package %{nil}'）"
+      warn "   · 修复：安装 file 与 rpm 工具（apt-get install -y rpm file / dnf install -y rpm-build file）"
+      warn "   · 如需产物带 -debuginfo：MOCENTER_RPM_DEBUGINFO=1 重新构建"
+    fi
     return 1
   fi
-  local built; built="$(find "$top/RPMS" -name '*.rpm' | head -1)"
-  [ -n "$built" ] || { warn "rpmbuild 未产出 rpm（$pkg/$arch）"; return 1; }
+  # 关掉 debuginfo 后 RPMS 下只应有一个 rpm；开启时才可能是两个（主包 +
+  # -debuginfo）。取「非 -debuginfo 的那个」作为交付产物，避免把子包搬到
+  # 包名 mocenter-*.rpm 的路径下张冠李戴。
+  local built
+  built="$(find "$top/RPMS" -name '*.rpm' ! -name '*-debuginfo-*.rpm' | head -1)"
+  [ -n "$built" ] || built="$(find "$top/RPMS" -name '*.rpm' | head -1)"
+  [ -n "$built" ] || { warn "rpmbuild 未产出 rpm（$pkg/$pkgarch）"; return 1; }
   mv "$built" "$out"
   rm -rf "$top"
   return 0

@@ -293,6 +293,15 @@ mc_in_list() {
   # mc_in_list <值> <空格分隔的候选串>
   case " $2 " in *" $1 "*) return 0 ;; *) return 1 ;; esac
 }
+# 0/1 开关的判断沿用本仓库既有约定（脚本里一律写作 [ "$X" = 1 ]），
+# 不采用「非空即真」：这样 MOCENTER_RPM_DEBUGINFO=0 这类「显式关闭」
+# 不会被误判为开启。大小写与常见真值写法一并放宽，便于人工临时导出。
+mc_is_true() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 # ---------- systemd 服务单元模板 ----------
 # 服务单元此前散落在「安装器 heredoc」与「打包脚本 heredoc」两处，

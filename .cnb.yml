@@ -94,6 +94,21 @@ $:
                 && echo "OK  $pair 受当前 Go 支持" \
                 || { echo "!! $pair 不被当前 Go 支持，却在构建矩阵里（会构建失败）"; exit 1; }
             done
+            echo "=== rpm 打包必须显式关闭 debuginfo 子包 ==="
+            # 发行版 rpm 默认已定义 debug_package 宏（rpm>=4.14 中自带 %ifnarch noarch，
+            # Fedora/CentOS/openSUSE 默认生效）。它会让 rpmbuild 生成 -debuginfo 子包，
+            # 其文件清单来自 find-debuginfo 生成的 debugfiles.list；而该脚本只收录
+            # 「ELF 且 not stripped」的文件。本项目二进制在构建期已被 strip（--ldflags
+            # "-s -w"），清单恒为空，报：
+            #   error: Empty %files file .../debugfiles.list
+            # 现象是「整批 .rpm 全失败」，且报错与源码毫无关系，极易被误判为代码问题。
+            # 这里在 PR 阶段就锚住这条约束，避免有人「顺手」把它删掉。
+            grep -q 'debug_package %{nil}' scripts/build-linux-all.sh \
+              && echo "OK  build-linux-all.sh 已显式关闭 debuginfo 子包" \
+              || { echo "!! scripts/build-linux-all.sh 未关闭 debuginfo 子包，.rpm 会报 Empty %files"; exit 1; }
+            grep -q 'Empty %files file .*debugfiles.list' scripts/build-linux-all.sh \
+              && echo "OK  已内置 debuginfo 空清单报错的排查指引" \
+              || { echo "!! 缺少 debuginfo 阶段的报错指引（缺 file(1) 时应给出提示）"; exit 1; }
             echo "=== 证书工具编译与测试 ==="
             (cd scripts/gencerts && go build ./... && go vet ./... && echo "OK  scripts/gencerts")
             (cd scripts/signcert && go build ./... && go vet ./... && go test ./... && echo "OK  scripts/signcert")
