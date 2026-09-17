@@ -14,12 +14,32 @@
 
 ### 方式一：基于 Docker 容器化部署
 
+仓库自带 `server/Dockerfile`，多阶段构建为单进程镜像（同时提供 :9000 与 :8080）。
+
 ```bash
-# 构建服务端镜像（需 Dockerfile，可参考规划书容器化章节）
-docker build -t mocenter-server ./server
-docker run -d -p 9000:9000 -p 8080:8080 \
-  mocenter-server -listen :9000 -http :8080 -user admin -password your-password
+# 1) 先构建 Web 前端（可选；不构建则容器不含 Web 界面）
+bash web/build.sh
+
+# 2) 构建镜像 —— 构建上下文是仓库根目录（镜像需 web/dist），故用 -f 指定 Dockerfile
+docker build -f server/Dockerfile -t mocenter-server:latest .
+
+# 3) 运行（数据挂载到持久卷，否则重建容器会重新生成 agent.key，
+#    已注册的 Agent 需要改用新密钥重新注册）
+docker run -d --name mocenter-server \
+  -p 9000:9000 -p 8080:8080 \
+  -v mocenter-data:/var/lib/mocenter \
+  -e MOCENTER_USER=admin -e MOCENTER_PASSWORD='强口令' \
+  mocenter-server:latest
+
+docker logs -f mocenter-server      # 查看启动日志（含托管安装包清单）
 ```
+
+启动参数通过环境变量注入（镜像内已全部展开）：`MOCENTER_USER` / `MOCENTER_PASSWORD` /
+`MOCENTER_LISTEN` / `MOCENTER_HTTP` / `MOCENTER_WHITELIST` / `MOCENTER_TLS_CERT` /
+`MOCENTER_TLS_KEY` / `MOCENTER_CA_CERT`；其它参数可用 `MOCENTER_EXTRA_ARGS` 透传。
+未提供用户名/口令时，容器内会自动创建 `admin` 并生成随机强口令写入
+`/var/lib/mocenter/initial-password.txt`（权限 0600），可用
+`docker exec mocenter-server cat /var/lib/mocenter/initial-password.txt` 查看后删除。
 
 ### 方式二：物理机直接部署（单进程托管 Web）
 
@@ -30,6 +50,53 @@ cd ../server && bash build.sh
 # 2. 启动（同时托管 Web 静态资源，单进程部署）
 ./mocenter-server -listen :9000 -http :8080 -user admin -password your-password -web ../web/dist
 ```
+
+### 方式三：Linux Server 一键构建 + systemd 服务（推荐）
+
+仓库提供了 Linux 侧的 Server 构建 / 打包 / 服务注册脚本（此前仅有一键脚本，
+其 Server 产物只适用于本机平台；Windows 侧由 `build-setup.bat` 产出图形安装程序）。
+
+```bash
+# 1) 多架构二进制：amd64 / arm64 / arm / 386 -> build/server/linux/
+bash scripts/packaging/build-linux-server.sh
+bash scripts/packaging/build-linux-server.sh amd64
+
+# 2) 生成 .deb / .rpm（内置 systemd 单元；web/dist 存在时会一并装入并托管）
+bash scripts/packaging/build-linux-server-pkg.sh all amd64
+
+# 3) 或一步到位：Server + Agent 全架构 + Web 前端 + 两类安装包
+bash scripts/packaging/build-linux-server-all.sh all amd64
+```
+
+安装包（或安装脚本）注册服务后的落盘位置：
+
+| 项目 | 位置 |
+|------|------|
+| 二进制 | `/usr/local/bin/mocenter-server` |
+| 启动参数 | `/etc/mocenter/mocenter-server.conf`（**请修改口令与白名单**） |
+| 全量配置 | `/etc/mocenter/mocenter-server.json`（首次启动自动生成） |
+| 数据目录 | `/var/lib/mocenter/data`（审计日志、`users.json`、`agent.key`） |
+| 托管安装包 | `/var/lib/mocenter/packages` |
+| Web 前端 | `/usr/share/mocenter/web` |
+| 装卸说明 | `/etc/mocenter/README.server` |
+| 日志 | `journalctl -u mocenter-server -f` |
+
+不打包时也可直接用安装脚本注册（需 root，第二个参数为二进制路径）：
+
+```bash
+bash scripts/packaging/build-linux-server.sh amd64
+sudo bash scripts/packaging/install-linux-server.sh install ./build/server/linux/mocenter-server-amd64
+sudo bash scripts/packaging/install-linux-server.sh status
+sudo bash scripts/packaging/install-linux-server.sh uninstall
+
+# 覆盖默认占位口令（默认 admin / change-me，注册后请立即修改）
+sudo MOCENTER_PASSWORD='强口令' bash scripts/packaging/install-linux-server.sh install ./mocenter-server
+```
+
+> 服务只监听 `:9000`（Agent 长连接）与 `:8080`（Web 控制台 / REST API）。
+> 生产环境请配置 TLS 证书（`MOCENTER_TLS_CERT` / `MOCENTER_TLS_KEY`，并可用
+> `MOCENTER_CA_CERT` 启用 mTLS）、设置 `MOCENTER_WHITELIST`，并用防火墙限制来源网段。
+> 证书生成见 `bash scripts/gen-cert.sh ./certs`。
 
 ## 三、Agent 部署
 

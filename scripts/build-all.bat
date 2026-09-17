@@ -4,6 +4,10 @@ REM MoCenter one-shot build script (Windows)
 REM Builds: server / agent / web / Windows GUI setup
 REM Usage: scripts\build-all.bat
 REM
+REM The server is built for Windows (it runs on the controlling host);
+REM this script cannot cross-build a Linux server. For that use:
+REM   bash scripts/packaging/build-linux-server.sh all
+REM
 REM NOTE: this file is deliberately ASCII-only. cmd.exe reads .bat files
 REM using the system ANSI codepage, so non-ASCII text gets mangled and can
 REM break line parsing. User-facing Chinese text lives in the Inno script.

@@ -2,8 +2,15 @@
 # =============================================================
 # MoCenter 一键构建脚本 (Linux/macOS)
 # 构建 web / server / agent 三大部分
-# 用法: bash scripts/build-all.sh [linux|windows]
-#       默认构建当前系统平台对应的 agent 二进制
+#
+# 用法: bash scripts/build-all.sh [linux|windows|darwin]
+#       参数只影响 Agent 的目标平台（Server 与 Web 是平台无关的），
+#       缺省构建当前系统平台对应的 agent 二进制
+#
+# 产物:
+#   build/mocenter-server[.exe]   服务端
+#   build/mocenter-agent[.exe]    Agent
+#   build/web/                    Web 前端静态资源
 # =============================================================
 set -e
 
@@ -25,11 +32,24 @@ echo "=========================================="
 mkdir -p "${OUT_DIR}"
 
 # ---------- 1. Server ----------
+# Server 只在本机运行，因此按其自身平台编译 —— 绝不能把 Agent 的目标平台
+# 传给它，否则在 Linux 上执行 `build-all.sh windows` 会误产出 linux 二进制，
+# 而在 macOS 上则相反。它的平台参数只作用于 Agent。
 echo ""
 echo "[1/3] 构建 Server ..."
 if command -v go >/dev/null 2>&1; then
-  (cd "${ROOT_DIR}/server" && go mod download && go build -ldflags "-s -w" -o "${OUT_DIR}/mocenter-server" .)
-  echo "  -> ${OUT_DIR}/mocenter-server"
+  case "$(uname -s)" in
+    Darwin) SERVER_GOOS=darwin ;;
+    MINGW*|MSYS*|CYGWIN*) SERVER_GOOS=windows ;;
+    *) SERVER_GOOS=linux ;;
+  esac
+  SERVER_OUT="mocenter-server"
+  [ "${SERVER_GOOS}" = "windows" ] && SERVER_OUT="mocenter-server.exe"
+  (cd "${ROOT_DIR}/server" && \
+    GOOS="${SERVER_GOOS}" GOARCH=amd64 CGO_ENABLED=0 go mod download && \
+    GOOS="${SERVER_GOOS}" GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" \
+      -o "${OUT_DIR}/${SERVER_OUT}" .)
+  echo "  -> ${OUT_DIR}/${SERVER_OUT}  (GOOS=${SERVER_GOOS} GOARCH=amd64)"
 else
   echo "  !! 未安装 Go，跳过 Server 构建"
 fi
@@ -39,17 +59,20 @@ echo ""
 echo "[2/3] 构建 Agent ..."
 if command -v go >/dev/null 2>&1; then
   AGENT_OUT="mocenter-agent"
+  AGENT_GOOS=linux
+  AGENT_GOARCH=amd64
   case "${PLATFORM}" in
-    linux)  GOOS=linux GOARCH=amd64 ;;
-    windows) GOOS=windows GOARCH=amd64; AGENT_OUT="mocenter-agent.exe" ;;
-    darwin) GOOS=darwin GOARCH=amd64 ;;
-    *) GOOS=linux GOARCH=amd64 ;;
+    linux)  AGENT_GOOS=linux ;;
+    windows) AGENT_GOOS=windows; AGENT_OUT="mocenter-agent.exe" ;;
+    darwin) AGENT_GOOS=darwin ;;
+    *) echo "  !! 未知平台 ${PLATFORM}，按 linux 处理"; AGENT_GOOS=linux ;;
   esac
-  export GOOS GOARCH CGO_ENABLED=0
-  (cd "${ROOT_DIR}/agent" && go mod download && \
+  (cd "${ROOT_DIR}/agent" && \
+    GOOS="${AGENT_GOOS}" GOARCH="${AGENT_GOARCH}" CGO_ENABLED=0 go mod download && \
+    GOOS="${AGENT_GOOS}" GOARCH="${AGENT_GOARCH}" CGO_ENABLED=0 \
     go build -ldflags "-s -w -X mocenter/agent/internal/version.Version=${AGENT_VERSION}" \
     -o "${OUT_DIR}/${AGENT_OUT}" .)
-  echo "  -> ${OUT_DIR}/${AGENT_OUT}  (GOOS=${GOOS} GOARCH=${GOARCH} agent_version=${AGENT_VERSION})"
+  echo "  -> ${OUT_DIR}/${AGENT_OUT}  (GOOS=${AGENT_GOOS} GOARCH=${AGENT_GOARCH} agent_version=${AGENT_VERSION})"
 else
   echo "  !! 未安装 Go，跳过 Agent 构建"
 fi
@@ -71,4 +94,7 @@ echo ""
 echo "=========================================="
 echo " 构建完成，产物位于: ${OUT_DIR}"
 ls -lh "${OUT_DIR}"
+echo ""
+echo " Linux Server 多架构二进制与 .deb/.rpm 安装包请用:"
+echo "   bash scripts/packaging/build-linux-server-all.sh all amd64"
 echo "=========================================="

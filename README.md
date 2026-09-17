@@ -53,6 +53,7 @@ MoCenter/
 │       └── protocol/      # 消息协议
 ├── server/                # 总控服务端 (Go)
 │   ├── main.go
+│   ├── Dockerfile         # 容器镜像（多阶段构建，单进程托管 Web）
 │   └── internal/
 │       ├── session/       # 会话池
 │       ├── route/         # 命令路由/审计/黑名单
@@ -80,12 +81,16 @@ MoCenter/
 │   ├── mcmd/              # 远程命令调试工具（REST + WebSocket）
 │   ├── gencerts/          # 证书生成的 Go 实现
 │   └── packaging/         # 多架构打包与部署
-│       ├── build-win-all.bat    # Windows 多架构 Agent
-│       ├── build-linux-all.sh   # Linux 多架构 Agent
-│       ├── build-linux-pkg.sh   # .deb / .rpm 安装包
-│       ├── build-setup.bat      # Windows 图形安装程序
-│       ├── install-windows.bat  # Windows 手动注册服务（备选）
-│       └── install-linux.sh     # Linux systemd 注册
+│       ├── build-win-all.bat           # Windows 多架构 Agent
+│       ├── build-linux-all.sh          # Linux 多架构 Agent
+│       ├── build-linux-pkg.sh          # Agent .deb / .rpm 安装包
+│       ├── build-linux-server.sh       # Linux 多架构 Server
+│       ├── build-linux-server-pkg.sh   # Server .deb / .rpm 安装包
+│       ├── build-linux-server-all.sh   # Linux 一键交付（Server+Agent+Web+安装包）
+│       ├── build-setup.bat             # Windows 图形安装程序
+│       ├── install-windows.bat         # Windows 手动注册服务（备选）
+│       ├── install-linux.sh            # Agent systemd 注册
+│       └── install-linux-server.sh     # Server systemd 注册
 └── docs/                  # 部署与运维手册
 ```
 
@@ -107,8 +112,44 @@ scripts\build-all.bat
 产物统一落在仓库根的 `build/`：`mocenter-server[.exe]`、`mocenter-agent[.exe]`、`web/`；
 Windows 版还会在第 `[4/4]` 步编译出 `MoCenter-Setup-<版本>.exe`。
 
+> 一键脚本里的 **Server 只按「本机平台」编译** —— 它的平台参数只作用于 Agent。
+> 要在 Linux 上产出 **Linux 版 Server**（多架构二进制、`.deb`/`.rpm`、systemd 服务），
+> 用 `scripts/packaging/build-linux-server*.sh`（见本节末尾「Linux Server 构建与打包」）。
+
 各子目录也提供独立构建脚本（`server/build.sh`、`agent/build.sh`、`web/build.sh`，及对应 `.bat`）。
 **全部脚本的用法、参数与产物位置见 [构建脚本参考](#构建脚本参考)。**
+
+#### Linux Server 构建与打包
+
+```bash
+# 多架构二进制 amd64 / arm64 / arm / 386 -> build/server/linux/
+bash scripts/packaging/build-linux-server.sh
+bash scripts/packaging/build-linux-server.sh amd64
+
+# .deb / .rpm（内置 systemd 单元 mocenter-server.service）-> build/packages/
+bash scripts/packaging/build-linux-server-pkg.sh all amd64
+
+# 一步到位：Server + Agent 全架构 + Web 前端 + 两类安装包
+bash scripts/packaging/build-linux-server-all.sh all amd64
+
+# 或用安装脚本直接注册 systemd 服务（需 root）
+sudo bash scripts/packaging/install-linux-server.sh install ./build/server/linux/mocenter-server-amd64
+```
+
+#### 容器化部署
+
+仓库自带 `server/Dockerfile`（多阶段构建，单进程同时提供 :9000 与 :8080）：
+
+```bash
+bash web/build.sh                                          # 可选：先出前端，镜像才能托管页面
+docker build -f server/Dockerfile -t mocenter-server:latest .   # 上下文为仓库根目录
+docker run -d --name mocenter-server -p 9000:9000 -p 8080:8080 \
+  -v mocenter-data:/var/lib/mocenter \
+  -e MOCENTER_USER=admin -e MOCENTER_PASSWORD='强口令' \
+  mocenter-server:latest
+```
+
+> 数据请挂载持久卷：容器重建会重新生成 `agent.key`，已注册的 Agent 需改用新密钥重新注册。
 
 ### 2. 启动服务端
 
@@ -194,7 +235,7 @@ npm run dev     # 开发模式 (代理到 :8080)
 | Node.js + npm | 18+ | 构建 Web 前端 |
 | [Inno Setup 6](https://jrsoftware.org/isdl.php) | 6.x | **仅**编译 Windows 图形安装程序 |
 | OpenSSL | — | **仅**生成 TLS/mTLS 证书 |
-| `dpkg-deb` 或 `fpm` | — | **仅**生成 Linux `.deb`（`.rpm` 需 `fpm`） |
+| `dpkg-deb` 或 `fpm` | — | **仅**生成 Linux `.deb`（Agent 与 Server 均适用；`.rpm` 需 `fpm`） |
 
 > Go / npm 缺失时，一键脚本会打印 `!! ... 跳过 ...` 并**继续构建其余部分**（不中断）。
 > 因此看到跳过提示不等于构建失败，请以最终产物为准。
@@ -245,13 +286,18 @@ scripts\build-all.bat
 | `web/build.sh` · `web/build.bat` | 跨平台 | 单独构建前端 | `web/dist/` |
 | `scripts/packaging/build-win-all.bat` | Windows | Agent 多架构（x86_64 / x86 / arm64 / arm） | `build\agent\windows\` |
 | `scripts/packaging/build-linux-all.sh` | Linux/macOS | Agent 多架构（amd64 / arm64 / arm / 386） | `build/agent/linux/` |
-| `scripts/packaging/build-linux-pkg.sh` | Linux/macOS | 生成 `.deb` / `.rpm` | `build/packages/` |
+| `scripts/packaging/build-linux-pkg.sh` | Linux/macOS | 生成 Agent `.deb` / `.rpm` | `build/packages/` |
+| `scripts/packaging/build-linux-server.sh` | Linux/macOS | **Server 多架构（amd64 / arm64 / arm / 386）** | `build/server/linux/` |
+| `scripts/packaging/build-linux-server-pkg.sh` | Linux/macOS | 生成 Server `.deb` / `.rpm`（含 Web 前端） | `build/packages/` |
+| `scripts/packaging/build-linux-server-all.sh` | Linux/macOS | **Linux 一键交付：Server + Agent + Web + 安装包** | `build/` |
 | `scripts/packaging/build-setup.bat` | Windows | 编译图形安装程序 | `build\MoCenter-Setup-<版本>.exe` |
 | `scripts/packaging/install-windows.bat` | Windows | 手动注册 Windows 服务（备选） | — |
-| `scripts/packaging/install-linux.sh` | Linux | 注册 systemd 服务 | — |
+| `scripts/packaging/install-linux.sh` | Linux | 注册 Agent systemd 服务 | — |
+| `scripts/packaging/install-linux-server.sh` | Linux | 注册 Server systemd 服务 | — |
 | `scripts/gen-cert.sh` | Linux/macOS | 生成 CA / 服务端 / 客户端证书 | 指定目录（默认 `certs/`） |
 | `scripts/fetch-packages.sh` | Linux/macOS | 拉取 VNC 安装包到服务端托管目录 | 指定目录 |
 | `scripts/mcmd/` | 跨平台 | 远程命令调试（REST + WebSocket） | — |
+| `server/Dockerfile` | Docker | 构建 Server 容器镜像 | `mocenter-server:latest` |
 
 ### 一键构建
 
@@ -271,20 +317,26 @@ bash scripts/build-all.sh darwin
 `build-all.sh` 的**唯一参数是 Agent 目标平台**（`linux` / `windows` / `darwin`，缺省取 `uname`）。
 Windows 版在第 `[4/4]` 步会调用 `build-setup.bat`；若 `installer/setup.iss` 不存在则跳过。
 
+> `build-all.sh` / `build-all.bat` 产出的 **Server 始终是「本机平台」的可执行文件** ——
+> 该参数只作用于 Agent。要在 Linux 上构建 **Linux 版 Server**（多架构或安装包），
+> 请用下面的 `scripts/packaging/build-linux-server*.sh`。
+
 ### 单独构建某个模块
 
 ```bash
 bash agent/build.sh [linux|windows|darwin] [amd64|386|arm64|arm]   # 默认当前平台 / amd64
-bash server/build.sh
+bash server/build.sh [linux|darwin|windows] [amd64|arm64|arm|386]  # 默认当前平台 / 本机架构
 bash web/build.sh
 ```
 
 ```bat
 REM Windows：参数为架构，默认 amd64
 agent\build.bat [386|amd64|arm|arm64]
-server\build.bat
+server\build.bat [386|amd64|arm|arm64]
 web\build.bat
 ```
+
+Server 依赖 `modernc.org/sqlite`（纯 Go），因此**无需 CGO 即可交叉编译**到 arm64 / arm 等架构。
 
 输出分别是 `agent/mocenter-agent[.exe]`、`server/mocenter-server[.exe]`、`web/dist/`（注意：**落在模块目录内**，
 与一键脚本输出到 `build/` 不同）。
@@ -316,6 +368,51 @@ MOCENTER_VERSION=1.2.3 bash scripts/packaging/build-linux-pkg.sh all amd64   # �
 两者允许不一致，例如「安装包 1.2.0 里装的 Agent 仍标记 1.0.1」是合法组合。
 生成的安装包内置 systemd 单元：安装后自动注册 `mocenter-agent.service`、设置开机自启，
 二进制落在 `/usr/local/bin/mocenter-agent`，配置文件为 `/etc/mocenter/mocenter-agent.conf`（**安装后请修改服务端地址**）。
+
+#### Linux Server（总控端）
+
+```bash
+# Server 多架构二进制：amd64 / arm64 / arm / 386 -> build/server/linux/
+bash scripts/packaging/build-linux-server.sh          # 全架构
+bash scripts/packaging/build-linux-server.sh amd64    # 只出 amd64
+
+# Server .deb / .rpm -> build/packages/
+bash scripts/packaging/build-linux-server-pkg.sh all amd64
+MOCENTER_VERSION=1.2.3 bash scripts/packaging/build-linux-server-pkg.sh deb arm64
+
+# 或一步到位：Server + Agent 全架构 + Web 前端 + 两类安装包
+bash scripts/packaging/build-linux-server-all.sh all amd64
+bash scripts/packaging/build-linux-server-all.sh none      # 只出二进制，不打包
+```
+
+Server 安装包内置 systemd 单元 `mocenter-server.service`，安装后自动：
+
+| 项目 | 位置 |
+|------|------|
+| 二进制 | `/usr/local/bin/mocenter-server` |
+| 启动参数 | `/etc/mocenter/mocenter-server.conf`（**安装后请修改口令/白名单**） |
+| 全量配置 | `/etc/mocenter/mocenter-server.json`（首次启动自动生成） |
+| 数据目录 | `/var/lib/mocenter/data`（审计日志、`users.json`、`agent.key`） |
+| 托管安装包 | `/var/lib/mocenter/packages` |
+| Web 前端 | `/usr/share/mocenter/web`（`web/dist` 存在时会随包装入） |
+| 装卸说明 | `/etc/mocenter/README.server` |
+
+> 打包前若已执行 `bash web/build.sh`，`web/dist` 会自动装入 `/usr/share/mocenter/web`
+> 并由服务端托管，装完即可直接打开控制台；未构建前端时只是不含 Web 界面，
+> `:9000` 长连接与 REST API 不受影响。
+
+也可不打包，直接用安装脚本注册服务（需 root；**第二个参数是本地 Server 二进制的路径**）：
+
+```bash
+bash scripts/packaging/build-linux-server.sh amd64
+sudo bash scripts/packaging/install-linux-server.sh install ./build/server/linux/mocenter-server-amd64
+sudo bash scripts/packaging/install-linux-server.sh status
+sudo bash scripts/packaging/install-linux-server.sh uninstall
+```
+
+> 安装前可用环境变量覆盖默认口令，例如：
+> `sudo MOCENTER_PASSWORD='强口令' bash scripts/packaging/install-linux-server.sh install ./mocenter-server`
+> 未指定时默认生成 `admin` / `change-me` 占位口令，**服务注册后请立即修改**。
 
 ### Windows 图形安装程序
 
@@ -362,10 +459,15 @@ scripts\packaging\install-windows.bat uninstall
 ```
 
 ```bash
-# Linux：注册 systemd 服务（需 root）
+# Linux：注册 Agent systemd 服务（需 root）
 sudo bash scripts/packaging/install-linux.sh install ./mocenter-agent
 sudo bash scripts/packaging/install-linux.sh status
 sudo bash scripts/packaging/install-linux.sh uninstall
+
+# Linux：注册 Server systemd 服务（需 root）
+sudo bash scripts/packaging/install-linux-server.sh install ./mocenter-server
+sudo bash scripts/packaging/install-linux-server.sh status
+sudo bash scripts/packaging/install-linux-server.sh uninstall
 ```
 
 > Windows 侧**推荐使用图形安装程序或 `mocenter-deploy.exe install`**（见下方「Windows 静默 / 脚本化安装」）：

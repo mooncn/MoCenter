@@ -54,8 +54,10 @@ echo " 版本: ${VERSION}"
 echo " 输出: ${OUT_DIR}"
 echo "=============================================="
 
-mkdir -p "${STAGE}" "${OUT_DIR}"
+# 先清空上一次的暂存目录，再重建 —— 顺序不能颠倒：
+# 若先 mkdir 后 rm，go build -o ${STAGE}/... 会因为目录已被删除而失败。
 rm -rf "${STAGE}"
+mkdir -p "${STAGE}" "${OUT_DIR}"
 
 # 1. 构建 Agent 二进制
 echo "[1/3] 构建 Agent (linux/${GOARCH}) ..."
