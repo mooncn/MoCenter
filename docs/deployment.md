@@ -108,6 +108,26 @@ sudo bash scripts/deploy/install-linux.sh --role=all status
 sudo bash scripts/deploy/install-linux.sh --role=server uninstall      # 加 --purge 连配置数据一起删
 ```
 
+**升级**（配置已存在即按升级处理，只换二进制与服务，不动配置）：
+
+```bash
+sudo bash scripts/deploy/install-linux.sh upgrade --role=server \
+     --bin=build/linux/binaries/server/linux/mocenter-server-amd64
+# 升级时无需重复提供 --user/--password；要清理重装（删除既有配置）加 --force
+```
+
+**保活自启**（脚本按环境自动选择）：
+
+| 环境 | 注册内容 |
+|------|----------|
+| 有 systemd | `mocenter-<角色>.service`（开机自启 + `Restart=always`）+ `mocenter-<角色>-watchdog.timer`（每 5 分钟巡检，进程不在就拉起） |
+| 无 systemd（容器/精简系统） | `/etc/cron.d/mocenter-<角色>`：`@reboot` + 每 5 分钟巡检，共用 `/usr/local/bin/mocenter-keepalive` |
+| 两者都没有 | 告警，并提示用容器编排的 `--restart=always` / `restartPolicy: Always` |
+
+> 巡检脚本（`scripts/deploy/mocenter-keepalive.sh`）幂等：进程已在运行就直接退出；
+> 极端竞态下重复拉起的一方会被程序自身的单实例保护挡下，不会出现两个实例同时服务。
+> 用 `--no-keepalive` 可跳过保活任务注册，`--dry-run` 只打印将要执行的动作。
+
 > 安装脚本注册的 systemd 单元与安装包内的是**同一份模板**（`scripts/deploy/mocenter-*.service`），
 > 不会再出现"打包脚本改了、安装脚本忘改"。
 > 服务只监听 `:9000`（Agent 长连接）与 `:8080`（Web 控制台 / REST API）。
@@ -123,8 +143,23 @@ sudo bash scripts/deploy/install-linux.sh --role=server uninstall      # 加 --p
 
 ```bash
 cd web && npm run build   # 生成 dist/
+bash scripts/deploy/precompress-web.sh web/dist   # 预压缩 .br/.gz（推荐）
 # 将 dist 静态文件部署到 Nginx，或由 Go 后端一并托管
 ```
+
+### 加载性能（移动端浏览器尤其重要）
+
+服务端托管前端时（`-web <dist>`）已内置三项优化：
+
+1. **预压缩优先**：存在 `xxx.js.br` / `xxx.js.gz` 时按 `Accept-Encoding` 直接回传，
+   不再逐次压缩。前端主包 gzip 后约 280KB，弱网移动端差别是数倍。
+2. **缓存头**：`/assets/*`（带内容哈希）返回 `immutable` 长缓存；`index.html` 与任意路由
+   回退均为 `no-cache`，发版即时生效。
+3. **前端侧分包**：`web/vite.config.js` 做依赖分包，终端（xterm）、远程桌面（noVNC）等
+   重依赖页面改为路由级懒加载 —— 首屏只下载 react/router 等基础块。
+
+> 用 Nginx 托管时请自行打开 `gzip`/`brotli` 与静态缓存；`try_files $uri /index.html;`
+> 的 SPA 回退保持不变即可。预压缩产物（`.gz`/`.br`）已在 `.gitignore` 中，属可再生成物。
 
 Nginx 反向代理示例（将 /api 与 /ws 代理到 Go 服务端）：
 
@@ -642,7 +677,39 @@ systemd 可用性探测，**不做任何改动**。建议先探测确认，再�
 > 按需求"没有类似方案则略过"。Windows 侧请继续用图形安装程序（`MoCenter-Setup-<版本>.exe`）或
 > `scripts\deploy\install-windows.bat`。
 
-## 十一、版本号管理
+## 十一、保活自启（服务之外的第二道保险）
+
+**目标**：进程被结束、服务被停掉、或环境根本不允许注册系统服务时，Agent/Server 仍能自动回来。
+
+### Windows：两个计划任务
+
+图形安装程序与 `mocenter-deploy.exe install` 都会额外注册（以 SYSTEM 主体运行，无需保存口令）：
+
+| 任务名 | 触发 | 作用 |
+|--------|------|------|
+| `<角色>Boot`（`MoCenterAgentBoot` / `MoCenterServerBoot`） | 开机（`ONSTART`，不可用时回退登录 `ONLOGON`） | 开机自启 |
+| `<角色>KeepAlive`（`MoCenterAgentKeepAlive` / `MoCenterServerKeepAlive`） | 每 5 分钟 | 巡检并拉起（进程被结束/崩溃后最多 5 分钟回来） |
+
+> - 服务能正常运行的环境里，它们是空转的安全网；容器/组策略禁用服务的环境里，
+>   它们就是唯一的自启与防杀通道。
+> - 计划任务通过 `mocenter-deploy.exe run -role <角色> -exe … -config …` 拉起进程，
+>   目的是让子进程带 `CREATE_NO_WINDOW`，避免每次拉起都闪一个黑窗口。
+> - `mocenter-deploy.exe uninstall` 会一并删除这两个任务；`status` 会打印它们是否存在。
+
+### Linux：systemd timer 或 cron
+
+见「方式三」中的**保活自启**表：有 systemd 时注册 `watchdog.timer`，
+无 systemd 时写 `/etc/cron.d/mocenter-<角色>`，两者共用
+`scripts/deploy/mocenter-keepalive.sh`（幂等，进程在跑就直接退出）。
+
+### 与单实例保护的关系
+
+保活手段（计划任务 / cron / timer）都只按"进程名是否存在"判断，天然有竞态：
+极端情况下可能同时拉起两份。这里**不依赖脚本自身去重**，而是由程序内的单实例保护兜底
+（见下节）：后启动的一方拿不到锁，会打印持有者信息后**主动退出**，不会出现两个实例
+同时连服务端互相顶号。
+
+## 十二、版本号管理
 
 **Server 版本与 Agent 版本互相独立**，各自定义、各自发版，集中定义在：
 
@@ -690,7 +757,7 @@ Agent 在注册时把版本号写入 `AgentInfo.AgentVersion` 并落库，仪表
 Agent 侧的判定逻辑很简单：目标版本 == 自身版本则跳过（除非勾选强制），否则执行升级。
 因此这个字段只需要在**同一台机器的历史序列**里有意义，不需要跨端对齐。
 
-## 十二、单实例保护
+## 十三、单实例保护
 
 Agent 与 Server **同一份配置只允许一个实例**。跨平台实现不同，但对使用者是同一件事：
 
@@ -758,7 +825,7 @@ Agent 与 Server **同一份配置只允许一个实例**。跨平台实现不�
 用**不同的 `-config`** 即可。锁按"配置路径哈希 + 角色"区分，
 不同配置的实例互不干扰 —— 这也是调试时同机跑两个 Agent 的正规做法。
 
-## 十三、常见故障处理
+## 十四、常见故障处理
 
 | 现象 | 排查方法 |
 |------|----------|
@@ -812,6 +879,6 @@ systemctl restart mocenter-server
   或给 Agent 配 `-server-fingerprint <部署身份指纹>`（按指纹校验，服务端换 IP/换证书都不受影响）。
 - Agent 侧日志在识别到这类错误时会直接附上上述排查指引。
 
-## 十四、远程升级 Agent
+## 十五、远程升级 Agent
 
 服务端发布新版本 → Agent 检测到新版本 → 下载升级包 → 校验签名 → 停止旧进程 → 替换二进制 → 重启新进程 → 上报版本信息。支持差分升级、失败自动回滚、灰度升级（规划书 12.4）。

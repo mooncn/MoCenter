@@ -343,6 +343,15 @@ build_web() {
   fi
 
   [ -f web/dist/index.html ] || die "web/dist/index.html 不存在，前端构建未产出可用静态资源"
+
+  # 预压缩 .br/.gz：服务端（serveSPA）优先回传预压缩产物，
+  # 弱网/移动端首屏体积降到约 1/3 —— 这是移动端加载慢最直接的解法。
+  # 缺 brotli 时只生成 .gz，不影响可用性。
+  if bash scripts/deploy/precompress-web.sh web/dist >/dev/null 2>&1; then
+    ok "静态资源已预压缩（.gz/.br，服务端优先回传）"
+  else
+    warn "静态资源预压缩未完成（端口不影响功能，仅影响弱网加载速度）"
+  fi
   local dest
   for p in $PLATFORMS; do
     dest="$OUT/$p/web"

@@ -311,8 +311,10 @@ scripts\build-all.bat
 | `scripts/build-windows-installer.bat` | Windows | 编译图形安装程序（父级为 `build-all.bat --type=installer`） | `build\windows\installer\MoCenter-Setup-<版本>.exe` |
 | `scripts/lib/common.sh` | — | 脚本公共库（被两个入口加载） | — |
 | `scripts/deploy/mocenter-*.service` | — | systemd 单元模板（打包与安装共用） | — |
-| `scripts/deploy/install-linux.sh` | Linux | 注册/卸载/查询 systemd 服务（`--role=agent\|server\|all`） | — |
+| `scripts/deploy/install-linux.sh` | Linux | 安装/升级/卸载 Agent·Server（systemd 服务 + 保活定时器；无 systemd 时回退 cron） | — |
 | `scripts/deploy/install-windows.bat` | Windows | 注册/卸载 Windows 服务（免安装包内自带） | — |
+| `scripts/deploy/mocenter-keepalive.sh` | Linux | 保活巡检（systemd timer / cron 共用；进程不在则拉起） | — |
+| `scripts/deploy/precompress-web.sh` | Linux/macOS | 前端产物预压缩 `.br`/`.gz`（服务端优先回传，弱网/移动端首屏更快） | `web/dist/` |
 | `agent/build.sh` · `agent/build.bat` | 跨平台 | 单独构建 Agent（模块内调试用） | `agent/mocenter-agent[.exe]` |
 | `server/build.sh` · `server/build.bat` | 跨平台 | 单独构建 Server（模块内调试用） | `server/mocenter-server[.exe]` |
 | `web/build.sh` · `web/build.bat` | 跨平台 | 单独构建前端 | `web/dist/` |
@@ -475,15 +477,35 @@ scripts\deploy\install-windows.bat uninstall
 ```
 
 ```bash
-# Linux：注册 systemd 服务（需 root），Agent 与 Server 共用同一脚本
-sudo bash scripts/deploy/install-linux.sh --role=agent  --server=your.server.com:9000
-sudo bash scripts/deploy/install-linux.sh --role=server --user=admin --password='强口令'
+# Linux：安装/升级（需 root），Agent 与 Server 共用同一脚本
+sudo bash scripts/deploy/install-linux.sh --role=agent  --bin=./mocenter-agent --server=your.server.com:9000
+sudo bash scripts/deploy/install-linux.sh --role=server --bin=./mocenter-server --user=admin --password='强口令'
+
+# 升级：配置已存在即按升级处理，只换二进制与服务，**不动配置**
+sudo bash scripts/deploy/install-linux.sh upgrade --role=agent --bin=./mocenter-agent
+# 清理重装：删除既有配置后重新生成（配置损坏时用）
+sudo bash scripts/deploy/install-linux.sh install --role=agent --bin=./mocenter-agent --force
+
 sudo bash scripts/deploy/install-linux.sh --role=all status
-sudo bash scripts/deploy/install-linux.sh --role=all uninstall
+sudo bash scripts/deploy/install-linux.sh --role=all uninstall [--purge]
 ```
 
 `--bin=` 可直接指定二进制路径，`--bin-dir=` 指定目录后按 `mocenter-<role>[-<arch>]` 自动查找
-（默认也会找 `build/linux/binaries/<role>/linux/`）。`--force-config` 覆盖已有配置，`--purge` 连配置与数据一起删。
+（默认也会找 `build/linux/binaries/<role>/linux/`）。`--purge` 连配置与数据一起删，
+`--no-keepalive` 跳过保活任务，`--dry-run` 只打印将要执行的动作。
+
+**保活自启按环境自动选择**：
+
+| 环境 | 注册内容 |
+|------|----------|
+| 有 systemd | `mocenter-<角色>.service`（开机自启 + `Restart=always`）**并**额外注册 `mocenter-<角色>-watchdog.timer`（每 5 分钟巡检，进程不在就拉起） |
+| 无 systemd（容器等） | `/etc/cron.d/mocenter-<角色>`：`@reboot` 拉起 + 每 5 分钟巡检，共用 `/usr/local/bin/mocenter-keepalive` |
+| 两者都没有 | 明确告警，并提示改用容器编排的重启策略（`--restart=always` / `restartPolicy: Always`） |
+
+> 巡检脚本幂等（进程在跑就直接退出），并由程序自身的单实例保护兜底，
+> 极端竞态下重复拉起的一方会自行退出，不会出现两个实例同时服务。
+> **升级语义**：检测到配置文件已存在即视为「已安装」——只替换二进制、服务单元与保活任务，
+> 服务端地址/注册密钥/账号/数据目录原样保留；要推倒重来必须显式加 `--force`。
 
 > Windows 侧**推荐使用图形安装程序或 `mocenter-deploy.exe install`**（见下方「Windows 静默 / 脚本化安装」）：
 > 它们走 SCM 握手，服务状态可被 `sc query` / 服务管理器正确观察。
@@ -653,9 +675,13 @@ Agent TCP 通道要求每台 Agent 持有与服务端一致的**预共享密钥*
 - ✅ 离线机器列表、操作审计界面
 - ✅ **操作审计分页与分类**：命令执行 / 运维操作 / 登录认证三类留痕，服务端分页检索（类别、关键字、操作人、时间范围筛选）+ CSV 导出；审计日志按留存策略自动清理
 - ✅ **数据增长治理**：审计/探针等持续增长的数据统一采用服务端分页 + 降采样 + 留存清理，长时间跨度趋势图自动按桶聚合，避免全量返回拖垮浏览器与内存
-- ✅ **移动端自适应 UI**：响应式布局（侧边栏抽屉、表格卡片化、栅格表单），支持手机/平板操作
+- ✅ **移动端自适应 UI**：响应式布局（侧边栏抽屉、表格卡片化、栅格表单），支持手机/平板操作；仪表盘主机列表在窄屏保持**紧凑短卡片**（CPU/内存/磁盘并排，低频字段省略），趋势图**就地展开在该条记录下方**
+- ✅ **前端加载优化**：路由级代码分割（终端/远程桌面/延迟监测等按需加载）+ 依赖分包 + 服务端预压缩（`.br`/`.gz`）与哈希资源长缓存 —— 移动端弱网首屏体积约降至 1/3
+- ✅ **首页状态标记与浮动统计栏**：离线节点在卡片右上角标红（与在线绿点同位置）；顶部统计栏滚动吸附，最右侧为后台登录入口
 - ✅ 鉴权（Token）+ IP 白名单 + 速率限制
 - ✅ Agent 断线指数退避重连、进程守护崩溃自启
+- ✅ **保活自启（服务不可用环境的兜底）**：Windows 注册「开机自启 + 每 5 分钟巡检」计划任务；Linux 有 systemd 时注册服务 + `watchdog.timer`，无 systemd（容器等）时回退 `/etc/cron.d` 计划任务 —— 进程被结束也能自动回来
+- ✅ **一键升级语义**：安装脚本/安装引擎先探测配置文件是否存在，存在即按**升级**处理（只换二进制与服务、不动配置），要清理重装必须显式加 `--force` / `-force`
 - ✅ **零配置 TLS/mTLS**：服务端自动生成部署身份 CA 与证书，Agent 只需注册密钥即可换取客户端证书（mTLS）；Web 控制台默认 HTTPS/WSS + HSTS；也支持外部 CA 与公钥指纹校验
 - ✅ **Agent"简单模式"**：一个 `agent.key` 完成加密 + 双向认证，无需分发 ca.crt / client.crt / client.key
 - ✅ **服务端托管 Web 静态资源**：`-web web/dist` 单进程部署
@@ -835,9 +861,14 @@ sudo dnf install -y rpm-build file      # Fedora / RHEL / openSUSE
 | 二进制 | `%ProgramFiles%\MoCenter\` |
 | 配置与数据 | `%ProgramData%\MoCenter\<角色>\`（与二进制分离，升级/重装不覆盖） |
 | 服务 | `MoCenterAgent` / `MoCenterServer`，开机自启 + 失败自动重启 |
+| 保活计划任务 | `<角色>Boot`（开机/登录自启）+ `<角色>KeepAlive`（每 5 分钟巡检，进程不在就拉起）；卸载时一并删除 |
 | 日志 | `%ProgramData%\MoCenter\<角色>\logs\`（服务模式下 stdout 无去处，故落文件） |
 | 卸载 | 控制面板「应用和功能」；服务会停止并移除，**配置与数据默认保留** |
 
+> **升级语义**：向导不区分"全新安装/升级"，由引擎按"配置是否存在"自动判断 ——
+> 已装过的机器上重跑向导只会替换二进制与服务，配置、账号与数据原样保留；
+> 需要清理重装时用命令行引擎加 `-force`。
+>
 > 向导本身只负责**收集参数 + 摆放文件**；服务注册、配置落盘、单实例保护、日志重定向
 > 都交给随包安装的 `mocenter-deploy.exe`，两处不重复实现，也就不会出现"界面说的和实际做的"不一致。
 > 安装引擎的失败原因会写入安装目录下的 **`mocenter-deploy.log`**，安装失败时先看这个文件。
@@ -856,6 +887,13 @@ mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key 
 REM 总控机
 mocenter-deploy.exe install -role server -user admin -password <登录密码>
 
+REM 升级：配置已存在即按升级处理，只换二进制与服务，不动配置
+mocenter-deploy.exe upgrade -role agent
+REM 升级时无需重复提供 -server / -agent-key / -user / -password
+
+REM 清理重装：删除既有配置与数据后重来
+mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key <注册密钥> -force
+
 REM 查看状态（无需管理员）/ 卸载（默认保留配置与数据）
 mocenter-deploy.exe status -role all
 mocenter-deploy.exe uninstall -role all
@@ -863,6 +901,11 @@ mocenter-deploy.exe uninstall -role all
 
 > - 需以**管理员**身份运行（注册服务、写 Program Files 都需要）。
 > - 监听地址用 `-listen` / `-http`；TLS 等参数用 `-extra "-tls -ca-cert C:\ca.crt"` 透传。
+> - **升级不动配置**：检测到 `<数据目录>\<角色>\mocenter-<角色>.json` 已存在即按升级处理，
+>   账号/连接参数/数据库全部保留；要清理重装需显式加 `-force`。
+> - **保活兜底**：安装时额外注册两个计划任务（以 SYSTEM 运行）—— `<角色>Boot`（开机自启）
+>   与 `<角色>KeepAlive`（每 5 分钟巡检，进程不在就拉起）。服务能跑时它们是空转的安全网；
+>   服务不可用（容器、组策略禁服务）时就是唯一的自启与防杀通道。卸载会一并摘掉。
 > - **便携形态不受影响**：不安装时直接运行 `mocenter-agent.exe` 即可，配置落在 **exe 同目录**
 >   （基准是 exe 位置而非当前工作目录，所以服务、计划任务、双击运行都落在同一处）。
 > - **单实例保护**：同一份配置只允许一个实例（Windows 命名互斥体 / Linux·macOS `flock`），

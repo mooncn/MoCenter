@@ -152,6 +152,15 @@ export default function Dashboard({ agents }) {
 
   const online = (agents || []).filter((a) => a.online).length
   const offline = (agents || []).filter((a) => !a.online).length
+  // 资源占用均值只统计**在线**主机：离线主机的 CPU/内存是它们断线前最后一次上报的值，
+  // 混进平均值会长期污染统计（一台机器下线后其旧值会永远留在分母里）。
+  const onlineAgents = (agents || []).filter((a) => a.online)
+  const avgOf = (key) => {
+    if (onlineAgents.length === 0) return 0
+    return onlineAgents.reduce((s, a) => s + (a[key] || 0), 0) / onlineAgents.length
+  }
+  // 保留一位小数：否则 0.4% 会被四舍五入成 0%，看起来像"没数据"
+  const fmtPct = (v) => (v > 0 && v < 1 ? v.toFixed(1) : Math.round(v))
 
   // 排序结果做缓存：WebSocket 每 5 秒推一次新数组，但排序键不变时不重复排
   const sortedAgents = useMemo(() => sortAgents(agents, sortKey, sortDir), [agents, sortKey, sortDir])
@@ -185,12 +194,13 @@ export default function Dashboard({ agents }) {
 
   return (
     <div>
-      <div className="page-head">
-        <div>
+      {/* 顶部浮动统计栏：滚动时吸附在顶部，最右侧固定为后台登录入口 */}
+      <div className="stat-bar">
+        <div className="stat-bar-head">
           <h2>仪表盘</h2>
           <div className="sub">主机探针信息总览 · 在线 {online} / 离线 {offline} / 共 {agents.length}</div>
         </div>
-        <span className={`badge ${serverAlive === false ? 'offline' : serverAlive ? 'online' : ''}`} style={{ marginRight: 12 }}>
+        <span className={`badge ${serverAlive === false ? 'offline' : serverAlive ? 'online' : ''}`}>
           <span className={`dot ${serverAlive === false ? 'offline' : serverAlive ? 'online' : ''}`} />{' '}
           {serverAlive === null ? '服务端检测中…' : serverAlive ? '服务端在线' : '服务端离线'}
         </span>
@@ -200,6 +210,8 @@ export default function Dashboard({ agents }) {
           <option value="24h">最近 24 小时</option>
           <option value="7d">最近 7 天</option>
         </select>
+        {/* 登录后台：排在最右侧，移动端也能一眼看到 */}
+        <a className="btn-login" href="/login" title="登录后台">🔑 登录后台</a>
       </div>
 
       {/* 汇总指标 */}
@@ -217,12 +229,12 @@ export default function Dashboard({ agents }) {
           <div className="label">注册主机</div>
         </div>
         <div className="metric">
-          <div className="value">{(agents || []).length > 0 ? Math.round((agents || []).reduce((s, a) => s + a.cpu_usage, 0) / agents.length) : 0}%</div>
-          <div className="label">平均 CPU</div>
+          <div className="value">{fmtPct(avgOf('cpu_usage'))}%</div>
+          <div className="label">平均 CPU <span className="metric-note">（在线 {onlineAgents.length} 台）</span></div>
         </div>
         <div className="metric">
-          <div className="value">{(agents || []).length > 0 ? Math.round((agents || []).reduce((s, a) => s + a.mem_usage, 0) / agents.length) : 0}%</div>
-          <div className="label">平均内存</div>
+          <div className="value">{fmtPct(avgOf('mem_usage'))}%</div>
+          <div className="label">平均内存 <span className="metric-note">（在线 {onlineAgents.length} 台）</span></div>
         </div>
       </div>
 
@@ -263,8 +275,12 @@ export default function Dashboard({ agents }) {
             </tr>
           </thead>
           <tbody>
-            {sortedAgents.map((a) => (
-              <tr key={a.agent_id}>
+            {sortedAgents.map((a) => {
+              const trendOpen = selectedAgent === a.agent_id
+              return (
+              <React.Fragment key={a.agent_id}>
+              {/* 离线节点整行标红：红点位于卡片右上角（与在线绿点同一位置） */}
+              <tr className={a.online ? '' : 'row-offline'}>
                 <td data-label="主机">
                   <b>{a.remark || a.hostname}</b>
                   <div style={{ color: '#8b98a5', fontSize: 12 }}>
@@ -285,6 +301,7 @@ export default function Dashboard({ agents }) {
                   <span className={`badge ${a.online ? 'online' : 'offline'}`}>
                     {a.online ? '在线' : '离线'}
                   </span>
+                  <span className={`cell-dot ${a.online ? 'online' : 'offline'}`} aria-hidden="true" />
                 </td>
                 <td data-label="公网IP/位置">
                   <PublicIPCell agent={a} />
@@ -323,12 +340,28 @@ export default function Dashboard({ agents }) {
                 </td>
                 <td data-label="最后在线">{a.online ? fmtTime(a.last_seen) : `离线 ${fmtOffline(a)}`}</td>
                 <td data-label="趋势">
-                  <button className="secondary btn-sm" onClick={() => setSelectedAgent(selectedAgent === a.agent_id ? '' : a.agent_id)}>
-                    {selectedAgent === a.agent_id ? '收起' : '查看'}
+                  <button className="secondary btn-sm" onClick={() => setSelectedAgent(trendOpen ? '' : a.agent_id)}>
+                    {trendOpen ? '收起' : '查看'}
                   </button>
                 </td>
               </tr>
-            ))}
+              {/* 趋势图**紧跟该条记录下方**展开（原实现放在列表最底部，移动端要滚很久） */}
+              {trendOpen && (
+                <tr className="trend-row">
+                  <td colSpan="13" data-label="趋势图">
+                    <div className="trend-inline">
+                      <div className="trend-title">
+                        探针历史趋势 · {nameOf(a)}
+                        <span className="trend-tip">与上方「最近时段」筛选联动</span>
+                      </div>
+                      <TrendChart history={history || []} />
+                    </div>
+                  </td>
+                </tr>
+              )}
+              </React.Fragment>
+              )
+            })}
             {(agents || []).length === 0 && (
               <tr><td colSpan="13" className="table-empty">暂无主机接入</td></tr>
             )}
@@ -337,13 +370,6 @@ export default function Dashboard({ agents }) {
         </div>
       </div>
 
-      {/* 历史趋势图 */}
-      {selectedAgent && (
-        <div className="card" style={{ marginTop: 20 }}>
-          <h3>探针历史趋势 · {agents.find((a) => a.agent_id === selectedAgent)?.hostname}</h3>
-          <TrendChart history={history || []} />
-        </div>
-      )}
     </div>
   )
 }

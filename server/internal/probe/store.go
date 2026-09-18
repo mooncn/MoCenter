@@ -56,6 +56,11 @@ type Store struct {
 	remarkRenameFn func(oldID, newID string) error
 	// geoResolver 地理位置解析器
 	geoResolver *geo.Resolver
+	// geoNotify 地理位置**异步**解析完成后的回调（通常为「广播一次主机列表」）。
+	// 解析走外部网络且可达数秒，绝不能阻塞返回主机列表的调用方。
+	geoNotify func()
+	// wg 追踪后台任务（地理位置解析），便于测试等待收敛
+	wg sync.WaitGroup
 	// db SQLite 持久化（可选）
 	db *storage.DB
 }
@@ -168,6 +173,12 @@ func (s *Store) renameRemark(oldID, newID string) error {
 
 // SetGeoResolver 注入地理位置解析器。
 func (s *Store) SetGeoResolver(r *geo.Resolver) { s.geoResolver = r }
+
+// SetGeoNotify 注入地理位置异步解析完成后的回调（通常为「广播一次主机列表」）。
+func (s *Store) SetGeoNotify(fn func()) { s.geoNotify = fn }
+
+// WaitBackground 等待后台任务（地理位置解析）结束，仅供测试使用。
+func (s *Store) WaitBackground() { s.wg.Wait() }
 
 // resolveLocked 返回 agentID 对应的设备主键（调用方须持有锁）。
 // 未知 agentID 时回退为「把它当作 UUID 未知的新设备」的键，便于纯查询场景。
@@ -691,13 +702,25 @@ func (s *Store) All() []*protocol.AgentInfo {
 		if s.remarkFn != nil {
 			clone.Remark = s.remarkFn(clone.AgentID)
 		}
-		// 解析公网 IP 地理位置
+		// 公网 IP 地理位置：只读缓存，未命中时后台解析并回调补推。
+		//
+		// 注意这里**不能**同步查询：All() 每次探针推送（5–10 秒一次）都会走一遍，
+		// 外部地理接口慢时会把整条 WS 推送链路拖住数秒 —— 前端表现为首屏
+		// 长时间空白、偶尔才成功，移动端高版本浏览器上尤其明显。
 		ip := clone.PublicIP
 		if ip == "" {
 			ip = clone.PublicIPv6
 		}
 		if s.geoResolver != nil && ip != "" {
-			clone.Geo = s.geoResolver.Lookup(ip)
+			resolver, notify := s.geoResolver, s.geoNotify
+			clone.Geo = resolver.LookupCached(ip)
+			if clone.Geo == nil {
+				s.wg.Add(1)
+				go func() {
+					defer s.wg.Done()
+					resolver.LookupAsync(ip, notify)
+				}()
+			}
 		}
 		out = append(out, &clone)
 	}

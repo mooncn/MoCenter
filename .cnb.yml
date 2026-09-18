@@ -32,6 +32,8 @@ main:
           script: |
             echo "=== [web] npm install & build ==="
             cd web && npm install --no-audit --no-fund && npm run build
+            # 预压缩：服务端优先回传 .gz/.br，弱网/移动端首屏体积降到约 1/3
+            bash scripts/deploy/precompress-web.sh web/dist || true
             echo "web build done -> dist/"
     - name: package-linux
       docker:
@@ -51,7 +53,9 @@ main:
         - name: install
           script: cd web && npm ci --no-audit --no-fund || npm install --no-audit --no-fund
         - name: build
-          script: cd web && npm run build
+          script: |
+            cd web && npm run build
+            bash ../scripts/deploy/precompress-web.sh dist || true
         - name: lint
           script: cd web && echo "web build & assets generated"
 
@@ -116,4 +120,5 @@ $:
           image: node:20
           script: |
             cd web && npm install --no-audit --no-fund && npm run build
+            bash ../scripts/deploy/precompress-web.sh dist || true
             echo "web build OK"

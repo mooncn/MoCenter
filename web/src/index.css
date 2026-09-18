@@ -523,6 +523,94 @@ button.primary { background: var(--accent); }
   /* 不可排序列：连表头都不显示（点了没反应的按钮比没有按钮更让人困惑） */
   .table-stack.sortable-table thead th:not(.sortable) { display: none; }
 
+  /* ===== 仪表盘窄屏紧凑卡片 =====
+     `.blocky` 的单列堆叠每个字段独占一行，主机卡片会被拉得很长（一屏一台），
+     点「查看」都要滚半天。这里把仪表盘高频字段压成紧凑版：
+       · 主机名 + 状态/操作同一行；
+       · 系统/位置/最后在线各占一行且超长省略；
+       · CPU/内存/磁盘三项并排一行；
+       · 架构、网络明细、UUID 直接省略（信息价值低 / 已在别处展示）。
+     信息密度上来后，一屏能看到多台主机，也更容易点中目标。 */
+  .table-stack.blocky tr {
+    padding: 8px 12px; margin-bottom: 8px; position: relative;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px;
+  }
+  .table-stack.blocky tr td { padding: 3px 0; font-size: 12.5px; display: block; grid-column: 1 / -1; }
+  .table-stack.blocky tr td::before { display: none; }
+
+  .table-stack.blocky tr td[data-label="主机"] { grid-column: 1; padding: 0; }
+  .table-stack.blocky tr td[data-label="主机"] b { display: block; font-size: 13.5px; }
+  .table-stack.blocky tr td[data-label="主机"] > div { display: inline; margin: 0; font-size: 11.5px; }
+  .table-stack.blocky tr td[data-label="主机"] > div[title^="设备唯一 UUID"] { display: none; }
+  .table-stack.blocky tr td[data-label="主机"] > div:last-child { margin-left: 6px; }
+
+  .table-stack.blocky tr td[data-label="状态"] { grid-column: 2; padding: 0; text-align: right; }
+  .table-stack.blocky tr td[data-label="趋势"] { grid-column: 2; padding: 0; display: flex; justify-content: flex-end; }
+
+  /* 低频字段压成单行省略 */
+  .table-stack.blocky tr td[data-label="公网IP/位置"],
+  .table-stack.blocky tr td[data-label="系统"],
+  .table-stack.blocky tr td[data-label="最后在线"],
+  .table-stack.blocky tr td[data-label="版本"],
+  .table-stack.blocky tr td[data-label="延迟"] {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .table-stack.blocky tr td[data-label="公网IP/位置"] > div,
+  .table-stack.blocky tr td[data-label="系统"] > div { display: inline; width: auto; font-size: 11.5px; }
+  .table-stack.blocky tr td[data-label="系统"] > div + div::before { content: ' · '; color: var(--muted); }
+  .table-stack.blocky tr td[data-label="公网IP/位置"] > div { margin-right: 8px; }
+  /* 移动端省略：架构已随「系统」行展示；网络明细/延迟价值低于版面成本 */
+  .table-stack.blocky tr td[data-label="架构"],
+  .table-stack.blocky tr td[data-label="网络"],
+  .table-stack.blocky tr td[data-label="延迟"] { display: none; }
+
+  /* 资源占用一行三段并排 */
+  .table-stack.blocky tr td[data-label="CPU"],
+  .table-stack.blocky tr td[data-label="内存"],
+  .table-stack.blocky tr td[data-label="磁盘"] { padding: 4px 8px 0 0; }
+  .table-stack.blocky tr td[data-label="CPU"] { grid-column: 1 / 2; }
+  .table-stack.blocky tr td[data-label="内存"] { grid-column: 2 / 3; }
+  .table-stack.blocky tr td[data-label="磁盘"] { grid-column: 3 / 4; }
+  .table-stack.blocky tr td[data-label="CPU"]::before,
+  .table-stack.blocky tr td[data-label="内存"]::before,
+  .table-stack.blocky tr td[data-label="磁盘"]::before {
+    display: block; font-size: 10.5px; opacity: .8; margin: 0 0 2px;
+  }
+  .table-stack.blocky tr td[data-label="CPU"] > div:first-child,
+  .table-stack.blocky tr td[data-label="磁盘"] > div:first-child { display: none; }
+  .table-stack.blocky tr td[data-label="内存"] > div {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11.5px;
+  }
+  .table-stack.blocky tr td[data-label="CPU"] .bar,
+  .table-stack.blocky tr td[data-label="内存"] .bar,
+  .table-stack.blocky tr td[data-label="磁盘"] .bar { margin-top: 4px; height: 6px; max-width: none; }
+
+  /* 离线红点：卡片是 grid，absolute 会塌成 0 宽，改为常规流式紧贴状态徽章 */
+  .table-stack.blocky tr.row-offline td[data-label="状态"] {
+    display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+  }
+  .table-stack.blocky tr.row-offline td[data-label="状态"] .cell-dot {
+    position: static; display: inline-block; width: 10px; height: 10px;
+  }
+
+  /* 行内展开的折线图：作为卡片的一部分，紧贴主机卡片下方 */
+  .table-stack.blocky tr.trend-row {
+    display: block; margin-top: -8px;
+    border-top-left-radius: 0; border-top-right-radius: 0;
+    border-color: var(--accent);
+  }
+  .table-stack.blocky tr.trend-row > td { display: block; grid-column: 1 / -1; }
+  .trend-inline svg { max-height: 190px; }
+
+  /* 浮动统计栏：窄屏分两行，「登录后台」贴最右 */
+  .stat-bar {
+    margin: -12px -12px 12px; padding: 10px 12px;
+    border-radius: 0; border-left: none; border-right: none; gap: 8px;
+  }
+  .stat-bar-head { flex: 1 1 100%; }
+  .stat-bar > select { flex: 1 1 120px; width: auto; }
+  .btn-login { padding: 8px 12px; font-size: 13px; }
+
   .pagination { flex-direction: column; align-items: stretch; }
   .pagination-controls { justify-content: center; }
   .pagination-info { text-align: center; }
@@ -1015,4 +1103,64 @@ button.primary { background: var(--accent); }
 @media (max-width: 640px) {
   .kv th { width: 78px; font-size: 13px; }
   .cmd-box { white-space: normal; overflow-wrap: anywhere; }
+}
+
+
+/* ============================================================
+   顶部浮动统计栏（仪表盘）
+   滚动时吸附顶部：服务端状态、时段筛选与「登录后台」入口始终可见。
+   ============================================================ */
+.stat-bar {
+  position: sticky; top: 0; z-index: 26;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
+  margin: 0 0 18px; padding: 10px 14px;
+  background: rgba(26, 33, 41, .94); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  backdrop-filter: blur(8px);
+}
+.stat-bar-head { flex: 1 1 240px; min-width: 0; }
+.stat-bar-head h2 { font-size: 19px; }
+.stat-bar-head .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.stat-bar > select { width: 150px; flex: 0 0 auto; }
+
+/* 登录后台：始终排在最右侧 */
+.btn-login {
+  margin-left: auto; flex: 0 0 auto;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 14px; border-radius: 8px; font-size: 13.5px; font-weight: 600;
+  color: #fff; background: var(--accent); border: 1px solid var(--accent);
+  white-space: nowrap;
+}
+.btn-login:hover { opacity: .88; color: #fff; }
+
+/* 指标卡说明小字 */
+.metric-note { color: #6b7280; font-size: 11px; font-weight: 400; }
+
+/* ============================================================
+   离线节点标红（同级在线绿点位置）
+   ============================================================ */
+.cell-dot {
+  position: absolute; top: 10px; right: 10px;
+  width: 10px; height: 10px; border-radius: 50%;
+  display: none; /* 桌面端已有「状态」列，不重复标记 */
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, .25);
+}
+.cell-dot.offline { background: var(--red); }
+.cell-dot.online { background: var(--green); }
+tr.row-offline > td:last-child { position: relative; }
+tr.row-offline > td:last-child .cell-dot { display: inline-block; }
+
+/* 行内展开的趋势图（紧贴该条记录下方，不再跑到列表最底部） */
+.trend-row > td { background: var(--panel-2); padding: 12px 14px; }
+.trend-inline { width: 100%; }
+.trend-title {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+  font-size: 13px; font-weight: 600; margin-bottom: 8px;
+}
+.trend-tip { color: var(--muted); font-size: 11px; font-weight: 400; }
+
+/* 路由懒加载占位：弱网下给用户一个明确反馈，而不是空白 */
+.route-loading {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 40vh; color: var(--muted); font-size: 14px;
 }

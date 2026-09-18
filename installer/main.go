@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -27,27 +28,30 @@ import (
 
 // options 安装/卸载参数。
 type options struct {
-	role       string // agent | server | all
-	server     string // Agent 连接的服务端地址
-	agentID    string
-	agentUUID  string // 设备硬件 UUID（设备身份；留空由 Agent 自动探测并持久化）
-	proxyIP    string
-	agentKey   string // Agent 注册预共享密钥（与服务端 agent.key 相同）
-	adminUser  string // Server 的登录用户名
-	adminPass  string // Server 的登录密码
+	role          string // agent | server | all
+	server        string // Agent 连接的服务端地址
+	agentID       string
+	agentUUID     string // 设备硬件 UUID（设备身份；留空由 Agent 自动探测并持久化）
+	proxyIP       string
+	agentKey      string // Agent 注册预共享密钥（与服务端 agent.key 相同）
+	adminUser     string // Server 的登录用户名
+	adminPass     string // Server 的登录密码
 	adminPassFile string // Server 登录密码所在文件（优先于 adminPass）
-	listen     string // Server 的 Agent TCP 监听
-	httpAddr   string // Server 的 HTTP 监听
-	webDir     string // Server 托管的 Web 静态资源目录
-	installDir string // 二进制目录
-	dataRoot   string // 数据根目录
-	extra      string // 追加到服务命令行的额外参数
+	listen        string // Server 的 Agent TCP 监听
+	httpAddr      string // Server 的 HTTP 监听
+	webDir        string // Server 托管的 Web 静态资源目录
+	installDir    string // 二进制目录
+	dataRoot      string // 数据根目录
+	extra         string // 追加到服务命令行的额外参数
 	// serverFingerprint 服务端身份公钥指纹（免 CA 文件校验服务端；可选）。
 	serverFingerprint string
 	// serverName 部署身份名（写入服务端 CA，便于区分多套总控；可选）。
 	serverName string
-	purge      bool // 卸载时是否删除数据
-	keepBins   bool // 卸载时保留二进制（由外部安装器负责删除时用）
+	force      bool   // 安装/卸载时强制清理既有配置与数据后重来（默认升级模式，保留配置）
+	runExe     string // run 子命令：要拉起的可执行文件（默认按角色推导）
+	runConfig  string // run 子命令：目标进程的配置文件路径
+	purge      bool   // 卸载时是否删除数据
+	keepBins   bool   // 卸载时保留二进制（由外部安装器负责删除时用）
 }
 
 func main() {
@@ -71,6 +75,9 @@ func main() {
 	flag.StringVar(&o.extra, "extra", "", "追加到服务命令行的额外参数")
 	flag.StringVar(&o.serverFingerprint, "server-fingerprint", "", "服务端身份公钥指纹（可选；填了就不需要 CA 文件，也不受服务端换 IP/证书影响）")
 	flag.StringVar(&o.serverName, "server-name", "", "部署身份名（可选；写入服务端 CA，用于区分多套总控）")
+	flag.BoolVar(&o.force, "force", false, "安装/卸载时强制清理既有配置与数据后重装（默认升级模式：保留配置）")
+	flag.StringVar(&o.runExe, "exe", "", "run 子命令内部使用：要拉起的可执行文件路径")
+	flag.StringVar(&o.runConfig, "config", "", "run 子命令内部使用：目标进程的配置文件路径")
 	flag.BoolVar(&o.purge, "purge", false, "卸载时同时删除配置与数据（默认保留）")
 	flag.BoolVar(&o.keepBins, "keep-binaries", false, "卸载时保留二进制（由外层安装器负责删除时使用）")
 
@@ -101,12 +108,21 @@ func main() {
 
 	var err error
 	switch cmd {
-	case "install":
+	case "install", "upgrade":
+		// upgrade 与 install 同路径：是否为升级由"配置是否存在"决定
 		err = doInstall(o)
 	case "uninstall":
 		err = doUninstall(o)
 	case "status":
 		err = doStatus(o)
+	case "run":
+		// 内部动作：由计划任务（保活/开机自启）调用，拉起工作进程。
+		// 包一层是为了让子进程带 CREATE_NO_WINDOW —— schtasks /tr 直接起
+		// 控制台程序会在用户会话里闪出黑窗口。
+		err = doRun(o)
+	case "keepalive":
+		// 内部动作：保活巡检（进程不在则拉起）。
+		err = doKeepalive(o)
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -151,8 +167,24 @@ func usage() {
 
 用法:
   mocenter-deploy.exe install   [选项]    安装并注册为 Windows 服务（默认动作）
+  mocenter-deploy.exe upgrade   [选项]    升级：只替换二进制与服务，保留配置（等同 install）
   mocenter-deploy.exe uninstall [选项]    停止并删除服务
-  mocenter-deploy.exe status    [选项]    查看服务与路径状态
+  mocenter-deploy.exe status    [选项]    查看服务、保活任务与路径状态
+  mocenter-deploy.exe run       [选项]    内部动作：拉起工作进程（供计划任务调用，勿手工使用）
+  mocenter-deploy.exe keepalive [选项]    内部动作：巡检并拉起（供计划任务调用，勿手工使用）
+
+升级 semantics:
+  · 检测到 <数据目录>\<角色>\mocenter-<角色>.json 已存在时按**升级**处理：
+    只替换二进制与服务定义，账号/连接参数/数据库全部保留；
+  · 升级时无需重复提供 -server / -agent-key / -user / -password；
+  · 要清理重装（删除既有配置与数据）需显式加 -force。
+
+保活:
+  安装时会额外注册两个计划任务（以 SYSTEM 运行）：
+  · <角色>Boot       开机（不可用时改为登录）自启；
+  · <角色>KeepAlive  每 5 分钟巡检，进程不在就拉起。
+  服务能跑时它们是安全网；容器/禁用服务的环境里它们是唯一的自启与防杀通道。
+  卸载时会一并删除。
 
 示例:
   REM 在被控机上安装 Agent（-agent-key 取总控机 <data>\agent.key 的内容）
@@ -180,4 +212,63 @@ func usage() {
     图形安装器以隐藏窗口调用本程序，那里是唯一能看到真实原因的地方。
   - 便携形态不受影响：直接运行 mocenter-agent.exe 即可，配置落在 exe 同目录。
 `)
+}
+
+// doRun 内部动作：以隐藏窗口拉起工作进程（供计划任务「开机自启」调用）。
+//
+// 命令行为：mocenter-deploy.exe run -role <角色> -exe <路径> -config <配置路径>
+// 单独实现它的意义：schtasks 直接启动控制台程序会在用户会话里闪出黑窗口，
+// 经由本引擎创建 CREATE_NO_WINDOW 子进程即可完全隐藏。
+func doRun(o options) error {
+	role := strings.TrimSpace(o.role)
+	if role != "agent" && role != "server" {
+		return fmt.Errorf("run 需要 -role agent|server，实得 %q", o.role)
+	}
+	exe := strings.TrimSpace(o.runExe)
+	if exe == "" {
+		exe = filepath.Join(o.installDir, "mocenter-"+role+".exe")
+	}
+	args := []string{}
+	if conf := strings.TrimSpace(o.runConfig); conf != "" {
+		args = append(args, "-config", conf)
+	} else {
+		args = append(args, "-config", filepath.Join(o.dataRoot, role, "mocenter-"+role+".json"))
+	}
+	if role == "server" {
+		args = append(args, "-data", filepath.Join(o.dataRoot, role))
+	}
+	if s := strings.TrimSpace(o.extra); s != "" {
+		args = append(args, strings.Fields(s)...)
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.SysProcAttr = hiddenWindowAttr()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("拉起 %s 失败: %v（计划任务会按间隔重试）", exe, err)
+	}
+	fmt.Printf("已拉起 %s（pid=%d）\n", exe, cmd.Process.Pid)
+	// 立即返回：进程交由系统接管。若已有实例在跑，目标程序自身的单实例保护
+	// 会让新进程安静退出，不会出现两个实例并存。
+	return nil
+}
+
+// doKeepalive 内部动作：巡检并在必要时拉起（供计划任务每 5 分钟调用）。
+func doKeepalive(o options) error {
+	role := strings.TrimSpace(o.role)
+	if role != "agent" && role != "server" {
+		return fmt.Errorf("keepalive 需要 -role agent|server，实得 %q", o.role)
+	}
+	exe := strings.TrimSpace(o.runExe)
+	if exe == "" {
+		exe = filepath.Join(o.installDir, "mocenter-"+role+".exe")
+	}
+	conf := strings.TrimSpace(o.runConfig)
+	if conf == "" {
+		conf = filepath.Join(o.dataRoot, role, "mocenter-"+role+".json")
+	}
+	if err := runKeepAlive(role, exe, conf); err != nil {
+		// 巡检失败不算致命：下一个周期会重试，日志记录即可
+		fmt.Printf("巡检未完成: %v\n", err)
+		return nil
+	}
+	return nil
 }

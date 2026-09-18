@@ -12,6 +12,9 @@
 ;   - 向导只负责「收集参数 + 摆放文件」，真正的服务注册、配置落盘、
 ;     单实例与日志重定向仍由 mocenter-deploy.exe 完成，避免两套逻辑各写一遍。
 ;   - 因此本脚本里没有任何服务注册代码，只有界面与参数拼装。
+;   - 向导**不**做「全新安装 / 升级」的区分：引擎会按"配置是否存在"自动判断 ——
+;     已装过的机器上重跑向导只会替换二进制与服务，配置与账号原样保留。
+;     需要清理重装时用命令行引擎加 -force。
 ;
 ; 关于中文界面：
 ;   向导自定义页面（标题、说明、字段）全部是中文；框架按钮（下一步/安装等）
@@ -219,6 +222,20 @@ begin
 end;
 
 // NextButtonClick 在离开"必要项"页时校验必填项，避免装完才发现参数缺失。
+// InstalledRoleHasConfig 判断某角色是否已装过（配置存在）。
+// 已装过时向导不再强制填写连接参数 —— 引擎会按「升级」处理并保留原配置，
+// 硬性拦截只会让运维在升级时卡在"必须重新输入服务端地址"这一页。
+function InstalledRoleHasConfig(role: String): Boolean;
+var
+  base: String;
+begin
+  base := SafeVal(PageAdv.Values[0]);
+  if Pos('agent', role) > 0 then
+    Result := FileExists(base + '\agent\mocenter-agent.json')
+  else
+    Result := FileExists(base + '\server\mocenter-server.json');
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   role: String;
@@ -227,6 +244,12 @@ begin
   if CurPageID = PageBasic.ID then
   begin
     role := GetRoleStr('');
+    if InstalledRoleHasConfig(role) then
+    begin
+      // 升级路径：配置与账号都沿用既有的，无需重复填写
+      Result := True;
+      Exit;
+    end;
     if (Pos('agent', role) > 0) and (SafeVal(PageBasic.Values[0]) = '') then
     begin
       MsgBox('安装 Agent 必须填写服务端地址（host:port）。', mbError, MB_OK);

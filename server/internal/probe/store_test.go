@@ -2,9 +2,13 @@ package probe
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"mocenter/server/internal/geo"
 	"mocenter/server/internal/protocol"
 )
 
@@ -440,4 +444,85 @@ func TestProbeNetDeltaRejectsAbsurdCounterJump(t *testing.T) {
 	if !p2.NetDeltaKnown || p2.NetInDeltaBytes != 1000 {
 		t.Fatalf("正常增量应被采纳: known=%v delta=%d", p2.NetDeltaKnown, p2.NetInDeltaBytes)
 	}
+}
+
+// TestAllDoesNotBlockOnGeoLookup 回归：All() 每次探针推送（5–10 秒一次）都会
+// 被调用，绝不能被外部地理定位服务拖住。
+//
+// 早期实现是同步请求外部接口，首次上线的主机会让整条 WS 推送卡住数秒 ——
+// 前端表现为首屏长时间空白、偶尔才成功（移动端高版本浏览器上尤其明显）。
+func TestAllDoesNotBlockOnGeoLookup(t *testing.T) {
+	s := NewStore(nil)
+	// 指向必然连接失败的地址：若实现真去同步请求，本用例会明显变慢
+	r := geo.NewResolver()
+	r.SetTimeout(300 * time.Millisecond)
+	r.SetEndpoints("http://127.0.0.1:1/%s", "http://127.0.0.1:1/%s", "http://127.0.0.1:1/%s")
+	s.SetGeoResolver(r)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", Online: true, PublicIP: "8.8.4.4"})
+
+	done := make(chan struct{})
+	go func() {
+		s.All()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("All() 被地理定位解析阻塞：必须只读缓存 + 后台补齐")
+	}
+	s.WaitBackground()
+}
+
+// TestAllKicksOffAsyncGeoLookup 未命中缓存时应在后台补齐并回调通知
+// （前端据此收到"补推的那一帧"，地区/国旗才会显示出来）。
+func TestAllKicksOffAsyncGeoLookup(t *testing.T) {
+	s := NewStore(nil)
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = w.Write([]byte(`{"code":200,"data":{"country":"美国","as_country":"US","region":"加州","city":"洛杉矶"}}`))
+	}))
+	defer srv.Close()
+
+	r := geo.NewResolver()
+	r.SetEndpoints(srv.URL+"/%s", srv.URL+"/%s", srv.URL+"/%s")
+	s.SetGeoResolver(r)
+	notified := make(chan struct{}, 8)
+	s.SetGeoNotify(func() { notified <- struct{}{} })
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", Online: true, PublicIP: "8.8.4.4"})
+
+	// 首次：返回 nil（未缓存），但应触发后台解析
+	if got := s.All()[0].Geo; got != nil {
+		t.Fatalf("首次调用不应有地理位置（未缓存，且不得同步请求），实得 %+v", got)
+	}
+	select {
+	case <-notified:
+	case <-time.After(3 * time.Second):
+		t.Fatal("解析完成后必须回调，否则前端拿不到地区/国旗")
+	}
+	s.WaitBackground()
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("应只解析一次，实得 %d 次", n)
+	}
+	// 第二次：应直接读缓存
+	got := s.All()[0].Geo
+	if got == nil || got.CountryCode != "US" {
+		t.Fatalf("缓存生效后应返回地理位置，实得 %+v", got)
+	}
+	s.All()
+	time.Sleep(100 * time.Millisecond)
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("缓存命中后不应重复解析，实得 %d 次", n)
+	}
+}
+
+// TestAllSkipsGeoWhenNoResolver 未注入解析器时不应 panic（部署时可能只跑命令行）。
+func TestAllSkipsGeoWhenNoResolver(t *testing.T) {
+	s := NewStore(nil)
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", Online: true, PublicIP: "8.8.4.4"})
+	got := s.All()
+	if len(got) != 1 || got[0].Geo != nil {
+		t.Fatalf("无解析器时应返回主机但不带地理位置，实得 %+v", got)
+	}
+	s.WaitBackground()
 }

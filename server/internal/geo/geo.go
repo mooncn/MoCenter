@@ -135,6 +135,8 @@ const (
 type cacheEntry struct {
 	geo      *protocol.GeoInfo
 	expireAt time.Time
+	// loading 标记该 IP 正在后台解析（占位用），避免并发重复请求
+	loading bool
 }
 
 // NewResolver 创建解析器。
@@ -551,4 +553,81 @@ func stringsCountColon(s string) int {
 		}
 	}
 	return n
+}
+
+// LookupCached 只返回缓存中的地理位置，**绝不发起网络请求**。
+//
+// 存在的理由：All() / 公开状态页等"每次探针推送都会走一遍"的热路径不能
+// 同步等待外部接口（见 LookupAsync 注释）。
+func (r *Resolver) LookupCached(ip string) *protocol.GeoInfo {
+	ip = trimIP(ip)
+	if ip == "" {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.cache[ip]; ok && e.geo != nil && time.Now().Before(e.expireAt) {
+		return e.geo
+	}
+	return nil
+}
+
+// LookupAsync 异步解析地理位置：立即返回缓存结果（未命中返回 nil），
+// 后台完成解析后调用 notify。
+//
+// 为什么必须异步：外部地理接口单次耗时可达数秒。早期在 All() 里同步查询，
+// 意味着「首个主机列表推送」会被这个外部 HTTP 请求卡住 —— 前端表现为
+// 首屏长时间空白、偶尔才成功（移动端高版本浏览器上尤其明显）。改为
+// 「先返回缓存 + 后台补齐 + 回调补推一次列表」后，列表推送与外部服务解耦。
+func (r *Resolver) LookupAsync(ip string, notify func()) *protocol.GeoInfo {
+	ip = trimIP(ip)
+	if Private(ip) {
+		return nil
+	}
+	r.mu.Lock()
+	if e, ok := r.cache[ip]; ok && (time.Now().Before(e.expireAt) || e.loading) {
+		geo := e.geo
+		r.mu.Unlock()
+		return geo
+	}
+	// 占位并标记 in-flight：同一 IP 只发一次请求。
+	// 否则每个探针周期（默认 5–10 秒）都会重新打一次外部接口，很快就触发限流。
+	r.cache[ip] = &cacheEntry{geo: nil, expireAt: time.Now().Add(cacheFail), loading: true}
+	r.mu.Unlock()
+
+	go func() {
+		geo := r.fetch(ip)
+		r.mu.Lock()
+		if geo != nil {
+			r.cache[ip] = &cacheEntry{geo: geo, expireAt: time.Now().Add(cacheOK)}
+		} else {
+			if len(r.cache) >= maxFailCached {
+				r.pruneLocked()
+			}
+			r.cache[ip] = &cacheEntry{geo: nil, expireAt: time.Now().Add(cacheFail)}
+		}
+		r.mu.Unlock()
+		if notify != nil {
+			notify()
+		}
+	}()
+	return nil
+}
+
+// SetTimeout 设置单源请求超时（测试与嵌入方调优用）。
+func (r *Resolver) SetTimeout(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.timeout = d
+}
+
+// SetEndpoints 覆盖各源查询模板（含一个 %s 占位 IP）。
+// 生产部署不需要它（内置默认值即正式接口）；主要供测试注入 httptest 服务，
+// 以及私有化部署把解析指向自建服务。
+func (r *Resolver) SetEndpoints(iping, ipapi, ipwho string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ipingEndpoint = iping
+	r.ipapiEndpoint = ipapi
+	r.ipwhoEndpoint = ipwho
 }

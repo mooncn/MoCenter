@@ -508,6 +508,11 @@ func main() {
 
 	hub := ws.NewHub()
 
+	// 地理位置异步解析完成后补推一次主机列表。
+	// 解析走外部接口（可达数秒），因此列表推送先返回缓存、解析完成后自动补一帧，
+	// 而不是在推送路径上同步等待 —— 后者是首屏长时间空白的主因。
+	store.SetGeoNotify(func() { hub.Broadcast(protocol.TypeAgentList, store.All()) })
+
 	// --- 公开站点（免登录，Issue #5）---
 	// 注意：这些端点不经过 guard，一切数据都取自 publicview 的脱敏视图，
 	// agent_id / uuid / 内网地址永不出网。
@@ -2558,9 +2563,10 @@ func isLoopbackAddr(addr string) bool {
 // 都能直接喂进来，不必先教会用户"格式不对"。
 //
 // 另外做两个安全约束：
-//   · 文件不能是"人人可读"（含 group/other 读位）—— 口令文件可读意味着口令泄露，
-//     宁可启动失败也要让运维先修权限；
-//   · 空口令直接报错，落到 auth 层会变成一个"空密码可用"的坏账号。
+//
+//	· 文件不能是"人人可读"（含 group/other 读位）—— 口令文件可读意味着口令泄露，
+//	  宁可启动失败也要让运维先修权限；
+//	· 空口令直接报错，落到 auth 层会变成一个"空密码可用"的坏账号。
 func readPasswordFile(path string) (string, error) {
 	st, err := os.Stat(path)
 	if err != nil {
@@ -2612,26 +2618,160 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 }
 
 // serveSPA 托管 SPA 静态资源，并对非 API/WS 路径回退到 index.html。
+//
+// 移动端（尤其 Chrome 145+）加载慢的三个原因，这里都做了处理：
+//  1. **压缩传输**：优先回传构建期预压缩产物（.br/.gz，见
+//     scripts/deploy/precompress-web.sh）。主包压缩后 868KB -> 283KB(gzip)/约240KB(br)，
+//     弱网移动端的差别是数倍；缺失预压缩产物时按 Accept-Encoding 走标准协商。
+//  2. **缓存头**：带内容哈希的 /assets/* 直接 immutable 长缓存（不再回源校验），
+//     index.html 则 no-cache —— 否则每次导航都要发一次条件请求，手机端串行等待明显。
+//  3. **正确 MIME**：模块脚本必须是 JS MIME，类型不对浏览器会拒绝执行。
 func serveSPA(mux *http.ServeMux, webDir string) {
-	fs := http.FileServer(http.Dir(webDir))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// API 与 WS 已有独立路由，这里只处理静态资源
 		p := r.URL.Path
-		if p == "/" || strings.HasPrefix(p, "/api") || strings.HasPrefix(p, "/ws") {
-			if p != "/" && (strings.HasPrefix(p, "/api") || strings.HasPrefix(p, "/ws")) {
-				// 交由其他处理器
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-		}
-		// SPA 路由回退：若请求路径不是实际文件，返回 index.html
-		filePath := filepath.Join(webDir, filepath.Clean("/"+r.URL.Path))
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			http.ServeFile(w, r, filepath.Join(webDir, "index.html"))
+		// API 与 WS 有独立路由（ServeMux 精确匹配优先），到这里说明未命中，返回 404
+		if strings.HasPrefix(p, "/api") || strings.HasPrefix(p, "/ws") || strings.HasPrefix(p, "/vnc-ws") {
+			http.NotFound(w, r)
 			return
 		}
-		fs.ServeHTTP(w, r)
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// 根路径与目录都用应用外壳（SPA 由前端路由接管）
+		if p == "/" || p == "" {
+			serveIndexHTML(w, r, webDir)
+			return
+		}
+		rel := filepath.Clean("/" + p)
+		filePath := filepath.Join(webDir, rel)
+		// 目录穿越兜底：Clean 后仍越界一律 404（不回退 index.html，
+		// 否则 /../etc/passwd 之类的探测会拿到 200，掩盖真实意图）
+		root := filepath.Clean(webDir) + string(os.PathSeparator)
+		if !strings.HasPrefix(filePath, root) {
+			http.NotFound(w, r)
+			return
+		}
+		if fi, err := os.Stat(filePath); err == nil && !fi.IsDir() {
+			serveStaticFile(w, r, filePath, fi, false)
+			return
+		}
+		// SPA 路由回退：未知路径交给前端路由
+		serveIndexHTML(w, r, webDir)
 	})
+}
+
+// serveIndexHTML 返回应用外壳。入口文件不缓存，保证发版后立刻生效。
+func serveIndexHTML(w http.ResponseWriter, r *http.Request, webDir string) {
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	serveStaticFile(w, r, filepath.Join(webDir, "index.html"), nil, true)
+}
+
+// serveStaticFile 输出静态文件：压缩协商 + 缓存头。
+// entry=true 表示这是 SPA 入口（含任意路由回退），一律 no-cache。
+func serveStaticFile(w http.ResponseWriter, r *http.Request, path string, fi os.FileInfo, entry bool) {
+	if fi == nil {
+		st, err := os.Stat(path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		fi = st
+	}
+	// 带内容哈希的静态资源（vite 产物在 /assets/ 下）永久缓存
+	if !entry && (strings.HasPrefix(r.URL.Path, "/assets/") || hasContentHash(filepath.Base(path))) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	if ct := mimeByExt(filepath.Ext(path)); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	// 预压缩产物优先：省去每次请求的压缩开销，也避免弱网下反复传输大包
+	if enc := pickEncoding(r.Header.Get("Accept-Encoding")); enc.name != "" {
+		if cand := path + "." + enc.ext; fileExists(cand) {
+			w.Header().Set("Content-Encoding", enc.name)
+			w.Header().Set("Vary", "Accept-Encoding")
+			http.ServeFile(w, r, cand)
+			return
+		}
+	}
+	http.ServeFile(w, r, path)
+}
+
+type encoding struct {
+	name string // Content-Encoding 值
+	ext  string // 预压缩产物后缀
+}
+
+// pickEncoding 解析 Accept-Encoding，支持 br / gzip（br 优先，体积更小）。
+func pickEncoding(header string) encoding {
+	h := strings.ToLower(header)
+	if h == "" {
+		return encoding{}
+	}
+	if strings.Contains(h, "br") {
+		return encoding{name: "br", ext: "br"}
+	}
+	if strings.Contains(h, "gzip") {
+		return encoding{name: "gzip", ext: "gz"}
+	}
+	return encoding{}
+}
+
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir()
+}
+
+// hasContentHash 判断文件名是否带内容哈希（vite 产物形如 index-CY0gmwch.js）。
+// 误判会把可变文件永久缓存，因此要求哈希段是字母数字且长度合理。
+func hasContentHash(name string) bool {
+	base := strings.TrimSuffix(name, filepath.Ext(name))
+	i := strings.LastIndex(base, "-")
+	if i < 0 || i == len(base)-1 {
+		return false
+	}
+	h := base[i+1:]
+	if len(h) < 5 || len(h) > 24 {
+		return false
+	}
+	for _, c := range h {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+// mimeByExt 指定常见前端资源的 MIME。
+// .js 必须是 JS MIME，否则 module script 会被浏览器拒绝执行。
+func mimeByExt(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".js", ".mjs":
+		return "text/javascript; charset=utf-8"
+	case ".css":
+		return "text/css; charset=utf-8"
+	case ".html", ".htm":
+		return "text/html; charset=utf-8"
+	case ".json", ".map":
+		return "application/json; charset=utf-8"
+	case ".svg":
+		return "image/svg+xml"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	case ".ico":
+		return "image/x-icon"
+	case ".woff2":
+		return "font/woff2"
+	case ".woff":
+		return "font/woff"
+	default:
+		return ""
+	}
 }
 
 // handleWebMessage 处理 Web 前端通过 WebSocket 发来的消息。

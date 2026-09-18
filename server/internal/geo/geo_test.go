@@ -374,3 +374,124 @@ func TestFetchSkipsIpingForIPv6(t *testing.T) {
 		t.Fatalf("IPv4 应请求主源 1 次，实际 %d", n)
 	}
 }
+
+// ---------------------------------------------------------------- 异步解析
+//
+// 背景：All()（每次探针推送 / WS 广播都会调用）早期是**同步**查询外部地理接口，
+// 接口慢时会把整条推送链路拖住数秒，前端表现为首屏长时间空白、偶尔才成功。
+
+// TestLookupCachedNeverBlocks 只读缓存，绝不发起网络请求。
+func TestLookupCachedNeverBlocks(t *testing.T) {
+	r := NewResolver()
+	// 指向一个必然失败的地址：若实现真去请求，本用例会因超时而变慢/失败
+	r.ipingEndpoint = "http://127.0.0.1:1/%s"
+	r.ipapiEndpoint = "http://127.0.0.1:1/%s"
+	r.ipwhoEndpoint = "http://127.0.0.1:1/%s"
+
+	done := make(chan struct{})
+	go func() {
+		if g := r.LookupCached("8.8.4.4"); g != nil {
+			t.Errorf("未缓存的 IP 应返回 nil，实得 %+v", g)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("LookupCached 阻塞了：必须只读缓存，不得发起网络请求")
+	}
+
+	// 手工塞缓存后应能读到
+	r.mu.Lock()
+	r.cache["8.8.4.4"] = &cacheEntry{geo: &protocol.GeoInfo{CountryCode: "US"}, expireAt: time.Now().Add(time.Hour)}
+	r.mu.Unlock()
+	if g := r.LookupCached("8.8.4.4"); g == nil || g.CountryCode != "US" {
+		t.Fatalf("缓存命中应返回结果，实得 %+v", g)
+	}
+
+	// 内网地址不参与解析
+	if g := r.LookupCached("192.168.1.1"); g != nil {
+		t.Fatalf("私网地址不应有地理位置，实得 %+v", g)
+	}
+	if g := r.LookupAsync("192.168.1.1", nil); g != nil {
+		t.Fatalf("私网地址不应触发解析，实得 %+v", g)
+	}
+}
+
+// TestLookupAsyncDeduplicates 同一 IP 的并发解析只允许触发**一次** fetch。
+//
+// 一次 fetch 内部会按优先级依次尝试多个源（正常重试策略），因此不能按 HTTP
+// 请求数计数 —— 这里注入的桩直接统计 fetch 被调用的次数。
+//
+// 要拦的是"每次 All() 都新起一次 fetch"：那样每个探针周期（5–10 秒）
+// 都会重打外部接口，很快触发免费额度限流。
+func TestLookupAsyncDeduplicates(t *testing.T) {
+	r := NewResolver()
+	// 桩只实现"第一个源"（iping）能解析的响应，让它一次 fetch 内即命中，
+	// 这样 HTTP 请求数就等于 fetch 次数，断言直观。
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(80 * time.Millisecond) // 拉长在途窗口，确保并发调用都撞上占位
+		w.Header().Set("Content-Type", "application/json")
+		// api.iping.cc 的口径：code=200 且 data 里有国家/省/市才算命中
+		_, _ = w.Write([]byte(`{"code":200,"data":{"ip":"8.8.8.8","country":"美国","as_country":"US","region":"加州","city":"洛杉矶"}}`))
+	}))
+	defer srv.Close()
+	r.ipingEndpoint = srv.URL + "/%s"
+	r.ipapiEndpoint = srv.URL + "/%s"
+	r.ipwhoEndpoint = srv.URL + "/%s"
+
+	notified := make(chan struct{}, 8)
+	for i := 0; i < 5; i++ {
+		r.LookupAsync("8.8.8.8", func() { notified <- struct{}{} })
+	}
+	select {
+	case <-notified:
+	case <-time.After(3 * time.Second):
+		t.Fatal("解析完成后必须回调，否则前端拿不到地区/国旗")
+	}
+	time.Sleep(250 * time.Millisecond)
+	// 并发 5 次调用只应产生 1 次外部请求（其余命中 in-flight 占位）
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("同一 IP 并发解析应只请求一次，实得 %d 次（会快速打爆外部接口配额）", n)
+	}
+	if g := r.LookupCached("8.8.8.8"); g == nil || g.CountryCode != "US" {
+		t.Fatalf("解析结果应写入缓存，实得 %+v", g)
+	}
+
+	// 缓存命中后再次调用不应产生新请求
+	r.LookupAsync("8.8.8.8", nil)
+	time.Sleep(150 * time.Millisecond)
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("缓存命中后不应再请求外部接口，实得 %d 次", n)
+	}
+}
+
+// TestLookupAsyncCallsNotifyOnFailure 解析失败也必须回调 ——
+// 否则"占位"条目会一直挂着 loading，该 IP 的地理信息永远补不上。
+func TestLookupAsyncCallsNotifyOnFailure(t *testing.T) {
+	r := NewResolver()
+	r.ipingEndpoint = "http://127.0.0.1:1/%s"
+	r.ipapiEndpoint = "http://127.0.0.1:1/%s"
+	r.ipwhoEndpoint = "http://127.0.0.1:1/%s"
+	r.timeout = 200 * time.Millisecond
+
+	done := make(chan struct{}, 1)
+	r.LookupAsync("1.1.1.1", func() { done <- struct{}{} })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("解析失败同样要回调，否则前端永远等不到补推")
+	}
+	// 失败后不应残留 loading 标记（否则该 IP 再也不会被重试）
+	r.mu.Lock()
+	e := r.cache["1.1.1.1"]
+	r.mu.Unlock()
+	if e == nil {
+		t.Fatal("失败结果也应缓存（短 TTL），避免每次都重打外部接口")
+	}
+	if e.loading {
+		t.Fatal("解析结束后必须清掉 loading 标记")
+	}
+}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, Suspense, lazy } from 'react'
 import { Routes, Route, NavLink, Navigate, useLocation, Link } from 'react-router-dom'
 import Dashboard from './pages/Dashboard.jsx'
 import Terminal from './pages/Terminal.jsx'
@@ -115,23 +115,26 @@ function Layout() {
               {NAV_ITEMS.find((i) => (i.end ? location.pathname === i.to : location.pathname.startsWith(i.to)))?.label || 'MoCenter'}
             </span>
           </div>
-          <Routes>
-            <Route path="/" element={<Dashboard agents={agents} />} />
-            <Route path="/terminal" element={<Terminal agents={agents} />} />
-            <Route path="/vnc" element={<Vnc agents={agents} />} />
-            <Route path="/portmap" element={<PortMap agents={agents} />} />
-            <Route path="/ops" element={<Ops agents={agents} />} />
-            <Route path="/offline" element={<Offline agents={agents} />} />
-            <Route path="/audit" element={<Audit />} />
-            <Route path="/site-config" element={<SiteConfig />} />
-            <Route path="/latency" element={<Latency agents={agents} />} />
-            <Route path="/deploy" element={<Deploy />} />
-            <Route path="/enroll" element={<AgentEnroll />} />
-            <Route path="/backup" element={<Backup />} />
-            <Route path="/account" element={<Account />} />
-            {/* 兜底：未知后台路径回到仪表盘，而不是空白页 */}
-            <Route path="*" element={<Navigate to={ADMIN} replace />} />
-          </Routes>
+          {/* fallback 给懒加载期间一个明确反馈，避免弱网下"点了没反应" */}
+          <Suspense fallback={<div className="route-loading">正在加载页面…</div>}>
+            <Routes>
+              <Route path="/" element={<Dashboard agents={agents} />} />
+              <Route path="/terminal" element={<Terminal agents={agents} />} />
+              <Route path="/vnc" element={<Vnc agents={agents} />} />
+              <Route path="/portmap" element={<PortMap agents={agents} />} />
+              <Route path="/ops" element={<Ops agents={agents} />} />
+              <Route path="/offline" element={<Offline agents={agents} />} />
+              <Route path="/audit" element={<Audit />} />
+              <Route path="/site-config" element={<SiteConfig />} />
+              <Route path="/latency" element={<Latency agents={agents} />} />
+              <Route path="/deploy" element={<Deploy />} />
+              <Route path="/enroll" element={<AgentEnroll />} />
+              <Route path="/backup" element={<Backup />} />
+              <Route path="/account" element={<Account />} />
+              {/* 兜底：未知后台路径回到仪表盘，而不是空白页 */}
+              <Route path="*" element={<Navigate to={ADMIN} replace />} />
+            </Routes>
+          </Suspense>
         </div>
       </div>
     </SocketContext.Provider>
