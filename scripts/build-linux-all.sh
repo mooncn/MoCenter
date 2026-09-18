@@ -404,7 +404,10 @@ MoCenter Server 安装说明
 ========================
 
 1. 修改配置：/etc/mocenter/mocenter-server.conf
-   至少修改 MOCENTER_PASSWORD（默认 change-me 仅为占位）。
+   该文件**不含口令**：初始口令放在 /etc/mocenter/initial-password（0600，
+   首次创建账号后即可删除），服务单元通过 -password-file 引用它。
+   —— 刻意不用 -password：命令行参数会出现在 ps 与 systemctl show 里，
+   等于把后台口令对所有本机用户公开。
    所有可调参数（TLS、白名单、TOTP、Token 有效期等）见启动后自动生成的
    /etc/mocenter/mocenter-server.json。
 

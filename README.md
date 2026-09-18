@@ -171,7 +171,9 @@ docker run -d --name mocenter-server -p 9000:9000 -p 8080:8080 \
 
 ```bash
 cd server
-./mocenter-server -listen :9000 -http :8080 -user admin -password your-password
+# 口令走 0600 文件（推荐）：避免出现在 ps / systemctl show 里
+printf '%s' 'your-password' > /etc/mocenter/initial-password && chmod 600 /etc/mocenter/initial-password
+./mocenter-server -listen :9000 -http :8080 -user admin -password-file /etc/mocenter/initial-password
 # 可选: -whitelist 1.2.3.4,10.0.0.0/8   # IP 白名单
 # 可选: -web web/dist                  # 同时托管 Web 前端（单进程部署）
 # 可选: -require-agent-cert            # 强制 Agent 携带客户端证书（默认允许"先换取"）
@@ -526,12 +528,37 @@ go run . -agent <agent_id> -cmd "ipconfig" -server http://127.0.0.1:8088 -shell 
 也可在启动时直接指定：
 
 ```bash
-# 指定用户名 + 密码
+# 【推荐】口令放 0600 文件，只传文件路径
+printf '%s' 'your-password' > /etc/mocenter/initial-password
+chmod 600 /etc/mocenter/initial-password
+mocenter-server -user admin -password-file /etc/mocenter/initial-password
+
+# 也可直接在命令行传口令（**不推荐**，见下方说明）
 mocenter-server -user admin -password your-password
 
 # 再叠加 OTP：需提供 base32 密钥（兼容 Google Authenticator）
-mocenter-server -user admin -password your-password -totp-secret JBSWY3DPEHPK3PXP
+mocenter-server -user admin -password-file /etc/mocenter/initial-password -totp-secret JBSWY3DPEHPK3PXP
 ```
+
+> **为什么推荐 `-password-file` 而不是 `-password`**
+>
+> 命令行参数对**同机任意用户可见**：
+>
+> ```bash
+> ps -ef | grep mocenter-server        # 进程列表直接显示 -password <明文>
+> systemctl show mocenter-server -p ExecStart   # 服务单元里的参数一模一样（无需 root）
+> ```
+>
+> 也就是说，一旦口令走命令行，它就等同于写在 `/etc/systemd/system/mocenter-server.service`
+> 里公开摆着 —— 安装脚本也会把它带进 `ExecStart`，升级/排障时随手 `systemctl show` 就露了。
+> 走 `-password-file`（0600）后只有 root 能读到；账号建好后这个文件就可以删掉。
+>
+> 服务端对 `-password-file` 是 **fail-closed** 的：文件不存在、是目录、内容为空、
+> 或权限宽松到同组/其他用户可读，都会**拒绝启动并说明原因**，而不是静默回退到随机口令 ——
+> 后者会让运维以为在用文件里的口令，登录不上时才发现且极难定位。
+>
+> 已有账号时该文件被**完全忽略**（不读、不校验）：即使文件被删或权限变化也不会影响启动，
+> 更不会把用户在后台改过的口令重置回文件里的值。
 
 登录页只填 **用户名、密码**（若该账号绑定了 OTP，再填 6 位动态验证码）。
 

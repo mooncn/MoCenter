@@ -1,6 +1,143 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useMemo, useRef } from 'react'
 import { Api } from '../api/api.js'
 import Flag from '../components/Flag.jsx'
+
+// ============================================================
+// 排序（按列点击表头）
+// ============================================================
+//
+// 关键设计：**只有"稳定字段"参与排序**。
+// 主机列表每 5 秒被 WebSocket 整表替换一次，若按 CPU/内存/网速这类每帧都变的
+// 数值排序，行序会一轮一个样 —— 用户刚想点某个主机的"查看"，它已经被挤走了。
+// 因此：
+//   · 可排序列只包含在一次刷新内不会变的字段（名称/状态/系统/架构/位置/磁盘容量/版本/最后在线）；
+//   · 其他列点上去给出提示，而不是"点了没反应"；
+//   · 每种排序都以「名称」作为并列时的二级键，保证同值行顺序确定（不会因遍历顺序抖动）。
+const SORT_COLUMNS = {
+  host: 'name',
+  status: 'online',
+  geo: 'geo',
+  os: 'os',
+  arch: 'arch',
+  disk: 'disk',
+  version: 'version',
+  lastseen: 'lastseen',
+}
+
+// 动态列：点了会提示"不参与排序"，避免用户以为表头坏了
+const DYNAMIC_COLUMNS = new Set(['publicip', 'cpu', 'mem', 'network', 'latency'])
+
+// 显示名：备注优先，其次主机名，最后 agent_id
+function nameOf(a) {
+  return (a.remark || a.hostname || a.agent_id || '')
+}
+
+function lastSeenTs(a) {
+  // 在线的用 last_seen；离线的用"最后一次离线时间"，缺失时退回 last_seen
+  return Number(a.online ? a.last_seen : (a.last_offline_at || a.last_seen)) || 0
+}
+
+function geoOf(a) {
+  const g = a.geo
+  if (!g) return ''
+  return [g.country, g.region, g.city].filter(Boolean).join(' ')
+}
+
+// sortAgents 返回排好序的**新数组**（不改原数组：agents 来自上层 state，
+// 原地排序会让 React 看不出变化，也会影响其它正在读它的组件）。
+function sortAgents(list, key, dir) {
+  const arr = [...(list || [])]
+  const sign = dir === 'desc' ? -1 : 1
+  const byName = (a, b) => nameOf(a).localeCompare(nameOf(b), 'zh-Hans-CN', { numeric: true })
+  if (!key || key === 'default') {
+    // 默认：在线优先 + 名称。在线是这张表的第一信息，不应被排序方向打乱。
+    return arr.sort((a, b) => (a.online === b.online ? byName(a, b) : (a.online ? -1 : 1)))
+  }
+  const cmp = {
+    name: (a, b) => sign * byName(a, b),
+    online: (a, b) => (Number(b.online) || 0) - (Number(a.online) || 0) || sign * byName(a, b),
+    geo: (a, b) => sign * (geoOf(a).localeCompare(geoOf(b), 'zh-Hans-CN') || 0) || byName(a, b),
+    os: (a, b) => sign * (String(a.os_type || '').localeCompare(String(b.os_type || '')) || 0) || byName(a, b),
+    arch: (a, b) => sign * (String(a.arch || '').localeCompare(String(b.arch || '')) || 0) || byName(a, b),
+    // 磁盘按**容量**排（比按百分比有意义：一眼看出谁的盘小）
+    disk: (a, b) => sign * ((a.disk_total_bytes || 0) - (b.disk_total_bytes || 0)) || byName(a, b),
+    version: (a, b) => sign * (String(a.agent_version || '').localeCompare(String(b.agent_version || '')) || 0) || byName(a, b),
+    lastseen: (a, b) => sign * (lastSeenTs(a) - lastSeenTs(b)) || byName(a, b),
+  }
+  return arr.sort(cmp[key] || byName)
+}
+
+// useSort 三态排序：未排序 -> 升序 -> 降序 -> 回到默认。
+// 相比"升/降两态"，多出来的"取消排序"能让用户随时退回「在线优先」这个最实用的视图。
+function useSort() {
+  const [sortKey, setSortKey] = useState('default')
+  const [sortDir, setSortDir] = useState('asc')
+  const [hint, setHint] = useState('')
+  const hintTimer = useRef(null)
+
+  const click = (col) => {
+    if (DYNAMIC_COLUMNS.has(col)) {
+      showHint('该列每 5 秒都在变，排序会让行序不停跳动，因此不参与排序；请按「状态 / 主机 / 磁盘 / 最后在线」排序')
+      return
+    }
+    const key = SORT_COLUMNS[col]
+    if (!key) return
+    if (sortKey !== key) { setSortKey(key); setSortDir('asc'); return }
+    if (sortDir === 'asc') { setSortDir('desc'); return }
+    setSortKey('default'); setSortDir('asc')
+  }
+
+  function showHint(msg) {
+    setHint(msg)
+    if (hintTimer.current) clearTimeout(hintTimer.current)
+    // 3 秒后自动消失：它只是"为什么点不动"的解释，不是常驻提示
+    hintTimer.current = setTimeout(() => setHint(''), 3000)
+  }
+
+  return { sortKey, sortDir, click, hint }
+}
+
+// SortMark 表头排序标记：未排序 ↕ / 升序 ▲ / 降序 ▼
+function SortMark({ active, dir }) {
+  return <span className={`sort-mark ${active ? 'on' : ''}`}>{active ? (dir === 'asc' ? '▲' : '▼') : '↕'}</span>
+}
+
+// TH_LABELS：排序列 key -> 显示名（用于排序状态提示条）
+const TH_LABELS = {
+  name: '主机', online: '状态', geo: '地理位置', os: '系统', arch: '架构',
+  disk: '磁盘', version: '版本', lastseen: '最后在线',
+}
+// 反向索引：key -> 表头 col（"重置"按钮需要用它走回 clickSort 的三态逻辑）
+const SORT_KEYS_BY_KEY = Object.fromEntries(Object.entries(SORT_COLUMNS).map(([col, key]) => [key, col]))
+
+// Th 表头单元格。
+//
+// 移动端特殊处理：窄屏下表格会被 `.table-stack` 折叠成"一主机一卡片"，
+// 表头整行 `display:none` —— 排序入口会**彻底消失**。因此这里额外渲染一个
+// 只在小屏显示的排序按钮（`.th-mobile`），让手机上也能排序。
+function Th({ col, label, sortKey, dir, onClick }) {
+  const sortable = !!SORT_COLUMNS[col]
+  const active = sortable && sortKey === SORT_COLUMNS[col]
+  return (
+    <th
+      className={sortable ? 'sortable' : ''}
+      onClick={sortable ? () => onClick(col) : undefined}
+      title={sortable
+        ? '点击排序 / 再点切换升降序 / 第三次恢复默认（仅非动态字段）'
+        : '该列数值每 5 秒变化，不参与排序'}
+    >
+      <span className="th-label">{label}{sortable && <SortMark active={active} dir={dir} />}</span>
+      {sortable && (
+        <button
+          type="button"
+          className="th-mobile"
+          onClick={(e) => { e.stopPropagation(); onClick(col) }}
+          aria-label={`按${label}排序`}
+        >{label}{<SortMark active={active} dir={dir} />}</button>
+      )}
+    </th>
+  )
+}
 
 // 主机探针信息面板：展示各主机 CPU/内存/磁盘/流量等实时状态与历史趋势
 export default function Dashboard({ agents }) {
@@ -10,8 +147,14 @@ export default function Dashboard({ agents }) {
   // 服务端存活状态：null=检测中 true=在线 false=离线
   const [serverAlive, setServerAlive] = useState(null)
 
+  // 列排序：状态保存在本组件，数据每 5 秒刷新也不会重置用户的选择
+  const { sortKey, sortDir, click: clickSort, hint: sortHint } = useSort()
+
   const online = (agents || []).filter((a) => a.online).length
   const offline = (agents || []).filter((a) => !a.online).length
+
+  // 排序结果做缓存：WebSocket 每 5 秒推一次新数组，但排序键不变时不重复排
+  const sortedAgents = useMemo(() => sortAgents(agents, sortKey, sortDir), [agents, sortKey, sortDir])
 
   const sinceMap = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800 }
 
@@ -86,27 +229,41 @@ export default function Dashboard({ agents }) {
       {/* 主机列表 */}
       <div className="card">
         <h3>主机列表</h3>
+        {/* 排序提示条：点动态列时解释"为什么点不动"，3 秒后自动消失 */}
+        {sortHint ? <div className="notice" style={{ background: 'var(--panel-2)', color: 'var(--muted)' }}>{sortHint}</div> : null}
+        {sortKey !== 'default' && (
+          <div className="cell-sub" style={{ marginBottom: 8 }}>
+            已按「{TH_LABELS[sortKey] || sortKey}」{sortDir === 'asc' ? '升序' : '降序'}排列 ·
+            再点一次切换方向，第三次恢复默认（在线优先）
+            <button
+              className="btn-mini"
+              style={{ marginLeft: 8, fontSize: 11, padding: '2px 8px' }}
+              onClick={() => clickSort(SORT_KEYS_BY_KEY[sortKey])}
+              title="恢复默认排序（在线优先 + 名称）"
+            >重置</button>
+          </div>
+        )}
         <div className="table-scroll">
-        <table className="table-stack">
+        <table className="table-stack sortable-table blocky">
           <thead>
             <tr>
-              <th>主机</th>
-              <th>状态</th>
-              <th>公网 IP / 地理位置</th>
-              <th>系统</th>
-              <th>架构</th>
-              <th>CPU</th>
-              <th>内存</th>
-              <th>磁盘</th>
-              <th>网络(累计↓↑ / 速率↓↑)</th>
-              <th>延迟</th>
-              <th>版本</th>
-              <th>最后在线</th>
+              <Th col="host" label="主机" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="status" label="状态" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="geo" label="公网 IP / 地理位置" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="os" label="系统" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="arch" label="架构" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="cpu" label="CPU" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="mem" label="内存" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="disk" label="磁盘" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="network" label="网络(累计↓↑ / 速率↓↑)" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="latency" label="延迟" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="version" label="版本" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
+              <Th col="lastseen" label="最后在线" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
               <th>趋势</th>
             </tr>
           </thead>
           <tbody>
-            {(agents || []).map((a) => (
+            {sortedAgents.map((a) => (
               <tr key={a.agent_id}>
                 <td data-label="主机">
                   <b>{a.remark || a.hostname}</b>
@@ -172,8 +329,8 @@ export default function Dashboard({ agents }) {
                 </td>
               </tr>
             ))}
-            {agents.length === 0 && (
-              <tr><td colSpan="11" className="table-empty">暂无主机接入</td></tr>
+            {(agents || []).length === 0 && (
+              <tr><td colSpan="13" className="table-empty">暂无主机接入</td></tr>
             )}
           </tbody>
         </table>

@@ -21,7 +21,10 @@
 #   --server=host:port          Agent 要连接的服务端地址（默认 your.server.com:9000）
 #   --agentid=名称              Agent 标识（留空回退为设备 UUID/主机名）
 #   --proxy-ip=前缀             国内加速代理前缀（可选）
-#   --user= / --password=       Server 后台登录账号（密码默认 change-me，务必修改）
+#   --user= / --password=       Server 后台登录账号
+#                               ⚠️ 口令**不写入服务单元**：本脚本会把它落成 0600 的
+#                                  /etc/mocenter/initial-password，服务单元只引用该文件。
+#                                  未提供时自动生成 16 位随机强口令并打印一次。
 #   --listen= / --http=         Server 监听地址（默认 :9000 / :8080）
 #   --web-dir=路径              Server 托管的 Web 静态资源目录
 #   --force-config              覆盖已存在的配置文件（默认保留现场修改）
@@ -42,7 +45,9 @@ SERVER="${MOCENTER_SERVER:-your.server.com:9000}"
 AGENT_ID="${MOCENTER_AGENT_ID:-}"
 PROXY_IP="${MOCENTER_PROXY_IP:-}"
 S_USER="${MOCENTER_USER:-admin}"
-S_PASS="${MOCENTER_PASSWORD:-change-me}"
+# 默认**不再是 change-me**：固定默认口令写在脚本里等于公开口令，
+# "忘了改"就是一次现成的入侵路径。留空 = 安装时生成随机强口令。
+S_PASS="${MOCENTER_PASSWORD:-}"
 S_LISTEN="${MOCENTER_LISTEN:-:9000}"
 S_HTTP="${MOCENTER_HTTP:-:8080}"
 S_WEB_DIR="${MOCENTER_WEB_DIR:-/usr/share/mocenter/web}"
@@ -51,6 +56,8 @@ PURGE=0
 
 BIN_DIR_DEFAULT="/usr/local/bin"
 CONF_DIR="/etc/mocenter"
+# 初始口令文件：0600、仅 root 可读。服务启动时读取，创建完账号即可删除。
+PASS_FILE="$CONF_DIR/initial-password"
 DATA_DIR="/var/lib/mocenter/data"
 PKG_DIR="/var/lib/mocenter/packages"
 
@@ -143,12 +150,52 @@ render_conf() {
     sed -e "s|^MOCENTER_LISTEN=.*|MOCENTER_LISTEN=${S_LISTEN}|" \
         -e "s|^MOCENTER_HTTP=.*|MOCENTER_HTTP=${S_HTTP}|" \
         -e "s|^MOCENTER_USER=.*|MOCENTER_USER=${S_USER}|" \
-        -e "s|^MOCENTER_PASSWORD=.*|MOCENTER_PASSWORD=${S_PASS}|" \
+        -e "s|^MOCENTER_PASSWORD_FILE=.*|MOCENTER_PASSWORD_FILE=${PASS_FILE}|" \
         -e "s|^MOCENTER_WEB_DIR=.*|MOCENTER_WEB_DIR=${S_WEB_DIR}|" \
         "$TPL_DIR/mocenter-server.conf" > "$dest"
   fi
   chmod 0600 "$dest"
   info "  已生成配置：$dest"
+}
+
+# ---------------------------------------------------------------- 初始口令文件
+# 把口令落成 0600 的**文件**，而不是让服务单元通过 -password 传参。
+#
+# 原因：systemd 的 ExecStart 参数对任意本地用户可读
+#   · ps -ef | grep mocenter-server
+#   · systemctl show mocenter-server -p ExecStart
+# 于是"口令只告诉了我"这件事并不成立。文件方式下只有 root 能读。
+#
+# 生成策略：
+#   · 用户显式给了 --password：用它；
+#   · 没给：生成 16 位随机强口令（避免出现"两边都是默认口令"的部署），
+#     并在安装结束打印一次，提示登录后立即修改。
+#
+# 已存在**任何账号**时服务端会忽略该文件内容，所以重复安装不会把口令重置回去；
+# 但本脚本也不覆盖已存在的口令文件，避免把运维刚改好的口令顶掉。
+write_password_file() {
+  if [ -f "$PASS_FILE" ]; then
+    info "  保留现有口令文件：$PASS_FILE（如已登录过，该文件可安全删除）"
+    return 0
+  fi
+  local generated=0
+  if [ -z "$S_PASS" ]; then
+    # tr 只取字母数字，避免生成带 $/`/\ 的口令在后续脚本里被二次解析
+    S_PASS="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16 || true)"
+    [ -n "$S_PASS" ] || die "随机口令生成失败，请用 --password= 显式指定"
+    generated=1
+  fi
+  # umask 兜底：即使 install 的 -m 在某些文件系统上被忽略，也不会短暂变成可读文件
+  ( umask 077; printf '%s' "$S_PASS" > "$PASS_FILE" )
+  chmod 0600 "$PASS_FILE"
+  chown root:root "$PASS_FILE" 2>/dev/null || true
+  if [ "$generated" = 1 ]; then
+    printf '\n  >>> 已生成初始口令（仅本次显示）：%s\n' "$S_PASS"
+    printf '      写入：%s（0600）\n' "$PASS_FILE"
+  else
+    info "  已写入初始口令文件：$PASS_FILE（0600）"
+  fi
+  printf '      提示：登录后请立即在「账号设置」修改密码，随后删除该文件。\n'
 }
 
 # ---------------------------------------------------------------- 安装
@@ -160,10 +207,12 @@ do_install_role() {
   unit="$(unit_name "$role")"
   mkdir -p "$BIN_DIR_DEFAULT" "$CONF_DIR"
   [ "$role" = "server" ] && mkdir -p "$DATA_DIR" "$PKG_DIR" "$S_WEB_DIR"
+  chmod 0700 "$CONF_DIR" 2>/dev/null || true
 
   info "== 安装 $role =="
   install -m 0755 "$bin" "$BIN_DIR_DEFAULT/mocenter-${role}"
   ok "二进制 -> $BIN_DIR_DEFAULT/mocenter-${role}"
+  [ "$role" = "server" ] && write_password_file
   render_conf "$role" "$CONF_DIR/mocenter-${role}.conf"
 
   [ -f "$TPL_DIR/$unit" ] || die "缺少服务单元模板：$TPL_DIR/$unit"
@@ -194,7 +243,7 @@ do_uninstall_role() {
   rm -f "$BIN_DIR_DEFAULT/mocenter-${role}"
   ok "已移除二进制 $BIN_DIR_DEFAULT/mocenter-${role}"
   if [ "$PURGE" = 1 ]; then
-    rm -rf "$CONF_DIR/mocenter-${role}.conf" "$CONF_DIR/certs"
+    rm -rf "$CONF_DIR/mocenter-${role}.conf" "$CONF_DIR/certs" "$PASS_FILE"
     [ "$role" = "server" ] && rm -rf "$DATA_DIR" "$PKG_DIR"
     ok "已删除配置与数据（--purge）"
   else
@@ -224,6 +273,7 @@ if [ "$ACTION" = "install" ]; then
   ok "完成。"
   printf '   Agent : journalctl -u mocenter-agent -f\n'
   printf '   Server: journalctl -u mocenter-server -f\n'
-  [ "$S_PASS" = "change-me" ] && printf '   !! Server 默认口令仍为 change-me，请立即修改 /etc/mocenter/mocenter-server.conf\n'
+  printf '   口令文件: %s（0600，仅 root 可读；创建完账号后建议删除）\n' "$PASS_FILE"
+  printf '   !! 口令不会出现在服务单元里：如需查看执行参数请用 systemctl show -p ExecStart\n'
   exit 0
 fi

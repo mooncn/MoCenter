@@ -322,7 +322,12 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
 
 ## 五、安全配置
 
-1. **设置登录账号**：服务端启动时通过 `-user` / `-password` 指定后台账号，并在 Web「账号设置」里
+0. **口令不要写在命令行上**：`-password` 会出现在 `ps -ef` 与
+   `systemctl show -p ExecStart` 里（普通用户即可读），等于把口令贴在服务单元中。
+   改用 `-password-file <0600 文件>`（见「三、口令不会出现在服务单元里」）。
+   服务端内置的两条安装链路（`install-linux.sh` / `install-windows.bat`）已默认走文件方式，
+   图形安装程序也改为经临时文件传递。
+1. **设置登录账号**：服务端启动时通过 `-user` / `-password-file` 指定后台账号，并在 Web「账号设置」里
    绑定 OTP 二次校验。凭证只有一种：用户名 + 密码(+OTP)，**没有全局 API Key**。
 2. **IP 白名单**：通过 `-whitelist 1.2.3.4,10.0.0.0/8` 限制可访问服务端的源 IP。
 3. **TLS/mTLS —— 默认已开启，通常无需配置**：

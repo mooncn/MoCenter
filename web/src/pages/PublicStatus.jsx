@@ -252,10 +252,15 @@ function NodeCards({ nodes, visible }) {
   const memOn = visible('mem_usage')
   const diskOn = visible('disk_usage')
   const loadOn = visible('load')
+  // 这里用的是**字段开关**（后台展示配置）而不是"本次响应里有没有这个值"：
+  // 开关开着就固定渲染这几行，值缺了显示「—」。若按"有没有值"决定渲染，
+  // 主机离线/刚接入/探针抖动时卡片内容会整体抽掉，看起来就是"一会儿有一会儿没有"。
   return (
     <div className="public-cards">
       {nodes.map((n) => {
-        const hasMeta = osOn && (n.os_type || n.arch)
+        // 可见性只看字段开关：开关开着就渲染（值缺了显示「—」），
+        // 因此卡片高度与条目集合在两次刷新之间是稳定的。
+        const hasMeta = osOn || visible('geo')
         const hasBars = cpuOn || memOn || diskOn || loadOn
         return (
           <button
@@ -278,8 +283,8 @@ function NodeCards({ nodes, visible }) {
 
             {hasMeta && (
               <div className="public-card-meta">
-                <span className="tag-os">{osText(n)}</span>
-                {visible('geo') && geoText(n) && <span className="tag-geo">{geoText(n)}</span>}
+                <span className="tag-os">{osText(n) || '—'}</span>
+                {visible('geo') && <span className="tag-geo">{geoText(n) || '—'}</span>}
               </div>
             )}
 
@@ -298,9 +303,12 @@ function NodeCards({ nodes, visible }) {
   )
 }
 
-// 负载一行：Load1 为主，括号内带 5/15 分钟值；服务端未下发时显示「—」。
+// 负载一行：Load1 为主，括号内带 5/15 分钟值。
+//
+// 与 MiniBar 同理：开关开着就**一直显示这一行**（未采到显示「—」），
+// 不因为某个周期没取到值就把整行抽掉，避免卡片高度与内容闪烁。
 function LoadLine({ node }) {
-  const has = typeof node.load1 === 'number'
+  const has = typeof node.load1 === 'number' && Number.isFinite(node.load1)
   const busy = has && node.load1 >= 1
   return (
     <div className="public-mini public-load">
@@ -509,15 +517,26 @@ function osText(n) {
   return [n.os_type, n.arch].filter(Boolean).join(' · ')
 }
 
+// MiniBar 单条指标（CPU / RAM / 磁盘）。
+//
+// **0 也要照常展示**：条目的可见性只由后台「展示配置」的字段开关决定
+//（未开启的字段服务端根本不下发，value 为 undefined，此时整条不渲染）。
+// 只要字段开着，即使这一轮采到 0%（或服务端暂时没上报数值）也照样画出来 ——
+// 否则探针每 5 秒刷新一次、值在 0 与非 0 之间跳动时，进度条会"一会儿有一会儿没有"，
+// 页面看起来在闪，反而让人怀疑机器状态不稳。
+//
+// 唯一的例外是**服务端明确置空**（null）：那表示"这次确实没采到"，
+// 与"采到了 0"是两件事，显示成 0% 会凭空造出一个不存在的读数。
 function MiniBar({ label, value, sub }) {
   if (value === undefined || value === null) return null
-  const v = Math.max(0, Math.min(100, value))
+  const known = typeof value === 'number' && Number.isFinite(value)
+  const v = known ? Math.max(0, Math.min(100, value)) : 0
   const cls = v > 85 ? 'danger' : v > 60 ? 'warn' : ''
   return (
     <div className="public-mini">
       <div className="public-mini-row">
         <span className="k">{label}</span>
-        <span className="v">{v.toFixed(1)}%</span>
+        <span className="v">{known ? `${v.toFixed(1)}%` : '—'}</span>
       </div>
       <div className={`bar ${cls}`}><div style={{ width: `${v}%` }} /></div>
       {sub ? <div className="cell-sub">{sub}</div> : null}
@@ -658,11 +677,15 @@ export function PublicNode() {
 }
 
 // 节点公开字段明细（只渲染存在的字段：服务端未开启的字段根本不返回）
+//
+// 判断"有没有"用 undefined/null/空串，**不用 `value === 0`**：
+// 0% 的 CPU、0B 的流量、0 秒的运行时长都是真实读数，被当成"没有"会让这些行
+// 在刷新之间忽隐忽现（典型现象：负载 0 的机器"运行时长"一行一会儿有一会儿没有）。
 function NodeFacts({ node }) {
   const rows = useMemo(() => {
     const out = []
     const push = (label, value) => {
-      if (value === undefined || value === null || value === '' || value === 0) return
+      if (value === undefined || value === null || value === '') return
       out.push({ label, value })
     }
     push('节点编号', node.node_id)
@@ -684,9 +707,9 @@ function NodeFacts({ node }) {
       : '')
     push('下行速率', hasNet(node) ? fmtRate(node.net_rate_in) : '')
     push('上行速率', hasNet(node) ? fmtRate(node.net_rate_out) : '')
-    push('累计下行', node.net_total_in ? fmtBytes(node.net_total_in) : '')
-    push('累计上行', node.net_total_out ? fmtBytes(node.net_total_out) : '')
-    push('运行时长', node.uptime ? fmtDuration(node.uptime) : '')
+    push('累计下行', typeof node.net_total_in === 'number' ? fmtBytes(node.net_total_in) : '')
+    push('累计上行', typeof node.net_total_out === 'number' ? fmtBytes(node.net_total_out) : '')
+    push('运行时长', typeof node.uptime === 'number' ? fmtDuration(node.uptime) : '')
     push('最后在线', node.last_seen ? new Date(node.last_seen * 1000).toLocaleString() : '')
     return out
   }, [node])

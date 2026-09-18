@@ -29,6 +29,16 @@ type Config struct {
 	User       string `json:"user"`        // 登录用户名
 	Password   string `json:"password"`    // 登录密码（仅首次创建账号用，**不落盘**，恒为空）
 	TOTPSecret string `json:"totp_secret"` // TOTP 密钥（base32；**不落盘**，恒为空）
+	// AdminPasswordFile 初始口令文件路径（**推荐用法**）。
+	//
+	// 为什么不直接给 -password：命令行参数会出现在 `ps` 输出里，
+	// 也会被 systemd 写进 `systemctl show -p ExecStart`（任何本地用户都能读到）——
+	// 等于把后台口令贴在服务单元里。改为从 0600 的文件读，
+	// 只有 root（以及被显式授权者）能拿到口令。
+	//
+	// 仅在"本地还没有任何账号"时用于创建初始账号；已有账号时忽略（避免每次重启
+	// 把用户改过的口令重置回文件里的值）。文件读完即提示删除。
+	AdminPasswordFile string `json:"admin_password_file"`
 	// PkgDir 安装包托管目录（Agent 可经长连接直接拉取）；留空用 <data>/packages。
 	PkgDir string `json:"pkg_dir"`
 	// AgentKey Agent 注册预共享密钥；留空则自动生成并写到 <data>/agent.key。

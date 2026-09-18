@@ -34,6 +34,7 @@ type options struct {
 	agentKey   string // Agent 注册预共享密钥（与服务端 agent.key 相同）
 	adminUser  string // Server 的登录用户名
 	adminPass  string // Server 的登录密码
+	adminPassFile string // Server 登录密码所在文件（优先于 adminPass）
 	listen     string // Server 的 Agent TCP 监听
 	httpAddr   string // Server 的 HTTP 监听
 	webDir     string // Server 托管的 Web 静态资源目录
@@ -60,6 +61,7 @@ func main() {
 	flag.StringVar(&o.agentKey, "agent-key", "", "Agent 注册预共享密钥（取服务端 <data>\\agent.key 的内容；role 含 agent 时必填）")
 	flag.StringVar(&o.adminUser, "user", "", "Server 的登录用户名（role 含 server 时必填）")
 	flag.StringVar(&o.adminPass, "password", "", "Server 的登录密码（role 含 server 时必填）")
+	flag.StringVar(&o.adminPassFile, "password-file", "", "从文件读取 Server 登录密码（优先于 -password；图形安装程序走这条路径，避免口令出现在命令行里）")
 	flag.StringVar(&o.listen, "listen", ":9000", "Server 的 Agent TCP 监听地址")
 	flag.StringVar(&o.httpAddr, "http", ":8080", "Server 的 REST/WebSocket 监听地址")
 	flag.StringVar(&o.webDir, "web", "", "Server 托管的 Web 静态资源目录（留空则不托管前端）")
@@ -156,10 +158,11 @@ func usage() {
   mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key <注册密钥>
 
   REM 在总控机上安装 Server
-  mocenter-deploy.exe install -role server -user admin -password <登录密码>
+  mocenter-deploy.exe install -role server -user admin -password-file <0600 口令文件>   # 推荐
+  mocenter-deploy.exe install -role server -user admin -password <登录密码>            # 不推荐：口令会出现在命令行里
 
   REM 一台机器同时装两者
-  mocenter-deploy.exe install -role all -server 127.0.0.1:9000 -user admin -password <登录密码>
+  mocenter-deploy.exe install -role all -server 127.0.0.1:9000 -user admin -password-file <0600 口令文件>
 
   REM 卸载（保留配置与数据）
   mocenter-deploy.exe uninstall -role all

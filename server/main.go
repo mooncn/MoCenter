@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -77,7 +78,8 @@ func main() {
 	dataDir := flag.String("data", defaultDataDir, "数据目录（审计日志持久化等）")
 	pkgDir := flag.String("pkg-dir", "", "安装包托管目录（Agent 可经长连接直接拉取，避免公网下载）；留空则用 <data>/packages")
 	user := flag.String("user", "", "登录用户名（设置后启用用户名+密码登录）")
-	password := flag.String("password", "", "登录密码")
+	password := flag.String("password", "", "登录密码（**不推荐**：会出现在 ps 与 systemctl show 里，建议改用 -password-file）")
+	passwordFile := flag.String("password-file", os.Getenv("MOCENTER_PASSWORD_FILE"), "初始口令文件路径（权限应 0600）。仅用于首次创建账号，优先于 -password")
 	totpSecret := flag.String("totp-secret", "", "TOTP 密钥（base32，设置后登录需提供一次性验证码，兼容 Google Authenticator）")
 	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
 	agentKey := flag.String("agent-key", os.Getenv("MOCENTER_AGENT_KEY"), "Agent 注册预共享密钥（留空则自动生成并写到 <data>/agent.key）")
@@ -109,8 +111,9 @@ func main() {
 			DataDir:   *dataDir,
 			User:      *user,
 			// 不落盘明文密码与 TOTP 密钥：账号以哈希持久化到 users.json
-			Password:         "",
-			TOTPSecret:       "",
+			Password:          "",
+			TOTPSecret:        "",
+			AdminPasswordFile: *passwordFile,
 			PkgDir:           *pkgDir,
 			AgentKey:         *agentKey,
 			ProxyIP:          *proxyIP,
@@ -161,6 +164,11 @@ func main() {
 		}
 		if cfg.Password != "" && *password == "" {
 			*password = cfg.Password
+		}
+		// 口令文件路径同样从配置文件回填：服务模式（systemd）不带命令行参数，
+		// 配置文件是它唯一的来源；不回填就表现为"配置里写了却不生效"。
+		if cfg.AdminPasswordFile != "" && *passwordFile == os.Getenv("MOCENTER_PASSWORD_FILE") {
+			*passwordFile = cfg.AdminPasswordFile
 		}
 		if cfg.TOTPSecret != "" && *totpSecret == "" {
 			*totpSecret = cfg.TOTPSecret
@@ -227,6 +235,7 @@ func main() {
 			"insecure":           func() { cfg.Insecure = *insecure },
 			"data":               func() { cfg.DataDir = *dataDir },
 			"user":               func() { cfg.User = *user },
+			"password-file":      func() { cfg.AdminPasswordFile = *passwordFile },
 			"pkg-dir":            func() { cfg.PkgDir = *pkgDir },
 			"agent-key":          func() { cfg.AgentKey = *agentKey },
 			"proxy-ip":           func() { cfg.ProxyIP = *proxyIP },
@@ -237,7 +246,7 @@ func main() {
 			"server-name":        func() { cfg.ServerName = *serverName },
 		}
 		dirty := false
-		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl", "require-agent-cert", "admin-tls-days", "server-name"} {
+		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "password-file", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl", "require-agent-cert", "admin-tls-days", "server-name"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -392,6 +401,41 @@ func main() {
 	authz.SetTokenTTL(*tokenTTL)
 	loginGuard := auth.NewLoginGuard()
 	userMgr := auth.NewUserManager(filepath.Join(*dataDir, "users.json"))
+
+	// 初始口令的来源优先级：口令文件 > -password。
+	//
+	// 口令文件是**推荐**路径：命令行参数会被 `ps` 与 `systemctl show -p ExecStart`
+	// 暴露给任意本地用户，等于把后台口令写进服务单元。这里只做"读一次"：
+	// 账号一旦存在，文件内容不再被使用（见下方 HasUsers 判断），
+	// 因此用户改过口令后重启服务不会被文件里的旧值覆盖回去。
+	//
+	// fail-closed：文件存在但读不动/解析失败时**不静默回退**到 -password 或随机口令，
+	// 而是明确报错并退出 —— 否则运维以为在用文件里的口令，实际用的是别的，
+	// 只会在"登录不上"时才发现，且极难定位。
+	// Load 必须先于下面所有 HasUsers 判断：账号是从 users.json 读进来的，
+	// 不先 Load 的话 HasUsers() 永远返回 false，于是每次重启都会走"首次创建"分支
+	// —— 结果是启动时读口令文件（文件已删/权限变化就启动失败），
+	// 而且看起来像"账号没被记住"。
+	if err := userMgr.Load(); err != nil {
+		log.Fatalf("加载账号文件 %s 失败: %v", filepath.Join(*dataDir, "users.json"), err)
+	}
+
+	if pf := strings.TrimSpace(*passwordFile); pf != "" {
+		if userMgr.HasUsers() {
+			// 已有账号：**不读、也不校验**口令文件。读取会因权限/内容问题
+			// 在"其实用不到它"的机器上导致启动失败；而即使读到也不会生效 ——
+			// 账号以 users.json 里的哈希为准，这里只提示可以删掉这个文件了。
+			log.Printf("已存在账号，忽略初始口令文件 %s（该文件仅在首次创建账号时使用，可安全删除）", pf)
+		} else {
+			pw, ferr := readPasswordFile(pf)
+			if ferr != nil {
+				log.Fatalf("读取初始口令文件 %s 失败: %v（该文件应为仅 root 可读的 0600 文件）", pf, ferr)
+			}
+			*password = pw
+			log.Printf("已从口令文件 %s 读取初始口令（仅本次创建账号使用，登录后请立即修改并删除该文件）", pf)
+		}
+	}
+
 	if err := userMgr.InitFromFlags(*user, *password, *totpSecret); err != nil {
 		if errors.Is(err, auth.ErrInitPasswordRequired) {
 			// 提供了 -user 但缺少 -password：给出明确提示，避免静默生成空密码坏账号
@@ -2495,6 +2539,65 @@ func isLoopbackAddr(addr string) bool {
 	}
 	ip := net.ParseIP(strings.Trim(host, "[]"))
 	return ip != nil && ip.IsLoopback()
+}
+
+// readPasswordFile 读取初始口令文件。
+//
+// 兼容两种写法，都是运维顺手就会写出来的形式：
+//
+//	纯口令一行           -> 直接用它
+//	KEY=VALUE 形式       -> 取 MOCENTER_PASSWORD / PASSWORD / ADMIN_PASSWORD / 任意 *_PASSWORD 的值
+//
+// 这样 `install-linux.sh` 生成的文件、以及手工 `echo 'MOCENTER_PASSWORD=x' > f`
+// 都能直接喂进来，不必先教会用户"格式不对"。
+//
+// 另外做两个安全约束：
+//   · 文件不能是"人人可读"（含 group/other 读位）—— 口令文件可读意味着口令泄露，
+//     宁可启动失败也要让运维先修权限；
+//   · 空口令直接报错，落到 auth 层会变成一个"空密码可用"的坏账号。
+func readPasswordFile(path string) (string, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("%s 是目录，不是文件", path)
+	}
+	// Windows 上 Mode() 的权限位语义与 Unix 不同（永远带 0666 左右的位），
+	// 因此只在类 Unix 平台做这个检查。
+	if runtime.GOOS != "windows" {
+		if perm := st.Mode().Perm(); perm&0077 != 0 {
+			return "", fmt.Errorf("%s 的权限为 %04o，同组/其他用户可读；请改为 0600（chmod 600 %s）", path, perm, path)
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	pw := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if eq := strings.IndexByte(line, '='); eq > 0 {
+			key := strings.ToUpper(strings.TrimSpace(line[:eq]))
+			val := strings.TrimSpace(line[eq+1:])
+			val = strings.Trim(val, `"'`)
+			// 只认"像口令"的键名，避免把 USER=admin 这类行误当口令
+			if key == "PASSWORD" || key == "MOCENTER_PASSWORD" || key == "ADMIN_PASSWORD" || strings.HasSuffix(key, "_PASSWORD") {
+				pw = val
+				break
+			}
+			continue
+		}
+		pw = strings.Trim(line, `"'`)
+		break
+	}
+	if strings.TrimSpace(pw) == "" {
+		return "", fmt.Errorf("%s 中未找到有效口令（空文件？）", path)
+	}
+	return pw, nil
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

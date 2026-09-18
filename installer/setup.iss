@@ -108,6 +108,36 @@ begin
   Result := r;
 end;
 
+// PasswordPath 口令文件路径。安装引擎读完即删，因此全程只在 ssPostInstall 期间存在。
+var
+  PasswordPath: String;
+
+// WritePasswordFile 把 Server 口令写入仅管理员可读的临时文件，返回其路径。
+//
+// 为什么不用命令行传口令：安装向导进程的命令行在安装期间可被同机其他用户读到
+// （`wmic process get commandline`、任务管理器"命令行"列），
+// 而服务本身的 binPath 我们是不放口令的 —— 若这里用命令行传，等于把前面的防护绕过去了。
+//
+// 写失败时**不降级**为命令行传参：那正好是我们要避免的那条路。
+// 宁可让安装停下并提示原因。
+function WritePasswordFile(const Password: String): String;
+var
+  p: String;
+begin
+  Result := '';
+  if Password = '' then
+    Exit;
+  p := ExpandConstant('{tmp}\mc-admin-pw');
+  if not SaveStringToFile(p, Password, False) then
+  begin
+    MsgBox('无法写入临时口令文件：' + p + #13#10#13#10 +
+           '请不要用 -password 之类的命令行方式绕过（那会让口令对同机其他用户可见）。',
+           mbCriticalError, MB_OK);
+    Abort;
+  end;
+  Result := p;
+end;
+
 // BuildInstallParams 把向导收集的参数拼成 mocenter-deploy.exe 的命令行。
 function BuildInstallParams(Param: String): String;
 var
@@ -127,7 +157,12 @@ begin
   if Pos('server', role) > 0 then
   begin
     s := s + ' -user "' + SafeVal(PageBasic.Values[1]) + '"';
-    s := s + ' -password "' + SafeVal(PageBasic.Values[2]) + '"';
+    // 口令**不拼进命令行**，改由口令文件传递（见 WritePasswordFile）。
+    // 命令行在安装进行的那几秒里对其他本地进程可见
+    // （wmic process get commandline / 任务管理器"命令行"列），
+    // 等于把后台口令广播出去；写成仅管理员可读的文件则没有这个窗口。
+    if PasswordPath <> '' then
+      s := s + ' -password-file "' + PasswordPath + '"';
     s := s + ' -listen "' + SafeVal(PageAdv.Values[1]) + '"';
     s := s + ' -http "' + SafeVal(PageAdv.Values[2]) + '"';
     if DirExists(ExpandConstant('{app}\web')) then
@@ -231,6 +266,9 @@ begin
   if CurStep = ssPostInstall then
   begin
     WizardForm.StatusLabel.Caption := '正在注册系统服务并启动...';
+    // 口令先落文件（仅本次安装有效；安装引擎读完会立即删除）
+    if Pos('server', GetRoleStr('')) > 0 then
+      PasswordPath := WritePasswordFile(SafeVal(PageBasic.Values[2]));
     if not Exec(ExpandConstant('{app}\mocenter-deploy.exe'), BuildInstallParams(''),
                 ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, rc) then
     begin

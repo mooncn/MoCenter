@@ -14,17 +14,31 @@
   --yellow: #eab308;
 }
 
+/* 根级底色的三重保险（对应「移动端 Chrome 145+ 黑屏」）：
+   1. html 也要铺底色 —— 只给 body 铺时，一旦出现"实际文档高度 < 视口高度"
+      （地址栏收缩、软键盘收起、动态视口重算的瞬间），浏览器会用 html 的底色
+      填充视口，缺省是**白色**，表现为整屏闪白/黑；
+   2. `background-attachment: fixed` 让底色始终铺满视口，不随文档高度变化；
+   3. 高度用 dvh（动态视口）而不是 vh —— 移动端地址栏收起时 vh 不变，
+      dvh 才等于"当前真正可见的高度"。老浏览器不认 dvh 时退回 vh。
+   这三条都是"让底色永远覆盖整个视口"，不改变任何布局尺寸。 */
+html {
+  background-color: var(--bg);
+  color-scheme: dark;
+}
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  background: var(--bg);
+  background-color: var(--bg);
+  background-attachment: fixed;
   color: var(--text);
   min-height: 100vh;
+  min-height: 100dvh;
 }
 
 a { color: var(--accent); text-decoration: none; }
 
 /* 布局 */
-.layout { display: flex; min-height: 100vh; }
+.layout { display: flex; min-height: 100vh; min-height: 100dvh; }
 .sidebar {
   width: 220px; background: var(--panel);
   border-right: 1px solid var(--border); padding: 16px 0;
@@ -57,7 +71,16 @@ th { color: var(--muted); font-weight: 600; font-size: 13px; }
 tr:hover td { background: var(--panel-2); }
 
 /* 徽章/状态 */
-.badge { padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+/* 徽章/短标签**一律不换行**。
+   中文默认按字断行，"在线" 两个汉字之间就能断开 —— 三列宽的表格里会渲染成
+   上下各一个字的"在线"，看起来像布局坏了（这正是「状态列错误换行」的根因）。
+   white-space 只是第一层保险：更要紧的是让它**按内容宽度收缩**，
+   否则在 flex/grid 父容器里仍可能被压到换行。 */
+.badge {
+  padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;
+  white-space: nowrap; display: inline-block; width: fit-content; max-width: 100%;
+}
+.tag-os, .lat-kind, .lat-badge, .cell-sub .badge { white-space: nowrap; }
 .badge.online { background: rgba(34,197,94,.15); color: var(--green); }
 .badge.offline { background: rgba(239,68,68,.15); color: var(--red); }
 .badge.idle { background: rgba(234,179,8,.15); color: var(--yellow); }
@@ -116,7 +139,8 @@ label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px
 
 /* 登录 */
 .login-wrap {
-  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; min-height: 100dvh;
+  display: flex; align-items: center; justify-content: center;
   background: var(--bg);
 }
 .login-box {
@@ -152,10 +176,15 @@ label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px
 ::-webkit-scrollbar-thumb:hover { background: #46586b; background-clip: content-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-body { -webkit-text-size-adjust: 100%; overflow-x: hidden; }
+/* overflow-x: hidden 只在**近两年**保留：
+   它会把 body 变成滚动容器，并让 sticky 在部分移动端浏览器上失效
+   （.public-summary / .mobile-topbar / .sidebar 都依赖 sticky）。
+   因此改为在 html 上裁横向溢出，body 保持普通文档流。 */
+html { overflow-x: hidden; }
+body { -webkit-text-size-adjust: 100%; }
 
 /* 布局：侧边栏使用渐变与柔和阴影 */
-.layout { min-height: 100vh; }
+.layout { min-height: 100vh; min-height: 100dvh; }
 .sidebar {
   width: var(--sidebar-w);
   position: sticky; top: 0; height: 100vh;
@@ -209,6 +238,16 @@ button.primary { background: var(--accent); }
 }
 .filter-bar .form-row { margin-bottom: 0; }
 .filter-actions { display: flex; gap: 8px; }
+
+/* 排序表头：仅"稳定字段"可点。动态数值列的表头保持普通样式（鼠标指针不变），
+   让"能不能排"在点击之前就看得出来。 */
+.sortable-table th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+.sortable-table th.sortable:hover { color: var(--text); }
+.sortable-table th.sortable .th-label { display: inline-flex; align-items: center; gap: 3px; }
+.sort-mark { font-size: 10px; opacity: .4; }
+.sort-mark.on { opacity: 1; color: var(--accent); }
+/* 窄屏排序按钮：宽屏隐藏（宽屏用表头点击即可） */
+.th-mobile { display: none; }
 
 /* 表格：容器滚动，避免窄屏撑破布局 */
 .table-scroll { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -361,7 +400,17 @@ button.primary { background: var(--accent); }
   .metric .value { font-size: 19px; }
   .card { padding: 14px; }
 
-  /* 表格卡片化：每行折叠为一张小卡片，避免横向滚动 */
+  /* ------------------------------------------------------------
+     表格卡片化：每行折叠为一张小卡片，避免横向滚动
+     ------------------------------------------------------------
+     · 默认用**两列栅格**（左侧字段名 88px + 右侧内容自适应），阅读效率最高；
+     · 行内**元素较多**的表格（如仪表盘，含进度条/多行数值/按钮）改用
+       `.table-stack.blocky` 的**单列堆叠**：内容占满整行。两列栅格下
+       右侧可用宽度只有 300px 左右，CPU 型号、网络累计值这类长内容会被压成
+       竖排的"一个字一行"，反而比横向滚动还难读。
+     · 单列堆叠时字段名行不再占一整行，而是收成一行小标题（更省纵向空间，
+       仪表盘一屏少滚半页）。
+     ------------------------------------------------------------ */
   .table-stack thead { display: none; }
   .table-stack, .table-stack tbody, .table-stack tr, .table-stack td { display: block; width: 100%; }
   .table-stack tr {
@@ -399,6 +448,80 @@ button.primary { background: var(--accent); }
   .table-stack td .bar { max-width: 220px; }
   /* 表单控件在卡片内不要溢出 */
   .table-stack td input, .table-stack td select { max-width: 100%; }
+
+  /* ===== 仪表盘专用：单列堆叠 + 稳定状态列 ===== */
+
+  /* 主机的"备注 + 主机名 + UUID"三行在窄屏下容易糊成一团：
+     主机名与 UUID 用等宽/灰阶拉开层次，"备注"按钮不再贴到 UUID 上。 */
+  .table-stack td[data-label="主机"] b { font-size: 14px; }
+  .table-stack td[data-label="主机"] > div { line-height: 1.5; margin-top: 2px; }
+  .table-stack td[data-label="主机"] > div:last-child { margin-top: 6px; }
+
+  /* blocky：字段名收成小标题，内容占满整行。
+     注意 `.table-stack td::before` 在原规则里是 title + margin-right，
+     这里必须把 margin-right 显式清掉，否则小标题行会凭空多出一段缩进，
+     同一列里"主机"这种自带多行内容的单元格看起来就错位了。 */
+  .table-stack.blocky td { display: block; padding: 6px 0; }
+  .table-stack.blocky td::before {
+    display: block; width: auto; margin: 0 0 3px; padding-top: 0;
+    font-size: 11px; letter-spacing: .3px; opacity: .85;
+  }
+  .table-stack.blocky td > div { width: auto; }
+  .table-stack.blocky td:empty { display: none; }
+
+  /* 进度条在卡片里要看得见：6px 高 + 4px 内边距在"0%"时几乎只剩一条线，
+     容易被当成"没画出来"。这里加高到 8px，并去掉圆角内衬的视觉压缩。 */
+  .table-stack td .bar { height: 8px; margin-top: 6px; }
+  .public-mini .bar { height: 8px; }
+
+  /* 仪表盘统计卡：三列 -> 两列，避免"0% 平均 CPU"被挤成两行 */
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metrics .metric .label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* 仪表盘页头：状态徽章与时间窗选择器各占一行，不再挤在一起 */
+  .page-head .badge { white-space: nowrap; }
+
+  /* 趋势/状态等单元格里的进度条：占满卡片宽度（原来 220px 在窄屏偏窄） */
+  .table-stack td .bar { max-width: 100%; }
+
+  /* ===== 移动端排序：把表头折叠成一行可横滑的排序按钮 =====
+     卡片视图下 thead 是 display:none，排序入口会消失。
+     这里把 thead 重新显示为一条**横向滚动**的按钮条：
+        · 只保留可排序列（不可排的按钮已被 .th-sort-off 隐掉）；
+        · nowrap + overflow-x:auto，窄屏滑动即可，不占额外纵向空间；
+        · sticky 吸顶，滚动列表时随时能改排序。 */
+  /* top 取顶栏高度 + 一点余量：卡片模式下 thead 吸顶后，
+     第一张卡片的"主机"小标题要紧贴着它下面，不能钻到条下面去。 */
+  .table-stack.sortable-table thead {
+    display: block; position: sticky; top: calc(var(--topbar-h) + 4px); z-index: 20;
+    margin: 0 -2px 10px; padding: 6px 2px 8px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  .table-stack.sortable-table thead tr {
+    display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .table-stack.sortable-table thead th {
+    display: block; flex: 0 0 auto; padding: 0; border: none;
+  }
+  .table-stack.sortable-table thead th .th-label { display: none; }
+  .table-stack.sortable-table thead th th { display: none; }
+  .table-stack.sortable-table .th-mobile {
+    display: inline-flex; align-items: center; gap: 3px;
+    padding: 5px 11px; font-size: 12px; font-weight: 600;
+    background: var(--panel-2); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px;
+    white-space: nowrap; cursor: pointer;
+  }
+  .table-stack.sortable-table .th-mobile:active { background: var(--border); }
+  .table-stack.sortable-table .th-mobile .sort-mark { font-size: 9px; }
+  .table-stack.sortable-table th.sortable .th-mobile,
+  .table-stack.sortable-table th.sortable .th-mobile .sort-mark.on { color: #7cb0ff; }
+  .table-stack.sortable-table th.sortable .th-mobile:has(.sort-mark.on) {
+    background: var(--accent-soft); border-color: rgba(59, 130, 246, .45); color: #cfe2ff;
+  }
+  /* 不可排序列：连表头都不显示（点了没反应的按钮比没有按钮更让人困惑） */
+  .table-stack.sortable-table thead th:not(.sortable) { display: none; }
 
   .pagination { flex-direction: column; align-items: stretch; }
   .pagination-controls { justify-content: center; }
@@ -603,7 +726,11 @@ button.primary { background: var(--accent); }
 }
 .tag-geo { color: var(--muted); }
 .public-geo { color: #6fb2ff; }
-.public-card-bars { display: flex; flex-direction: column; gap: 7px; }
+/* 卡片内指标区：固定为 4 行的最小高度（CPU/RAM/磁盘/负载 四条）。
+   条目本身由字段开关决定是否渲染（开关不变则条数不变），这里再固定高度，
+   保证"某一轮值缺失/为 0"时卡片不会忽高忽矮，列表不会跟着上下跳。 */
+.public-card-bars { display: flex; flex-direction: column; gap: 7px; min-height: 86px; }
+.public-mini .bar { height: 8px; margin-top: 6px; }
 .public-mini { margin-bottom: 0; }
 .public-mini-row { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 11.5px; color: var(--muted); }
 .public-mini-row .v { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
@@ -678,6 +805,39 @@ button.primary { background: var(--accent); }
   .public-cards { grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 10px; }
   .public-card { padding: 10px 11px 11px; }
   .public-card-name { font-size: 13px; }
+  /* 极窄屏（小屏手机）：一行放不下两列时退回单列，
+     卡片内部的指标条才有足够宽度 —— 148px 宽下"CPU 100.0%"会把数值挤成两行。 */
+  .public-mini-row { font-size: 11px; }
+  .public-table th, .public-table td { padding: 8px 9px; }
+}
+
+/* 移动端：公开状态页的表格同样折叠成卡片。
+   公开页的列表视图列多（最多 11 列），窄屏横向滚动的体验很差，
+   直接复用后台的 `.table-stack` 卡片化，两处行为一致、维护也少一份。 */
+@media (max-width: 900px) {
+  .public-table-card .public-table thead { display: none; }
+  .public-table-card .public-table,
+  .public-table-card .public-table tbody,
+  .public-table-card .public-table tr,
+  .public-table-card .public-table td { display: block; width: 100%; }
+  .public-table-card .public-table tr {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 10px;
+    cursor: pointer;
+  }
+  .public-table-card .public-table tr:hover td { background: transparent; }
+  .public-table-card .public-table td {
+    border: none; padding: 5px 0; font-size: 13px; white-space: normal;
+    display: grid; grid-template-columns: 84px minmax(0, 1fr);
+    gap: 10px; align-items: start; text-align: left; overflow-wrap: anywhere;
+  }
+  .public-table-card .public-table td::before {
+    content: attr(data-label);
+    color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap;
+  }
+  .public-table-card .public-table td > * { margin: 0; max-width: 100%; }
+  /* 排序提示条在卡片视图下没有"表头"可点，直接隐藏（桌面才有意义） */
+  .public-table-card .sort-hint { padding: 4px 2px 8px; }
 }
 
 /* ============================================================
