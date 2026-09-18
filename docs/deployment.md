@@ -690,7 +690,75 @@ Agent 在注册时把版本号写入 `AgentInfo.AgentVersion` 并落库，仪表
 Agent 侧的判定逻辑很简单：目标版本 == 自身版本则跳过（除非勾选强制），否则执行升级。
 因此这个字段只需要在**同一台机器的历史序列**里有意义，不需要跨端对齐。
 
-## 十二、常见故障处理
+## 十二、单实例保护
+
+Agent 与 Server **同一份配置只允许一个实例**。跨平台实现不同，但对使用者是同一件事：
+
+| 平台 | 机制 | 说明 |
+|------|------|------|
+| Windows | 命名互斥体（`CreateMutexW`，优先 `Global\`） | 内核对象，进程退出即释放 |
+| Linux / macOS / *BSD | `flock(2)` 独占锁 | 文件锁，进程退出（含 `SIGKILL`、断电重启）由内核释放 |
+
+两个平台都**不需要清理陈旧状态**：不会出现"进程已经死了、锁还在"把新实例永久挡在门外的问题。
+
+### 为什么 Linux 上必须做
+
+`systemd` 只保证"同一 unit 不会跑两份"。但下面这些情况它管不到，而它们恰好都很常见：
+
+- **定时任务保活**：`*/5 * * * * pgrep -f mocenter-agent || /usr/local/bin/mocenter-agent ...`
+  —— 脚本按进程名判断，服务重启、手工换路径、`-daemon` 派生都会让它判断失误；
+- **手工排查再启一份**：排障时最常见的动作；
+- **服务报失败但进程还活着**（`nohup` / supervisor / `-daemon` 混用）。
+
+重复实例的危害不是"多占点内存"：它们共用同一配置（同一 `agent_id`、同一套客户端证书），
+会一起连服务端**互相顶号**；隧道、VNC、端口映射的会话状态错乱；
+若 Server 也重复启动，还会共用同一个 SQLite 文件互相踩踏。定时任务每 5 分钟拉一个，越滚越多。
+
+### 锁文件在哪
+
+**与 `-config` 指定的配置文件同目录**，命名为 `.mocenter-<role>-<哈希>.lock`：
+
+| 部署形态 | 配置文件 | 锁文件 |
+|----------|----------|--------|
+| systemd 安装（推荐） | `/etc/mocenter/mocenter-agent.json` | `/etc/mocenter/.mocenter-Agent-xxxxxxxx.lock` |
+| 便携 / 手工启动 | 二进制同目录的 `mocenter-agent.json` | 同目录 |
+
+> 安装包的 systemd 单元**必须**显式传 `-config /etc/mocenter/mocenter-agent.json`。
+> 不传的话配置（与锁文件）会落到 `/usr/local/bin`，而"以 root 跑服务 + 以普通用户跑 cron 保活"
+> 这种最常见的组合就**拿不到同一把锁**（目录不可写 → 降级放行），保护等于没做。
+> 本仓库的 `scripts/deploy/mocenter-agent.service` 已按此写好。
+
+### 拿到锁失败时的行为（刻意设计）
+
+1. **退出，绝不杀进程**。日志会打印持有者 PID、可执行文件、配置路径与启动时间：
+
+   ```
+   [单实例] 已有实例正在运行: PID 12345（该 PID 来自上一次开机，属异常退出遗留，不可按编号判断进程）
+   （可执行文件 /usr/local/bin/mocenter-agent，配置 /etc/mocenter/mocenter-agent.json，启动于 2026-09-18T10:00:00+08:00）
+   ```
+
+2. **不自动"清理"锁文件**。判断可能出错（容器 PID 命名空间、其它用户），
+   而误删 / 误杀一个正在跑远控会话的 Agent 后果严重。确认系统里确实没有实例在运行，
+   再手工删锁文件重启。
+
+### 锁文件打开失败时
+
+只读文件系统、目录不可写、SELinux 等情况下**不阻塞启动**（宁可多跑一个，也要让 Agent 起得来），
+但会打印明确的告警，不会静默失效：
+
+```
+[单实例] 警告: 无法打开锁文件 /etc/mocenter/.mocenter-Agent-xxxxxxxx.lock: permission denied
+—— 本次启动**未启用**单实例保护
+```
+
+看到这行说明**保护没生效**，请把 `-config` 指到可写目录（或修正目录权限）。
+
+### 同一台机器跑多份 Agent
+
+用**不同的 `-config`** 即可。锁按"配置路径哈希 + 角色"区分，
+不同配置的实例互不干扰 —— 这也是调试时同机跑两个 Agent 的正规做法。
+
+## 十三、常见故障处理
 
 | 现象 | 排查方法 |
 |------|----------|
@@ -704,6 +772,8 @@ Agent 侧的判定逻辑很简单：目标版本 == 自身版本则跳过（除�
 | 一键部署报 `sudo: not found` | 已修复：当前用户是 root 时不再使用 sudo。若版本较旧请升级服务端 |
 | 一键部署报服务启动成功但 Agent 不上线 | 检查写入的注册密钥是否与服务端一致（`/etc/mocenter/mocenter-agent.json` 的 `agent_key`）、服务端地址是否从目标机可达；`systemctl status mocenter-agent` 看日志 |
 | 恢复备份后数据没变 | 恢复后需**重启服务端**；被覆盖的旧文件在 `<文件名>.before-restore` |
+| 日志出现「已有一个使用同一配置的 Agent 在运行，本次启动终止」 | **这是保护生效，不是故障**：已有实例持有单实例锁。用 `systemctl status mocenter-agent` / `ps -ef \| grep mocenter-agent` 确认。若确实是上次断电遗留（日志会提示锁文件多久没被刷新、PID 是否来自上一次开机），删掉锁文件后重启即可，**不要**去杀那个 PID（可能已被复用）。详见「单实例保护」 |
+| 日志出现「无法打开锁文件 … 本次启动**未启用**单实例保护」 | 锁文件所在目录对运行用户不可写。锁文件与 `-config` 指定的配置文件同目录，请确保该目录可写（systemd 单元里是 `/etc/mocenter`，见「单实例保护」） |
 | Agent 报 `x509: certificate is valid for 127.0.0.1, ::1, not <IP>` | 服务端证书 SAN 不含 Agent 连接用的地址。见下方「TLS 证书 SAN 不匹配」 |
 | Agent 报 `remote error: tls: certificate required` | 服务端启用了 mTLS（`-ca-cert`）但 Agent 未带客户端证书；用 `-agent-key` 走自动换取，或补 `-client-cert`/`-client-key` |
 | 换了新证书仍报旧 SAN | 证书只在服务端**启动时**加载，替换文件后必须重启服务端进程 |
@@ -742,6 +812,6 @@ systemctl restart mocenter-server
   或给 Agent 配 `-server-fingerprint <部署身份指纹>`（按指纹校验，服务端换 IP/换证书都不受影响）。
 - Agent 侧日志在识别到这类错误时会直接附上上述排查指引。
 
-## 十三、远程升级 Agent
+## 十四、远程升级 Agent
 
 服务端发布新版本 → Agent 检测到新版本 → 下载升级包 → 校验签名 → 停止旧进程 → 替换二进制 → 重启新进程 → 上报版本信息。支持差分升级、失败自动回滚、灰度升级（规划书 12.4）。

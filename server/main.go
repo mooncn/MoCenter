@@ -351,11 +351,17 @@ func main() {
 
 	// 单实例保护：必须在打开数据库之前拿到 —— 两个实例共用同一个 SQLite 文件
 	// （以及同一个审计日志）会互相踩踏。服务与手工启动的实例共用同一配置时尤其要注意。
-	release, ok := winapp.AcquireSingleton(winapp.SingletonKey("Server", *configPath))
+	// 与 Agent 同理：非 Windows 平台此前完全没有这层保护（Linux 上定时任务保活
+	// 会拉出多个 Server，直接损坏数据库），现由 flock 覆盖。
+	// 同理不去终止已有实例，只让本次启动退出。
+	singleKey := winapp.SingletonKey("Server", *configPath)
+	release, ok := winapp.AcquireSingleton(singleKey, *configPath)
 	if !ok {
-		log.Fatalf("已有一个使用同一配置(%s)的 Server 在运行，本次启动终止", *configPath)
+		log.Fatalf("已有一个使用同一配置(%s)的 Server 在运行，本次启动终止（%s）",
+			*configPath, winapp.DescribeSingleton(singleKey, *configPath))
 	}
 	defer release()
+	log.Printf("[server] 已取得单实例锁：%s", winapp.DescribeSingleton(singleKey, *configPath))
 
 	// 打开 SQLite 持久化存储
 	dbPath := filepath.Join(*dataDir, "mocenter.db")

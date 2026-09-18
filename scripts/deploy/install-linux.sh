@@ -144,6 +144,7 @@ render_conf() {
   if [ "$role" = "agent" ]; then
     sed -e "s|^MOCENTER_SERVER=.*|MOCENTER_SERVER=${SERVER}|" \
         -e "s|^MOCENTER_AGENT_ID=.*|MOCENTER_AGENT_ID=${AGENT_ID}|" \
+        -e "s|^MOCENTER_CONFIG=.*|MOCENTER_CONFIG=$CONF_DIR/mocenter-agent.json|" \
         "$TPL_DIR/mocenter-agent.conf" > "$dest"
     [ -n "$PROXY_IP" ] && printf 'MOCENTER_PROXY_IP=%s\n' "$PROXY_IP" >> "$dest"
   else

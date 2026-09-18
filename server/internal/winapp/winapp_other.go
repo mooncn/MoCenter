@@ -1,7 +1,8 @@
 //go:build !windows
 
-// 非 Windows 平台的桩实现：Linux/macOS 由 systemd/launchd 管理进程，
-// 既没有 SCM，也不需要应用层单实例保护（服务管理器已保证）。
+// 非 Windows 平台：Linux/macOS 由 systemd/launchd 管理进程形态，
+// 但**单实例保护同样必要** —— 定时任务保活、手工重复启动都会拉起重复实例
+// （两个 Server 共用同一份 SQLite 会互相踩踏）。实现见 singleton_unix.go。
 package winapp
 
 import "errors"
@@ -13,6 +14,3 @@ func IsWindowsService() bool { return false }
 func RunAsService(string, func(), func()) error {
 	return errors.New("仅 Windows 支持以系统服务方式运行")
 }
-
-// AcquireSingleton 非 Windows 平台不启用单实例保护。
-func AcquireSingleton(string) (func(), bool) { return func() {}, true }

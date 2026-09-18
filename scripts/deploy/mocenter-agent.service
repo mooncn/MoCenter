@@ -8,9 +8,17 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/mocenter/mocenter-agent.conf
-ExecStart=/usr/local/bin/mocenter-agent -server ${MOCENTER_SERVER} -agentid ${MOCENTER_AGENT_ID} -proxy-ip ${MOCENTER_PROXY_IP} -daemon
+# ⚠️ 必须显式指定 -config：默认配置路径是"可执行文件同目录"（即 /usr/local/bin），
+#    那里不适合放运行期数据 —— 配置、creds 与**单实例锁文件**都会落在 /etc/mocenter。
+#    锁文件必须与配置文件同目录（见 internal/winapp/singleton_unix.go 的说明）：
+#    放在 /usr/local/bin 会让"以 root 跑服务 + 以普通用户跑 cron 保活"这种
+#    最常见的组合拿不到同一把锁（目录不可写 → 降级放行 → 又出现重复实例）。
+ExecStart=/usr/local/bin/mocenter-agent -config ${MOCENTER_CONFIG} -server ${MOCENTER_SERVER} -agentid ${MOCENTER_AGENT_ID} -proxy-ip ${MOCENTER_PROXY_IP} -daemon
 Restart=always
 RestartSec=5
+# 停止时给足时间优雅退出（关闭已有隧道 / 释放锁），避免 systemd 直接 SIGKILL 后
+# 与"手工启动的新实例"短暂并存。
+TimeoutStopSec=20
 LimitNOFILE=1048576
 
 [Install]

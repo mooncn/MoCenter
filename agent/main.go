@@ -219,12 +219,24 @@ func main() {
 	}
 
 	// 单实例保护：同一份配置只允许一个 Agent 实例。
-	// 否则「服务 + 手工启动一份」会同时连服务端、互相顶掉，隧道与 VNC 状态也会错乱。
-	release, ok := winapp.AcquireSingleton(winapp.SingletonKey("Agent", *configPath))
+	//
+	// 此前只在 Windows 生效（命名互斥体），Linux/macOS 直接放行 —— 于是
+	// 「systemd 服务 + 定时任务保活 + 手工排查启动一份」很容易同时跑起多个实例：
+	// 它们共用同一配置（同一 agent_id、同一套客户端证书）一起连服务端互相顶号，
+	// 隧道、VNC、端口映射的会话状态错乱；定时任务每 5 分钟拉一个，越滚越多。
+	// 现在非 Windows 走 flock（见 internal/winapp/singleton_unix.go），
+	// 进程无论怎么退出（含被 SIGKILL、断电）锁都由内核自动释放，不会留下陈旧锁。
+	//
+	// 注意：这里**不会**去终止已有实例，只让自己的启动失败 —— 误杀一个正在
+	// 跑远控会话的 Agent 后果不可控，交给运维判断更安全。
+	singleKey := winapp.SingletonKey("Agent", *configPath)
+	release, ok := winapp.AcquireSingleton(singleKey, *configPath)
 	if !ok {
-		log.Fatalf("已有一个使用同一配置(%s)的 Agent 在运行，本次启动终止", *configPath)
+		log.Fatalf("已有一个使用同一配置(%s)的 Agent 在运行，本次启动终止（%s）",
+			*configPath, winapp.DescribeSingleton(singleKey, *configPath))
 	}
 	defer release()
+	log.Printf("[agent] 已取得单实例锁：%s", winapp.DescribeSingleton(singleKey, *configPath))
 
 	// 换取成功后清理：证书路径写回配置、注册密钥清空（一次性使用）。
 	// 这样运维在配置里再也看不到可直接冒充的长期凭据，只有本机 0600 的证书私钥。
