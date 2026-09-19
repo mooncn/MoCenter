@@ -21,10 +21,12 @@ api.interceptors.response.use(
   (error) => {
     if (error.response?.status === 401) {
       localStorage.removeItem('mc_token')
-      // 不在登录页时跳转；登录页自身的 401 由页面逻辑处理
-      if (!window.location.pathname.startsWith('/login')) {
+      // 不在登录页时跳转；登录页自身的 401 由页面逻辑处理。
+      // 注意用 /admin/login —— 根级 /login 只作为兼容别名重定向过来，
+      // 在它上面判断会漏掉真实地址（/admin/login）。
+      if (!window.location.pathname.startsWith('/admin/login')) {
         const current = window.location.pathname + window.location.search
-        window.location.href = `/login?redirect=${encodeURIComponent(current)}`
+        window.location.href = `/admin/login?redirect=${encodeURIComponent(current)}`
       }
     }
     return Promise.reject(error)
@@ -32,6 +34,11 @@ api.interceptors.response.use(
 )
 
 export const Api = {
+  // Agent 接入信息（服务端地址/身份指纹/注册密钥），用于生成"一条命令"接入新主机
+  async serverInfo() {
+    const { data } = await api.get('/server-info')
+    return data
+  },
   // 获取全部主机（含离线）
   async agents() {
     const { data } = await api.get('/agents')
@@ -142,6 +149,190 @@ export const Api = {
     const { data } = await api.post('/agents/remark', { agent_id: agentId, remark })
     return data
   },
+
+  // --- 公开展示配置（登录后可改；决定未登录访客能看什么） ---
+
+  // 读取公开展示配置与字段元数据
+  async siteConfig() {
+    const { data } = await api.get('/site/config')
+    return data
+  },
+  // 保存公开展示配置
+  async saveSiteConfig(cfg) {
+    const { data } = await api.post('/site/config', cfg)
+    return data
+  },
+  // 恢复默认（公开页关闭）
+  async resetSiteConfig() {
+    const { data } = await api.post('/site/config/reset')
+    return data
+  },
+  // 可挑选的公开主机（最小字段列表）
+  async siteHosts() {
+    const { data } = await api.get('/site/hosts')
+    return data
+  },
+
+  // --- 延迟监测（ICMP/TCP/HTTP） ---
+
+  // 主机延迟历史曲线：返回 { ok, agent, targets, series:[{target,kind,points:[{ts,ms,ok}]}] }
+  // 失败的探测点也在 points 里（ok=false），前端画断点而不是丢弃
+  async latency(agent, range, target) {
+    const { data } = await api.get('/latency', { params: { agent, range, target } })
+    return data
+  },
+  // 读取某主机的延迟探测目标
+  async latencyTargets(agent) {
+    const { data } = await api.get('/latency/targets', { params: { agent } })
+    return data
+  },
+  // 下发延迟探测目标（形如 icmp:1.1.1.1 / tcp:1.1.1.1:443 / http:https://x）
+  async saveLatencyTargets(agentId, targets) {
+    const { data } = await api.post('/latency/targets', { agent_id: agentId, targets })
+    return data
+  },
+
+  // --- 版本与升级 ---
+
+  // 服务端版本 + 各 Agent 版本与升级判定（含离线 GeoIP 库状态）
+  async version() {
+    const { data } = await api.get('/version')
+    return data
+  },
+
+  // --- 备份 / 恢复 ---
+
+  // 列出已有备份包（含包内清单摘要）
+  async backups() {
+    const { data } = await api.get('/backup')
+    return data
+  },
+  // 创建备份
+  async createBackup() {
+    const { data } = await api.post('/backup', null, { timeout: 300000 })
+    return data
+  },
+  // 查看备份包清单（恢复前确认）
+  async inspectBackup(file) {
+    const { data } = await api.post('/backup', null, { params: { action: 'inspect', file } })
+    return data
+  },
+  // 从备份恢复（不可逆，前端需二次确认）
+  async restoreBackup(file) {
+    const { data } = await api.post('/backup', null, { params: { action: 'restore', file }, timeout: 300000 })
+    return data
+  },
+  // 删除备份包
+  async deleteBackup(file) {
+    const { data } = await api.delete('/backup', { params: { file } })
+    return data
+  },
+  // 下载备份包（走浏览器原生下载，带 Authorization 头）
+  async downloadBackup(file) {
+    const { data } = await api.get('/backup', { params: { download: file }, responseType: 'blob', timeout: 300000 })
+    return data
+  },
+
+  // --- 一键部署 Agent ---
+
+  // 可下发的 Agent 安装包
+  async deployPackages() {
+    const { data } = await api.get('/agents/deploy')
+    return data
+  },
+  // 执行部署；probe_only=true 时仅做连通性与环境探测，不做任何改动
+  async deployAgent(payload) {
+    const { data } = await api.post('/agents/deploy', payload, { timeout: 180000 })
+    return data
+  },
+}
+
+// 公开站点 API（**免登录**）：
+// 不带 Authorization 头，绝不调用带 token 的实例，避免把会话凭据带到匿名页面。
+const publicApi = axios.create({ baseURL: '/api/public', timeout: 10000 })
+
+export const PublicApi = {
+  // 公开页是否已启用（只返回布尔值，供登录页给出入口）
+  async enabled() {
+    try {
+      const { data } = await publicApi.get('/enabled')
+      return !!(data && data.enabled)
+    } catch {
+      return false
+    }
+  },
+  // 站点品牌文案（标题 / 页脚）。与 enabled 同一个免鉴权端点：
+  // 登录页在**登录前**就要显示正确的站点标题，这是它存在的理由。
+  async branding() {
+    try {
+      const { data } = await publicApi.get('/enabled')
+      return {
+        site_title: data?.site_title || '',
+        site_footer: data?.site_footer || '',
+      }
+    } catch {
+      return { site_title: '', site_footer: '' }
+    }
+  },
+  // 公开状态：配置 + 字段元数据 + 节点列表 + 汇总
+  async state() {
+    const { data } = await publicApi.get('/state')
+    return data
+  },
+  // 节点历史趋势（node 为派生节点编号）
+  async samples(node, range) {
+    const { data } = await publicApi.get('/samples', { params: { node, range } })
+    return data
+  },
+}
+
+// 公开站点 WebSocket：免登录实时推送（仅节点列表与汇总）。
+// 与 MCSocket 分开实现：公开页不需要（也不应该）携带 Token 与命令通道。
+export class PublicSocket {
+  constructor({ onData, onStatus } = {}) {
+    this.onData = onData
+    this.onStatus = onStatus
+    this.alive = true
+    this.ws = null
+    this.delay = 1000
+  }
+
+  connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    this.ws = new WebSocket(`${proto}://${location.host}/api/public/ws`)
+    this.ws.onopen = () => {
+      this.delay = 1000
+      this.onStatus?.('connected')
+    }
+    this.ws.onmessage = (ev) => {
+      try {
+        this.onData?.(JSON.parse(ev.data))
+      } catch { /* 忽略非 JSON 帧 */ }
+    }
+    this.ws.onclose = () => {
+      this.onStatus?.('disconnected')
+      if (!this.alive) return
+      // 总开关关闭时端点返回 404（对外"不存在"）。这不是网络故障，
+      // 无限重连只会在控制台刷屏并给服务端带来无意义请求 —— 停止重试，
+      // 由页面的 HTTP 拉取结果（enabled=false / 404）驱动界面状态。
+      if (this.gone) return
+      // 指数退避重连：服务端被重启或网络抖动时不至于打满连接
+      setTimeout(() => {
+        this.delay = Math.min(this.delay * 2, 30000)
+        this.connect()
+      }, this.delay)
+    }
+    this.ws.onerror = () => {
+      // 握手失败（未启用/服务未就绪）时不再重试，避免"未启用"部署下的控制台噪音
+      this.gone = true
+      this.ws && this.ws.close()
+    }
+  }
+
+  close() {
+    this.alive = false
+    this.ws && this.ws.close()
+  }
 }
 
 // WebSocket 客户端：用于接收服务端实时推送（主机状态、命令输出等）。

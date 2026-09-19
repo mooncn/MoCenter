@@ -25,11 +25,30 @@ type Conn struct {
 	Online     bool
 	LastSeen   time.Time
 	RemoteAddr string
-	enc        *json.Encoder
+	// CertCN 客户端证书的 CN（"简单模式"下由服务端签发的证书 CN = agent_id）。
+	// 有证书时身份以证书为准，避免"报文自报身份"被冒用。
+	CertCN string
+	enc    *json.Encoder
 	// HeartbeatInterval 该 Agent 当前被服务端动态下发的心跳间隔（秒）。
 	// 用于在 Tick 中按每个 Agent 的实际心跳频率判定超时，
 	// 避免弱网下心跳间隔被拉长后仍按固定阈值误判离线。
 	HeartbeatInterval int
+	// AgentVersion Agent 注册时自报的版本号（空串 = 旧版 Agent 未上报）。
+	AgentVersion string
+}
+
+// SetAgentVersion 记录 Agent 自报的版本号（注册时写入）。
+func (c *Conn) SetAgentVersion(v string) {
+	c.mu.Lock()
+	c.AgentVersion = strings.TrimSpace(v)
+	c.mu.Unlock()
+}
+
+// GetAgentVersion 线程安全地读取 Agent 版本号。
+func (c *Conn) GetAgentVersion() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.AgentVersion
 }
 
 // SetLastSeen 线程安全地刷新连接的最后活跃时间。

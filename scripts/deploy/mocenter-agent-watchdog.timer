@@ -1,0 +1,18 @@
+# MoCenter Agent 保活定时器。
+#
+# 为什么服务已有 Restart=always 还要它：
+#   · Restart=always 只覆盖"进程自己退出"；被人手工 stop、被外部强杀但
+#     systemd 未记录、容器内 systemd 语义异常等情况它管不到；
+#   · 巡检成本极低（pgrep 一次），但能把"静默掉线"的窗口从"没人发现"
+#     压到最长 5 分钟。
+[Unit]
+Description=定时巡检 MoCenter Agent（每 5 分钟）
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=mocenter-agent-watchdog.service
+
+[Install]
+WantedBy=timers.target

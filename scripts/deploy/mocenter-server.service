@@ -1,0 +1,36 @@
+# MoCenter Server systemd 服务单元（打包时装入 /lib/systemd/system/）
+# 由 scripts/build-linux-all.sh 与 scripts/deploy/install-linux.sh 共用，避免两处各写一份。
+#
+# ⚠️ 不要把口令写进 ExecStart：命令行参数对**任意本地用户**可见
+#    （`ps -ef`、`systemctl show -p ExecStart`，乃至审计日志），
+#    等于把后台口令贴在了服务单元里。这里改为：
+#      · 初始口令从 0600 文件读（MOCENTER_PASSWORD_FILE，首次创建账号后即可删除）；
+#      · 其它参数继续由 EnvironmentFile 注入（systemd 会保护环境变量的可见性，
+#        且 EnvironmentFile 本身就是 0600）。
+[Unit]
+Description=MoCenter Server (集中式主机远控管理总控服务端)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/mocenter
+EnvironmentFile=-/etc/mocenter/mocenter-server.conf
+ExecStart=/usr/local/bin/mocenter-server \
+  -listen ${MOCENTER_LISTEN} \
+  -http ${MOCENTER_HTTP} \
+  -user ${MOCENTER_USER} \
+  -password-file ${MOCENTER_PASSWORD_FILE} \
+  -data ${MOCENTER_DATA} \
+  -config ${MOCENTER_CONFIG} \
+  -pkg-dir /var/lib/mocenter/packages \
+  -web ${MOCENTER_WEB_DIR}
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+# 服务只应读写自己的配置与数据目录
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

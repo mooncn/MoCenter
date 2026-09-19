@@ -67,15 +67,24 @@ func doInstall(o options) error {
 		return err
 	}
 	for _, r := range roles {
+		// 升级（配置已存在且未指定 -force）：连接参数与账号都沿用既有的，
+		// 不要求重新提供，也不覆盖配置 —— 这就是「升级不动配置」。
+		if !o.force && existingInstall(o, r) {
+			fmt.Printf("[%s] 检测到既有配置，按升级处理（保留配置与账号）\n", r)
+			continue
+		}
 		if r == "agent" && strings.TrimSpace(o.server) == "" {
-			return errors.New("安装 Agent 必须指定 -server（服务端地址 host:port）")
+			return errors.New("安装 Agent 必须指定 -server（服务端地址 host:port）；" +
+				"若本机已装过（配置存在），可省略该参数直接升级")
 		}
 		if r == "agent" && strings.TrimSpace(o.agentKey) == "" {
 			return errors.New("安装 Agent 必须指定 -agent-key（取总控机数据目录下 agent.key 的内容）：" +
-				"服务端要求 Agent 携带注册密钥，否则连接会被拒绝")
+				"服务端要求 Agent 携带注册密钥，否则连接会被拒绝。" +
+				"若本机已装过（配置存在），可省略该参数直接升级")
 		}
-		if r == "server" && (strings.TrimSpace(o.adminUser) == "" || strings.TrimSpace(o.adminPass) == "") {
-			return errors.New("安装 Server 必须指定 -user 与 -password（后台登录账号）")
+		if r == "server" && (strings.TrimSpace(o.adminUser) == "" || (strings.TrimSpace(o.adminPass) == "" && strings.TrimSpace(o.adminPassFile) == "")) {
+			return errors.New("安装 Server 必须指定 -user 与 -password（后台登录账号）；" +
+				"若本机已装过（配置存在），可省略这两项直接升级")
 		}
 	}
 
@@ -101,10 +110,20 @@ func installRole(m *mgr.Mgr, o options, role string) error {
 	dataDir := filepath.Join(o.dataRoot, role)
 	confPath := filepath.Join(dataDir, "mocenter-"+role+".json")
 
-	fmt.Printf("\n=== 安装 %s ===\n", role)
+	// 升级识别：配置存在即视为「已安装」，只替换二进制与服务定义，
+	// **不动配置与数据**（服务端地址、注册密钥、账号、数据库原样保留）。
+	// 要推倒重来必须显式加 -force，避免一次误操作抹掉现场。
+	upgrade := !o.force && existingInstall(o, role)
+
+	fmt.Printf("\n=== %s %s ===\n", map[bool]string{true: "升级", false: "安装"}[upgrade], role)
 	fmt.Printf("  服务名  : %s\n", name)
 	fmt.Printf("  二进制  : %s\n", exePath)
 	fmt.Printf("  配置数据: %s\n", dataDir)
+	if upgrade {
+		fmt.Printf("  模式    : 保留既有配置（如需清理重装请加 -force）\n")
+	} else if o.force {
+		fmt.Printf("  模式    : -force 已指定，按【清理重装】处理\n")
+	}
 
 	// 1) 先停掉并删除旧服务：既保证重复安装幂等，也避免正在运行的 exe 被占用无法覆盖
 	if err := stopAndDeleteService(m, name); err != nil {
@@ -124,8 +143,30 @@ func installRole(m *mgr.Mgr, o options, role string) error {
 		return fmt.Errorf("创建数据目录失败: %w", err)
 	}
 	// Server 角色：创建后台登录账号（用户名+密码，密码只存 SHA-256 摘要）。
-	// 已存在账号时保持不动，避免重装覆盖用户后来改过的密码。
-	if role == "server" {
+	// 升级或已有账号时保持不动，避免覆盖用户后来改过的密码。
+	if role == "server" && !upgrade {
+		// 口令优先从文件读。
+		//
+		// 为什么需要：图形安装程序（Inno Setup）通过命令行调用本程序，
+		// 而"安装向导进程的命令行"在安装进行的那几秒里对其他本地进程可见
+		// （典型是 `wmic process get commandline` / 任务管理器"命令行"列）。
+		// 由安装程序把口令先写进仅管理员可读的临时文件、再把**路径**传进来，
+		// 就可以完全避开这条泄露路径。
+		if pf := strings.TrimSpace(o.adminPassFile); pf != "" {
+			b, rerr := os.ReadFile(pf)
+			if rerr != nil {
+				return fmt.Errorf("读取口令文件 %s 失败: %w", pf, rerr)
+			}
+			o.adminPass = strings.TrimSpace(string(b))
+			if o.adminPass == "" {
+				return fmt.Errorf("口令文件 %s 为空", pf)
+			}
+			// 读完立即删除：里面的口令已经被摘要进 users.json，留着只是多一个泄露面。
+			// 删不掉不视为失败（可能被安全软件占用），但要提示。
+			if derr := os.Remove(pf); derr != nil {
+				fmt.Printf("  警告: 口令文件 %s 未能删除（%v），请手动删除\n", pf, derr)
+			}
+		}
 		created, err := ensureServerAccount(dataDir, o.adminUser, o.adminPass)
 		if err != nil {
 			return err
@@ -168,7 +209,34 @@ func installRole(m *mgr.Mgr, o options, role string) error {
 		return err
 	}
 	fmt.Println("  [5/5] 服务已启动")
+
+	// 7) 保活兜底：注册「开机自启 + 每 5 分钟巡检拉起」两个计划任务。
+	//    服务能跑时它们是空转的安全网；服务不可用（容器/策略禁服务）时，
+	//    它们就是唯一的自启与防杀通道。失败只告警，不影响安装成功。
+	if err := installKeepAlive(role, exePath, confPath); err != nil {
+		fmt.Printf("  [保活] 警告: 注册计划任务失败（不影响服务本身）: %v\n", err)
+		fmt.Printf("         进程被结束后需手工重启；可重跑安装或改用计划任务方式部署\n")
+	} else {
+		watchdog, boot := keepAliveTasks(role)
+		fmt.Printf("  [保活] 已注册计划任务：开机自启（%s）+ 每 5 分钟巡检（%s）\n", boot, watchdog)
+	}
 	return nil
+}
+
+// existingInstall 判断某角色是否已有安装（以配置文件是否存在为准）。
+//
+// 配置文件是「装过」的可靠标志：二进制可能被手工替换，而配置代表本机的
+// 连接参数与数据目录，升级时必须原样保留。
+func existingInstall(o options, role string) bool {
+	confPath := filepath.Join(o.dataRoot, role, "mocenter-"+role+".json")
+	if fi, err := os.Stat(confPath); err == nil && !fi.IsDir() {
+		return true
+	}
+	// 兼容早期把配置放在安装目录的版本
+	if fi, err := os.Stat(filepath.Join(o.installDir, "mocenter-"+role+".json")); err == nil && !fi.IsDir() {
+		return true
+	}
+	return false
 }
 
 // writeConfig 写配置文件。
@@ -187,6 +255,11 @@ func writeConfig(role, path string, o options) error {
 		if o.webDir != "" {
 			obj["web_dir"] = o.webDir
 		}
+		// 服务端默认自动生成 CA 与 Agent 通道证书（零配置 TLS），
+		// 这里只记录身份名，便于多套总控之间区分。
+		if strings.TrimSpace(o.serverName) != "" {
+			obj["server_name"] = strings.TrimSpace(o.serverName)
+		}
 	} else {
 		if strings.TrimSpace(o.agentKey) == "" {
 			return errors.New("安装 Agent 必须指定 -agent-key（取服务端 <data>\\agent.key 的内容）：" +
@@ -196,6 +269,12 @@ func writeConfig(role, path string, o options) error {
 			"server":    o.server,
 			"agent_key": strings.TrimSpace(o.agentKey),
 			"daemon":    true,
+			// 首次启动用注册密钥换取客户端证书（服务端内置 CA 签发），
+			// 换取成功后该字段会被清空、证书落到 creds\ 下 —— 运维无需手工准备证书。
+			"enrollment_secret": strings.TrimSpace(o.agentKey),
+		}
+		if strings.TrimSpace(o.serverFingerprint) != "" {
+			obj["server_fingerprint"] = strings.TrimSpace(o.serverFingerprint)
 		}
 		if o.agentID != "" {
 			obj["agent_id"] = o.agentID
@@ -218,7 +297,8 @@ func writeConfig(role, path string, o options) error {
 // ensureServerAccount 在数据目录下创建/补全后台登录账号（users.json）。
 //
 // 为什么不把密码写进 mocenter-server.json：本项目的既有约定是「密码不落盘明文」
-// （见 server/main.go：-password 只用于首次创建账号，随后以摘要持久化到 users.json）。
+// （见 server/main.go：-password / -password-file 只用于首次创建账号，
+// 随后以摘要持久化到 users.json；-password-file 是推荐写法，避免口令进命令行）。
 // 因此这里直接写 users.json。
 //
 // 摘要算法：这里仍写**单轮 SHA-256**（三个 module 相互独立、不做包引用，属既有取舍）。
@@ -375,6 +455,14 @@ func doUninstall(o options) error {
 		}
 		fmt.Printf("已删除服务 %s\n", name)
 
+		// 先摘掉保活任务：否则看门狗会在卸载后把进程又拉起来
+		if err := uninstallKeepAlive(r); err != nil {
+			fmt.Printf("  警告: 删除保活计划任务失败: %v\n", err)
+		} else {
+			watchdog, boot := keepAliveTasks(r)
+			fmt.Printf("已删除保活计划任务（%s / %s）\n", boot, watchdog)
+		}
+
 		exePath := filepath.Join(o.installDir, "mocenter-"+r+".exe")
 		// 由外层安装器（Inno）调用时保留二进制，交给它统一删除，
 		// 避免两边都删导致"文件不存在"的噪音与竞态。
@@ -414,6 +502,8 @@ func doStatus(o options) error {
 		fmt.Printf("  二进制  : %s\n", filepath.Join(o.installDir, "mocenter-"+r+".exe"))
 		fmt.Printf("  配置数据: %s\n", filepath.Join(o.dataRoot, r))
 		fmt.Printf("  状态    : %s\n", queryServiceState(name))
+		watchdog, boot := keepAliveTasks(r)
+		fmt.Printf("  保活任务: %s=%v  %s=%v\n", boot, taskExists(boot), watchdog, taskExists(watchdog))
 	}
 	return nil
 }

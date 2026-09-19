@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 )
+
 // HardwareUUID 返回硬件 UUID。
 // 优先读 /sys/class/dmi/id/product_uuid（需要 root 权限），
 // 失败时回退执行 dmidecode -s system-uuid。
@@ -105,3 +106,37 @@ func diskDetails() (total, used int64) {
 
 // windowsNetTraffic Unix 平台占位（不会被执行）。
 func windowsNetTraffic() (recv, sent int64) { return 0, 0 }
+
+// loadAvg 返回系统 1/5/15 分钟平均负载。
+//
+// Linux 直接读 /proc/loadavg（第一个字段起为三个数值，Win 无关）；
+// macOS/BSD 没有 /proc，用 sysctl -n vm.loadavg 兜底（输出形如 "{ 1.2 1.1 0.9 }"）。
+// 两者都拿不到时返回 ok=false —— 调用方据此标记"本平台不提供负载"。
+func loadAvg() (l1, l5, l15 float64, ok bool) {
+	if b, err := os.ReadFile("/proc/loadavg"); err == nil {
+		f := strings.Fields(string(b))
+		if len(f) >= 3 {
+			a, e1 := strconv.ParseFloat(f[0], 64)
+			b2, e2 := strconv.ParseFloat(f[1], 64)
+			c, e3 := strconv.ParseFloat(f[2], 64)
+			if e1 == nil && e2 == nil && e3 == nil {
+				return a, b2, c, true
+			}
+		}
+	}
+	out, err := exec.Command("sysctl", "-n", "vm.loadavg").Output()
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	f := strings.Fields(strings.Trim(strings.TrimSpace(string(out)), "{}"))
+	if len(f) < 3 {
+		return 0, 0, 0, false
+	}
+	a, e1 := strconv.ParseFloat(f[0], 64)
+	b2, e2 := strconv.ParseFloat(f[1], 64)
+	c, e3 := strconv.ParseFloat(f[2], 64)
+	if e1 != nil || e2 != nil || e3 != nil {
+		return 0, 0, 0, false
+	}
+	return a, b2, c, true
+}

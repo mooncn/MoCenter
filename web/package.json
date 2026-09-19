@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check:vnc": "node scripts/check-vnc-pointer.mjs"
+    "check:vnc": "node scripts/check-vnc-pointer.mjs",
+    "check:flag": "node scripts/check-flag-sprite.mjs",
+    "gen:flag": "node scripts/gen-flag-sprite.mjs"
   },
   "dependencies": {
     "@novnc/novnc": "^1.7.0",

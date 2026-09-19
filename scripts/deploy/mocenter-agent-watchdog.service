@@ -1,0 +1,11 @@
+# MoCenter Agent 保活巡检（oneshot）—— 由 mocenter-agent-watchdog.timer 每 5 分钟触发。
+# 与 install-linux.sh 生成的 cron 版共用同一个巡检脚本，逻辑只有一份。
+[Unit]
+Description=MoCenter Agent 保活巡检（进程不在则拉起）
+After=mocenter-agent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mocenter-keepalive agent
+# 巡检本身很轻，失败不影响 systemd 服务本体
+SuccessExitStatus=0 1

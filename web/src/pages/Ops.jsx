@@ -201,8 +201,8 @@ export default function Ops({ agents }) {
               </select>
             </div>
             <div className="form-row">
-              <label>目标版本</label>
-              <input value={upVersion} onChange={(e) => setUpVersion(e.target.value)} placeholder="如 1.1.0" />
+              <label>目标版本（Agent 版本，可留空）</label>
+              <input value={upVersion} onChange={(e) => setUpVersion(e.target.value)} placeholder="如 1.1.0，留空则用服务端版本" />
             </div>
             <div className="form-row" style={{ gridColumn: '1 / -1' }}>
               <label>升级包下载地址</label>
@@ -217,7 +217,9 @@ export default function Ops({ agents }) {
         </form>
         {upNotice && <div className={`notice ${upNotice.includes('失败') ? 'err' : 'ok'}`} style={{ marginTop: 12 }}>{upNotice}</div>}
         <div className="sub" style={{ marginTop: 12 }}>
-          升级流程：Agent 下载升级包 → 校验 MD5 → 备份旧版本 → 替换二进制 → 自动重启（失败自动回滚）。
+          升级流程：Agent 下载升级包 → 校验 SHA-256/签名 → 备份旧版本 → 替换二进制 → 自动重启（失败自动回滚）。
+          Agent 版本与服务端版本互相独立：此处填写的版本只表示"本次要升到哪个版本"，
+          与当前服务端版本不同也能下发；若与目标 Agent 当前版本相同则会跳过（可用强制升级覆盖）。
         </div>
       </div>
 

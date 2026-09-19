@@ -31,9 +31,8 @@ cd scripts/gencerts
 一条命令完成：生成全新证书 + 自动写入两侧配置文件。
 
 ```bash
+# -ip 留空时会自动探测本机公网 IP（含 IPv6）
 go run . all \
-  -ip 192.168.123.196 \
-  -dns test.mocenter.local \
   -server-config ../mocenter-server.json \
   -agent-config ../mocenter-agent.json
 ```
@@ -41,7 +40,8 @@ go run . all \
 作用：
 
 1. 生成 `certs/` 下的 `ca.crt`、`ca.key`、`server.crt`、`server.key`、`client.crt`、`client.key`；
-2. server 证书 SAN 同时包含 `192.168.123.196` 与 `test.mocenter.local`；
+2. server 证书 SAN 包含**自动探测到的公网 IP** + 本机网卡地址 + 回环地址
+   （也可用 `-ip` / `-dns` 显式指定，例如 `-ip 192.168.123.196 -dns test.mocenter.local`）；
 3. 把证书**绝对路径**写进两侧配置（不覆盖已有字段）：
    - 服务端配置：`tls_cert` / `tls_key` / `ca_cert`
    - Agent 配置：`client_cert` / `client_key` / `ca_cert`，并自动置 `tls: true`
@@ -76,7 +76,8 @@ go run . all \
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-dir` | `certs` | 证书输出目录 |
-| `-ip` | `127.0.0.1` | 服务端真实 IP，逗号分隔可填多个（`server`/`all` 使用），写入 SAN |
+| `-ip` | 空（自动探测公网 IP） | 服务端真实 IP，逗号分隔可填多个（`server`/`all` 使用），写入 SAN |
+| `-no-auto` | `false` | 不自动探测公网 IP（仅用 `-ip`/`-dns` 指定的地址） |
 | `-dns` | 空 | 服务端域名，逗号分隔可填多个，写入 SAN |
 | `-server-config` | 空 | 生成后把 `tls_cert/tls_key/ca_cert` 绝对路径写入**服务端**配置文件 |
 | `-agent-config` | 空 | 生成后把 `client_cert/client_key/ca_cert` 绝对路径写入 **Agent** 配置文件，并置 `tls:true` |
@@ -98,8 +99,9 @@ go run . client -dir certs
 # 1. 生成 CA（只需一次）
 go run . ca
 
-# 2. 为服务端签发证书（按服务端真实 IP/域名）
+# 2. 为服务端签发证书（按服务端真实 IP/域名；省略 -ip 则自动探测公网 IP）
 go run . server -ip 192.168.123.196 -dns test.mocenter.local
+go run . server          # 等价于自动探测公网 IP（本机网卡与回环地址始终写入）
 
 # 3. 为 Agent 签发客户端证书
 go run . client
@@ -130,7 +132,16 @@ go run . client
 ## 常见问题
 
 **Q1：Agent 报 `tls: failed to verify certificate: x509: certificate is valid for ..., not <IP>`**
-服务端证书 SAN 未包含该 IP/域名。用 `go run . server -ip <实际IP/域名> -dns <域名>` 重签服务端证书，并仅替换服务端 `server.crt/server.key` 即可。
+服务端证书 SAN 未包含该地址。重签服务端证书并重启服务端即可（同一 CA，Agent 侧无需改动）：
+
+```bash
+go run . server                       # 自动按公网 IP 重签
+go run . server -ip <IP> -dns <域名>   # 或显式指定，建议 IP 与域名都写
+```
+
+只想重签服务端证书时也可用更专注的 `scripts/signcert`（默认同样自动探测公网 IP）。
+
+> 注意：证书只在服务端**启动时**加载，替换 `server.crt`/`server.key` 后必须重启服务端进程。
 
 **Q2：证书私钥会被误提交到 git？**
 `.gitignore` 已忽略 `certs/`、`*.key`、`*.crt`、`*.pem`，不会误入版本库。

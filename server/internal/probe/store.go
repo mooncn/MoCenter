@@ -56,6 +56,11 @@ type Store struct {
 	remarkRenameFn func(oldID, newID string) error
 	// geoResolver 地理位置解析器
 	geoResolver *geo.Resolver
+	// geoNotify 地理位置**异步**解析完成后的回调（通常为「广播一次主机列表」）。
+	// 解析走外部网络且可达数秒，绝不能阻塞返回主机列表的调用方。
+	geoNotify func()
+	// wg 追踪后台任务（地理位置解析），便于测试等待收敛
+	wg sync.WaitGroup
 	// db SQLite 持久化（可选）
 	db *storage.DB
 }
@@ -117,6 +122,7 @@ func (s *Store) loadAgentsFromDB() {
 			DiskUsedBytes:  row.DiskUsed,
 			NetRateIn:      row.NetRateIn,
 			NetRateOut:     row.NetRateOut,
+			AgentVersion:   row.AgentVersion,
 		}
 		// 同一设备已存在（UUID 相同）：保留更「新」的一条作为主记录，其余作别名
 		if old, ok := s.devices[key]; ok {
@@ -167,6 +173,12 @@ func (s *Store) renameRemark(oldID, newID string) error {
 
 // SetGeoResolver 注入地理位置解析器。
 func (s *Store) SetGeoResolver(r *geo.Resolver) { s.geoResolver = r }
+
+// SetGeoNotify 注入地理位置异步解析完成后的回调（通常为「广播一次主机列表」）。
+func (s *Store) SetGeoNotify(fn func()) { s.geoNotify = fn }
+
+// WaitBackground 等待后台任务（地理位置解析）结束，仅供测试使用。
+func (s *Store) WaitBackground() { s.wg.Wait() }
 
 // resolveLocked 返回 agentID 对应的设备主键（调用方须持有锁）。
 // 未知 agentID 时回退为「把它当作 UUID 未知的新设备」的键，便于纯查询场景。
@@ -431,25 +443,47 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 		a.CPUUsage = p.CPUUsage
 		a.MemUsage = p.MemUsage
 		a.DiskUsage = p.DiskUsage
-		// 计算网络速率（字节/秒）：相邻探针累计值差 / 时间间隔
-		if a.NetInBytes > 0 && p.NetInBytes >= a.NetInBytes && a.LastSeen > 0 {
+		// 计算网络速率（字节/秒）与本次采样增量（字节）：相邻探针累计值差。
+		//
+		// 两种情况视为"增量未知"并把增量标记为 0 + Known=false：
+		//   - 首个采样点（没有前驱）；
+		//   - 计数器回绕 / 换网卡导致累计值变小。
+		// 时间差必须为正，否则会出现除零或把历史间隔当成瞬时速度。
+		// 前置条件：有可信的前一个采样时刻。这里用 LastSeen > 0 而不是
+		// 旧实现的 NetInBytes > 0 —— 后者会让"累计值恰好为 0 的首次上报"
+		// 一直算不出速率；同时下面的 >= 判断已经能挡住计数器回绕。
+		p.NetDeltaKnown = false
+		if a.LastSeen > 0 && p.Timestamp > a.LastSeen {
 			dt := p.Timestamp - a.LastSeen
-			if dt > 0 {
-				a.NetRateIn = (p.NetInBytes - a.NetInBytes) / dt
+			// 异常大增量（超过 100Tbit/s 的瞬时速率）视为"计数器不可信"：
+			// 典型场景是从旧库恢复的设备，NetInBytes 过去未持久化（为 0），
+			// 首个采样会把"自启动以来的全部流量"当成这几秒的增量。
+			// 这种点既不该画进趋势，也不该被窗口累计求和 —— 直接按未知处理。
+			if p.NetInBytes >= a.NetInBytes && rateWithinLimit(p.NetInBytes-a.NetInBytes, dt) {
+				p.NetInDeltaBytes = p.NetInBytes - a.NetInBytes
+				a.NetRateIn = p.NetInDeltaBytes / dt
+			} else {
+				a.NetRateIn = 0
 			}
+			if p.NetOutBytes >= a.NetOutBytes && rateWithinLimit(p.NetOutBytes-a.NetOutBytes, dt) {
+				p.NetOutDeltaBytes = p.NetOutBytes - a.NetOutBytes
+				a.NetRateOut = p.NetOutDeltaBytes / dt
+			} else {
+				a.NetRateOut = 0
+			}
+			// 收发两侧都不可信时整点标记未知，避免用 0 参与窗口求和
+			p.NetDeltaKnown = p.NetInDeltaBytes > 0 || p.NetOutDeltaBytes > 0
 		} else {
 			a.NetRateIn = 0
-		}
-		if a.NetOutBytes > 0 && p.NetOutBytes >= a.NetOutBytes && a.LastSeen > 0 {
-			dt := p.Timestamp - a.LastSeen
-			if dt > 0 {
-				a.NetRateOut = (p.NetOutBytes - a.NetOutBytes) / dt
-			}
-		} else {
 			a.NetRateOut = 0
 		}
 		a.NetInBytes = p.NetInBytes
 		a.NetOutBytes = p.NetOutBytes
+		// 负载：仅在 Agent 给出了负载（指针非 nil）时更新。旧版 Agent 不上报、
+		// Windows 未取到队列长度时保持原值，不会把已有数值刷成 0。
+		if p.Load1 != nil {
+			a.Load1, a.Load5, a.Load15 = p.Load1, p.Load5, p.Load15
+		}
 		a.KernelVersion = p.KernelVersion
 		a.OSType = p.OSType
 		a.Uptime = p.Uptime
@@ -469,6 +503,15 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 			a.DiskTotalBytes, a.DiskUsedBytes = p.DiskTotalBytes, p.DiskUsedBytes
 		}
 	}
+	// 延迟（ICMP/TCP/HTTP）：整表覆盖而不是合并。
+	// 合并会让"上一轮通了、这一轮超时"的目标继续显示旧延迟值 ——
+	// 监控里这会直接导致故障被掩盖，因此本轮没探到的目标必须消失。
+	if len(p.LatencyTargets) > 0 || len(p.LatencyMS) > 0 {
+		if a != nil {
+			a.Latency = p.LatencyMS
+			a.LatencyTargets = p.LatencyTargets
+		}
+	}
 	h := s.history[key]
 	// 历史采样里的 agent_id 统一写成设备当前 agent_id，保证趋势图/查询口径一致
 	p.AgentID = s.deviceAgentIDLocked(key, p.AgentID)
@@ -482,7 +525,104 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 	// 异步写入探针历史到 SQLite
 	if s.db != nil {
 		go s.persistProbeHistory(p)
+		go s.persistLatency(p)
 	}
+}
+
+// persistLatency 把本轮延迟探测结果落库（一行一个目标）。
+//
+// 只落"本轮实际探过的目标"：Agent 未配置延迟探测时不写任何行，
+// 也就不会在历史里产生大片 0ms 的假数据。
+func (s *Store) persistLatency(p *protocol.ProbeDataReq) {
+	if s.db == nil || len(p.LatencyTargets) == 0 {
+		return
+	}
+	rows := make([]*storage.LatencyRow, 0, len(p.LatencyTargets))
+	for _, target := range p.LatencyTargets {
+		if strings.TrimSpace(target) == "" {
+			continue
+		}
+		ms, ok := p.LatencyMS[target]
+		rows = append(rows, &storage.LatencyRow{
+			AgentID:   p.AgentID,
+			Timestamp: p.Timestamp,
+			Target:    target,
+			Kind:      latencyKind(target),
+			LatencyMS: ms,
+			OK:        ok,
+		})
+	}
+	if err := s.db.InsertLatencyHistory(rows); err != nil {
+		log.Printf("[probe] 持久化延迟历史失败: %v", err)
+	}
+}
+
+// latencyKind 从目标标识 "kind:addr" 中取出探测方式。
+func latencyKind(target string) string {
+	if i := strings.Index(target, ":"); i > 0 {
+		k := strings.ToLower(target[:i])
+		if k == "icmp" || k == "tcp" || k == "http" {
+			return k
+		}
+	}
+	return "icmp"
+}
+
+// LatencyTargets 返回某主机当前生效的延迟探测目标（按设备解析 agent_id）。
+func (s *Store) LatencyTargets(agentID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.devices[s.resolveLocked(agentID)]
+	if !ok || a == nil {
+		return nil
+	}
+	return append([]string(nil), a.LatencyTargets...)
+}
+
+// SetLatencyTargets 在服务端记录某主机"应探测的目标"。
+//
+// 用途：服务端下发目标后立即写内存，前端不必等 Agent 下一轮上报才能
+// 看到新目标（否则配置后界面会"卡"一个采集周期）。
+func (s *Store) SetLatencyTargets(agentID string, targets []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.devices[s.resolveLocked(agentID)]
+	if !ok || a == nil {
+		return
+	}
+	a.LatencyTargets = append([]string(nil), targets...)
+}
+
+// LatencyHistory 返回某主机的延迟历史（优先查库，无库时回退"当前值"单点）。
+func (s *Store) LatencyHistory(agentID string, since time.Time, target string, limit int) []*storage.LatencyRow {
+	if agentID == "" {
+		return []*storage.LatencyRow{}
+	}
+	if s.db != nil {
+		rows, err := s.db.QueryLatencyHistory(agentID, since.Unix(), target, limit)
+		if err == nil {
+			return rows
+		}
+		log.Printf("[probe] 查询延迟历史失败，回退内存: %v", err)
+	}
+	// 无数据库（内存模式）：只能给出当前一个点，避免前端完全空白
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.devices[s.resolveLocked(agentID)]
+	if !ok || a == nil || len(a.Latency) == 0 {
+		return []*storage.LatencyRow{}
+	}
+	out := make([]*storage.LatencyRow, 0, len(a.Latency))
+	for k, v := range a.Latency {
+		if target != "" && k != target {
+			continue
+		}
+		out = append(out, &storage.LatencyRow{
+			AgentID: agentID, Timestamp: a.LastSeen, Target: k,
+			Kind: latencyKind(k), LatencyMS: v, OK: true,
+		})
+	}
+	return out
 }
 
 // deviceAgentIDLocked 返回设备当前对外使用的 agent_id（调用方须持有锁）。
@@ -562,17 +702,74 @@ func (s *Store) All() []*protocol.AgentInfo {
 		if s.remarkFn != nil {
 			clone.Remark = s.remarkFn(clone.AgentID)
 		}
-		// 解析公网 IP 地理位置
+		// 公网 IP 地理位置：只读缓存，未命中时后台解析并回调补推。
+		//
+		// 注意这里**不能**同步查询：All() 每次探针推送（5–10 秒一次）都会走一遍，
+		// 外部地理接口慢时会把整条 WS 推送链路拖住数秒 —— 前端表现为首屏
+		// 长时间空白、偶尔才成功，移动端高版本浏览器上尤其明显。
 		ip := clone.PublicIP
 		if ip == "" {
 			ip = clone.PublicIPv6
 		}
 		if s.geoResolver != nil && ip != "" {
-			clone.Geo = s.geoResolver.Lookup(ip)
+			resolver, notify := s.geoResolver, s.geoNotify
+			clone.Geo = resolver.LookupCached(ip)
+			if clone.Geo == nil {
+				s.wg.Add(1)
+				go func() {
+					defer s.wg.Done()
+					resolver.LookupAsync(ip, notify)
+				}()
+			}
 		}
 		out = append(out, &clone)
 	}
 	return out
+}
+
+// rateLimitBytesPerSec 速率上限（字节/秒）：400 Gbit/s（=50 GB/s）。
+//
+// 取舍：真实网卡最高约 400GbE，且探针周期通常 5–10 秒，因此 50GB/s 已远超
+// 任何真实主机；同时它足以挡住"旧库恢复导致自启动累计被当成单次增量"
+// 这类异常（那种情况下算出来的速率动辄 TB/s）。
+// 宁可把极端场景判为"未知"（趋势不连线、累计不计入），也不要在公开页
+// 画出一个荒唐的尖峰。
+const rateLimitBytesPerSec = int64(400_000_000_000) / 8
+
+// rateWithinLimit 判断"增量/时间"是否在合理量级内。
+func rateWithinLimit(delta, dt int64) bool {
+	if dt <= 0 || delta < 0 {
+		return false
+	}
+	return delta/dt <= rateLimitBytesPerSec
+}
+
+// derefFloat 解引用可选负载值；nil 与负值都按 0 处理（历史行/旧库）。
+func derefFloat(v *float64) float64 {
+	if v == nil || *v < 0 {
+		return 0
+	}
+	return *v
+}
+
+// loadPtr 由历史行的负载构造公开用指针。
+//
+// 为什么需要 others：旧库补列后，历史行的负载列一律为 0，无法与"空闲机器"区分。
+// 约定"三个值全为 0 = 未知"（不下发指针 → 前端显示「—」），
+// 只要有一个值大于 0 就认为该行确实记录了负载。
+func loadPtr(v float64, others ...float64) *float64 {
+	if v < 0 {
+		return nil
+	}
+	if v == 0 {
+		for _, o := range others {
+			if o > 0 {
+				return &v
+			}
+		}
+		return nil
+	}
+	return &v
 }
 
 // firstNonEmpty 返回第一个非空字符串。
@@ -583,6 +780,39 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// NetTotalsSince 返回某 Agent 在时间窗内的收发字节总量。
+//
+// 口径（重要）：**按采样增量求和**，即"历史留存窗口内的流量"，而不是
+// 网卡累计计数器（后者是自设备启动以来的总量，会随着运行时间无限增长）。
+// 为什么公开页偏向前者：累计计数器同时暴露了"这台机器总共跑了多少流量"，
+// 对直连连接类节点（HTTPS/流媒体/代理）等于公开业务承载量。
+//
+// 返回的 known 表示窗口内是否至少有一个可信增量点：全为 0 且 known=false
+// 时前端应展示"—"而不是"0B"（否则表现为"没跑流量"的误导）。
+func (s *Store) NetTotalsSince(agentID string, since time.Time) (in, out int64, known bool) {
+	if agentID == "" {
+		return 0, 0, false
+	}
+	if s.db != nil {
+		i, o, err := s.db.ProbeNetTotals(agentID, since.Unix())
+		if err == nil {
+			return i, o, true
+		}
+		log.Printf("[probe] 统计窗口流量失败，回退内存: %v", err)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.history[s.resolveLocked(agentID)] {
+		if p == nil || !p.NetDeltaKnown || time.Unix(p.Timestamp, 0).Before(since) {
+			continue
+		}
+		in += p.NetInDeltaBytes
+		out += p.NetOutDeltaBytes
+		known = true
+	}
+	return in, out, known
 }
 
 // HistoryDownsampled 返回某 Agent 的历史采样，并按需降采样到 maxPoints 个点。
@@ -607,24 +837,29 @@ func (s *Store) HistoryDownsampled(agentID string, since time.Time, maxPoints in
 				out := make([]*protocol.ProbeDataReq, 0, len(rows))
 				for _, r := range rows {
 					out = append(out, &protocol.ProbeDataReq{
-						AgentID:        r.AgentID,
-						Timestamp:      r.Timestamp,
-						CPUUsage:       r.CPUUsage,
-						MemUsage:       r.MemUsage,
-						DiskUsage:      r.DiskUsage,
-						NetInBytes:     r.NetInBytes,
-						NetOutBytes:    r.NetOutBytes,
-						OSType:         r.OSType,
-						KernelVersion:  r.KernelVersion,
-						Uptime:         r.Uptime,
-						PublicIP:       r.PublicIP,
-						OSVersion:      r.OSVersion,
-						CPUModel:       r.CPUModel,
-						CPUMHz:         r.CPUMHz,
-						MemTotalBytes:  r.MemTotal,
-						MemUsedBytes:   r.MemUsed,
-						DiskTotalBytes: r.DiskTotal,
-						DiskUsedBytes:  r.DiskUsed,
+						AgentID:          r.AgentID,
+						Timestamp:        r.Timestamp,
+						CPUUsage:         r.CPUUsage,
+						MemUsage:         r.MemUsage,
+						DiskUsage:        r.DiskUsage,
+						NetInBytes:       r.NetInBytes,
+						NetOutBytes:      r.NetOutBytes,
+						OSType:           r.OSType,
+						KernelVersion:    r.KernelVersion,
+						Uptime:           r.Uptime,
+						PublicIP:         r.PublicIP,
+						OSVersion:        r.OSVersion,
+						CPUModel:         r.CPUModel,
+						CPUMHz:           r.CPUMHz,
+						MemTotalBytes:    r.MemTotal,
+						MemUsedBytes:     r.MemUsed,
+						DiskTotalBytes:   r.DiskTotal,
+						DiskUsedBytes:    r.DiskUsed,
+						NetInDeltaBytes:  r.NetInDelta,
+						NetOutDeltaBytes: r.NetOutDelta,
+						Load1:            loadPtr(r.Load1, r.Load5, r.Load15),
+						Load5:            loadPtr(r.Load5, r.Load1, r.Load15),
+						Load15:           loadPtr(r.Load15, r.Load1, r.Load5),
 					})
 				}
 				return out
@@ -654,24 +889,29 @@ func (s *Store) History(agentID string, since time.Time) []*protocol.ProbeDataRe
 			out := make([]*protocol.ProbeDataReq, 0, len(rows))
 			for _, r := range rows {
 				out = append(out, &protocol.ProbeDataReq{
-					AgentID:        r.AgentID,
-					Timestamp:      r.Timestamp,
-					CPUUsage:       r.CPUUsage,
-					MemUsage:       r.MemUsage,
-					DiskUsage:      r.DiskUsage,
-					NetInBytes:     r.NetInBytes,
-					NetOutBytes:    r.NetOutBytes,
-					OSType:         r.OSType,
-					KernelVersion:  r.KernelVersion,
-					Uptime:         r.Uptime,
-					PublicIP:       r.PublicIP,
-					OSVersion:      r.OSVersion,
-					CPUModel:       r.CPUModel,
-					CPUMHz:         r.CPUMHz,
-					MemTotalBytes:  r.MemTotal,
-					MemUsedBytes:   r.MemUsed,
-					DiskTotalBytes: r.DiskTotal,
-					DiskUsedBytes:  r.DiskUsed,
+					AgentID:          r.AgentID,
+					Timestamp:        r.Timestamp,
+					CPUUsage:         r.CPUUsage,
+					MemUsage:         r.MemUsage,
+					DiskUsage:        r.DiskUsage,
+					NetInBytes:       r.NetInBytes,
+					NetOutBytes:      r.NetOutBytes,
+					OSType:           r.OSType,
+					KernelVersion:    r.KernelVersion,
+					Uptime:           r.Uptime,
+					PublicIP:         r.PublicIP,
+					OSVersion:        r.OSVersion,
+					CPUModel:         r.CPUModel,
+					CPUMHz:           r.CPUMHz,
+					MemTotalBytes:    r.MemTotal,
+					MemUsedBytes:     r.MemUsed,
+					DiskTotalBytes:   r.DiskTotal,
+					DiskUsedBytes:    r.DiskUsed,
+					NetInDeltaBytes:  r.NetInDelta,
+					NetOutDeltaBytes: r.NetOutDelta,
+					Load1:            loadPtr(r.Load1, r.Load5, r.Load15),
+					Load5:            loadPtr(r.Load5, r.Load1, r.Load15),
+					Load15:           loadPtr(r.Load15, r.Load1, r.Load5),
 				})
 			}
 			return out
@@ -684,7 +924,9 @@ func (s *Store) History(agentID string, since time.Time) []*protocol.ProbeDataRe
 	h := s.history[s.resolveLocked(agentID)]
 	var out []*protocol.ProbeDataReq
 	for _, p := range h {
-		if time.Unix(p.Timestamp, 0).After(since) {
+		// 与 SQL 侧 `timestamp >= since` 保持一致：恰好落在窗口起点的采样要计入，
+		// 否则内存回退与数据库查询会给出两种结果（同一部署换路径就变数）。
+		if !time.Unix(p.Timestamp, 0).Before(since) {
 			out = append(out, p)
 		}
 	}
@@ -721,6 +963,11 @@ func (s *Store) persistAgent(info *protocol.AgentInfo) {
 		DiskUsed:      info.DiskUsedBytes,
 		NetRateIn:     info.NetRateIn,
 		NetRateOut:    info.NetRateOut,
+		Load1:         derefFloat(info.Load1),
+		Load5:         derefFloat(info.Load5),
+		Load15:        derefFloat(info.Load15),
+		LoadKnown:     info.Load1 != nil,
+		AgentVersion:  info.AgentVersion,
 	}
 	if err := s.db.UpsertAgent(row); err != nil {
 		log.Printf("[probe] 持久化主机信息失败: %v", err)
@@ -748,6 +995,11 @@ func (s *Store) persistProbeHistory(p *protocol.ProbeDataReq) {
 		MemUsed:       p.MemUsedBytes,
 		DiskTotal:     p.DiskTotalBytes,
 		DiskUsed:      p.DiskUsedBytes,
+		NetInDelta:    p.NetInDeltaBytes,
+		NetOutDelta:   p.NetOutDeltaBytes,
+		Load1:         derefFloat(p.Load1),
+		Load5:         derefFloat(p.Load5),
+		Load15:        derefFloat(p.Load15),
 	}
 	if err := s.db.InsertProbeHistory(row); err != nil {
 		log.Printf("[probe] 持久化探针历史失败: %v", err)

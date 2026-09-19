@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -83,14 +84,38 @@ func urlEncode(s string) string {
 	return replacer.Replace(s)
 }
 
+// ipv4Services 公网 IPv4 回显服务（顺序即优先级）。
+//
+// 顺序按**国内可达性**排：ipify / ident.me 在部分国内网络下不可达
+// （连接重置 / DNS 污染），会导致公网 IP 拿不到 —— 而服务端的地理位置
+// （节点地区、国旗）完全依赖这个 IP，于是表现为"地区和国旗不显示"。
+// 因此把国内可达的回显（tool.mooncn.win、ip.sb）放在前面，境外服务仅作兜底。
+var ipv4Services = []string{
+	"http://tool.mooncn.win/ip/?format=json",
+	"https://api-ipv4.ip.sb/ip",
+	"https://ipv4.icanhazip.com",
+	"https://ipv4.ident.me/",
+	"https://api.ipify.org?format=json",
+}
+
+// ipv6Services 公网 IPv6 回显服务（顺序即优先级）。
+//
+// 不含 tool.mooncn.win 这类"回显本机出口 IP"的服务：它在无 IPv6 出口的机器上
+// 会回 IPv4，把它放进 IPv6 列表只会白跑一次请求（地址族过滤会挡住结果）。
+var ipv6Services = []string{
+	"https://api-ipv6.ip.sb/ip",
+	"https://ipv6.icanhazip.com",
+	"https://ipv6.ident.me/",
+	"https://api6.ipify.org?format=json",
+}
+
+// v4ServiceOrder / v6ServiceOrder 以文本形式暴露服务顺序，便于用例断言优先级。
+func v4ServiceOrder() string { return strings.Join(ipv4Services, "\n") }
+func v6ServiceOrder() string { return strings.Join(ipv6Services, "\n") }
+
 // DetectIPv4 探测公网 IPv4。
 func (d *Detector) DetectIPv4() (string, error) {
-	// 依次尝试多个回显服务，取首个成功结果
-	services := []string{
-		"https://api.ipify.org?format=json",
-		"https://ipv4.ident.me/",
-		"https://api.ip.sb/geoip",
-	}
+	services := ipv4Services
 	var lastErr error
 	for _, svc := range services {
 		body, err := d.httpGet(svc)
@@ -98,7 +123,9 @@ func (d *Detector) DetectIPv4() (string, error) {
 			lastErr = err
 			continue
 		}
-		if ip := parseIPResponse(body); ip != "" {
+		// 回显服务应答的**不一定是对应地址族**（透明代理、双栈 DNS、服务端改写
+		// 都会让"IPv6 回显"返回 IPv4）。用地址族过滤，避免把 IPv4 当成 IPv6 上报。
+		if ip := parseIPResponse(body); isIPv4(ip) {
 			return ip, nil
 		}
 	}
@@ -107,10 +134,9 @@ func (d *Detector) DetectIPv4() (string, error) {
 
 // DetectIPv6 探测公网 IPv6。
 func (d *Detector) DetectIPv6() (string, error) {
-	services := []string{
-		"https://api6.ipify.org?format=json",
-		"https://ipv6.ident.me/",
-	}
+	// 同样优先国内可达的回显服务（ip.sb 走腾讯 Anycast）。
+	// 结果必须按地址族过滤（isIPv6）：回显服务应答的不一定是所请求的地址族。
+	services := ipv6Services
 	var lastErr error
 	for _, svc := range services {
 		body, err := d.httpGet(svc)
@@ -118,7 +144,7 @@ func (d *Detector) DetectIPv6() (string, error) {
 			lastErr = err
 			continue
 		}
-		if ip := parseIPResponse(body); ip != "" {
+		if ip := parseIPResponse(body); isIPv6(ip) {
 			return ip, nil
 		}
 	}
@@ -126,15 +152,22 @@ func (d *Detector) DetectIPv6() (string, error) {
 }
 
 // parseIPResponse 从多种回显服务响应中解析 IP 字符串。
+//
+// 支持两类响应：
+//   - JSON：{"ip":"1.2.3.4"}、{"query":"1.2.3.4"}、{"IPv4":"..."}，
+//     以及 tool.mooncn.win 这类细节字段（ident/address）。
+//   - 纯文本：直接就是 IP（如 icanhazip / ident.me）。
 func parseIPResponse(body []byte) string {
 	text := strings.TrimSpace(string(body))
 	// 优先尝试 JSON：{ "ip": "x.x.x.x" } 或 { "ip":"..." }
 	var m map[string]interface{}
 	if json.Unmarshal(body, &m) == nil {
-		for _, k := range []string{"ip", "query", "IPv4", "IPv6"} {
+		for _, k := range []string{"ip", "query", "IPv4", "IPv6", "ident", "address"} {
 			if v, ok := m[k]; ok {
-				if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
-					return strings.TrimSpace(s)
+				if s, ok := v.(string); ok {
+					if s = normalizeIP(s); s != "" {
+						return s
+					}
 				}
 			}
 		}
@@ -151,11 +184,64 @@ func parseIPResponse(body []byte) string {
 	return ""
 }
 
+// normalizeIP 清理回显服务的返回值：
+//   - 去掉 IPv4 的端口（"1.2.3.4:8080" —— 回显的是对端看到的源端口）；
+//   - 去掉 IPv6 的方括号与端口（"[2001:db8::1]:5678" -> "2001:db8::1"）；
+//   - 去掉 IPv6 的区域标识（"fe80::1%eth0" -> "fe80::1"）。
+func normalizeIP(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// [ipv6]:port 形式
+	if strings.HasPrefix(s, "[") {
+		if end := strings.Index(s, "]"); end > 0 {
+			s = s[1:end]
+		}
+	} else if i := strings.LastIndex(s, ":"); i > 0 && strings.Count(s, ":") == 1 {
+		// 形如 "1.2.3.4:8080"：只有一个冒号说明是 IPv4+端口
+		s = s[:i]
+	}
+	if i := strings.Index(s, "%"); i > 0 {
+		s = s[:i]
+	}
+	return s
+}
+
+// isIPv4 / isIPv6 判定地址族（不带端口）。用于过滤回显服务的误答。
+func isIPv4(ip string) bool {
+	ip = normalizeIP(ip)
+	if ip == "" {
+		return false
+	}
+	return net.ParseIP(ip) != nil && !strings.Contains(ip, ":")
+}
+
+func isIPv6(ip string) bool {
+	ip = normalizeIP(ip)
+	if ip == "" || !strings.Contains(ip, ":") {
+		return false
+	}
+	return net.ParseIP(ip) != nil
+}
+
+// 探测结果的缓存时长。
+const (
+	// cacheOK 探测到公网 IP 后的缓存时长：地址在运营商层面变化不频繁。
+	cacheOK = 30 * time.Minute
+	// cacheFail 探测失败后的重试间隔：必须**远短于** cacheOK。
+	//
+	// 这里曾是一个隐藏 Bug：失败结果（空 IP）也被当成"有效结果"缓存 30 分钟，
+	// 于是开机/断网/回显服务抖动导致的首轮失败，会让这台机器在半小时内
+	// 一直上报空公网 IP —— 服务端因此解析不出地理位置，公开页的
+	// "节点地区 + 国旗"就一直是空的，且**重启 Agent 也可能再撞上**。
+	cacheFail = 60 * time.Second
+)
+
 // Resolve 综合探测 IPv4 与 IPv6，带结果缓存。
 func (d *Detector) Resolve() Result {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	// 缓存 30 分钟
 	if time.Now().Before(d.expireAt) {
 		return d.result
 	}
@@ -167,6 +253,12 @@ func (d *Detector) Resolve() Result {
 		r.IPv6 = v6
 	}
 	d.result = r
-	d.expireAt = time.Now().Add(30 * time.Minute)
+	// 只探测到部分结果时按"成功"缓存，但下一次仍会重新尝试补齐缺失的那一类
+	// （expireAt 到期即重探，成功结果本身也会被重新探测刷新）。
+	if r.IPv4 != "" || r.IPv6 != "" {
+		d.expireAt = time.Now().Add(cacheOK)
+	} else {
+		d.expireAt = time.Now().Add(cacheFail)
+	}
 	return r
 }

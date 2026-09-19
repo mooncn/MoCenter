@@ -8,9 +8,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mocenter/agent/internal/ip"
+	"mocenter/agent/internal/latency"
 	"mocenter/agent/internal/protocol"
 )
 
@@ -32,6 +34,10 @@ type Collector struct {
 	start    time.Time
 	// 公网出口 IP 探测器
 	ipDetector *ip.Detector
+	// 延迟探测器与目标（ICMP/TCP/HTTP）
+	latencyProber *latency.Prober
+	latencyMu     sync.RWMutex
+	latencyTarget []latency.Target
 }
 
 type cpuTimes struct {
@@ -46,13 +52,38 @@ func NewCollector(agentID string) *Collector {
 // NewCollectorWithProxy 创建采集器，proxy 为可选的国内加速代理前缀。
 func NewCollectorWithProxy(agentID, proxy string) *Collector {
 	return &Collector{
-		AgentID:    agentID,
-		host:       hostname(),
-		osType:     runtime.GOOS,
-		arch:       runtime.GOARCH,
-		start:      time.Now(),
-		ipDetector: ip.NewDetector(proxy),
+		AgentID:       agentID,
+		host:          hostname(),
+		osType:        runtime.GOOS,
+		arch:          runtime.GOARCH,
+		start:         time.Now(),
+		ipDetector:    ip.NewDetector(proxy),
+		latencyProber: latency.New(),
 	}
+}
+
+// SetLatencyTargets 设置延迟探测目标（来自配置或服务端下发）。
+// 空列表表示不探测 —— 不探测时上报里不带任何延迟字段，而不是报一堆 0。
+func (c *Collector) SetLatencyTargets(specs []string) {
+	c.latencyMu.Lock()
+	c.latencyTarget = latency.ParseTargets(specs)
+	c.latencyMu.Unlock()
+}
+
+// LatencyTargets 返回当前探测目标。
+func (c *Collector) LatencyTargets() []latency.Target {
+	c.latencyMu.RLock()
+	defer c.latencyMu.RUnlock()
+	return append([]latency.Target(nil), c.latencyTarget...)
+}
+
+// ProbeLatency 对所有目标做一轮探测（供服务端按需触发）。
+func (c *Collector) ProbeLatency() map[string]float64 {
+	targets := c.LatencyTargets()
+	if len(targets) == 0 {
+		return nil
+	}
+	return c.latencyProber.ProbeAll(targets)
 }
 
 // PublicIPs 返回公网出口 IP（IPv4/IPv6）。
@@ -104,6 +135,19 @@ func (c *Collector) Sample() *protocol.ProbeDataReq {
 		MemUsedBytes:   memUsed,
 		DiskTotalBytes: diskTotal,
 		DiskUsedBytes:  diskUsed,
+	}
+	// 系统负载（1/5/15 分钟平均）。平台不提供时保持 nil，
+	// 前端据此显示「—」而不是把 0 当成"空闲"（0 本身是合法负载）。
+	if l1, l5, l15, ok := loadAvg(); ok {
+		p.Load1, p.Load5, p.Load15 = &l1, &l5, &l15
+	}
+	// 延迟监测：目标为空时**不带任何延迟字段**（而不是报 0 —— 0ms 会被
+	// 前端当成"最快"呈现，属于典型的监控误报）。
+	if targets := c.LatencyTargets(); len(targets) > 0 {
+		p.LatencyTargets = latency.FormatTargets(targets)
+		if ms := c.latencyProber.ProbeAll(targets); len(ms) > 0 {
+			p.LatencyMS = ms
+		}
 	}
 	// 内存使用率统一由明细计算（Linux /proc 与 Windows wmic 均适用）
 	if memTotal > 0 {

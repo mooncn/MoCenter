@@ -77,6 +77,21 @@ export default defineConfig(async () => {
       outDir: 'dist',
       // noVNC 依赖顶层 await，需要更高 ES target
       target: 'es2022',
+      // 依赖分包：VNC(noVNC) 与终端(xterm) 各自成块并按需加载。
+      // 公开状态页与后台首页不再为「可能用不到的功能」付下载代价 ——
+      // 移动端弱网下这是首屏耗时的主要来源。
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (!id.includes('node_modules')) return undefined
+            if (id.includes('novnc')) return 'vendor-novnc'
+            if (id.includes('xterm')) return 'vendor-xterm'
+            if (id.includes('react') || id.includes('scheduler')) return 'vendor-react'
+            return 'vendor'
+          },
+        },
+      },
+      chunkSizeWarningLimit: 600,
     },
     optimizeDeps: {
       esbuildOptions: { target: 'es2022' },

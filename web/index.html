@@ -2,11 +2,32 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- 移动端地址栏/状态栏配色：不指定时部分浏览器会在深色页面上取默认滚动色，
+         与页面底色不一致会看到明显的色带（甚至整屏底色异常） -->
+    <meta name="theme-color" content="#0f1419" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="format-detection" content="telephone=no" />
     <title>MoCenter · 集中式主机远控管理系统</title>
+    <!--
+      首屏底色内联在 <head>：
+      样式表是 <link> 加载的，在网络慢/资源被拦截（企业代理、缓存损坏）时，
+      body 在样式到达前是**浏览器默认白底**，随后才变深色 —— 看起来就是"先白后黑"，
+      严重的直接表现为"黑屏/白屏"。这里用内联样式先把底色铺上，样式表到达后再覆盖。
+      background-color 直接写 #0f1419（CSS 变量此刻还没定义，不能用 var()）。
+    -->
+    <style>
+      html { background-color: #0f1419; }
+      body { margin: 0; min-height: 100dvh; background-color: #0f1419; color: #e6edf3; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
+    <noscript>
+      <div style="padding: 24px; font-family: system-ui, sans-serif; color: #e6edf3; background: #0f1419">
+        本页面需要启用 JavaScript。请检查浏览器设置，或改用最新版 Chrome / Edge / Firefox 访问。
+      </div>
+    </noscript>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

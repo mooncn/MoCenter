@@ -54,6 +54,12 @@ func RunAsService(name string, start, stop func()) error {
 	return svc.Run(name, &serviceHandler{start: start, stop: stop})
 }
 
+// DescribeSingleton 返回单实例保护的可读描述（与 Unix 侧同签名，供启动日志打印）。
+func DescribeSingleton(key, configPath string) string {
+	_ = configPath
+	return "命名互斥体 " + key
+}
+
 // procCreateMutexW 直接取 kernel32!CreateMutexW。
 //
 // 为什么不用 x/sys 的封装：它在调用成功时会丢弃 last error，
@@ -67,7 +73,12 @@ var procCreateMutexW = windows.NewLazySystemDLL("kernel32.dll").NewProc("CreateM
 //
 // 命名空间优先 Global\（跨会话，服务与用户态都能看到）；非管理员无 Global 权限时
 // 回退 Local\。两者都建不出来时不阻塞启动 —— 宁可多跑一个，也不要因此起不来。
-func AcquireSingleton(key string) (func(), bool) {
+//
+// configPath 仅非 Windows 侧用于定位锁文件（必须与配置文件同目录，
+// 见 singleton_unix.go 的说明）；Windows 的互斥体是内核对象，与路径无关，
+// 因此这里忽略该参数，只为两个平台提供一致签名。
+func AcquireSingleton(key, configPath string) (func(), bool) {
+	_ = configPath
 	for _, prefix := range []string{`Global\`, `Local\`} {
 		name, err := windows.UTF16PtrFromString(prefix + key)
 		if err != nil {
