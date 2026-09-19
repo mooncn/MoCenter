@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { Api } from '../api/api.js'
+import SiteFooter from '../components/SiteFooter.jsx'
+import { DEFAULT_SITE_TITLE, FOOTER_YEAR_TOKEN } from '../utils/siteBranding.js'
 
 // 展示配置：控制**未登录访客**在公开状态页能看到的条目。
 //
@@ -164,6 +166,11 @@ export default function SiteConfig() {
         </div>
       </div>
 
+      {/* 站点品牌：浏览器标题 + 页脚。
+          与「公开页标题」的区别：这里是**全站外观**（标签页 + 页脚），
+          不受公开页总开关影响（后台、登录页同样生效）。 */}
+      <BrandingCard cfg={cfg} patch={patch} />
+
       {/* 主机范围 */}
       <div className="card">
         <h3>主机范围</h3>
@@ -311,6 +318,57 @@ export default function SiteConfig() {
   )
 }
 
+// BrandingCard 站点品牌配置：浏览器标签标题 + 页脚自定义内容。
+//
+// 页脚支持 HTML（需求），因此这里给出**实时预览**：所见即所得，
+// 避免保存后才发现标签写错（页脚在页面上占位不高，出问题不容易察觉）。
+function BrandingCard({ cfg, patch }) {
+  return (
+    <div className="card">
+      <h3>站点标题与页脚</h3>
+      <div className="desc">
+        标题显示在浏览器标签页；页脚显示在首页、节点详情页与登录页底部。
+        两者属于**站点外观**，不受下方「公开状态页」总开关影响。
+      </div>
+      <div className="form-grid" style={{ marginTop: 4 }}>
+        <div className="form-row">
+          <label>网站标题（浏览器标签）</label>
+          <input
+            value={cfg.site_title || ''}
+            onChange={(e) => patch({ site_title: e.target.value })}
+            placeholder={DEFAULT_SITE_TITLE}
+            maxLength={200}
+          />
+          <div className="cell-sub">留空则使用默认：{DEFAULT_SITE_TITLE}</div>
+        </div>
+        <div className="form-row">
+          <label>页脚内容（支持 HTML）</label>
+          <textarea
+            className="code-input"
+            rows={3}
+            value={cfg.site_footer || ''}
+            onChange={(e) => patch({ site_footer: e.target.value })}
+            placeholder={`${FOOTER_YEAR_TOKEN}©MOONCN`}
+            maxLength={4096}
+          />
+          <div className="cell-sub">
+            可用 <code>{FOOTER_YEAR_TOKEN}</code> 表示当前年份，留空则用默认
+            <code> {FOOTER_YEAR_TOKEN}©MOONCN</code>。可写 <code>&lt;a&gt;</code>、
+            <code>&lt;span&gt;</code> 等展示型标签；<code>&lt;script&gt;</code>/事件属性会被自动剔除。
+          </div>
+        </div>
+      </div>
+      {cfg.site_footer ? (
+        <div style={{ marginTop: 10 }}>
+          <div className="cell-sub" style={{ marginBottom: 4 }}>页脚预览：</div>
+          {/* 预览与线上渲染共用 SiteFooter，避免"预览对、线上不对" */}
+          <SiteFooter html={cfg.site_footer} />
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 // 规范化后端返回的配置，保证前端不会因为字段缺失而崩。
 function normalizeConfig(c) {
   const src = c || {}
@@ -322,6 +380,8 @@ function normalizeConfig(c) {
     fields: src.fields && typeof src.fields === 'object' ? { ...src.fields } : {},
     title: src.title || '',
     description: src.description || '',
+    site_title: src.site_title || '',
+    site_footer: src.site_footer || '',
     traffic_mode: src.traffic_mode === 'window' ? 'window' : 'boot',
   }
 }

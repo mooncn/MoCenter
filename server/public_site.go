@@ -103,13 +103,7 @@ func (p *publicSite) stateHandler() http.HandlerFunc {
 		writeJSON(w, map[string]interface{}{
 			"ok":      true,
 			"enabled": true,
-			"config": map[string]interface{}{
-				"title":         cfg.Title,
-				"description":   cfg.Description,
-				"hosts_enabled": cfg.HostsEnabled,
-				"traffic_mode":  cfg.TrafficModeOrDefault(),
-				"fields":        cfg.Fields,
-			},
+			"config":  publicConfigPayload(cfg),
 			"fields":  publicFieldCatalog(),
 			"nodes":   nodes,
 			"summary": publicview.BuildSummary(nodes, time.Now().Unix()),
@@ -256,19 +250,37 @@ func (p *publicSite) publicWSHandler() http.HandlerFunc {
 	}
 }
 
+// publicConfigPayload 构造下发给前端的公开配置片段。
+//
+// 刻意**只**包含展示所需的非敏感项：主机白名单、字段开关之外的东西
+// （host_ids / catalog_enabled 等）属于"公开策略"，没必要下发给匿名访客。
+// 站点标题与页脚属于**品牌文案**（运维自己配置、面向所有访客展示），
+// 因此一并下发，且页脚允许 HTML 原样透传。
+//
+// 注意：这里必须与 stateHandler 用同一个函数 —— 两处分别手写 map 曾经
+// 导致 WS 推送与首屏快照的 config 字段不一致（页面刷新后才变正常）。
+func publicConfigPayload(cfg *siteconfig.Config) map[string]interface{} {
+	if cfg == nil {
+		return map[string]interface{}{}
+	}
+	return map[string]interface{}{
+		"title":         cfg.Title,
+		"description":   cfg.Description,
+		"hosts_enabled": cfg.HostsEnabled,
+		"traffic_mode":  cfg.TrafficModeOrDefault(),
+		"fields":        cfg.Fields,
+		"site_title":    cfg.SiteTitleOrDefault(),
+		"site_footer":   cfg.SiteFooterOrDefault(),
+	}
+}
+
 // writePublicWS 生成并下发一条公开 WS 消息。
 func writePublicWS(conn *websocket.Conn, cfg *siteconfig.Config, nodes []*publicview.Node) {
 	payload, err := json.Marshal(map[string]interface{}{
 		"ok":      true,
 		"nodes":   nodes,
 		"summary": publicview.BuildSummary(nodes, time.Now().Unix()),
-		"config": map[string]interface{}{
-			"title":         cfg.Title,
-			"description":   cfg.Description,
-			"hosts_enabled": cfg.HostsEnabled,
-			"traffic_mode":  cfg.TrafficModeOrDefault(),
-			"fields":        cfg.Fields,
-		},
+		"config":  publicConfigPayload(cfg),
 	})
 	if err != nil {
 		return
@@ -459,8 +471,9 @@ func siteConfigHandler(store *siteconfig.Store, authz *auth.Auth, audit AuditFun
 			}
 			// 展示范围变更属于安全相关操作，纳入审计留痕
 			if audit != nil {
-				audit(r, fmt.Sprintf("更新公开展示配置 enabled=%v hosts=%v catalog=%v hosts_count=%d",
-					body.Enabled, body.HostsEnabled, body.CatalogEnabled, len(body.HostIDs)))
+				audit(r, fmt.Sprintf("更新公开展示配置 enabled=%v hosts=%v catalog=%v hosts_count=%d site_title=%q footer_len=%d",
+					body.Enabled, body.HostsEnabled, body.CatalogEnabled, len(body.HostIDs),
+					body.SiteTitleOrDefault(), len(body.SiteFooterOrDefault())))
 			}
 			writeJSON(w, map[string]interface{}{"ok": true, "msg": "展示配置已保存"})
 		default:
@@ -520,9 +533,22 @@ func siteHostOptionsHandler(store *probe.Store, authz *auth.Auth) http.HandlerFu
 //
 // 供前端在**登录前**判断公开页是否启用（例如登录页给出"查看公开状态页"入口）。
 // 刻意只返回一个布尔值：该端点本身必须免鉴权，因此不泄露任何其它信息。
+// 除 enabled 外，还会带上**站点品牌文案**（标题 / 页脚）。
+//
+// 为什么把品牌文案放在这个免鉴权端点上：管理后台的登录页在登录前就要用正确的
+// 站点标题（浏览器标签），而登录前的页面拿不到任何需要鉴权的接口。标题与页脚
+// 本身就是"给所有人看"的内容（页脚展示在公开页），不构成信息泄露。
+//
+// 仍然刻意**不**返回 host_ids / catalog_enabled / fields 等公开策略 —— 那些是
+// "哪些机器对外可见"的决策信息，不属于品牌文案。
 func publicConfigStateHandler(store *siteconfig.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg := store.Get()
-		writeJSON(w, map[string]interface{}{"ok": true, "enabled": cfg != nil && cfg.Enabled})
+		writeJSON(w, map[string]interface{}{
+			"ok":          true,
+			"enabled":     cfg != nil && cfg.Enabled,
+			"site_title":  cfg.SiteTitleOrDefault(),
+			"site_footer": cfg.SiteFooterOrDefault(),
+		})
 	}
 }

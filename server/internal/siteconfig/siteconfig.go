@@ -137,6 +137,17 @@ type Config struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 
+	// SiteTitle 浏览器标签页标题（<title>）。全站生效：公开页与后台都读它，
+	// 留空回退 DefaultSiteTitle，避免出现无标题的浏览器标签。
+	SiteTitle string `json:"site_title"`
+	// SiteFooter 页脚自定义内容，**支持 HTML**（如版权、备案号、备案链接）。
+	//
+	// 安全边界：该字段由**已登录运维**在后台配置，属于受信内容（与"未登录访客
+	// 可控的输入"不同），因此允许 HTML 并按原样渲染；渲染入口只有页脚一处，
+	// 且不会把它当模板引擎执行（见 Frontend 的 PublicStatus/SiteConfig 实现）。
+	// 留空回退 DefaultSiteFooter()。
+	SiteFooter string `json:"site_footer"`
+
 	// TrafficMode 流量统计口径：boot（自设备启动） / window（历史留存窗口内）。
 	// 直连连接类主机（HTTPS/流媒体/代理）长期累计流量很大，对外开放时更适合用
 	// window 口径，避免暴露总承载量。
@@ -151,6 +162,18 @@ func (c *Config) TrafficModeOrDefault() string {
 	return NormalizeTrafficMode(c.TrafficMode)
 }
 
+// 站点品牌默认值。
+const (
+	// DefaultSiteTitle 浏览器标签页默认标题。
+	DefaultSiteTitle = "MoCenter · 集中式主机远控管理系统"
+	// DefaultSiteFooter 页脚默认内容。`{year}` 是**年份占位符**，
+	// 由前端按当前年份替换 —— 这样默认值不必每年手工改一遍，
+	// 也不会因为配置里存了写死的年份而"过期"。
+	DefaultSiteFooter = "{year}©MOONCN"
+	// FooterYearToken 页脚年份占位符。
+	FooterYearToken = "{year}"
+)
+
 // Default 返回默认配置：总开关关闭，字段取目录默认值。
 func Default() *Config {
 	return &Config{
@@ -161,8 +184,26 @@ func Default() *Config {
 		Fields:         DefaultFields(),
 		Title:          "MoCenter 节点状态",
 		Description:    "本页面由 MoCenter 公开站点提供，仅展示非敏感运行指标。",
+		SiteTitle:      DefaultSiteTitle,
+		SiteFooter:     DefaultSiteFooter,
 		TrafficMode:    TrafficModeBoot,
 	}
+}
+
+// SiteTitleOrDefault 返回生效的浏览器标题（空值回退默认）。
+func (c *Config) SiteTitleOrDefault() string {
+	if c == nil || trimSpace(c.SiteTitle) == "" {
+		return DefaultSiteTitle
+	}
+	return trimSpace(c.SiteTitle)
+}
+
+// SiteFooterOrDefault 返回生效的页脚内容（空值回退默认），保留原始 HTML。
+func (c *Config) SiteFooterOrDefault() string {
+	if c == nil || trimSpace(c.SiteFooter) == "" {
+		return DefaultSiteFooter
+	}
+	return c.SiteFooter
 }
 
 // normalize 修正非法/越界取值，保证内存中的配置始终是"可用且安全"的。
@@ -191,6 +232,65 @@ func (c *Config) normalize() {
 	}
 	c.HostIDs = ids
 	c.TrafficMode = NormalizeTrafficMode(c.TrafficMode)
+
+	// 品牌文案：去掉首尾空白并做长度上限，防止配置被塞入超大内容，
+	// 以至于每次公开页响应/WS 推送都多带上百 KB。
+	c.Title = trimSpace(c.Title)
+	c.Description = trimSpace(c.Description)
+	c.SiteTitle = trimSpace(c.SiteTitle)
+	if len(c.SiteTitle) > maxSiteTitleLen {
+		c.SiteTitle = truncateRunes(c.SiteTitle, maxSiteTitleLen)
+	}
+	// 页脚允许 HTML，首尾空白无意义但**内部换行要保留**（多行版权信息），
+	// 因此只裁首尾、不做整体 trim 成单行。
+	c.SiteFooter = trimSpace(c.SiteFooter)
+	if len(c.SiteFooter) > maxSiteFooterLen {
+		c.SiteFooter = c.SiteFooter[:maxSiteFooterLen]
+	}
+}
+
+// 品牌文案长度上限（按字节，宽松即可：正常版权/备案号远小于此值）。
+const (
+	maxSiteTitleLen  = 200
+	maxSiteFooterLen = 4096
+)
+
+// truncateRunes 按字符截断（避免把多字节字符切成半个，产生乱码）。
+func truncateRunes(s string, n int) string {
+	i, count := 0, 0
+	for i < len(s) && count < n {
+		_, size := decodeRune(s[i:])
+		i += size
+		count++
+	}
+	return s[:i]
+}
+
+// decodeRune 内联 utf8.DecodeRuneInString，避免为一个截断引入 import。
+func decodeRune(s string) (rune, int) {
+	if len(s) == 0 {
+		return 0, 0
+	}
+	b := s[0]
+	switch {
+	case b < 0x80:
+		return rune(b), 1
+	case b < 0xE0:
+		if len(s) < 2 {
+			return 0xFFFD, 1
+		}
+		return rune(b&0x1F)<<6 | rune(s[1]&0x3F), 2
+	case b < 0xF0:
+		if len(s) < 3 {
+			return 0xFFFD, 1
+		}
+		return rune(b&0x0F)<<12 | rune(s[1]&0x3F)<<6 | rune(s[2]&0x3F), 3
+	default:
+		if len(s) < 4 {
+			return 0xFFFD, 1
+		}
+		return rune(b&0x07)<<18 | rune(s[1]&0x3F)<<12 | rune(s[2]&0x3F)<<6 | rune(s[3]&0x3F), 4
+	}
 }
 
 // FieldVisible 判断字段是否对公开页可见。

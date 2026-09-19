@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { PublicApi, PublicSocket } from '../api/api.js'
 import Flag from '../components/Flag.jsx'
+import SiteFooter, { useSiteTitle } from '../components/SiteFooter.jsx'
 
 // 公开状态页（**免登录**）：展示非敏感运行指标 + 节点详情（历史趋势）。
 //
@@ -75,6 +76,10 @@ export default function PublicStatus() {
 
   const nodes = snapshot?.nodes || []
   const config = snapshot?.config || {}
+
+  // 站点标题：后端默认值与 index.html 的静态标题一致，配置变更后（含 WS 推送）
+  // 标签页标题同步更新。
+  useSiteTitle(config.site_title)
 
   // 搜索：纯前端过滤（公开页节点数有限，不额外增加接口与限流压力）
   const filtered = useMemo(() => {
@@ -187,10 +192,30 @@ export default function PublicStatus() {
         </>
       )}
 
-      <footer className="public-foot">
+      {/* 页脚：内容来自后台「展示配置」，支持 HTML（版权 / 备案号 / 链接）。
+          未配置时回退默认 `{year}©MOONCN`（年份按当前年份替换）。 */}
+      <SiteFooter html={config.site_footer} />
+      <div className="public-foot-sub">
         数据每 5 秒由 Agent 上报 · 页面实时刷新 · <Link to="/admin/login">管理后台</Link>
-      </footer>
+      </div>
     </div>
+  )
+}
+
+// OnlineDot 卡片右上角的状态点。
+//
+// online 为 undefined 表示服务端未下发该字段（后台「展示配置」里关了「在线状态」），
+// 此时不渲染 —— 否则会凭空出现一个"离线"红点，比不显示更误导。
+function OnlineDot({ online }) {
+  if (online === undefined || online === null) return null
+  const label = online ? '在线' : '离线'
+  return (
+    <span
+      className={`dot card-dot ${online ? 'online' : 'offline'}`}
+      title={label}
+      aria-label={label}
+      role="img"
+    />
   )
 }
 
@@ -277,14 +302,13 @@ function NodeCards({ nodes, visible }) {
               <span className="public-card-head-right">
                 {/* 在线绿点 / 离线红点：卡片右上角，一眼分辨整屏里哪台掉线了。
                     `.dot.offline` 在别处是灰点（弱化），公开卡片上要求"离线标红"，
-                    因此这里用 card-dot 覆盖成红色；离线卡片同时整卡降透明。 */}
-                {n.online !== undefined && (
-                  <span
-                    className={`dot card-dot ${n.online ? 'online' : 'offline'}`}
-                    title={n.online ? '在线' : '离线'}
-                    aria-label={n.online ? '在线' : '离线'}
-                  />
-                )}
+                    因此这里用 card-dot 覆盖成红色；离线卡片同时整卡降透明。
+
+                    注意判断条件用 `!== undefined`（键存在即渲染）而**不是**真值判断：
+                    服务端把「在线状态」字段关闭时不下发 online 键（=undefined，不渲染）；
+                    下发了就是明确的 true/false，false 必须渲染成红点。
+                    用 `n.online &&` 的写法会让离线机器连点都不显示，与"没接入"混淆。 */}
+                <OnlineDot online={n.online} />
               </span>
             </div>
 
@@ -584,6 +608,7 @@ export function PublicNode() {
   const [samples, setSamples] = useState([])
   const [loaded, setLoaded] = useState(false)
   const [missing, setMissing] = useState(false)
+  const [config, setConfig] = useState({})
 
   // 节点明细：从公开状态接口里筛出该 node_id（接口不提供"按 node 查详情"，
   // 避免多出一个可枚举的详情端点）。
@@ -594,6 +619,8 @@ export function PublicNode() {
       const found = (d.nodes || []).find((x) => x.node_id === nodeId)
       if (found) { setNode(found); setMissing(false) }
       else setMissing(true)
+      // 详情页也要用配置里的站点标题与页脚（与首页保持一致）
+      if (d.config) setConfig(d.config)
     }).catch((err) => { if (alive && err.response?.status === 404) setMissing(true) })
 
     pull()
@@ -618,6 +645,10 @@ export function PublicNode() {
     { key: '24h', label: '最近 24 小时' },
     { key: '7d', label: '最近 7 天' },
   ]
+
+  // 标题与页脚：hooks 必须在任何 early return **之前**调用（否则条件分支下
+  // hook 数量变化会触发 React 报错），因此放在 missing 判断上方。
+  useSiteTitle(config.site_title)
 
   if (missing) {
     return (
@@ -679,6 +710,8 @@ export function PublicNode() {
           ? <div className="public-empty">正在加载历史数据…</div>
           : <PublicTrend samples={samples} />}
       </div>
+
+      <SiteFooter html={config.site_footer} />
     </div>
   )
 }

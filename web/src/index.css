@@ -870,6 +870,25 @@ button.primary { background: var(--accent); }
 .public-foot {
   margin-top: 28px; text-align: center; color: var(--muted); font-size: 12.5px;
 }
+/* 页脚自定义内容（后台「展示配置」）里的链接与行内元素：
+   深色底上默认蓝色太暗，统一提亮到主题强调色，并保持下划线可点感。 */
+.site-foot a { color: var(--accent); text-decoration: none; }
+.site-foot a:hover, .site-foot a:focus-visible { text-decoration: underline; }
+.site-foot img { max-height: 20px; vertical-align: middle; }
+/* 页脚下方那行"数据每 5 秒由 Agent 上报…"：与自定义页脚同一区块、
+   但字号更小更弱，避免和运维写的版权信息抢注意力。 */
+.public-foot-sub {
+  margin-top: 6px; text-align: center; color: var(--muted);
+  font-size: 12px; opacity: .78;
+}
+.public-foot-sub a { color: inherit; }
+/* 后台页脚（登录页）：登录框下方的页脚只需要一点上边距 */
+.login-wrap .site-foot { margin-top: 18px; opacity: .85; }
+/* 多行代码/HTML 输入框：等宽字体便于核对标签 */
+.code-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px; line-height: 1.6; resize: vertical;
+}
 .public-tips { margin-left: 18px; color: var(--muted); font-size: 13px; line-height: 1.9; }
 .public-tips code { color: var(--text); }
 

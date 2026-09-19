@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { Navigate, useNavigate, useSearchParams } from 'react-router-dom'
 import { Api, PublicApi } from '../api/api.js'
+import SiteFooter, { useSiteTitle } from '../components/SiteFooter.jsx'
 // 登录成功后的默认落地页：**后台仪表盘**（不是公开状态页）
 const DEFAULT_REDIRECT = '/admin'
 
@@ -21,6 +22,8 @@ export default function Login() {
   const [err, setErr] = useState('')
   // 公开状态页是否启用：启用时给未登录访客一个入口（无信息泄露，只查布尔值）
   const [publicEnabled, setPublicEnabled] = useState(false)
+  // 站点品牌文案（标题 / 页脚）：登录前也要显示正确的标签页标题
+  const [branding, setBranding] = useState({ site_title: '', site_footer: '' })
   // 会话校验结果：null=校验中 true=已登录 false=未登录
   // **必须三态**：只看"本地有没有 token"是不够的（token 过期/被服务端吊销时依然存在），
   // 但直接往前端判断也会把"还没校验完"误判成"未登录"，于是已登录用户会看到登录表单闪一下。
@@ -48,8 +51,11 @@ export default function Login() {
   useEffect(() => {
     let alive = true
     PublicApi.enabled().then((v) => alive && setPublicEnabled(v)).catch(() => {})
+    PublicApi.branding().then((b) => alive && setBranding(b)).catch(() => {})
     return () => { alive = false }
   }, [])
+
+  useSiteTitle(branding.site_title)
 
   const doLogin = async (e) => {
     e.preventDefault()
@@ -136,6 +142,8 @@ export default function Login() {
           OTP，需一并填写 6 位动态验证码。
         </div>
       </form>
+      {/* 页脚：后台登录页也展示站点页脚（内容由「展示配置」维护） */}
+      <SiteFooter html={branding.site_footer} />
     </div>
   )
 }

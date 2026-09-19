@@ -261,6 +261,19 @@ export const PublicApi = {
       return false
     }
   },
+  // 站点品牌文案（标题 / 页脚）。与 enabled 同一个免鉴权端点：
+  // 登录页在**登录前**就要显示正确的站点标题，这是它存在的理由。
+  async branding() {
+    try {
+      const { data } = await publicApi.get('/enabled')
+      return {
+        site_title: data?.site_title || '',
+        site_footer: data?.site_footer || '',
+      }
+    } catch {
+      return { site_title: '', site_footer: '' }
+    }
+  },
   // 公开状态：配置 + 字段元数据 + 节点列表 + 汇总
   async state() {
     const { data } = await publicApi.get('/state')

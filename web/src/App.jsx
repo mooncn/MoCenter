@@ -15,7 +15,8 @@ import Backup from './pages/Backup.jsx'
 import AgentEnroll from './pages/AgentEnroll.jsx'
 import Login from './pages/Login.jsx'
 import PublicStatus, { PublicNode } from './pages/PublicStatus.jsx'
-import { Api, MCSocket } from './api/api.js'
+import { Api, PublicApi, MCSocket } from './api/api.js'
+import { applySiteTitle } from './utils/siteBranding.js'
 
 // 全局 WebSocket 上下文
 export const SocketContext = React.createContext(null)
@@ -60,6 +61,11 @@ function Layout() {
   useEffect(() => {
     // 拉取主机列表
     Api.agents().then((d) => setAgents(Array.isArray(d) ? d : [])).catch(() => {})
+
+    // 站点标题：后台页面同样使用「展示配置」里的标题。
+    // 用免鉴权端点（/api/public/enabled 附带品牌文案）读取 —— 登录页与后台
+    // 共用一份来源，避免"登录前一个标题、登录后又变回去"。
+    PublicApi.branding().then((b) => applySiteTitle(b.site_title)).catch(() => {})
 
     // 备注保存后刷新主机列表，使备注在仪表盘即时生效
     const onRemarkSaved = () => Api.agents().then((d) => setAgents(Array.isArray(d) ? d : [])).catch(() => {})

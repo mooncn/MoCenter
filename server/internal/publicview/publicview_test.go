@@ -419,3 +419,78 @@ func TestLoadZeroIsValidValue(t *testing.T) {
 }
 
 func f64(v float64) *float64 { return &v }
+
+// 回归：离线状态必须**显式**出现在 JSON 里（"online": false）。
+//
+// 历史 Bug：Online 曾是 `bool` + `omitempty`，离线（false）是零值，被
+// omitempty 从 JSON 中抹掉 —— 前端拿到的 online 是 undefined，于是
+//
+//	· 卡片右上角状态点整个不渲染（离线机器看着像"没接入"）；
+//	· 列表视图状态列显示 "-"；节点详情不显示在线/离线徽标。
+//
+// 修复后三态语义明确：nil=字段未开启 / true=在线 / false=离线。
+func TestOfflineStateSerializedExplicitly(t *testing.T) {
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+	a := sampleAgent()
+	a.Online = false
+
+	node := BuildNode(a, cfg)
+	if node.Online == nil {
+		t.Fatal("「在线状态」开启时 Online 不应为 nil")
+	}
+	raw, _ := json.Marshal(node)
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := m["online"]
+	if !ok {
+		t.Fatal("离线节点必须在 JSON 中显式携带 online: false（否则前端无法区分「离线」与「字段未开启」）")
+	}
+	if v != false {
+		t.Fatalf("离线节点 online 应为 false，实际 %v", v)
+	}
+	if node.IsOnline() {
+		t.Fatal("IsOnline 对离线节点应返回 false")
+	}
+}
+
+// 关闭「在线状态」字段时 online 键必须消失（与其它字段一样的数据不下发）。
+func TestOnlineFieldGate(t *testing.T) {
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+	cfg.Fields = map[string]bool{}
+	node := BuildNode(sampleAgent(), cfg)
+	if node.Online != nil {
+		t.Fatal("关闭「在线状态」后 Online 应为 nil")
+	}
+	raw, _ := json.Marshal(node)
+	var m map[string]interface{}
+	_ = json.Unmarshal(raw, &m)
+	if _, ok := m["online"]; ok {
+		t.Error("关闭「在线状态」后 JSON 中不应出现 online 键")
+	}
+	// 字段未开启时按离线归类，保证汇总的在线+离线=总数恒成立
+	if node.IsOnline() {
+		t.Error("字段未开启时 IsOnline 应返回 false")
+	}
+}
+
+// 汇总的在线/离线计数必须与节点状态一致（含离线→在线切换）。
+func TestSummaryOnlineOfflineCounts(t *testing.T) {
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+	agents := []*protocol.AgentInfo{
+		{AgentID: "a", Online: true},
+		{AgentID: "b", Online: false},
+		{AgentID: "c", Online: false},
+	}
+	s := BuildSummary(BuildNodes(agents, cfg), 0)
+	if s.Total != 3 || s.Online != 1 || s.Offline != 2 {
+		t.Fatalf("在线/离线统计错误: total=%d online=%d offline=%d", s.Total, s.Online, s.Offline)
+	}
+	if s.Online+s.Offline != s.Total {
+		t.Fatalf("在线+离线应等于总数: %d+%d != %d", s.Online, s.Offline, s.Total)
+	}
+}

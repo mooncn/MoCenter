@@ -46,8 +46,20 @@ type Node struct {
 	Remark string `json:"remark,omitempty"`
 	// Hostname 主机名（敏感：可能含内网命名规范，默认关闭）
 	Hostname string `json:"hostname,omitempty"`
-	// Online 在线状态
-	Online bool `json:"online,omitempty"`
+	// Online 在线状态。
+	//
+	// 用 *bool 而不是 bool：bool + omitempty 会把**离线**（false）当成"零值"
+	// 一并从 JSON 里抹掉，前端拿到的是 undefined —— 于是"离线"既无法与
+	// "该字段未开启"区分，状态点还会整个不渲染（离线机器看起来像没接入）。
+	//
+	// 三态语义：
+	//   nil   = 「在线状态」字段未开启（响应里不出现 online 键）；
+	//   &true = 在线；
+	//   &false= 离线（显式出现 "online": false）。
+	//
+	// 注意：这里必须保留 omitempty —— 它让 nil 时不输出，正好满足"未勾选的
+	// 字段在结构体层面即零值、序列化后从 JSON 消失"的安全约定。
+	Online *bool `json:"online,omitempty"`
 	// LastSeen 最后在线时间（Unix 秒）
 	LastSeen int64 `json:"last_seen,omitempty"`
 	// Uptime 运行时长（秒）
@@ -176,6 +188,25 @@ func MaskPublicIP(ip string) string {
 	return parts[0] + "." + parts[1] + ".*.*"
 }
 
+// IsOnline 返回是否在线。
+//
+// nil（「在线状态」字段未开启）一律按**离线**处理：这样汇总统计
+// （在线/离线台数）在任何配置下都有定义，不会因为字段开关而产生
+// "既不在线也不离线"的第三类计数。
+func (n *Node) IsOnline() bool {
+	return n != nil && n.Online != nil && *n.Online
+}
+
+// OnlineState 返回在线状态的展示三元组，供前端/汇总复用：
+// known=false 表示「在线状态」字段未开启（前端据此不渲染状态点）。
+// （前端目前直接用 JSON 里有没有 online 键判断，此方法供 Go 侧写测试更直观。）
+func (n *Node) OnlineState() (online, known bool) {
+	if n == nil || n.Online == nil {
+		return false, false
+	}
+	return *n.Online, true
+}
+
 // maskIPSwitch 掩码开关：true 时对公网 IP 做部分掩码。
 // 由 BuildNode 的调用方（server）按部署策略注入，默认开启掩码。
 var maskIPSwitch = true
@@ -204,7 +235,8 @@ func BuildNode(a *protocol.AgentInfo, cfg *siteconfig.Config) *Node {
 		n.Hostname = a.Hostname
 	}
 	if on("online") {
-		n.Online = a.Online
+		online := a.Online
+		n.Online = &online
 	}
 	if on("last_seen") {
 		n.LastSeen = a.LastSeen
@@ -326,9 +358,11 @@ func BuildNodes(agents []*protocol.AgentInfo, cfg *siteconfig.Config) []*Node {
 			out = append(out, n)
 		}
 	}
+	// 在线优先排序：IsOnline() 把"字段未开启"（nil）与"离线"一致对待，
+	// 因此未开启在线状态时本排序退化为按名称排，行为与之前一致。
 	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Online != out[j].Online {
-			return out[i].Online
+		if out[i].IsOnline() != out[j].IsOnline() {
+			return out[i].IsOnline()
 		}
 		return displayName(out[i]) < displayName(out[j])
 	})
@@ -353,7 +387,7 @@ func BuildSummary(nodes []*Node, updatedAt int64) *Summary {
 		return s
 	}
 	for _, n := range nodes {
-		if n.Online {
+		if n.IsOnline() {
 			s.Online++
 		} else {
 			s.Offline++
