@@ -49,5 +49,13 @@ scripts\build-all.bat --help
 scripts\build-all.bat
 ```
 
-产物统一落在 `build/`（可用 `--outdir=` 改），先按 `linux/` `windows/` 分类，再按
-`binaries/` `web/` `packages/` `installer/` 分类。
+产物统一落在 `build/`（可用 `--outdir=` 改），**只按用途分类一次**，平台体现在文件名与
+`bin/<角色>/<平台>/` 这一层：
+
+```
+build/bin/{server,agent}/<linux|windows>/mocenter-<角色>-<架构>[.exe]
+build/bin/deploy/windows/mocenter-deploy.exe
+build/web/                                  # 前端（两平台同一份）
+build/packages/{deb,rpm,zip}/
+build/setup/MoCenter-Setup-<版本>.exe       # 图形安装程序（Windows）
+```

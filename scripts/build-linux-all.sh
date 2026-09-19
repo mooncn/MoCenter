@@ -32,15 +32,11 @@
 #   --list                                                打印支持的取值后退出
 #   --help                                                显示本帮助
 #
-# 产物布局（outdir 下先按平台分类，再按用途分类）:
-#   build/linux/binaries/server/linux/mocenter-server-<arch>
-#   build/linux/binaries/agent/<linux|windows>/mocenter-agent-<arch>[.exe]
-#   build/linux/web/                        Web 前端静态资源
-#   build/linux/packages/{deb,rpm}/         .deb / .rpm 安装包
-#   build/linux/installer/                  Windows 图形安装程序（在 Linux 上构建时）
-#   build/windows/binaries/.../             Windows 免安装 zip 的原始素材
-#   build/windows/packages/zip/             Windows 免安装 zip
-#   build/windows/installer/                Windows 图形安装程序
+# 产物布局（outdir 下只按用途分类一次，见 setup_outdir 的说明）:
+#   build/bin/{server,agent,deploy}/<platform>/   Go 二进制
+#   build/web/                                    Web 前端静态资源（两平台共用同一份）
+#   build/packages/{deb,rpm,zip}/                 安装包
+#   build/setup/                                  Windows 图形安装程序（Inno Setup）
 #
 # 环境变量（与命令行等价，命令行优先）:
 #   MOCENTER_SERVER_VERSION / MOCENTER_AGENT_VERSION / MOCENTER_VERSION(兼容旧名)
@@ -183,6 +179,14 @@ expand_lists() {
 }
 
 # ---------------------------------------------------------------- 输出目录
+#
+# 产物布局：**只按用途分类一次**（bin / web / packages / setup），平台体现在文件名里。
+#
+# 为什么不再按平台先分一层：旧布局是 build/<平台>/{binaries/<角色>/<平台>,web,packages,installer}，
+# 一路最多套 6 层（build/linux/binaries/server/linux/mocenter-server-amd64），
+# 且「平台」只在 linux 侧就出现了三次。实际要看的是"这堆产物是干嘛的"，
+# 平台信息在文件名（mocenter-agent-amd64.exe / …-windows-amd64.zip）里已经写死了。
+# 前端两平台本就完全相同（同一份 web/dist），按平台复制两遍纯属浪费。
 setup_outdir() {
   case "$OPT_OUTDIR" in
     /*) OUT="$OPT_OUTDIR" ;;
@@ -200,7 +204,7 @@ setup_outdir() {
   # 清理粒度：只删掉「本次确实会重新生成」的目录/文件。
   # 之前是按 (平台, 类型) 整目录清理，跑 --type=agent 会把同平台下 server 的
   # 产物一起删掉 —— 参数组合之间会互相破坏，不符合"可重复执行"的预期。
-  local p a role path n
+  local p a role n
   # 1) 二进制：精确到文件。
   #    注意 --binary=0 时必须**保留**已有二进制 —— 它正是"复用已有产物只做打包"
   #    这一用法的前提，清掉就等于把打包的输入删了。
@@ -210,32 +214,40 @@ setup_outdir() {
         mc_in_list "$role" "${TYPES[*]:-}" || continue
         for a in $ARCHS; do
           n="mocenter-${role}-${a}"; [ "$p" = "windows" ] && n="${n}.exe"
-          rm -f "$OUT/$p/binaries/$role/$p/$n"
+          rm -f "$OUT/bin/$role/$p/$n"
         done
-        rmdir "$OUT/$p/binaries/$role/$p" "$OUT/$p/binaries/$role" "$OUT/$p/binaries" 2>/dev/null || true
+        rmdir "$OUT/bin/$role/$p" "$OUT/bin/$role" 2>/dev/null || true
       done
     done
   else
     info "  --binary=0：保留已有二进制（复用为打包输入）"
   fi
-  # 2) Web 前端
+  # 2) Web 前端（两平台共用同一份）
   if mc_in_list "web" "${TYPES[*]:-}"; then
-    for p in $PLATFORMS; do rm -rf "$OUT/$p/web"; done
+    rm -rf "$OUT/web"
   fi
   # 3) 安装包：只清本次要产出的格式
-  if mc_in_list "deb" "$PKGS" && mc_in_list "linux" "$PLATFORMS"; then rm -rf "$OUT/linux/packages/deb"; fi
-  if mc_in_list "rpm" "$PKGS" && mc_in_list "linux" "$PLATFORMS"; then rm -rf "$OUT/linux/packages/rpm"; fi
-  if mc_in_list "zip" "$PKGS" && mc_in_list "windows" "$PLATFORMS"; then rm -rf "$OUT/windows/packages/zip"; fi
+  if mc_in_list "deb" "$PKGS" && mc_in_list "linux" "$PLATFORMS"; then rm -rf "$OUT/packages/deb"; fi
+  if mc_in_list "rpm" "$PKGS" && mc_in_list "linux" "$PLATFORMS"; then rm -rf "$OUT/packages/rpm"; fi
+  if mc_in_list "zip" "$PKGS" && mc_in_list "windows" "$PLATFORMS"; then rm -rf "$OUT/packages/zip"; fi
   # 4) 安装程序
   if mc_in_list "installer" "${TYPES[*]:-}" && mc_in_list "windows" "$PLATFORMS"; then
-    rm -rf "$OUT/windows/installer"
+    rm -rf "$OUT/setup"
   fi
-  # 5) 上次异常中断遗留的中间目录
-  find "$OUT" -maxdepth 4 -name '.stage-*' -o -maxdepth 4 -name '.rpmbuild' 2>/dev/null | while read -r d; do rm -rf "$d"; done
+  # 5) 旧布局（<平台>/{binaries,web,packages,installer}）残留：
+  #    升级后第一次构建时会留下两份同名产物，容易误用旧的，这里顺手清掉。
+  for p in $PLATFORMS; do
+    if [ -d "$OUT/$p" ] && [ -d "$OUT/$p/binaries" ]; then
+      warn "  清理旧布局残留：$OUT/$p（当前布局见 --help 的「产物布局」）"
+      rm -rf "$OUT/$p"
+    fi
+  done
+  # 6) 上次异常中断遗留的中间目录
+  find "$OUT" -maxdepth 3 -name '.stage-*' -o -maxdepth 3 -name '.rpmbuild' 2>/dev/null | while read -r d; do rm -rf "$d"; done
 }
 
 # ---------------------------------------------------------------- 构建：Go 二进制
-# 统一产物路径：<out>/<platform>/binaries/{server,agent}/{linux,windows}/<name>-<arch>[.exe]
+# 统一产物路径：<out>/bin/{server,agent}/<platform>/<name>-<arch>[.exe]
 build_go() {
   local mod="$1" plat="$2" arch="$3" out="$4" ldflags="$5"
   mc_go_build "$mod" "$out" "$plat" "$arch" "$ldflags"
@@ -264,7 +276,7 @@ build_binaries() {
       [ "$p" = "windows" ] && port_archs="$(echo "$port_archs" | tr ' ' '\n' | grep -Ex 'amd64|386' | tr '\n' ' ')"
       [ -n "$port_archs" ] || continue
       step "构建 Server 二进制（$p，版本 ${OPT_SERVER_VERSION}）"
-      local out_dir="$OUT/$p/binaries/server/$p"
+      local out_dir="$OUT/bin/server/$p"
       local outs=()
       for a in $port_archs; do
         local name="mocenter-server-${a}"; [ "$p" = "windows" ] && name="${name}.exe"
@@ -283,7 +295,7 @@ build_binaries() {
       local archs; archs="$(mc_platform_archs_filtered "$p" "$ARCHS")"
       [ -n "$archs" ] || { info "  $p 没有任何可构建架构（请求：$ARCHS），跳过"; continue; }
       step "构建 Agent 二进制（$p，版本 ${OPT_AGENT_VERSION}）"
-      local out_dir="$OUT/$p/binaries/agent/$p"
+      local out_dir="$OUT/bin/agent/$p"
       local outs=()
       for a in $archs; do
         local name="mocenter-agent-${a}"; [ "$p" = "windows" ] && name="${name}.exe"
@@ -352,13 +364,11 @@ build_web() {
   else
     warn "静态资源预压缩未完成（端口不影响功能，仅影响弱网加载速度）"
   fi
-  local dest
-  for p in $PLATFORMS; do
-    dest="$OUT/$p/web"
-    rm -rf "$dest"; mkdir -p "$dest"
-    cp -r web/dist/. "$dest/"
-    ok "Web 前端 -> $dest"
-  done
+  # 前端两平台完全相同（同一份 web/dist 与同一批预压缩产物），只放一份
+  local dest="$OUT/web"
+  rm -rf "$dest"; mkdir -p "$dest"
+  cp -r web/dist/. "$dest/"
+  ok "Web 前端 -> $dest"
 }
 
 # ---------------------------------------------------------------- Windows 安装程序素材
@@ -369,7 +379,7 @@ prepare_installer_payload() {
   local ld="-X mocenter/agent/internal/version.Version=${OPT_AGENT_VERSION}"
   build_go agent  windows amd64 "$payload/mocenter-agent.exe"  "$ld" >/dev/null
   build_go server windows amd64 "$payload/mocenter-server.exe" "" >/dev/null
-  build_go installer windows amd64 "$payload/mocenter-deploy.exe" "" >/dev/null
+  build_go installer windows amd64 "$payload/mocenter-deploy.exe" "" >/dev/null  # 角色名是模块目录名
   ok "mocenter-agent.exe / mocenter-server.exe / mocenter-deploy.exe -> $payload"
   if [ -f web/dist/index.html ]; then
     rm -rf "$payload/web"; mkdir -p "$payload/web"; cp -r web/dist/. "$payload/web/"
@@ -471,7 +481,7 @@ pkg_depends_deb() {
 build_deb() {
   # build_deb <文件树> <角色> <架构>
   local stage="$1" role="$2" arch="$3" pkg="mocenter-${role}"
-  local out="$OUT/linux/packages/deb/${pkg}_${OPT_SERVER_VERSION}_$(mc_pkg_arch_deb "$arch")_${arch}.deb"
+  local out="$OUT/packages/deb/${pkg}_${OPT_SERVER_VERSION}_$(mc_pkg_arch_deb "$arch")_${arch}.deb"
   local tool; tool="$(mc_pkg_tool_deb)"
   [ -n "$tool" ] || { warn "缺少 dpkg-deb 与 fpm，跳过 .deb（$pkg/$arch）"; return 1; }
   local pkgarch; pkgarch="$(mc_pkg_arch_deb "$arch")"
@@ -528,7 +538,7 @@ rpm_description() {
 
 build_rpm() {
   local stage="$1" role="$2" arch="$3" pkg="mocenter-${role}"
-  local out="$OUT/linux/packages/rpm/${pkg}-${OPT_SERVER_VERSION}-1.$(mc_pkg_arch_rpm "$arch").rpm"
+  local out="$OUT/packages/rpm/${pkg}-${OPT_SERVER_VERSION}-1.$(mc_pkg_arch_rpm "$arch").rpm"
   local tool; tool="$(mc_pkg_tool_rpm)"
   [ -n "$tool" ] || { warn "缺少 fpm 与 rpmbuild，跳过 .rpm（$pkg/$arch）"; return 1; }
   local pkgarch; pkgarch="$(mc_pkg_arch_rpm "$arch")"
@@ -548,7 +558,7 @@ build_rpm() {
 # 用 rpmbuild 直接组包（不依赖 fpm，便于在只装了 rpm 工具的镜像里出包）
 build_rpm_with_rpmbuild() {
   local stage="$1" role="$2" pkgarch="$3" out="$4"
-  local pkg="mocenter-${role}" top="$OUT/linux/packages/.rpmbuild"
+  local pkg="mocenter-${role}" top="$OUT/packages/.rpmbuild"
   rm -rf "$top"
   mkdir -p "$top"/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT}
   # 把 stage 的文件树打成一个 tar 作为 source，再写 spec 指定安装路径
@@ -706,13 +716,13 @@ build_linux_packages() {
   local -a jobs=()
   for role in $roles; do
     for arch in $pkgarchs; do
-      bin="$OUT/linux/binaries/$role/linux/mocenter-${role}-${arch}"
+      bin="$OUT/bin/$role/linux/mocenter-${role}-${arch}"
       if [ ! -f "$bin" ]; then
         warn "缺少二进制 $bin，跳过 $role/$arch 的打包；先执行：
          bash scripts/build-linux-all.sh --type=$role --platform=linux --arch=$arch --package=none"
         failed=1; continue
       fi
-      stage="$OUT/linux/packages/.stage-${role}-${arch}"
+      stage="$OUT/packages/.stage-${role}-${arch}"
       stage_linux_pkg "$role" "$arch" "$stage" "$bin"
       for fmt in deb rpm; do
         [ "$fmt" = deb ] && [ "$want_deb" = 0 ] && continue
@@ -758,13 +768,13 @@ build_windows_zip() {
       if [ "$role" = "server" ]; then
         case "$arch" in amd64|386) ;; *) continue ;; esac
       fi
-      src="$OUT/windows/binaries/$role/windows/mocenter-${role}-${arch}.exe"
+      src="$OUT/bin/$role/windows/mocenter-${role}-${arch}.exe"
       if [ ! -f "$src" ]; then
         warn "缺少 $src，跳过 $role/$arch 的 zip；先执行：
          bash scripts/build-linux-all.sh --type=$role --platform=windows --arch=$arch --package=none"
         continue
       fi
-      stage="$OUT/windows/packages/.stage-${role}-${arch}"
+      stage="$OUT/packages/.stage-${role}-${arch}"
       mc_reset_dir "$stage"
       mkdir -p "$stage/bin"
       cp "$src" "$stage/bin/"
@@ -786,7 +796,7 @@ EOF
       # 服务注册/卸载脚本：Windows 侧不支持符号链接，直接生成副本
       cp scripts/deploy/install-windows.bat "$stage/install-windows.bat" 2>/dev/null || true
       cp scripts/deploy/uninstall-windows.bat "$stage/uninstall-windows.bat" 2>/dev/null || true
-      zip="$OUT/windows/packages/zip/mocenter-${role}-${OPT_SERVER_VERSION}-windows-${arch}.zip"
+      zip="$OUT/packages/zip/mocenter-${role}-${OPT_SERVER_VERSION}-windows-${arch}.zip"
       mc_make_zip "$stage" "$zip" "mocenter-${role}"
       rm -rf "$stage"
       ok "$(basename "$zip")  ($(du -h "$zip" | cut -f1))"

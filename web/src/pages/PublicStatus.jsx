@@ -275,8 +275,15 @@ function NodeCards({ nodes, visible }) {
                 {n.remark || n.node_id}
               </span>
               <span className="public-card-head-right">
+                {/* 在线绿点 / 离线红点：卡片右上角，一眼分辨整屏里哪台掉线了。
+                    `.dot.offline` 在别处是灰点（弱化），公开卡片上要求"离线标红"，
+                    因此这里用 card-dot 覆盖成红色；离线卡片同时整卡降透明。 */}
                 {n.online !== undefined && (
-                  <span className={`dot ${n.online ? 'online' : 'offline'}`} title={n.online ? '在线' : '离线'} />
+                  <span
+                    className={`dot card-dot ${n.online ? 'online' : 'offline'}`}
+                    title={n.online ? '在线' : '离线'}
+                    aria-label={n.online ? '在线' : '离线'}
+                  />
                 )}
               </span>
             </div>
@@ -738,7 +745,12 @@ function NodeFacts({ node }) {
 // 混在一条轴里会把流量线压成贴地直线，所以分开。
 export function PublicTrend({ samples }) {
   const W = 900, H = 260, PAD_L = 40, PAD_R = 62, PAD_T = 26, PAD_B = 26
-  const series = (samples || []).slice(-300)
+  const series = useMemo(() => (samples || []).slice(-300), [samples])
+  // 悬浮选中的采样点下标（null = 未选中）。鼠标移入或手指点按后，
+  // 显示该横轴位置**所有曲线**的数值与采样时间 —— 折线只能看出趋势，
+  // "这个尖峰到底是多少"才是运维要的信息。
+  const [hover, setHover] = useState(null)
+  const wrapRef = useRef(null)
   if (series.length === 0) {
     return (
       <div className="public-empty">
@@ -800,8 +812,36 @@ export function PublicTrend({ samples }) {
   const fmtTs = (ts) => (ts ? new Date(ts * 1000).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '')
   const allKeys = [...pctKeys, ...netKeys]
 
+  // 浏览器坐标 -> 采样点下标。
+  // rect 是 CSS 像素、viewBox 是逻辑坐标，必须按实际宽度缩放：窄屏下 SVG 被压到
+  // 三百多像素，若直接按 W 换算，选中的点会整体偏移。
+  const pick = (clientX) => {
+    const el = wrapRef.current
+    if (!el) return null
+    const rect = el.getBoundingClientRect()
+    if (rect.width <= 0) return null
+    const x = ((clientX - rect.left) / rect.width) * W
+    const i = Math.round(((x - PAD_L) / (W - PAD_L - PAD_R)) * Math.max(1, series.length - 1))
+    return Math.min(series.length - 1, Math.max(0, i))
+  }
+  const onMove = (e) => setHover(pick(e.clientX))
+  const onTouch = (e) => {
+    const t = e.touches?.[0] || e.changedTouches?.[0]
+    if (t) setHover(pick(t.clientX))
+  }
+  const cur = hover === null ? null : series[hover]
+  const tipLeft = cur ? (xOf(hover) / W) * 100 : 0
+  const tipFlip = tipLeft > 60
+
+  // 单点数值文本：百分比类带 %，速率类按量级格式化；该点无数据时显示「—」
+  const pointText = (k, v) => {
+    if (typeof v !== 'number') return '—'
+    return k.unit === '%' ? `${v.toFixed(1)}%` : fmtRate(v)
+  }
+
   return (
-    <div>
+    <div className="trend-chart" ref={wrapRef} onMouseMove={onMove} onMouseLeave={() => setHover(null)}
+      onTouchStart={onTouch} onTouchMove={onTouch}>
       <svg viewBox={`0 0 ${W} ${H}`} className="public-trend-svg">
         <defs>
           {allKeys.map((k) => (
@@ -831,7 +871,34 @@ export function PublicTrend({ samples }) {
 
         <text x={PAD_L} y={H - 8} fill="#8b98a5" fontSize="10">{fmtTs(first)}</text>
         <text x={W - PAD_R} y={H - 8} fill="#8b98a5" fontSize="10" textAnchor="end">{fmtTs(last)}</text>
+
+        {/* 选中横轴的竖向指示线与各曲线数据点。
+            未知点（服务端用 null 表示）不画点，避免凭空造出一个读数。 */}
+        {cur && (
+          <g>
+            <line x1={xOf(hover)} y1={PAD_T - 10} x2={xOf(hover)} y2={H - PAD_B} stroke="#8b98a5" strokeDasharray="3 3" />
+            {pctKeys.map((k) => (typeof cur[k.key] === 'number'
+              ? <circle key={k.key} cx={xOf(hover)} cy={yPct(cur[k.key])} r="3.5" fill={k.color} stroke="#0f1519" strokeWidth="1.5" />
+              : null))}
+            {netKeys.map((k) => (typeof cur[k.key] === 'number'
+              ? <circle key={k.key} cx={xOf(hover)} cy={yNet(cur[k.key])} r="3.5" fill={k.color} stroke="#0f1519" strokeWidth="1.5" />
+              : null))}
+          </g>
+        )}
       </svg>
+
+      {/* 数值浮层：百分比与速率一次列全，不必为了看另一条线再挪一次鼠标 */}
+      {cur && (
+        <div className={`trend-tipbox ${tipFlip ? 'flip' : ''}`} style={{ left: `${tipLeft}%` }}>
+          <div className="tip-time">{fmtTs(cur.ts)}</div>
+          {allKeys.map((k) => (
+            <div className="tip-row" key={k.key}>
+              <i style={{ background: k.color }} />{k.label}
+              <b>{pointText(k, cur[k.key])}</b>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="public-legend">
         {allKeys.map((k) => (
@@ -841,7 +908,7 @@ export function PublicTrend({ samples }) {
         ))}
       </div>
       <div className="cell-sub" style={{ marginTop: 6 }}>
-        共 {series.length} 个采样点（服务端已按需降采样）
+        共 {series.length} 个采样点（服务端已按需降采样）· 鼠标悬停 / 点击图表可查看该时刻数值
         {netKeys.length > 0 ? ' · 流量为相邻采样差值，未知点不连线' : ''}
       </div>
     </div>

@@ -113,6 +113,30 @@ $:
             grep -q 'Empty %files file .*debugfiles.list' scripts/build-linux-all.sh \
               && echo "OK  已内置 debuginfo 空清单报错的排查指引" \
               || { echo "!! 缺少 debuginfo 阶段的报错指引（缺 file(1) 时应给出提示）"; exit 1; }
+            echo "=== 构建产物布局锚定 ==="
+            # 产物路径散落在 shell/bat/iss/文档五处，任一处漏改就会出现"构建成功但产物
+            # 落在旧目录"，而 CI 只跑构建不校验产物位置，这种漂移要到手工验证时才暴露。
+            # 这里在 PR 阶段锚住统一布局（用途分类一次：bin / web / packages / setup）。
+            #
+            # 只看**赋值语句**有没有写旧路径：注释里的历史说明（"以前是 build/linux/
+            # binaries/..."）不该被判红，那种误报会逼着人把解释删掉。
+            grep -nE '(OUT|out_dir|dest|stage|src|zip|bin)=\$?\{?OUT\}?/(linux|windows)/(binaries|packages|installer|web)' \
+              scripts/build-linux-all.sh \
+              && { echo "!! scripts/build-linux-all.sh 仍把产物写到旧布局（<平台>/…）"; exit 1; } \
+              || echo "OK  build-linux-all.sh 产物路径已是新布局"
+            grep -nE 'SET \"?(SERVER_BIN|AGENT_BIN|WEB_OUT|ZIP_OUT|SETUP_OUT|ZR_STAGE)=.*(windows|linux)\\(binaries|packages|installer|web)' \
+              scripts/build-all.bat \
+              && { echo "!! scripts/build-all.bat 仍把产物写到旧布局（windows\\…）"; exit 1; } \
+              || echo "OK  build-all.bat 产物路径已是新布局"
+            grep -q 'packages/{deb,rpm,zip}' scripts/build-linux-all.sh \
+              && echo "OK  build-linux-all.sh 帮助文本已说明新布局" \
+              || { echo "!! scripts/build-linux-all.sh 的产物布局说明未同步"; exit 1; }
+            grep -q 'OutputDir=..\\build\\setup' installer/setup.iss \
+              && echo "OK  setup.iss 输出到 build\\setup" \
+              || { echo "!! installer/setup.iss 的 OutputDir 未同步到 build\\setup"; exit 1; }
+            grep -q 'OUT_DIR=%OUT_ROOT%\\setup' scripts/build-windows-installer.bat \
+              && echo "OK  build-windows-installer.bat 与 setup.iss 输出目录一致" \
+              || { echo "!! build-windows-installer.bat 的输出目录与 setup.iss 不一致"; exit 1; }
             echo "=== 证书工具编译与测试 ==="
             (cd scripts/gencerts && go build ./... && go vet ./... && echo "OK  scripts/gencerts")
             (cd scripts/signcert && go build ./... && go vet ./... && go test ./... && echo "OK  scripts/signcert")

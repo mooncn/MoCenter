@@ -611,6 +611,12 @@ button.primary { background: var(--accent); }
   .stat-bar > select { flex: 1 1 120px; width: auto; }
   .btn-login { padding: 8px 12px; font-size: 13px; }
 
+  /* 总览指标：窄屏一行两项，仍比原先的五张统计卡省一半纵向空间 */
+  .card-head-row { flex-direction: column; align-items: stretch; }
+  .overview-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ov-item { min-width: 0; }
+  .ov-v { font-size: 16px; }
+
   .pagination { flex-direction: column; align-items: stretch; }
   .pagination-controls { justify-content: center; }
   .pagination-info { text-align: center; }
@@ -786,7 +792,15 @@ button.primary { background: var(--accent); }
   transform: translateY(-2px); border-color: #3f5470; outline: none;
   box-shadow: var(--glow);
 }
-.public-card.offline { opacity: .66; }
+/* 离线卡片：整卡降透明 + 右上角红点。
+   卡片本身不整体刷红（大面积红色会盖过 CPU/内存等真正要读的信息），
+   改为「红点 + 淡红描边」，既醒目又不影响读数。 */
+.public-card.offline { opacity: .72; border-color: rgba(239, 68, 68, .38); }
+.public-card.offline:hover, .public-card.offline:focus-visible { border-color: rgba(239, 68, 68, .7); }
+/* 卡片右上角状态点：在线绿 / 离线红（区别于后台的"离线灰点"语义） */
+.card-dot { width: 10px; height: 10px; margin-right: 0; }
+.card-dot.online { background: var(--green); box-shadow: 0 0 0 3px rgba(34, 197, 94, .16); }
+.card-dot.offline { background: var(--red); box-shadow: 0 0 0 3px rgba(239, 68, 68, .18); }
 .public-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .public-card-head-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .public-card-name {
@@ -1123,7 +1137,7 @@ button.primary { background: var(--accent); }
 .stat-bar-head .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
 .stat-bar > select { width: 150px; flex: 0 0 auto; }
 
-/* 登录后台：始终排在最右侧 */
+/* 回首页：始终排在最右侧 */
 .btn-login {
   margin-left: auto; flex: 0 0 auto;
   display: inline-flex; align-items: center; gap: 6px;
@@ -1132,9 +1146,63 @@ button.primary { background: var(--accent); }
   white-space: nowrap;
 }
 .btn-login:hover { opacity: .88; color: #fff; }
+/* 公开页入口用次级样式：它不是这一页的主操作，抢眼反而会盖过状态信息 */
+.btn-login.btn-home {
+  background: transparent; color: var(--accent); border-color: var(--accent);
+}
 
 /* 指标卡说明小字 */
 .metric-note { color: #6b7280; font-size: 11px; font-weight: 400; }
+
+/* ============================================================
+   「主机探针信息总览」头部汇总指标
+   五项指标（在线/离线/注册/平均 CPU/平均内存）原先各占一张卡片，
+   移动端两列布局下光统计就占掉一整屏。收进卡片头部后：
+   桌面端一行排开，窄屏自动换行成两列，列表本身立即上移。
+   ============================================================ */
+.card-head-row {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 10px 18px; flex-wrap: wrap; margin-bottom: 12px;
+}
+.card-head-row h3 { margin-bottom: 0; }
+.overview-metrics {
+  display: flex; flex-wrap: wrap; gap: 8px 10px; min-width: 0;
+}
+.ov-item {
+  display: flex; flex-direction: column; align-items: flex-start;
+  min-width: 76px; padding: 5px 11px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+}
+.ov-v {
+  font-size: 17px; font-weight: 700; line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+}
+.ov-l { color: var(--muted); font-size: 11px; margin-top: 1px; white-space: nowrap; }
+.ov-item.ok .ov-v { color: var(--green); }
+.ov-item.bad .ov-v { color: var(--red); }
+
+/* ============================================================
+   折线图交互浮层（前后台共用同一套类名）
+   图表本体是 SVG（逻辑坐标 900x260 左右），浮层用绝对定位的 HTML：
+   字号不随画布缩放，窄屏也能读清；且不参与 SVG 的裁剪。
+   ============================================================ */
+.trend-chart { position: relative; touch-action: pan-y; }
+.trend-tipbox {
+  position: absolute; top: 6px; transform: translateX(8px);
+  min-width: 118px; padding: 7px 10px;
+  background: rgba(15, 21, 25, .94); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: var(--shadow);
+  font-size: 11.5px; color: var(--text); pointer-events: none;
+  z-index: 5;
+}
+/* 指示线靠右时浮层翻到左侧，避免被容器右边界裁掉 */
+.trend-tipbox.flip { transform: translateX(calc(-100% - 8px)); }
+.trend-tipbox .tip-time {
+  color: var(--muted); font-size: 11px; margin-bottom: 4px; white-space: nowrap;
+}
+.trend-tipbox .tip-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.trend-tipbox .tip-row i { width: 8px; height: 8px; border-radius: 2px; flex: 0 0 auto; }
+.trend-tipbox .tip-row b { margin-left: auto; font-variant-numeric: tabular-nums; }
 
 /* ============================================================
    离线节点标红（同级在线绿点位置）

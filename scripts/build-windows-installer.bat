@@ -10,7 +10,7 @@ REM
 REM Steps:
 REM   1) Build agent / server / deploy engine into installer\payload\
 REM   2) Copy the built web frontend (web\dist) into installer\payload\web\
-REM   3) Compile installer\setup.iss with ISCC -> <out>\windows\installer\
+REM   3) Compile installer\setup.iss with ISCC -> <out>\setup\
 REM
 REM This file is deliberately ASCII-only and uses only the plainest cmd syntax.
 REM cmd.exe reads .bat files with the system ANSI codepage, so non-ASCII text
@@ -27,8 +27,11 @@ setlocal
 set "ROOT_DIR=%~dp0.."
 if "%ROOT_DIR:~-1%"=="\" set "ROOT_DIR=%ROOT_DIR:~0,-1%"
 set "PAYLOAD=%ROOT_DIR%\installer\payload"
+REM %1 is the build root (build-all.bat passes its --outdir); setup.iss writes
+REM into <root>\setup. Do NOT pass ..\build\setup here -- that would add a
+REM second "setup".
 if "%~1"=="" ( set "OUT_ROOT=%ROOT_DIR%\build" ) else ( set "OUT_ROOT=%~1" )
-set "OUT_DIR=%OUT_ROOT%\windows\installer"
+set "OUT_DIR=%OUT_ROOT%\setup"
 set "AGENT_VERSION=%~2"
 if "%AGENT_VERSION%"=="" set "AGENT_VERSION=%MOCENTER_AGENT_VERSION%"
 

@@ -6,7 +6,7 @@
 ;      —— 它会编译 agent / server / 安装引擎到 installer\payload\，再调用本脚本
 ;   2) 编译本脚本：
 ;        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\setup.iss
-;      产物：build\MoCenter-Setup-<版本>.exe
+;      产物：build\setup\MoCenter-Setup-<版本>.exe
 ;
 ; 设计说明：
 ;   - 向导只负责「收集参数 + 摆放文件」，真正的服务注册、配置落盘、
@@ -38,7 +38,7 @@ DefaultDirName={autopf}\MoCenter
 DisableProgramGroupPage=yes
 ; 注册服务、写 Program Files 都需要管理员
 PrivilegesRequired=admin
-OutputDir=..\build
+OutputDir=..\build\setup
 OutputBaseFilename=MoCenter-Setup-{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes

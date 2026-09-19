@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react'
 import { Api } from '../api/api.js'
 import Flag from '../components/Flag.jsx'
+import Pagination from '../components/Pagination.jsx'
 
 // ============================================================
 // 排序（按列点击表头）
@@ -150,6 +151,11 @@ export default function Dashboard({ agents }) {
   // 列排序：状态保存在本组件，数据每 5 秒刷新也不会重置用户的选择
   const { sortKey, sortDir, click: clickSort, hint: sortHint } = useSort()
 
+  // 分页：主机数会一直增长，整表渲染既拖慢首屏也让移动端滚不到底。
+  // 分页放在**排序之后**（先排全量再切页），否则"按磁盘容量排序"只会对当前页生效。
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
+
   const online = (agents || []).filter((a) => a.online).length
   const offline = (agents || []).filter((a) => !a.online).length
   // 资源占用均值只统计**在线**主机：离线主机的 CPU/内存是它们断线前最后一次上报的值，
@@ -164,6 +170,17 @@ export default function Dashboard({ agents }) {
 
   // 排序结果做缓存：WebSocket 每 5 秒推一次新数组，但排序键不变时不重复排
   const sortedAgents = useMemo(() => sortAgents(agents, sortKey, sortDir), [agents, sortKey, sortDir])
+
+  // 当前页切片。页码收敛在渲染期算（而不是用 effect 改 state）：
+  // 主机数变少或每页条数调大时，越界的页码当帧即被夹回最后一页，
+  // 不会先渲染一屏空白再跳回。
+  const totalPages = Math.max(1, Math.ceil(sortedAgents.length / pageSize))
+  const curPage = Math.min(Math.max(1, page), totalPages)
+  const pagedAgents = useMemo(
+    () => sortedAgents.slice((curPage - 1) * pageSize, curPage * pageSize),
+    [sortedAgents, curPage, pageSize]
+  )
+  const changePageSize = (n) => { setPageSize(n); setPage(1) }
 
   const sinceMap = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800 }
 
@@ -194,10 +211,12 @@ export default function Dashboard({ agents }) {
 
   return (
     <div>
-      {/* 顶部浮动统计栏：滚动时吸附在顶部，最右侧固定为后台登录入口 */}
+      {/* 顶部浮动统计栏：滚动时吸附在顶部。右侧「回首页」是公开状态页入口 ——
+          这里已经是后台仪表盘，再放一个「登录后台」只会让人误以为当前没登录。 */}
       <div className="stat-bar">
         <div className="stat-bar-head">
           <h2>仪表盘</h2>
+          {/* 站点汇总与下面「主机探针信息总览」同源同口径，保持一行摘要 */}
           <div className="sub">主机探针信息总览 · 在线 {online} / 离线 {offline} / 共 {agents.length}</div>
         </div>
         <span className={`badge ${serverAlive === false ? 'offline' : serverAlive ? 'online' : ''}`}>
@@ -210,37 +229,25 @@ export default function Dashboard({ agents }) {
           <option value="24h">最近 24 小时</option>
           <option value="7d">最近 7 天</option>
         </select>
-        {/* 登录后台：排在最右侧，移动端也能一眼看到 */}
-        <a className="btn-login" href="/login" title="登录后台">🔑 登录后台</a>
-      </div>
-
-      {/* 汇总指标 */}
-      <div className="metrics" style={{ marginBottom: 20 }}>
-        <div className="metric">
-          <div className="value">{online}</div>
-          <div className="label">在线主机</div>
-        </div>
-        <div className="metric">
-          <div className="value">{offline}</div>
-          <div className="label">离线主机</div>
-        </div>
-        <div className="metric">
-          <div className="value">{agents.length}</div>
-          <div className="label">注册主机</div>
-        </div>
-        <div className="metric">
-          <div className="value">{fmtPct(avgOf('cpu_usage'))}%</div>
-          <div className="label">平均 CPU <span className="metric-note">（在线 {onlineAgents.length} 台）</span></div>
-        </div>
-        <div className="metric">
-          <div className="value">{fmtPct(avgOf('mem_usage'))}%</div>
-          <div className="label">平均内存 <span className="metric-note">（在线 {onlineAgents.length} 台）</span></div>
-        </div>
+        {/* 回首页：公开节点状态页（未开放时该页会给出提示） */}
+        <a className="btn-login btn-home" href="/" title="返回公开节点状态页">🏠 回首页</a>
       </div>
 
       {/* 主机列表 */}
       <div className="card">
-        <h3>主机列表</h3>
+        <div className="card-head-row">
+          <h3>主机探针信息总览</h3>
+          {/* 五项汇总指标：原先各占一张卡片，独立于列表之上。
+              移动端一屏只能放两列，五张卡就把首屏占满了 —— 这里收进总览卡片头部，
+              列表本身立刻上移，桌面端也不再重复一块统计区。 */}
+          <div className="overview-metrics">
+            <OverviewMetric value={online} label="在线主机" tone="ok" />
+            <OverviewMetric value={offline} label="离线主机" tone={offline > 0 ? 'bad' : ''} />
+            <OverviewMetric value={agents.length} label="注册主机" />
+            <OverviewMetric value={`${fmtPct(avgOf('cpu_usage'))}%`} label="平均 CPU" sub={`在线 ${onlineAgents.length} 台`} />
+            <OverviewMetric value={`${fmtPct(avgOf('mem_usage'))}%`} label="平均内存" sub={`在线 ${onlineAgents.length} 台`} />
+          </div>
+        </div>
         {/* 排序提示条：点动态列时解释"为什么点不动"，3 秒后自动消失 */}
         {sortHint ? <div className="notice" style={{ background: 'var(--panel-2)', color: 'var(--muted)' }}>{sortHint}</div> : null}
         {sortKey !== 'default' && (
@@ -275,7 +282,7 @@ export default function Dashboard({ agents }) {
             </tr>
           </thead>
           <tbody>
-            {sortedAgents.map((a) => {
+            {pagedAgents.map((a) => {
               const trendOpen = selectedAgent === a.agent_id
               return (
               <React.Fragment key={a.agent_id}>
@@ -362,65 +369,145 @@ export default function Dashboard({ agents }) {
               </React.Fragment>
               )
             })}
-            {(agents || []).length === 0 && (
+            {sortedAgents.length === 0 && (
               <tr><td colSpan="13" className="table-empty">暂无主机接入</td></tr>
             )}
           </tbody>
         </table>
         </div>
+        <Pagination
+          total={sortedAgents.length}
+          page={curPage}
+          pageSize={pageSize}
+          onPage={setPage}
+          onPageSize={changePageSize}
+          loading={false}
+        />
       </div>
 
     </div>
   )
 }
 
+// OverviewMetric 总览卡片头部的单个指标。
+//
+// 用 span 而不是 div：它嵌在 h3 同一行的 flex 容器里，块级元素会把行高撑坏。
+function OverviewMetric({ value, label, sub, tone }) {
+  return (
+    <span className={`ov-item ${tone || ''}`}>
+      <span className="ov-v">{value}</span>
+      <span className="ov-l">{label}{sub ? <i className="metric-note"> {sub}</i> : null}</span>
+    </span>
+  )
+}
+
 // 轻量 SVG 趋势折线图（无外部依赖）
+//
+// 交互：鼠标移入 / 手指在图上滑动或点按后，显示当前横轴位置**所有曲线**的读数与采样时间。
+// 折线图只能看出"大概在涨"，运维实际要的是"上午十点 CPU 到底多少"，
+// 因此这里补上竖向指示线与悬浮数值浮层。
+// 触摸端刻意不做"抬手即隐藏"：手指会挡住浮层，抬手就消失根本读不到数，
+// 改为保留至下一次点按。
 function TrendChart({ history }) {
   const W = 900, H = 240, PAD = 30
+  // 悬浮选中的采样点下标；null = 未选中
+  const [hover, setHover] = useState(null)
+  const wrapRef = useRef(null)
+  const series = useMemo(() => (history || []).slice(-200), [history])
+
   if (!history || history.length === 0) {
     return <div style={{ color: '#8b98a5', textAlign: 'center', padding: 30 }}>该时间段暂无历史采样数据</div>
   }
 
-  const series = history.slice(-200) // 最多展示 200 个点
-  const draw = (key, color) => {
-    const vals = series.map((p) => p[key] || 0)
-    const max = Math.max(100, ...vals)
-    const pts = vals.map((v, i) => {
-      const x = PAD + (i / (series.length - 1)) * (W - PAD * 2)
-      const y = H - PAD - (v / max) * (H - PAD * 2)
-      return `${x.toFixed(1)},${y.toFixed(1)}`
-    }).join(' ')
-    const last = vals[vals.length - 1]
-    return (
-      <g key={key}>
-        <polyline points={pts} fill="none" stroke={color} strokeWidth="2" />
-        <text x={W - PAD - 8} y={H - PAD - (last / max) * (H - PAD * 2) + 4} fill={color} fontSize="11" textAnchor="end">{Math.round(last)}%</text>
-      </g>
-    )
+  const n = series.length
+  // 单点时 div 会为 0：直接按整段宽度画，避免除零得到 NaN 坐标
+  const xOf = (i) => (n <= 1 ? PAD : PAD + (i / (n - 1)) * (W - PAD * 2))
+
+  // 数值 -> 坐标。最大值参与的是**所有曲线**（保持 0-100% 网格语义），
+  // 若只按当前曲线取最大值，三条线的相对高低就失去意义了。
+  const allVals = []
+  for (const p of series) for (const k of ['cpu_usage', 'mem_usage', 'disk_usage']) allVals.push(Number(p[k]) || 0)
+  const max = Math.max(100, ...allVals)
+  const yOf = (v) => H - PAD - (Math.max(0, v) / max) * (H - PAD * 2)
+
+  const lines = [
+    { key: 'cpu_usage', color: '#4da3ff', label: 'CPU' },
+    { key: 'mem_usage', color: '#52c41a', label: '内存' },
+    { key: 'disk_usage', color: '#fa8c16', label: '磁盘' },
+  ]
+
+  // 把浏览器坐标换算成采样点下标。
+  // getBoundingClientRect 给的是 CSS 像素，viewBox 是逻辑坐标，必须按实际宽度缩放，
+  // 否则窄屏（SVG 被压到 320px）时选中的点会整体偏移。
+  const pick = (clientX) => {
+    const el = wrapRef.current
+    if (!el) return null
+    const rect = el.getBoundingClientRect()
+    if (rect.width <= 0) return null
+    const x = ((clientX - rect.left) / rect.width) * W
+    const ratio = (x - PAD) / (W - PAD * 2)
+    const i = Math.round(ratio * (n - 1))
+    return Math.min(n - 1, Math.max(0, i))
   }
 
+  const onMove = (e) => setHover(pick(e.clientX))
+  // 触摸设备没有 hover：按下即定位，抬起后保留一会儿便于读数（手指会挡住浮层）
+  const onTouch = (e) => {
+    const t = e.touches?.[0] || e.changedTouches?.[0]
+    if (t) setHover(pick(t.clientX))
+  }
+
+  const cur = hover === null ? null : series[hover]
+  // 浮层靠右时贴到指示线左侧，避免被 SVG 右边界裁掉
+  const tipLeft = cur ? (xOf(hover) / W) * 100 : 0
+  const tipFlip = tipLeft > 62
+
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto' }}>
-      {/* 网格线 */}
-      {[0, 25, 50, 75, 100].map((g) => {
-        const y = H - PAD - (g / 100) * (H - PAD * 2)
-        return <g key={g}>
-          <line x1={PAD} y1={y} x2={W - PAD} y2={y} stroke="#2a3340" strokeDasharray="4 4" />
-          <text x={PAD - 6} y={y + 4} fill="#8b98a5" fontSize="10" textAnchor="end">{g}%</text>
-        </g>
-      })}
-      {draw('cpu_usage', '#4da3ff')}
-      {draw('mem_usage', '#52c41a')}
-      {draw('disk_usage', '#fa8c16')}
-      <g>
-        <rect x={PAD} y={4} width={10} height={10} fill="#4da3ff" />
-        <text x={PAD + 14} y={13} fill="#8b98a5" fontSize="11">CPU</text>
-        <rect x={PAD + 60} y={4} width={10} height={10} fill="#52c41a" />
-        <text x={PAD + 74} y={13} fill="#8b98a5" fontSize="11">内存</text>
-        <rect x={PAD + 120} y={4} width={10} height={10} fill="#fa8c16" />
-        <text x={PAD + 134} y={13} fill="#8b98a5" fontSize="11">磁盘</text>
-      </g>
-    </svg>
+    <div className="trend-chart" ref={wrapRef} onMouseMove={onMove} onMouseLeave={() => setHover(null)}
+      onTouchStart={onTouch} onTouchMove={onTouch}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto' }}>
+        {/* 网格线 */}
+        {[0, 25, 50, 75, 100].map((g) => {
+          const y = H - PAD - (g / 100) * (H - PAD * 2)
+          return <g key={g}>
+            <line x1={PAD} y1={y} x2={W - PAD} y2={y} stroke="#2a3340" strokeDasharray="4 4" />
+            <text x={PAD - 6} y={y + 4} fill="#8b98a5" fontSize="10" textAnchor="end">{g}%</text>
+          </g>
+        })}
+
+        {lines.map(({ key, color }) => {
+          const vals = series.map((p) => Number(p[key]) || 0)
+          const pts = vals.map((v, i) => `${xOf(i).toFixed(1)},${yOf(v).toFixed(1)}`).join(' ')
+          return <polyline key={key} points={pts} fill="none" stroke={color} strokeWidth="2"
+            strokeLinejoin="round" strokeLinecap="round" />
+        })}
+
+        {/* 选中位置的竖向指示线 + 三个采样点 */}
+        {cur && (
+          <g>
+            <line x1={xOf(hover)} y1={PAD - 8} x2={xOf(hover)} y2={H - PAD} stroke="#8b98a5" strokeDasharray="3 3" />
+            {lines.map(({ key, color }) => (
+              <circle key={key} cx={xOf(hover)} cy={yOf(Number(cur[key]) || 0)} r="3.5" fill={color}
+                stroke="#0f1519" strokeWidth="1.5" />
+            ))}
+          </g>
+        )}
+      </svg>
+
+      {/* 数值浮层：一次展示全部曲线，避免为了看内存再移动一次鼠标。
+          用百分比定位而非 SVG 内 text —— 字号不随画布缩放，窄屏也读得清。 */}
+      {cur && (
+        <div className={`trend-tipbox ${tipFlip ? 'flip' : ''}`} style={{ left: `${tipLeft}%` }}>
+          <div className="tip-time">{fmtTimeShort(cur.ts || cur.timestamp || 0)}</div>
+          {lines.map(({ key, color, label }) => (
+            <div className="tip-row" key={key}>
+              <i style={{ background: color }} />{label}
+              <b>{Math.round(Number(cur[key]) || 0)}%</b>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -469,6 +556,12 @@ function fmtTime(ts) {
   if (!ts) return '-'
   const d = new Date(ts * 1000)
   return d.toLocaleString()
+}
+
+// fmtTimeShort 折线图浮层用的短时间（同一天只显示 时:分，跨天带日期）
+function fmtTimeShort(ts) {
+  if (!ts) return '—'
+  return new Date(ts * 1000).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 function fmtOffline(a) {

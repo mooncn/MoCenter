@@ -54,13 +54,13 @@ cd ../server && bash build.sh
 ### 方式三：Linux 一键构建 + 安装包（推荐）
 
 构建与打包统一由 **`scripts/build-linux-all.sh`** 完成（`scripts/packaging/` 下的零碎脚本已合并进它），
-产物按平台分类落到 `build/`：
+产物只按用途分类一次落到 `build/`（平台体现在文件名与 `bin/<角色>/<平台>/` 这一层）：
 
 ```bash
 # 默认：全部类型 + 全部平台 + 全部架构 + 全部安装包
 bash scripts/build-linux-all.sh
 
-# 只出服务端多架构二进制（amd64/arm64/arm/386 -> build/linux/binaries/server/linux/）
+# 只出服务端多架构二进制（amd64/arm64/arm/386 -> build/bin/server/linux/）
 bash scripts/build-linux-all.sh --type=server --package=none
 
 # 只出 .deb（amd64）：会自动先构建需要的 linux 二进制
@@ -77,12 +77,12 @@ bash scripts/build-linux-all.sh --type=agent,server --platform=windows --package
 
 | 产物 | 路径 |
 |------|------|
-| 服务端二进制 | `build/linux/binaries/server/linux/mocenter-server-<arch>` |
-| Agent 二进制 | `build/linux/binaries/agent/<linux\|windows>/mocenter-agent-<arch>[.exe]` |
-| Web 前端 | `build/linux/web/` |
-| `.deb` / `.rpm` | `build/linux/packages/{deb,rpm}/` |
-| Windows zip | `build/windows/packages/zip/` |
-| Windows 图形安装程序 | `build/windows/installer/`（需在 Windows 上编译） |
+| 服务端二进制 | `build/bin/server/linux/mocenter-server-<arch>` |
+| Agent 二进制 | `build/bin/agent/<linux\|windows>/mocenter-agent-<arch>[.exe]` |
+| Web 前端 | `build/web/` |
+| `.deb` / `.rpm` | `build/packages/{deb,rpm}/` |
+| Windows zip | `build/packages/zip/` |
+| Windows 图形安装程序 | `build/setup/`（需在 Windows 上编译） |
 
 安装包注册服务后的落盘位置：
 
@@ -102,7 +102,7 @@ bash scripts/build-linux-all.sh --type=agent,server --platform=windows --package
 ```bash
 bash scripts/build-linux-all.sh --type=server --package=none
 sudo bash scripts/deploy/install-linux.sh --role=server \
-     --bin=build/linux/binaries/server/linux/mocenter-server-amd64 \
+     --bin=build/bin/server/linux/mocenter-server-amd64 \
      --user=admin --password='强口令'
 sudo bash scripts/deploy/install-linux.sh --role=all status
 sudo bash scripts/deploy/install-linux.sh --role=server uninstall      # 加 --purge 连配置数据一起删
@@ -112,7 +112,7 @@ sudo bash scripts/deploy/install-linux.sh --role=server uninstall      # 加 --p
 
 ```bash
 sudo bash scripts/deploy/install-linux.sh upgrade --role=server \
-     --bin=build/linux/binaries/server/linux/mocenter-server-amd64
+     --bin=build/bin/server/linux/mocenter-server-amd64
 # 升级时无需重复提供 --user/--password；要清理重装（删除既有配置）加 --force
 ```
 

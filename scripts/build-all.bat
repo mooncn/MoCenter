@@ -32,12 +32,13 @@ REM   --clean     wipe outdir first
 REM   --list      print allowed values
 REM   --help      show help
 REM
-REM Artifacts (same layout as the Linux script):
-REM   build\windows\binaries\server\windows\mocenter-server-<arch>.exe
-REM   build\windows\binaries\agent\windows\mocenter-agent-<arch>.exe
-REM   build\windows\web\                       web frontend static files
-REM   build\windows\packages\zip\              portable zips (binary+scripts)
-REM   build\windows\installer\                 GUI setup (Inno Setup)
+REM Artifacts (same layout as the Linux script: classified by purpose only,
+REM platform shows up in the FILE NAME, not in a directory level):
+REM   build\bin\server\windows\mocenter-server-<arch>.exe
+REM   build\bin\agent\windows\mocenter-agent-<arch>.exe
+REM   build\web\                       web frontend static files
+REM   build\packages\zip\              portable zips (binary+scripts)
+REM   build\setup\                     GUI setup (Inno Setup)
 REM
 REM NOTE: this file is deliberately ASCII-only.  cmd.exe reads .bat files
 REM using the system ANSI codepage, so non-ASCII text gets mangled and can
@@ -204,11 +205,11 @@ if "%OPT_AGENT_VERSION%"=="" set "OPT_AGENT_VERSION=%RSV%"
 if "%MOCENTER_SERVER_VERSION%"=="" set "MOCENTER_SERVER_VERSION=%OPT_SERVER_VERSION%"
 if "%MOCENTER_AGENT_VERSION%"==""  set "MOCENTER_AGENT_VERSION=%OPT_AGENT_VERSION%"
 
-set "SERVER_BIN=%OPT_OUTDIR%\windows\binaries\server\windows"
-set "AGENT_BIN=%OPT_OUTDIR%\windows\binaries\agent\windows"
-set "WEB_OUT=%OPT_OUTDIR%\windows\web"
-set "ZIP_OUT=%OPT_OUTDIR%\windows\packages\zip"
-set "SETUP_OUT=%OPT_OUTDIR%\windows\installer"
+set "SERVER_BIN=%OPT_OUTDIR%\bin\server\windows"
+set "AGENT_BIN=%OPT_OUTDIR%\bin\agent\windows"
+set "WEB_OUT=%OPT_OUTDIR%\web"
+set "ZIP_OUT=%OPT_OUTDIR%\packages\zip"
+set "SETUP_OUT=%OPT_OUTDIR%\setup"
 
 echo ==========================================
 echo  MoCenter build (Windows)
@@ -225,6 +226,8 @@ echo ==========================================
 if not exist "%OPT_OUTDIR%" mkdir "%OPT_OUTDIR%"
 if "%OPT_CLEAN%"=="1" (
   echo Cleaning %OPT_OUTDIR% ...
+  for %%D in (bin web packages setup) do if exist "%OPT_OUTDIR%%%D" rmdir /s /q "%OPT_OUTDIR%%%D"
+  REM leftover from the old per-platform layout
   if exist "%OPT_OUTDIR%\windows" rmdir /s /q "%OPT_OUTDIR%\windows"
 ) else (
   REM Remove only what this run will regenerate.  --binary=0 means "reuse the
@@ -237,6 +240,9 @@ if "%OPT_CLEAN%"=="1" (
   if /i "%OPT_PACKAGE%"=="all" if exist "%ZIP_OUT%" rmdir /s /q "%ZIP_OUT%"
   if /i "%OPT_PACKAGE%"=="zip" if exist "%ZIP_OUT%" rmdir /s /q "%ZIP_OUT%"
   if "%WANT_INSTALLER%"=="1" if exist "%SETUP_OUT%" rmdir /s /q "%SETUP_OUT%"
+  REM leftover from the old per-platform layout: it would leave a second copy of
+  REM every artifact behind, and the stale one is easy to pick up by mistake.
+  if exist "%OPT_OUTDIR%\windows\binaries" rmdir /s /q "%OPT_OUTDIR%\windows"
 )
 
 REM ---------------------------------------------------------------- server
@@ -319,8 +325,8 @@ if exist "%OPT_OUTDIR%" for /f "delims=" %%F in ('dir /b /s "%OPT_OUTDIR%" 2^>nu
 echo.
 echo  Next steps:
 echo    - Register a service on a target host ^(as admin^):
-echo        unzip build\windows\packages\zip\*.zip then run install-windows.bat install ^<server^>
-echo    - GUI installer output: build\windows\installer\MoCenter-Setup-*.exe
+echo        unzip build\packages\zip\*.zip then run install-windows.bat install ^<server^>
+echo    - GUI installer output: build\setup\MoCenter-Setup-*.exe
 echo ==========================================
 endlocal
 exit /b 0
@@ -443,7 +449,7 @@ if not exist "%ZR_BIN%" (
   echo      build it first: scripts\build-all.bat --type=%ZR_ROLE% --arch=%ZR_ARCH% --package=none
   exit /b 0
 )
-set "ZR_STAGE=%OPT_OUTDIR%\windows\packages\.stage-%ZR_ROLE%-%ZR_ARCH%"
+set "ZR_STAGE=%OPT_OUTDIR%\packages\.stage-%ZR_ROLE%-%ZR_ARCH%"
 if exist "%ZR_STAGE%" rmdir /s /q "%ZR_STAGE%"
 mkdir "%ZR_STAGE%\bin"
 copy /y "%ZR_BIN%" "%ZR_STAGE%\bin\" >nul
@@ -523,9 +529,9 @@ echo   --clean     wipe outdir first
 echo   --list      print allowed values
 echo.
 echo Artifacts:
-echo   build\windows\binaries\server\windows\mocenter-server-^<arch^>.exe
-echo   build\windows\binaries\agent\windows\mocenter-agent-^<arch^>.exe
-echo   build\windows\web\                       web frontend static files
-echo   build\windows\packages\zip\              portable zips ^(binary+scripts^)
-echo   build\windows\installer\                 GUI setup ^(Inno Setup^)
+echo   build\bin\server\windows\mocenter-server-^<arch^>.exe
+echo   build\bin\agent\windows\mocenter-agent-^<arch^>.exe
+echo   build\web\                       web frontend static files
+echo   build\packages\zip\              portable zips ^(binary+scripts^)
+echo   build\setup\                     GUI setup ^(Inno Setup^)
 exit /b 0
