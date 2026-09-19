@@ -4,22 +4,26 @@
 // 上报探针数据、接收并执行远程命令。
 //
 // 用法：
-//   首次：./agent -server host:port -agentid <id> [-hb 30] [-probe 10]
-//         （首次运行会自动把参数写入配置文件 mocenter-agent.json）
-//   后续：./agent（自动读取配置文件；命令行显式参数优先级更高）
+//
+//	首次：./agent -server host:port -agentid <id> [-hb 30] [-probe 10]
+//	      （首次运行会自动把参数写入配置文件 mocenter-agent.json）
+//	后续：./agent（自动读取配置文件；命令行显式参数优先级更高）
 package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"mocenter/agent/internal/client"
 	"mocenter/agent/internal/config"
 	"mocenter/agent/internal/daemon"
 	probepkg "mocenter/agent/internal/probe"
+	"mocenter/agent/internal/version"
 	"mocenter/agent/internal/winapp"
 )
 
@@ -38,9 +42,21 @@ func main() {
 	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
 	proxyIP := flag.String("proxy-ip", os.Getenv("MOCENTER_PROXY_IP"), "国内加速代理前缀（用于公网 IP 探测等境外服务，如 http://fa.mooncn.win/?url= ）")
 	agentKey := flag.String("agent-key", os.Getenv("MOCENTER_AGENT_KEY"), "与服务端预共享的注册密钥（服务端 agent.key 的内容）")
+	enrollSecret := flag.String("enroll-secret", os.Getenv("MOCENTER_ENROLL_SECRET"), "首次换取客户端证书用的注册密钥（换取成功后自动清空）")
+	serverFingerprint := flag.String("server-fingerprint", os.Getenv("MOCENTER_SERVER_FINGERPRINT"), "服务端身份公钥指纹（免 CA 文件校验服务端，服务端换地址/证书都不必更新）")
+	credsDir := flag.String("creds-dir", "", "客户端证书落盘目录（默认 <配置目录>/creds）")
 	upgradePubKey := flag.String("upgrade-pubkey", "", "升级包 Ed25519 公钥（hex 或文件路径）；未配置则拒绝升级，除非加 -upgrade-allow-unsigned")
 	upgradeAllowUnsigned := flag.Bool("upgrade-allow-unsigned", false, "允许无签名升级（危险：任何人拿到通道即可让本机执行任意二进制）")
+	latencyTargets := flag.String("latency-targets", "", "延迟探测目标，逗号分隔（如 icmp:1.1.1.1,tcp:1.1.1.1:443,http:https://example.com ）")
+	showVersion := flag.Bool("version", false, "打印版本号并退出")
 	flag.Parse()
+
+	// -version：打印后立即退出，不读配置文件、不探测硬件、不连服务端。
+	// 放在最前面是为了让打包脚本能快速取版本，也不会因环境缺配置而失败。
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
 	cfg, err := config.Load(*configPath)
@@ -50,21 +66,24 @@ func main() {
 	if cfg == nil {
 		// 首次启动：用当前参数生成配置
 		cfg = &config.Config{
-			Server:     *server,
-			AgentID:    *agentID,
-			UUID:       *agentUUID,
-			Heartbeat:  *hb,
-			ProbeEvery: *probe,
-			TLS:        *tlsEnabled,
-			Insecure:   *insecure,
-			Daemon:     *daemonize,
-			ClientCert: *clientCert,
-			ClientKey:  *clientKey,
-			CACert:     *caCert,
-			ProxyIP:    *proxyIP,
-			AgentKey:   *agentKey,
+			Server:               *server,
+			AgentID:              *agentID,
+			UUID:                 *agentUUID,
+			Heartbeat:            *hb,
+			ProbeEvery:           *probe,
+			TLS:                  *tlsEnabled,
+			Insecure:             *insecure,
+			Daemon:               *daemonize,
+			ClientCert:           *clientCert,
+			ClientKey:            *clientKey,
+			CACert:               *caCert,
+			ProxyIP:              *proxyIP,
+			AgentKey:             *agentKey,
+			ServerFingerprint:    *serverFingerprint,
+			EnrollmentSecret:     firstNonEmpty(*enrollSecret, *agentKey),
 			UpgradePubKey:        *upgradePubKey,
 			UpgradeAllowUnsigned: *upgradeAllowUnsigned,
+			LatencyTargets:       splitList(*latencyTargets),
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
 			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
@@ -112,11 +131,20 @@ func main() {
 		if cfg.AgentKey != "" && *agentKey == os.Getenv("MOCENTER_AGENT_KEY") {
 			*agentKey = cfg.AgentKey
 		}
+		if cfg.ServerFingerprint != "" && *serverFingerprint == os.Getenv("MOCENTER_SERVER_FINGERPRINT") {
+			*serverFingerprint = cfg.ServerFingerprint
+		}
+		if cfg.EnrollmentSecret != "" && *enrollSecret == os.Getenv("MOCENTER_ENROLL_SECRET") {
+			*enrollSecret = cfg.EnrollmentSecret
+		}
 		if cfg.UpgradePubKey != "" && *upgradePubKey == "" {
 			*upgradePubKey = cfg.UpgradePubKey
 		}
 		if cfg.UpgradeAllowUnsigned && !*upgradeAllowUnsigned {
 			*upgradeAllowUnsigned = true
+		}
+		if len(cfg.LatencyTargets) > 0 && strings.TrimSpace(*latencyTargets) == "" {
+			*latencyTargets = strings.Join(cfg.LatencyTargets, ",")
 		}
 	}
 
@@ -126,24 +154,27 @@ func main() {
 		explicit := map[string]bool{}
 		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
 		field := map[string]func(){
-			"server":      func() { cfg.Server = *server },
-			"agentid":     func() { cfg.AgentID = *agentID },
-			"uuid":        func() { cfg.UUID = *agentUUID },
-			"hb":          func() { cfg.Heartbeat = *hb },
-			"probe":       func() { cfg.ProbeEvery = *probe },
-			"tls":         func() { cfg.TLS = *tlsEnabled },
-			"insecure":    func() { cfg.Insecure = *insecure },
-			"daemon":      func() { cfg.Daemon = *daemonize },
-			"client-cert": func() { cfg.ClientCert = *clientCert },
-			"client-key":  func() { cfg.ClientKey = *clientKey },
-			"ca-cert":     func() { cfg.CACert = *caCert },
-			"proxy-ip":    func() { cfg.ProxyIP = *proxyIP },
-			"agent-key":   func() { cfg.AgentKey = *agentKey },
+			"server":                 func() { cfg.Server = *server },
+			"agentid":                func() { cfg.AgentID = *agentID },
+			"uuid":                   func() { cfg.UUID = *agentUUID },
+			"hb":                     func() { cfg.Heartbeat = *hb },
+			"probe":                  func() { cfg.ProbeEvery = *probe },
+			"tls":                    func() { cfg.TLS = *tlsEnabled },
+			"insecure":               func() { cfg.Insecure = *insecure },
+			"daemon":                 func() { cfg.Daemon = *daemonize },
+			"client-cert":            func() { cfg.ClientCert = *clientCert },
+			"client-key":             func() { cfg.ClientKey = *clientKey },
+			"ca-cert":                func() { cfg.CACert = *caCert },
+			"proxy-ip":               func() { cfg.ProxyIP = *proxyIP },
+			"agent-key":              func() { cfg.AgentKey = *agentKey },
+			"enroll-secret":          func() { cfg.EnrollmentSecret = *enrollSecret },
+			"server-fingerprint":     func() { cfg.ServerFingerprint = *serverFingerprint },
 			"upgrade-pubkey":         func() { cfg.UpgradePubKey = *upgradePubKey },
 			"upgrade-allow-unsigned": func() { cfg.UpgradeAllowUnsigned = *upgradeAllowUnsigned },
+			"latency-targets":        func() { cfg.LatencyTargets = splitList(*latencyTargets) },
 		}
 		dirty := false
-		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "upgrade-pubkey", "upgrade-allow-unsigned"} {
+		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "enroll-secret", "server-fingerprint", "upgrade-pubkey", "upgrade-allow-unsigned", "latency-targets"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -188,12 +219,38 @@ func main() {
 	}
 
 	// 单实例保护：同一份配置只允许一个 Agent 实例。
-	// 否则「服务 + 手工启动一份」会同时连服务端、互相顶掉，隧道与 VNC 状态也会错乱。
-	release, ok := winapp.AcquireSingleton(winapp.SingletonKey("Agent", *configPath))
+	//
+	// 此前只在 Windows 生效（命名互斥体），Linux/macOS 直接放行 —— 于是
+	// 「systemd 服务 + 定时任务保活 + 手工排查启动一份」很容易同时跑起多个实例：
+	// 它们共用同一配置（同一 agent_id、同一套客户端证书）一起连服务端互相顶号，
+	// 隧道、VNC、端口映射的会话状态错乱；定时任务每 5 分钟拉一个，越滚越多。
+	// 现在非 Windows 走 flock（见 internal/winapp/singleton_unix.go），
+	// 进程无论怎么退出（含被 SIGKILL、断电）锁都由内核自动释放，不会留下陈旧锁。
+	//
+	// 注意：这里**不会**去终止已有实例，只让自己的启动失败 —— 误杀一个正在
+	// 跑远控会话的 Agent 后果不可控，交给运维判断更安全。
+	singleKey := winapp.SingletonKey("Agent", *configPath)
+	release, ok := winapp.AcquireSingleton(singleKey, *configPath)
 	if !ok {
-		log.Fatalf("已有一个使用同一配置(%s)的 Agent 在运行，本次启动终止", *configPath)
+		log.Fatalf("已有一个使用同一配置(%s)的 Agent 在运行，本次启动终止（%s）",
+			*configPath, winapp.DescribeSingleton(singleKey, *configPath))
 	}
 	defer release()
+	log.Printf("[agent] 已取得单实例锁：%s", winapp.DescribeSingleton(singleKey, *configPath))
+
+	// 换取成功后清理：证书路径写回配置、注册密钥清空（一次性使用）。
+	// 这样运维在配置里再也看不到可直接冒充的长期凭据，只有本机 0600 的证书私钥。
+	handleEnrolled := func(cred client.CredentialFiles) {
+		cfg.ClientCert = cred.CertFile
+		cfg.ClientKey = cred.KeyFile
+		if cfg.CACert == "" {
+			cfg.CACert = cred.CAFile
+		}
+		cfg.EnrollmentSecret = ""
+		if err := config.Save(*configPath, cfg); err != nil {
+			log.Printf("警告: 保存换取结果到配置失败: %v", err)
+		}
+	}
 
 	start := func() {
 		// 服务模式：进程级重启交给 SCM（安装器已配置失败恢复动作），但进程内仍需兜住
@@ -204,6 +261,11 @@ func main() {
 			clientCert: *clientCert, clientKey: *clientKey, caCert: *caCert,
 			proxyIP: *proxyIP, agentKey: *agentKey,
 			upgradePubKey: *upgradePubKey, allowUnsigned: *upgradeAllowUnsigned,
+			latencyTargets:    splitList(*latencyTargets),
+			serverFingerprint: *serverFingerprint,
+			enrollSecret:      firstNonEmpty(*enrollSecret, *agentKey),
+			onEnrolled:        handleEnrolled,
+			configPath:        *configPath, credsDir: *credsDir,
 		}
 		if *daemonize || winapp.IsWindowsService() {
 			daemon.Supervise(func() { runClient(o) })
@@ -236,33 +298,66 @@ const agentServiceName = "MoCenterAgent"
 
 // runOpts 收敛 runClient 的入参，避免继续往位置参数上堆字段时错位。
 type runOpts struct {
-	server, agentID, agentUUID               string
-	hb, probe                               int
-	tls, insecure                           bool
-	clientCert, clientKey, caCert, proxyIP  string
-	agentKey, upgradePubKey                 string
-	allowUnsigned                           bool
+	server, agentID, agentUUID             string
+	hb, probe                              int
+	tls, insecure                          bool
+	clientCert, clientKey, caCert, proxyIP string
+	agentKey, upgradePubKey                string
+	allowUnsigned                          bool
+	latencyTargets                         []string
+	serverFingerprint, enrollSecret        string
+	configPath, credsDir                   string
+	onEnrolled                             func(client.CredentialFiles)
 }
 
 func runClient(o runOpts) {
 	c := client.New(client.Config{
-		ServerAddr: o.server,
-		AgentID:    o.agentID,
-		UUID:       o.agentUUID,
-		Heartbeat:  seconds(o.hb),
-		ProbeEvery: seconds(o.probe),
-		TLS:        o.tls,
-		Insecure:   o.insecure,
-		ClientCert: o.clientCert,
-		ClientKey:  o.clientKey,
-		CACert:     o.caCert,
-		ProxyIP:    o.proxyIP,
-		AgentKey:   o.agentKey,
+		ServerAddr:           o.server,
+		AgentID:              o.agentID,
+		UUID:                 o.agentUUID,
+		Heartbeat:            seconds(o.hb),
+		ProbeEvery:           seconds(o.probe),
+		TLS:                  o.tls,
+		Insecure:             o.insecure,
+		ClientCert:           o.clientCert,
+		ClientKey:            o.clientKey,
+		CACert:               o.caCert,
+		ProxyIP:              o.proxyIP,
+		AgentKey:             o.agentKey,
 		UpgradePubKey:        o.upgradePubKey,
 		UpgradeAllowUnsigned: o.allowUnsigned,
+		LatencyTargets:       o.latencyTargets,
+		ServerFingerprint:    o.serverFingerprint,
+		EnrollmentSecret:     o.enrollSecret,
+		ConfigPath:           o.configPath,
+		CredDir:              o.credsDir,
 	})
-	log.Printf("[agent] 启动 Agent %s，目标服务端 %s", o.agentID, o.server)
+	if o.onEnrolled != nil {
+		c.SetOnEnrolled(o.onEnrolled)
+	}
+	log.Printf("[agent] 启动 %s，Agent %s，目标服务端 %s", version.Full(), o.agentID, o.server)
 	c.Run()
 }
 
 func seconds(n int) time.Duration { return time.Duration(n) * time.Second }
+
+// splitList 拆分逗号分隔的列表并去除空白项。
+func splitList(s string) []string {
+	out := []string{}
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// firstNonEmpty 返回第一个非空白字符串。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}

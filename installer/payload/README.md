@@ -1,7 +1,7 @@
 # payload 目录
 
 本目录是**图形安装程序的打包素材**，供 `installer/setup.iss`（Inno Setup）收集文件用。
-构建脚本 `scripts/packaging/build-setup.bat` 会把下列内容准备齐：
+构建脚本 `scripts/build-windows-installer.bat`（由 `scripts\build-all.bat --type=installer` 调用）会把下列内容准备齐：
 
 | 文件/目录 | 来源 |
 |---|---|

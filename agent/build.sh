@@ -43,9 +43,14 @@ case "${PLATFORM}" in
   *) GOOS=linux GOARCH=amd64 ;;
 esac
 
+# Agent 版本：从 internal/version 读取（唯一事实来源），可用 MOCENTER_AGENT_VERSION 覆盖。
+# 它与 Server 版本互相独立，不需要跨端保持一致。
+AGENT_VERSION="${MOCENTER_AGENT_VERSION:-$(sed -n 's/^\s*const\s\+Version\s*=\s*"\([^"]*\)".*/\1/p' "$(dirname "${BASH_SOURCE[0]}")/internal/version/version.go" 2>/dev/null | head -1)}"
+AGENT_VERSION="${AGENT_VERSION:-1.0.1}"
+
 export GOOS GOARCH CGO_ENABLED=0
 echo "[agent] go mod download ..."
 go mod download
 echo "[agent] building ${OUT} (GOOS=${GOOS} GOARCH=${GOARCH}) ..."
-go build -ldflags "-s -w" -o "${OUT}" .
+go build -ldflags "-s -w -X mocenter/agent/internal/version.Version=${AGENT_VERSION}" -o "${OUT}" .
 echo "[agent] done -> ./${OUT}"

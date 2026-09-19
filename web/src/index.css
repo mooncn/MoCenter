@@ -14,17 +14,31 @@
   --yellow: #eab308;
 }
 
+/* 根级底色的三重保险（对应「移动端 Chrome 145+ 黑屏」）：
+   1. html 也要铺底色 —— 只给 body 铺时，一旦出现"实际文档高度 < 视口高度"
+      （地址栏收缩、软键盘收起、动态视口重算的瞬间），浏览器会用 html 的底色
+      填充视口，缺省是**白色**，表现为整屏闪白/黑；
+   2. `background-attachment: fixed` 让底色始终铺满视口，不随文档高度变化；
+   3. 高度用 dvh（动态视口）而不是 vh —— 移动端地址栏收起时 vh 不变，
+      dvh 才等于"当前真正可见的高度"。老浏览器不认 dvh 时退回 vh。
+   这三条都是"让底色永远覆盖整个视口"，不改变任何布局尺寸。 */
+html {
+  background-color: var(--bg);
+  color-scheme: dark;
+}
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-  background: var(--bg);
+  background-color: var(--bg);
+  background-attachment: fixed;
   color: var(--text);
   min-height: 100vh;
+  min-height: 100dvh;
 }
 
 a { color: var(--accent); text-decoration: none; }
 
 /* 布局 */
-.layout { display: flex; min-height: 100vh; }
+.layout { display: flex; min-height: 100vh; min-height: 100dvh; }
 .sidebar {
   width: 220px; background: var(--panel);
   border-right: 1px solid var(--border); padding: 16px 0;
@@ -57,7 +71,16 @@ th { color: var(--muted); font-weight: 600; font-size: 13px; }
 tr:hover td { background: var(--panel-2); }
 
 /* 徽章/状态 */
-.badge { padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+/* 徽章/短标签**一律不换行**。
+   中文默认按字断行，"在线" 两个汉字之间就能断开 —— 三列宽的表格里会渲染成
+   上下各一个字的"在线"，看起来像布局坏了（这正是「状态列错误换行」的根因）。
+   white-space 只是第一层保险：更要紧的是让它**按内容宽度收缩**，
+   否则在 flex/grid 父容器里仍可能被压到换行。 */
+.badge {
+  padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;
+  white-space: nowrap; display: inline-block; width: fit-content; max-width: 100%;
+}
+.tag-os, .lat-kind, .lat-badge, .cell-sub .badge { white-space: nowrap; }
 .badge.online { background: rgba(34,197,94,.15); color: var(--green); }
 .badge.offline { background: rgba(239,68,68,.15); color: var(--red); }
 .badge.idle { background: rgba(234,179,8,.15); color: var(--yellow); }
@@ -116,7 +139,8 @@ label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px
 
 /* 登录 */
 .login-wrap {
-  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; min-height: 100dvh;
+  display: flex; align-items: center; justify-content: center;
   background: var(--bg);
 }
 .login-box {
@@ -138,6 +162,11 @@ label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px
   --sidebar-w: 228px;
   --accent-soft: rgba(59, 130, 246, .14);
   --topbar-h: 56px;
+  /* 公开页专用：网络上下行配色 + 玻璃面板 */
+  --net-down: #21d4fd;
+  --net-up: #f759ab;
+  --glass: rgba(35, 44, 54, .62);
+  --glow: 0 0 0 1px rgba(90, 160, 255, .18), 0 18px 44px rgba(0, 0, 0, .38);
 }
 
 /* 滚动条美化 */
@@ -147,10 +176,15 @@ label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px
 ::-webkit-scrollbar-thumb:hover { background: #46586b; background-clip: content-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-body { -webkit-text-size-adjust: 100%; overflow-x: hidden; }
+/* overflow-x: hidden 只在**近两年**保留：
+   它会把 body 变成滚动容器，并让 sticky 在部分移动端浏览器上失效
+   （.public-summary / .mobile-topbar / .sidebar 都依赖 sticky）。
+   因此改为在 html 上裁横向溢出，body 保持普通文档流。 */
+html { overflow-x: hidden; }
+body { -webkit-text-size-adjust: 100%; }
 
 /* 布局：侧边栏使用渐变与柔和阴影 */
-.layout { min-height: 100vh; }
+.layout { min-height: 100vh; min-height: 100dvh; }
 .sidebar {
   width: var(--sidebar-w);
   position: sticky; top: 0; height: 100vh;
@@ -204,6 +238,16 @@ button.primary { background: var(--accent); }
 }
 .filter-bar .form-row { margin-bottom: 0; }
 .filter-actions { display: flex; gap: 8px; }
+
+/* 排序表头：仅"稳定字段"可点。动态数值列的表头保持普通样式（鼠标指针不变），
+   让"能不能排"在点击之前就看得出来。 */
+.sortable-table th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+.sortable-table th.sortable:hover { color: var(--text); }
+.sortable-table th.sortable .th-label { display: inline-flex; align-items: center; gap: 3px; }
+.sort-mark { font-size: 10px; opacity: .4; }
+.sort-mark.on { opacity: 1; color: var(--accent); }
+/* 窄屏排序按钮：宽屏隐藏（宽屏用表头点击即可） */
+.th-mobile { display: none; }
 
 /* 表格：容器滚动，避免窄屏撑破布局 */
 .table-scroll { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -356,7 +400,17 @@ button.primary { background: var(--accent); }
   .metric .value { font-size: 19px; }
   .card { padding: 14px; }
 
-  /* 表格卡片化：每行折叠为一张小卡片，避免横向滚动 */
+  /* ------------------------------------------------------------
+     表格卡片化：每行折叠为一张小卡片，避免横向滚动
+     ------------------------------------------------------------
+     · 默认用**两列栅格**（左侧字段名 88px + 右侧内容自适应），阅读效率最高；
+     · 行内**元素较多**的表格（如仪表盘，含进度条/多行数值/按钮）改用
+       `.table-stack.blocky` 的**单列堆叠**：内容占满整行。两列栅格下
+       右侧可用宽度只有 300px 左右，CPU 型号、网络累计值这类长内容会被压成
+       竖排的"一个字一行"，反而比横向滚动还难读。
+     · 单列堆叠时字段名行不再占一整行，而是收成一行小标题（更省纵向空间，
+       仪表盘一屏少滚半页）。
+     ------------------------------------------------------------ */
   .table-stack thead { display: none; }
   .table-stack, .table-stack tbody, .table-stack tr, .table-stack td { display: block; width: 100%; }
   .table-stack tr {
@@ -395,6 +449,174 @@ button.primary { background: var(--accent); }
   /* 表单控件在卡片内不要溢出 */
   .table-stack td input, .table-stack td select { max-width: 100%; }
 
+  /* ===== 仪表盘专用：单列堆叠 + 稳定状态列 ===== */
+
+  /* 主机的"备注 + 主机名 + UUID"三行在窄屏下容易糊成一团：
+     主机名与 UUID 用等宽/灰阶拉开层次，"备注"按钮不再贴到 UUID 上。 */
+  .table-stack td[data-label="主机"] b { font-size: 14px; }
+  .table-stack td[data-label="主机"] > div { line-height: 1.5; margin-top: 2px; }
+  .table-stack td[data-label="主机"] > div:last-child { margin-top: 6px; }
+
+  /* blocky：字段名收成小标题，内容占满整行。
+     注意 `.table-stack td::before` 在原规则里是 title + margin-right，
+     这里必须把 margin-right 显式清掉，否则小标题行会凭空多出一段缩进，
+     同一列里"主机"这种自带多行内容的单元格看起来就错位了。 */
+  .table-stack.blocky td { display: block; padding: 6px 0; }
+  .table-stack.blocky td::before {
+    display: block; width: auto; margin: 0 0 3px; padding-top: 0;
+    font-size: 11px; letter-spacing: .3px; opacity: .85;
+  }
+  .table-stack.blocky td > div { width: auto; }
+  .table-stack.blocky td:empty { display: none; }
+
+  /* 进度条在卡片里要看得见：6px 高 + 4px 内边距在"0%"时几乎只剩一条线，
+     容易被当成"没画出来"。这里加高到 8px，并去掉圆角内衬的视觉压缩。 */
+  .table-stack td .bar { height: 8px; margin-top: 6px; }
+  .public-mini .bar { height: 8px; }
+
+  /* 仪表盘统计卡：三列 -> 两列，避免"0% 平均 CPU"被挤成两行 */
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metrics .metric .label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* 仪表盘页头：状态徽章与时间窗选择器各占一行，不再挤在一起 */
+  .page-head .badge { white-space: nowrap; }
+
+  /* 趋势/状态等单元格里的进度条：占满卡片宽度（原来 220px 在窄屏偏窄） */
+  .table-stack td .bar { max-width: 100%; }
+
+  /* ===== 移动端排序：把表头折叠成一行可横滑的排序按钮 =====
+     卡片视图下 thead 是 display:none，排序入口会消失。
+     这里把 thead 重新显示为一条**横向滚动**的按钮条：
+        · 只保留可排序列（不可排的按钮已被 .th-sort-off 隐掉）；
+        · nowrap + overflow-x:auto，窄屏滑动即可，不占额外纵向空间；
+        · sticky 吸顶，滚动列表时随时能改排序。 */
+  /* top 取顶栏高度 + 一点余量：卡片模式下 thead 吸顶后，
+     第一张卡片的"主机"小标题要紧贴着它下面，不能钻到条下面去。 */
+  .table-stack.sortable-table thead {
+    display: block; position: sticky; top: calc(var(--topbar-h) + 4px); z-index: 20;
+    margin: 0 -2px 10px; padding: 6px 2px 8px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  .table-stack.sortable-table thead tr {
+    display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .table-stack.sortable-table thead th {
+    display: block; flex: 0 0 auto; padding: 0; border: none;
+  }
+  .table-stack.sortable-table thead th .th-label { display: none; }
+  .table-stack.sortable-table thead th th { display: none; }
+  .table-stack.sortable-table .th-mobile {
+    display: inline-flex; align-items: center; gap: 3px;
+    padding: 5px 11px; font-size: 12px; font-weight: 600;
+    background: var(--panel-2); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px;
+    white-space: nowrap; cursor: pointer;
+  }
+  .table-stack.sortable-table .th-mobile:active { background: var(--border); }
+  .table-stack.sortable-table .th-mobile .sort-mark { font-size: 9px; }
+  .table-stack.sortable-table th.sortable .th-mobile,
+  .table-stack.sortable-table th.sortable .th-mobile .sort-mark.on { color: #7cb0ff; }
+  .table-stack.sortable-table th.sortable .th-mobile:has(.sort-mark.on) {
+    background: var(--accent-soft); border-color: rgba(59, 130, 246, .45); color: #cfe2ff;
+  }
+  /* 不可排序列：连表头都不显示（点了没反应的按钮比没有按钮更让人困惑） */
+  .table-stack.sortable-table thead th:not(.sortable) { display: none; }
+
+  /* ===== 仪表盘窄屏紧凑卡片 =====
+     `.blocky` 的单列堆叠每个字段独占一行，主机卡片会被拉得很长（一屏一台），
+     点「查看」都要滚半天。这里把仪表盘高频字段压成紧凑版：
+       · 主机名 + 状态/操作同一行；
+       · 系统/位置/最后在线各占一行且超长省略；
+       · CPU/内存/磁盘三项并排一行；
+       · 架构、网络明细、UUID 直接省略（信息价值低 / 已在别处展示）。
+     信息密度上来后，一屏能看到多台主机，也更容易点中目标。 */
+  .table-stack.blocky tr {
+    padding: 8px 12px; margin-bottom: 8px; position: relative;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px;
+  }
+  .table-stack.blocky tr td { padding: 3px 0; font-size: 12.5px; display: block; grid-column: 1 / -1; }
+  .table-stack.blocky tr td::before { display: none; }
+
+  .table-stack.blocky tr td[data-label="主机"] { grid-column: 1; padding: 0; }
+  .table-stack.blocky tr td[data-label="主机"] b { display: block; font-size: 13.5px; }
+  .table-stack.blocky tr td[data-label="主机"] > div { display: inline; margin: 0; font-size: 11.5px; }
+  .table-stack.blocky tr td[data-label="主机"] > div[title^="设备唯一 UUID"] { display: none; }
+  .table-stack.blocky tr td[data-label="主机"] > div:last-child { margin-left: 6px; }
+
+  .table-stack.blocky tr td[data-label="状态"] { grid-column: 2; padding: 0; text-align: right; }
+  .table-stack.blocky tr td[data-label="趋势"] { grid-column: 2; padding: 0; display: flex; justify-content: flex-end; }
+
+  /* 低频字段压成单行省略 */
+  .table-stack.blocky tr td[data-label="公网IP/位置"],
+  .table-stack.blocky tr td[data-label="系统"],
+  .table-stack.blocky tr td[data-label="最后在线"],
+  .table-stack.blocky tr td[data-label="版本"],
+  .table-stack.blocky tr td[data-label="延迟"] {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .table-stack.blocky tr td[data-label="公网IP/位置"] > div,
+  .table-stack.blocky tr td[data-label="系统"] > div { display: inline; width: auto; font-size: 11.5px; }
+  .table-stack.blocky tr td[data-label="系统"] > div + div::before { content: ' · '; color: var(--muted); }
+  .table-stack.blocky tr td[data-label="公网IP/位置"] > div { margin-right: 8px; }
+  /* 移动端省略：架构已随「系统」行展示；网络明细/延迟价值低于版面成本 */
+  .table-stack.blocky tr td[data-label="架构"],
+  .table-stack.blocky tr td[data-label="网络"],
+  .table-stack.blocky tr td[data-label="延迟"] { display: none; }
+
+  /* 资源占用一行三段并排 */
+  .table-stack.blocky tr td[data-label="CPU"],
+  .table-stack.blocky tr td[data-label="内存"],
+  .table-stack.blocky tr td[data-label="磁盘"] { padding: 4px 8px 0 0; }
+  .table-stack.blocky tr td[data-label="CPU"] { grid-column: 1 / 2; }
+  .table-stack.blocky tr td[data-label="内存"] { grid-column: 2 / 3; }
+  .table-stack.blocky tr td[data-label="磁盘"] { grid-column: 3 / 4; }
+  .table-stack.blocky tr td[data-label="CPU"]::before,
+  .table-stack.blocky tr td[data-label="内存"]::before,
+  .table-stack.blocky tr td[data-label="磁盘"]::before {
+    display: block; font-size: 10.5px; opacity: .8; margin: 0 0 2px;
+  }
+  .table-stack.blocky tr td[data-label="CPU"] > div:first-child,
+  .table-stack.blocky tr td[data-label="磁盘"] > div:first-child { display: none; }
+  .table-stack.blocky tr td[data-label="内存"] > div {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11.5px;
+  }
+  .table-stack.blocky tr td[data-label="CPU"] .bar,
+  .table-stack.blocky tr td[data-label="内存"] .bar,
+  .table-stack.blocky tr td[data-label="磁盘"] .bar { margin-top: 4px; height: 6px; max-width: none; }
+
+  /* 离线红点：卡片是 grid，absolute 会塌成 0 宽，改为常规流式紧贴状态徽章 */
+  .table-stack.blocky tr.row-offline td[data-label="状态"] {
+    display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+  }
+  .table-stack.blocky tr.row-offline td[data-label="状态"] .cell-dot {
+    position: static; display: inline-block; width: 10px; height: 10px;
+  }
+
+  /* 行内展开的折线图：作为卡片的一部分，紧贴主机卡片下方 */
+  .table-stack.blocky tr.trend-row {
+    display: block; margin-top: -8px;
+    border-top-left-radius: 0; border-top-right-radius: 0;
+    border-color: var(--accent);
+  }
+  .table-stack.blocky tr.trend-row > td { display: block; grid-column: 1 / -1; }
+  .trend-inline svg { max-height: 190px; }
+
+  /* 浮动统计栏：窄屏分两行，「登录后台」贴最右 */
+  .stat-bar {
+    margin: -12px -12px 12px; padding: 10px 12px;
+    border-radius: 0; border-left: none; border-right: none; gap: 8px;
+  }
+  .stat-bar-head { flex: 1 1 100%; }
+  .stat-bar > select { flex: 1 1 120px; width: auto; }
+  .btn-login { padding: 8px 12px; font-size: 13px; }
+
+  /* 总览指标：窄屏一行两项，仍比原先的五张统计卡省一半纵向空间 */
+  .card-head-row { flex-direction: column; align-items: stretch; }
+  .overview-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ov-item { min-width: 0; }
+  .ov-v { font-size: 16px; }
+
   .pagination { flex-direction: column; align-items: stretch; }
   .pagination-controls { justify-content: center; }
   .pagination-info { text-align: center; }
@@ -425,4 +647,607 @@ button.primary { background: var(--accent); }
 /* 横屏/平板：终端高度自适应 */
 @media (max-height: 640px) {
   .vnc-wrap { min-height: 240px; }
+}
+
+/* ============================================================
+   公开状态页（免登录，Issue #5）
+   独立于后台布局：无侧边栏、无鉴权入口，视觉上更"对外"。
+   ============================================================ */
+.public-shell {
+  position: relative;
+  max-width: 1200px; margin: 0 auto;
+  padding: 32px 22px 56px;
+}
+/* 背景光晕：纯装饰，用绝对定位伪元素，不参与布局 */
+.public-shell::before {
+  content: ''; position: fixed; inset: -30% -10% auto -10%; height: 70vh;
+  background:
+    radial-gradient(50% 60% at 18% 0%, rgba(59, 130, 246, .16), transparent 70%),
+    radial-gradient(40% 50% at 82% 4%, rgba(33, 212, 253, .12), transparent 70%);
+  pointer-events: none; z-index: -1;
+}
+.public-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 18px; flex-wrap: wrap; margin-bottom: 22px;
+}
+.public-head-main { min-width: 0; }
+.public-head h1 {
+  font-size: 26px; letter-spacing: .2px; line-height: 1.3;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.public-desc { color: var(--muted); font-size: 13.5px; margin-top: 8px; line-height: 1.6; }
+.public-head-meta {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  color: var(--muted); font-size: 12px; margin-top: 10px;
+}
+.public-crumb { font-size: 12.5px; margin-bottom: 8px; }
+.public-head-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.public-search {
+  width: 180px; padding: 8px 12px; border-radius: 8px; font-size: 13.5px;
+  background: var(--glass); border: 1px solid var(--border); color: var(--text);
+}
+.public-search::placeholder { color: var(--muted); }
+.public-btn {
+  display: inline-block; padding: 8px 14px; border-radius: 8px;
+  background: var(--accent); color: #fff; font-size: 13.5px; border: 1px solid transparent;
+  transition: transform .12s, opacity .12s;
+}
+.public-btn:hover { opacity: .88; transform: translateY(-1px); }
+.public-btn.ghost { background: var(--glass); color: var(--text); border-color: var(--border); }
+.public-entry {
+  display: block; text-align: center; margin-top: 14px;
+  font-size: 13px; color: var(--muted);
+}
+.public-entry:hover { color: var(--accent); }
+
+/* 空态 / 加载态 */
+.public-empty {
+  text-align: center; color: var(--muted); padding: 44px 20px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.public-empty-icon { font-size: 34px; margin-bottom: 10px; }
+.public-empty-title { font-size: 16px; color: var(--text); margin-bottom: 6px; }
+.public-empty-sub { font-size: 13px; line-height: 1.7; }
+.public-empty-actions { margin-top: 18px; }
+.public-count { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; }
+
+/* 骨架屏：首屏骨架比"正在加载…"更少跳动 */
+.public-skeleton { display: flex; flex-direction: column; gap: 14px; }
+.public-skeleton .sk-bar,
+.public-skeleton .sk-metric,
+.public-skeleton .sk-card {
+  background: linear-gradient(90deg, var(--panel) 25%, var(--panel-2) 37%, var(--panel) 63%);
+  background-size: 400% 100%; animation: sk 1.4s ease infinite;
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.public-skeleton .sk-bar { height: 56px; }
+.public-skeleton .sk-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+.public-skeleton .sk-metric { height: 84px; }
+.public-skeleton .sk-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(226px, 1fr)); gap: 12px; }
+.public-skeleton .sk-card { height: 132px; }
+@keyframes sk { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
+/* 卡片右上角状态点 */
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
+.dot.online { background: var(--green); box-shadow: 0 0 0 3px rgba(34, 197, 94, .16); }
+.dot.offline { background: var(--muted); }
+
+/* 实时指示点 */
+.live-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 0 0 rgba(34, 197, 94, .6);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, .55); }
+  70% { box-shadow: 0 0 0 9px rgba(34, 197, 94, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+
+/* 顶部悬浮汇总条（sticky）
+   需求：把「节点总数/在线/离线/上行/下行/累计流量」集中放在页面顶部悬浮展示，
+   卡片区不再重复统计 —— 因此这条需要 sticky，滚动时始终可见。 */
+.public-summary {
+  position: sticky; top: 0; z-index: 30;
+  margin: -32px -22px 20px;
+  padding: 10px 22px;
+  background: rgba(15, 20, 25, .82);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(14px) saturate(1.2);
+}
+.public-summary-inner {
+  display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap;
+}
+.sm-item {
+  display: flex; flex-direction: column; justify-content: center;
+  min-width: 92px; padding: 6px 12px;
+  background: var(--glass); border: 1px solid var(--border); border-radius: 10px;
+}
+.sm-v {
+  font-size: 18px; font-weight: 700; letter-spacing: .2px; line-height: 1.25;
+  font-variant-numeric: tabular-nums; display: flex; align-items: baseline; gap: 3px;
+}
+.sm-u { font-size: 11px; font-style: normal; color: var(--muted); font-weight: 500; }
+.sm-l { color: var(--muted); font-size: 11.5px; margin-top: 2px; white-space: nowrap; }
+.sm-s { color: var(--muted); font-size: 10.5px; margin-top: 2px; opacity: .8; white-space: nowrap; }
+.sm-item.ok .sm-v { color: var(--green); }
+.sm-item.bad .sm-v { color: var(--red); }
+.sm-item.down .sm-v { color: var(--net-down); }
+.sm-item.up .sm-v { color: var(--net-up); }
+
+/* 卡片视图：小巧玲珑（宽 226px 起排，一屏可见更多机器） */
+.public-cards {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(226px, 1fr));
+  gap: 12px;
+}
+.public-card {
+  display: block; width: 100%; text-align: left; cursor: pointer;
+  background: linear-gradient(180deg, rgba(255,255,255,.028), transparent 62%), var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border); border-radius: 12px;
+  padding: 12px 13px 13px; box-shadow: var(--shadow);
+  transition: transform .15s, border-color .15s, box-shadow .15s;
+}
+.public-card:hover, .public-card:focus-visible {
+  transform: translateY(-2px); border-color: #3f5470; outline: none;
+  box-shadow: var(--glow);
+}
+/* 离线卡片：整卡降透明 + 右上角红点。
+   卡片本身不整体刷红（大面积红色会盖过 CPU/内存等真正要读的信息），
+   改为「红点 + 淡红描边」，既醒目又不影响读数。 */
+.public-card.offline { opacity: .72; border-color: rgba(239, 68, 68, .38); }
+.public-card.offline:hover, .public-card.offline:focus-visible { border-color: rgba(239, 68, 68, .7); }
+/* 卡片右上角状态点：在线绿 / 离线红（区别于后台的"离线灰点"语义） */
+.card-dot { width: 10px; height: 10px; margin-right: 0; }
+.card-dot.online { background: var(--green); box-shadow: 0 0 0 3px rgba(34, 197, 94, .16); }
+.card-dot.offline { background: var(--red); box-shadow: 0 0 0 3px rgba(239, 68, 68, .18); }
+.public-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.public-card-head-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.public-card-name {
+  font-weight: 700; font-size: 14px; line-height: 1.35;
+  display: flex; align-items: center; gap: 5px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 国旗：内置字形（不依赖系统 emoji 字体）+ emoji 兜底。
+   1.15em 让它跟随所在文本的字号 —— 卡片名、列表单元格、详情标题三处
+   字号不同，若写死 px 就会有的偏大有的偏小。 */
+.flag { flex: 0 0 auto; vertical-align: -0.12em; }
+.flag-img { width: 1.15em; height: auto; aspect-ratio: 1 / 1; border-radius: 2px; display: inline-block; }
+.flag-emoji { font-size: 1.05em; line-height: 1; display: inline-block; }
+.public-card-meta {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  color: var(--muted); font-size: 11.5px; margin: 6px 0 9px;
+  overflow: hidden;
+}
+.public-card-meta > span {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
+.tag-os {
+  padding: 1px 7px; border-radius: 999px; font-size: 11px;
+  background: rgba(59, 130, 246, .14); color: #7fb4ff; border: 1px solid rgba(59, 130, 246, .26);
+}
+.tag-geo { color: var(--muted); }
+.public-geo { color: #6fb2ff; }
+/* 卡片内指标区：固定为 4 行的最小高度（CPU/RAM/磁盘/负载 四条）。
+   条目本身由字段开关决定是否渲染（开关不变则条数不变），这里再固定高度，
+   保证"某一轮值缺失/为 0"时卡片不会忽高忽矮，列表不会跟着上下跳。 */
+.public-card-bars { display: flex; flex-direction: column; gap: 7px; min-height: 86px; }
+.public-mini .bar { height: 8px; margin-top: 6px; }
+.public-mini { margin-bottom: 0; }
+.public-mini-row { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 11.5px; color: var(--muted); }
+.public-mini-row .v { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.public-mini-row .v.warn { color: var(--yellow); }
+.load-more { color: var(--muted); font-style: normal; font-weight: 500; font-size: 10.5px; margin-left: 5px; }
+.public-load .public-mini-row { padding-top: 1px; }
+.public-table-card { margin-top: 0; }
+
+/* 列表视图：整行可点 */
+.public-table-card { padding: 0; overflow: hidden; }
+.public-table-card .table-scroll { overflow-x: auto; }
+.public-table { font-size: 13px; }
+.public-table th, .public-table td { padding: 9px 10px; white-space: nowrap; }
+.public-table th.sortable { cursor: pointer; user-select: none; }
+.public-table th.sortable:hover { color: var(--text); }
+.sort-mark { margin-left: 4px; font-size: 10px; opacity: .45; }
+.sort-mark.on { opacity: 1; color: var(--accent); }
+.public-table .row-name { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; }
+.public-table .pct { font-variant-numeric: tabular-nums; font-weight: 600; }
+.public-table .pct.warn { color: var(--yellow); }
+.public-table .pct.danger { color: var(--red); }
+.public-table .rate-down { color: var(--net-down); font-size: 12px; }
+.public-table .rate-up { color: var(--net-up); font-size: 12px; }
+.sort-hint { padding: 8px 12px 10px; }
+.public-row { cursor: pointer; }
+.public-row:hover td { background: var(--panel-2); }
+
+.public-card-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.public-facts {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px 20px;
+}
+.public-fact { display: flex; gap: 10px; font-size: 13px; padding: 6px 0; border-bottom: 1px dashed var(--border); }
+.public-fact .k { color: var(--muted); min-width: 88px; }
+.public-fact .v { word-break: break-all; }
+.public-foot {
+  margin-top: 28px; text-align: center; color: var(--muted); font-size: 12.5px;
+}
+/* 页脚自定义内容（后台「展示配置」）里的链接与行内元素：
+   深色底上默认蓝色太暗，统一提亮到主题强调色，并保持下划线可点感。 */
+.site-foot a { color: var(--accent); text-decoration: none; }
+.site-foot a:hover, .site-foot a:focus-visible { text-decoration: underline; }
+.site-foot img { max-height: 20px; vertical-align: middle; }
+/* 页脚下方那行"数据每 5 秒由 Agent 上报…"：与自定义页脚同一区块、
+   但字号更小更弱，避免和运维写的版权信息抢注意力。 */
+.public-foot-sub {
+  margin-top: 6px; text-align: center; color: var(--muted);
+  font-size: 12px; opacity: .78;
+}
+.public-foot-sub a { color: inherit; }
+/* 后台页脚（登录页）：登录框下方的页脚只需要一点上边距 */
+.login-wrap .site-foot { margin-top: 18px; opacity: .85; }
+/* 多行代码/HTML 输入框：等宽字体便于核对标签 */
+.code-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px; line-height: 1.6; resize: vertical;
+}
+.public-tips { margin-left: 18px; color: var(--muted); font-size: 13px; line-height: 1.9; }
+.public-tips code { color: var(--text); }
+
+/* 趋势图 */
+.public-trend-svg { width: 100%; height: auto; }
+.public-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 4px; font-size: 12px; color: var(--muted); }
+.public-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.public-legend-item i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+/* 分段切换（卡片/列表 / 时间窗） */
+.seg {
+  display: inline-flex; background: var(--glass); border: 1px solid var(--border);
+  border-radius: 8px; padding: 2px; flex-wrap: wrap;
+}
+.seg button { background: transparent; color: var(--muted); padding: 6px 14px; font-size: 13px; border-radius: 6px; }
+.seg button:hover { color: var(--text); }
+.seg button.on { background: var(--accent); color: #fff; }
+
+@media (max-width: 900px) {
+  .public-shell { padding: 18px 12px 44px; }
+  /* 悬浮条在窄屏改为横向滚动，避免换行后占掉半屏 */
+  .public-summary { margin: -18px -12px 16px; padding: 8px 12px; }
+  .public-summary-inner { flex-wrap: nowrap; overflow-x: auto; gap: 8px; padding-bottom: 2px; }
+  .sm-item { flex: 0 0 auto; min-width: 84px; padding: 5px 10px; }
+  .sm-v { font-size: 16px; }
+  .public-head { flex-direction: column; align-items: stretch; }
+  .public-head h1 { font-size: 21px; }
+  .public-head-actions { justify-content: space-between; }
+  .public-search { flex: 1 1 140px; width: auto; }
+  .public-card { padding: 12px; }
+  .public-fact { flex-direction: column; gap: 2px; }
+  .public-fact .k { min-width: 0; }
+}
+@media (max-width: 520px) {
+  .public-cards { grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 10px; }
+  .public-card { padding: 10px 11px 11px; }
+  .public-card-name { font-size: 13px; }
+  /* 极窄屏（小屏手机）：一行放不下两列时退回单列，
+     卡片内部的指标条才有足够宽度 —— 148px 宽下"CPU 100.0%"会把数值挤成两行。 */
+  .public-mini-row { font-size: 11px; }
+  .public-table th, .public-table td { padding: 8px 9px; }
+}
+
+/* 移动端：公开状态页的表格同样折叠成卡片。
+   公开页的列表视图列多（最多 11 列），窄屏横向滚动的体验很差，
+   直接复用后台的 `.table-stack` 卡片化，两处行为一致、维护也少一份。 */
+@media (max-width: 900px) {
+  .public-table-card .public-table thead { display: none; }
+  .public-table-card .public-table,
+  .public-table-card .public-table tbody,
+  .public-table-card .public-table tr,
+  .public-table-card .public-table td { display: block; width: 100%; }
+  .public-table-card .public-table tr {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 10px;
+    cursor: pointer;
+  }
+  .public-table-card .public-table tr:hover td { background: transparent; }
+  .public-table-card .public-table td {
+    border: none; padding: 5px 0; font-size: 13px; white-space: normal;
+    display: grid; grid-template-columns: 84px minmax(0, 1fr);
+    gap: 10px; align-items: start; text-align: left; overflow-wrap: anywhere;
+  }
+  .public-table-card .public-table td::before {
+    content: attr(data-label);
+    color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap;
+  }
+  .public-table-card .public-table td > * { margin: 0; max-width: 100%; }
+  /* 排序提示条在卡片视图下没有"表头"可点，直接隐藏（桌面才有意义） */
+  .public-table-card .sort-hint { padding: 4px 2px 8px; }
+}
+
+/* ============================================================
+   展示配置页（后台）
+   ============================================================ */
+.switch-list { display: flex; flex-direction: column; gap: 14px; }
+.switch-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 12px 14px; background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.switch-row.disabled { opacity: .5; }
+.switch-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; }
+.switch-desc { color: var(--muted); font-size: 12.5px; margin-top: 5px; line-height: 1.6; }
+.switch {
+  flex: 0 0 auto; width: 52px; height: 28px; padding: 0; border-radius: 999px;
+  background: #33404d; border: 1px solid var(--border); position: relative; transition: background .18s;
+}
+.switch .knob {
+  position: absolute; top: 2px; left: 2px; width: 22px; height: 22px;
+  border-radius: 50%; background: #e6edf3; transition: transform .18s;
+}
+.switch.on { background: var(--accent); border-color: var(--accent); }
+.switch.on .knob { transform: translateX(24px); }
+.switch:disabled { cursor: not-allowed; }
+
+.host-picker { display: flex; flex-wrap: wrap; gap: 8px; }
+.radio-item {
+  display: flex; gap: 10px; align-items: flex-start; margin: 0;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 12px 14px; cursor: pointer;
+}
+.radio-item:hover { border-color: var(--accent); }
+.radio-item.disabled { opacity: .55; cursor: not-allowed; }
+.radio-item input { width: auto; margin-top: 3px; }
+.radio-text { display: flex; flex-direction: column; gap: 4px; font-size: 13.5px; }
+.field-group-title {
+  color: var(--muted); font-size: 12.5px; font-weight: 700; letter-spacing: .4px;
+  text-transform: uppercase; margin-bottom: 8px;
+}
+.field-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+.field-item {
+  display: grid; grid-template-columns: auto 1fr; gap: 4px 8px;
+  align-items: center; cursor: pointer;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 10px 12px; margin: 0;
+}
+.field-item:hover { border-color: var(--accent); }
+.field-item.sensitive { border-color: rgba(250, 140, 22, .35); }
+.field-item input { width: auto; grid-row: 1; grid-column: 1; }
+.field-label { grid-row: 1; grid-column: 2; font-size: 13.5px; color: var(--text); }
+.field-desc { grid-row: 2; grid-column: 2; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+
+/* ============================================================
+   延迟监测 / 备份恢复 / 一键部署（本次新增页面）
+   ============================================================ */
+
+/* 页面头部：标题 + 控件（窄屏自动换行） */
+.lat-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.lat-head h3 { margin: 0; }
+.lat-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.lat-controls select { width: auto; min-width: 200px; }
+
+/* 提示条：ok / err / warn 三态 */
+.lat-msg { border-radius: var(--radius-sm); padding: 9px 12px; font-size: 13px; margin: 10px 0; line-height: 1.6; }
+.lat-msg.ok { background: rgba(82, 196, 26, .12); color: #8ee06a; border: 1px solid rgba(82, 196, 26, .3); }
+.lat-msg.err { background: rgba(239, 68, 68, .12); color: #ff9b9b; border: 1px solid rgba(239, 68, 68, .32); }
+.lat-msg.warn { background: rgba(250, 140, 22, .12); color: #ffc069; border: 1px solid rgba(250, 140, 22, .3); }
+
+/* 延迟表格 */
+.lat-table-wrap { width: 100%; overflow-x: auto; }
+.lat-table tbody tr { cursor: pointer; }
+.lat-table tbody tr.on td { background: rgba(77, 163, 255, .1); }
+.lat-loss { color: var(--red); font-weight: 600; }
+.mono { font-family: Menlo, Consolas, monospace; font-size: 12px; }
+
+/* 探测方式标签 */
+.lat-kind { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10.5px; font-weight: 700; letter-spacing: .4px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
+.lat-kind.icmp { color: #4da3ff; border-color: rgba(77, 163, 255, .35); }
+.lat-kind.tcp { color: #52c41a; border-color: rgba(82, 196, 26, .35); }
+.lat-kind.http { color: #fa8c16; border-color: rgba(250, 140, 22, .35); }
+
+/* 曲线图例 */
+.lat-legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; }
+.lat-legend-item { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-family: Menlo, Consolas, monospace; }
+.lat-legend-item i { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+.lat-legend-hint { color: var(--muted); font-size: 11.5px; line-height: 1.7; margin-top: 8px; }
+
+/* 目标编辑 */
+.lat-textarea, .deploy-grid textarea {
+  width: 100%; background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text);
+  font-family: Menlo, Consolas, monospace; font-size: 12.5px; padding: 10px; resize: vertical;
+}
+.lat-textarea:focus, .deploy-grid textarea:focus { outline: none; border-color: var(--accent); }
+
+/* 备份：清单里的"含凭据"标记 */
+.lat-badge { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 8px; font-size: 10px; background: rgba(250, 140, 22, .16); color: #ffc069; border: 1px solid rgba(250, 140, 22, .3); }
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.btn.sm, .btn.ghost.sm { padding: 4px 9px; font-size: 12px; }
+.btn.danger { background: rgba(239, 68, 68, .14); color: var(--red); border: 1px solid rgba(239, 68, 68, .35); }
+.btn.danger:hover:not(:disabled) { background: rgba(239, 68, 68, .22); }
+
+/* 恢复确认区：视觉上必须显眼，因为它是不可逆操作 */
+.restore-box { margin-top: 16px; border: 1px solid rgba(239, 68, 68, .32); border-radius: var(--radius-sm); padding: 14px; background: rgba(239, 68, 68, .05); }
+.restore-title { font-weight: 700; color: var(--red); margin-bottom: 6px; }
+.restore-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.restore-actions input { flex: 1 1 220px; max-width: 320px; }
+
+/* 一键部署表单 */
+.deploy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-top: 12px; }
+.deploy-grid label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+.deploy-grid .span2 { grid-column: 1 / -1; }
+.deploy-grid input, .deploy-grid select { width: 100%; }
+.deploy-grid input[type="password"] { font-family: Menlo, Consolas, monospace; }
+.deploy-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+
+/* 部署步骤：逐步展示，失败步骤用红色标出 */
+.deploy-steps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; }
+.deploy-steps li { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; background: var(--panel-2); }
+.deploy-steps li.ok { border-left: 3px solid var(--green); }
+.deploy-steps li.err { border-left: 3px solid var(--red); }
+.deploy-step-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.deploy-step-icon { font-weight: 700; }
+.deploy-steps li.ok .deploy-step-icon { color: var(--green); }
+.deploy-steps li.err .deploy-step-icon { color: var(--red); }
+.deploy-step-name { flex: 1; }
+.deploy-out {
+  margin: 8px 0 0; padding: 8px 10px; background: #0d1117; border: 1px solid var(--border);
+  border-radius: 6px; font-size: 11.5px; line-height: 1.6; color: #b9c4cf;
+  white-space: pre-wrap; word-break: break-all; max-height: 220px; overflow: auto;
+}
+.deploy-out.err { color: #ff9b9b; border-color: rgba(239, 68, 68, .3); }
+
+/* 窄屏：控件堆叠 */
+@media (max-width: 640px) {
+  .lat-controls { width: 100%; }
+  .lat-controls select { flex: 1 1 100%; }
+  .deploy-actions { flex-direction: column; }
+  .deploy-actions .btn { width: 100%; }
+  .restore-actions input { max-width: none; }
+}
+
+/* ============ Agent 接入页 ============ */
+.kv { width: 100%; border-collapse: collapse; }
+.kv th {
+  text-align: left; font-weight: 600; white-space: nowrap;
+  padding: 8px 14px 8px 0; width: 110px; vertical-align: top;
+}
+.kv td { padding: 8px 0; word-break: break-all; }
+.kv code, .key-box, .cmd-box {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  background: rgba(15, 23, 42, .06);
+  border-radius: 6px;
+  padding: 3px 7px;
+}
+.key-box { display: inline-block; min-width: 240px; max-width: 100%; overflow-wrap: anywhere; }
+.cmd-box {
+  display: block; flex: 1 1 auto; min-width: 0;
+  padding: 9px 11px; overflow-x: auto; white-space: nowrap;
+}
+.row-inline {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 6px 0 10px;
+}
+.btn-mini {
+  padding: 4px 10px; font-size: 12px; border-radius: 6px;
+  border: 1px solid rgba(100, 116, 139, .35);
+  background: transparent; color: inherit; cursor: pointer;
+  white-space: nowrap;
+}
+.btn-mini:hover { border-color: rgba(100, 116, 139, .7); }
+
+@media (max-width: 640px) {
+  .kv th { width: 78px; font-size: 13px; }
+  .cmd-box { white-space: normal; overflow-wrap: anywhere; }
+}
+
+
+/* ============================================================
+   顶部浮动统计栏（仪表盘）
+   滚动时吸附顶部：服务端状态、时段筛选与「登录后台」入口始终可见。
+   ============================================================ */
+.stat-bar {
+  position: sticky; top: 0; z-index: 26;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
+  margin: 0 0 18px; padding: 10px 14px;
+  background: rgba(26, 33, 41, .94); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  backdrop-filter: blur(8px);
+}
+.stat-bar-head { flex: 1 1 240px; min-width: 0; }
+.stat-bar-head h2 { font-size: 19px; }
+.stat-bar-head .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.stat-bar > select { width: 150px; flex: 0 0 auto; }
+
+/* 回首页：始终排在最右侧 */
+.btn-login {
+  margin-left: auto; flex: 0 0 auto;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 14px; border-radius: 8px; font-size: 13.5px; font-weight: 600;
+  color: #fff; background: var(--accent); border: 1px solid var(--accent);
+  white-space: nowrap;
+}
+.btn-login:hover { opacity: .88; color: #fff; }
+/* 公开页入口用次级样式：它不是这一页的主操作，抢眼反而会盖过状态信息 */
+.btn-login.btn-home {
+  background: transparent; color: var(--accent); border-color: var(--accent);
+}
+
+/* 指标卡说明小字 */
+.metric-note { color: #6b7280; font-size: 11px; font-weight: 400; }
+
+/* ============================================================
+   「主机探针信息总览」头部汇总指标
+   五项指标（在线/离线/注册/平均 CPU/平均内存）原先各占一张卡片，
+   移动端两列布局下光统计就占掉一整屏。收进卡片头部后：
+   桌面端一行排开，窄屏自动换行成两列，列表本身立即上移。
+   ============================================================ */
+.card-head-row {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 10px 18px; flex-wrap: wrap; margin-bottom: 12px;
+}
+.card-head-row h3 { margin-bottom: 0; }
+.overview-metrics {
+  display: flex; flex-wrap: wrap; gap: 8px 10px; min-width: 0;
+}
+.ov-item {
+  display: flex; flex-direction: column; align-items: flex-start;
+  min-width: 76px; padding: 5px 11px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+}
+.ov-v {
+  font-size: 17px; font-weight: 700; line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+}
+.ov-l { color: var(--muted); font-size: 11px; margin-top: 1px; white-space: nowrap; }
+.ov-item.ok .ov-v { color: var(--green); }
+.ov-item.bad .ov-v { color: var(--red); }
+
+/* ============================================================
+   折线图交互浮层（前后台共用同一套类名）
+   图表本体是 SVG（逻辑坐标 900x260 左右），浮层用绝对定位的 HTML：
+   字号不随画布缩放，窄屏也能读清；且不参与 SVG 的裁剪。
+   ============================================================ */
+.trend-chart { position: relative; touch-action: pan-y; }
+.trend-tipbox {
+  position: absolute; top: 6px; transform: translateX(8px);
+  min-width: 118px; padding: 7px 10px;
+  background: rgba(15, 21, 25, .94); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: var(--shadow);
+  font-size: 11.5px; color: var(--text); pointer-events: none;
+  z-index: 5;
+}
+/* 指示线靠右时浮层翻到左侧，避免被容器右边界裁掉 */
+.trend-tipbox.flip { transform: translateX(calc(-100% - 8px)); }
+.trend-tipbox .tip-time {
+  color: var(--muted); font-size: 11px; margin-bottom: 4px; white-space: nowrap;
+}
+.trend-tipbox .tip-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.trend-tipbox .tip-row i { width: 8px; height: 8px; border-radius: 2px; flex: 0 0 auto; }
+.trend-tipbox .tip-row b { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* ============================================================
+   离线节点标红（同级在线绿点位置）
+   ============================================================ */
+.cell-dot {
+  position: absolute; top: 10px; right: 10px;
+  width: 10px; height: 10px; border-radius: 50%;
+  display: none; /* 桌面端已有「状态」列，不重复标记 */
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, .25);
+}
+.cell-dot.offline { background: var(--red); }
+.cell-dot.online { background: var(--green); }
+tr.row-offline > td:last-child { position: relative; }
+tr.row-offline > td:last-child .cell-dot { display: inline-block; }
+
+/* 行内展开的趋势图（紧贴该条记录下方，不再跑到列表最底部） */
+.trend-row > td { background: var(--panel-2); padding: 12px 14px; }
+.trend-inline { width: 100%; }
+.trend-title {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+  font-size: 13px; font-weight: 600; margin-bottom: 8px;
+}
+.trend-tip { color: var(--muted); font-size: 11px; font-weight: 400; }
+
+/* 路由懒加载占位：弱网下给用户一个明确反馈，而不是空白 */
+.route-loading {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 40vh; color: var(--muted); font-size: 14px;
 }

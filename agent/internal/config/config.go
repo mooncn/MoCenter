@@ -17,20 +17,20 @@ import (
 // 所有字段**不带 omitempty**：首次生成的配置文件必须完整列出全部参数，
 // 让用户一眼看到有哪些可调项（值为空/默认即表示未启用或使用内置默认）。
 type Config struct {
-	Server     string `json:"server"`                // 服务端地址 host:port
-	AgentID    string `json:"agent_id"`              // Agent 名称/标识（可变，仅作显示与路由）
+	Server  string `json:"server"`   // 服务端地址 host:port
+	AgentID string `json:"agent_id"` // Agent 名称/标识（可变，仅作显示与路由）
 	// UUID 硬件唯一标识：**设备身份**，同一台机器恒定不变。
 	// 首次启动自动探测并写入配置，之后即使 agent_id 改了也仍被识别为同一台机器。
 	UUID       string `json:"uuid"`
-	Heartbeat  int    `json:"heartbeat"`             // 心跳间隔（秒），默认 30
-	ProbeEvery int    `json:"probe_every"`           // 探针采集周期（秒），默认 10
-	TLS        bool   `json:"tls"`                   // 启用 TLS 加密连接
-	Insecure   bool   `json:"insecure"`              // 跳过证书校验（自签名测试用）
-	Daemon     bool   `json:"daemon"`                // 进程守护模式（后台运行并崩溃自启）
-	ClientCert string `json:"client_cert"`           // mTLS 客户端证书
-	ClientKey  string `json:"client_key"`            // mTLS 客户端私钥
-	CACert     string `json:"ca_cert"`               // 校验服务端证书的 CA
-	ProxyIP    string `json:"proxy_ip"`              // 国内加速代理前缀
+	Heartbeat  int    `json:"heartbeat"`   // 心跳间隔（秒），默认 30
+	ProbeEvery int    `json:"probe_every"` // 探针采集周期（秒），默认 10
+	TLS        bool   `json:"tls"`         // 启用 TLS 加密连接
+	Insecure   bool   `json:"insecure"`    // 跳过证书校验（自签名测试用）
+	Daemon     bool   `json:"daemon"`      // 进程守护模式（后台运行并崩溃自启）
+	ClientCert string `json:"client_cert"` // mTLS 客户端证书
+	ClientKey  string `json:"client_key"`  // mTLS 客户端私钥
+	CACert     string `json:"ca_cert"`     // 校验服务端证书的 CA
+	ProxyIP    string `json:"proxy_ip"`    // 国内加速代理前缀
 	// AgentKey 与服务端预共享的注册密钥（应用层鉴权）。
 	// 服务端在数据目录生成 agent.key 并打印，Agent 侧填同一个值。
 	AgentKey string `json:"agent_key"`
@@ -39,6 +39,19 @@ type Config struct {
 	UpgradePubKey string `json:"upgrade_pubkey"`
 	// UpgradeAllowUnsigned 显式允许无签名升级（危险，仅用于迁移期）。
 	UpgradeAllowUnsigned bool `json:"upgrade_allow_unsigned"`
+	// LatencyTargets 延迟探测目标（ICMP/TCP/HTTP）。
+	// 规格形如 "icmp:1.1.1.1" / "tcp:1.1.1.1:443" / "http:https://example.com"，
+	// 省略 kind 前缀时按 icmp 处理。留空 = 不探测（不影响任何其它功能）。
+	LatencyTargets []string `json:"latency_targets"`
+	// ServerFingerprint 服务端身份公钥指纹（16 位 hex，可带分隔符）。
+	//
+	// 填了它就用"公钥指纹固定"校验服务端，**不需要 CA 文件、也不需要 -insecure**，
+	// 且服务端更换 IP/域名/证书都不必更新。留空则退回标准校验（系统根或 -ca-cert）。
+	ServerFingerprint string `json:"server_fingerprint"`
+	// EnrollmentSecret 首次连接时可用于换取客户端证书的注册密钥。
+	// 换取成功后证书与私钥落盘为 <配置目录>/client.crt|client.key（0600），
+	// 随后本字段会被**自动清空**（不再需要，减少泄露面）。
+	EnrollmentSecret string `json:"enrollment_secret"`
 }
 
 // DefaultPath 返回默认配置文件路径（便携态：与可执行文件同目录）。

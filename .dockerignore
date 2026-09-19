@@ -1,0 +1,39 @@
+# 构建上下文裁剪：只保留 server/ 与 web/dist（Dockerfile 需要的部分）
+# 其余目录（build/、build/packages/、certs/、data 等）体积大且与镜像无关。
+
+# 构建产物
+build/
+dist/
+**/dist/
+!web/dist/
+
+# 版本控制与 CI
+.git/
+.gitignore
+.cnb.yml
+
+# 运行时数据（含 agent.key、审计日志等敏感内容，绝不能进镜像）
+server/audits.jsonl
+server/users.json
+*.db
+*.db-shm
+*.db-wal
+certs/
+*.key
+*.pem
+*.crt
+packages/
+_diag/
+_diag*/
+_obf/
+.testtools/
+.codefree/
+.workbuddy/
+
+# 除 server/ 与 web/dist 外的 Go/Vue 源码目录
+agent/
+installer/
+proto/
+docs/
+scripts/
+*.md

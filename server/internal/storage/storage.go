@@ -101,7 +101,12 @@ func (db *DB) migrate() error {
 			mem_total       INTEGER NOT NULL DEFAULT 0,
 			mem_used        INTEGER NOT NULL DEFAULT 0,
 			disk_total      INTEGER NOT NULL DEFAULT 0,
-			disk_used       INTEGER NOT NULL DEFAULT 0
+			disk_used       INTEGER NOT NULL DEFAULT 0,
+			net_in_delta    INTEGER NOT NULL DEFAULT 0,
+			net_out_delta   INTEGER NOT NULL DEFAULT 0,
+			load1           REAL    NOT NULL DEFAULT 0,
+			load5           REAL    NOT NULL DEFAULT 0,
+			load15          REAL    NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_probe_agent_time ON probe_history(agent_id, timestamp)`,
 		// 主机信息
@@ -133,8 +138,31 @@ func (db *DB) migrate() error {
 			disk_used       INTEGER NOT NULL DEFAULT 0,
 			net_rate_in     INTEGER NOT NULL DEFAULT 0,
 			net_rate_out    INTEGER NOT NULL DEFAULT 0,
+			load1           REAL    NOT NULL DEFAULT 0,
+			load5           REAL    NOT NULL DEFAULT 0,
+			load15          REAL    NOT NULL DEFAULT 0,
+			load_known      INTEGER NOT NULL DEFAULT 0,
 			updated_at      INTEGER NOT NULL DEFAULT 0
 		)`,
+		// 延迟历史（ICMP/TCP/HTTP 探测结果）
+		//
+		// 表结构刻意做成「一行一个 (时间, 目标)」，而不是宽表（每目标一列）：
+		// 目标列表是可配置的（服务端下发、可增删），宽表需要改结构，
+		// 长表只需要插行 —— 且能在同一张表里容纳任意多个目标。
+		//
+		// latency_ms 为 0 且 ok=0 表示「该次探测失败/超时」。用 ok 列显式区分，
+		// 而不是把失败写成 0ms（那会让超时目标在趋势图里看起来最快）。
+		`CREATE TABLE IF NOT EXISTS latency_history (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			agent_id    TEXT    NOT NULL,
+			timestamp   INTEGER NOT NULL,
+			target      TEXT    NOT NULL,
+			kind        TEXT    NOT NULL DEFAULT '',
+			latency_ms  REAL    NOT NULL DEFAULT 0,
+			ok          INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_latency_agent_time ON latency_history(agent_id, timestamp)`,
+		`CREATE INDEX IF NOT EXISTS idx_latency_target_time ON latency_history(agent_id, target, timestamp)`,
 		// 命令黑名单
 		`CREATE TABLE IF NOT EXISTS blacklist (
 			id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +186,36 @@ func (db *DB) migrate() error {
 	}
 	// 审计类别（命令执行/运维操作/登录认证），旧库补列并回填默认值
 	if err := db.ensureColumn("audit_logs", "category", "TEXT NOT NULL DEFAULT 'command'"); err != nil {
+		return err
+	}
+	// 采样点流量增量（本次采样相对上一次的收发字节数）。旧库补列后历史行为 0，
+	// 即"该点流量未知"，趋势图会跳过这些点而不是画成 0 流量。
+	if err := db.ensureColumn("probe_history", "net_in_delta", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("probe_history", "net_out_delta", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// 系统负载（1/5/15 分钟平均）。旧库补列后历史行为 0，趋势图不会画负载线
+	// （LoadKnown 语义由实时探针携带，历史行按"未知"处理）。
+	for _, col := range []string{"load1", "load5", "load15"} {
+		if err := db.ensureColumn("probe_history", col, "REAL NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	for _, col := range []string{"load1", "load5", "load15"} {
+		if err := db.ensureColumn("agents", col, "REAL NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	// Agent 自报的版本号（旧库补列后为空 = "未知版本"）。服务端据此判断
+	// 「该主机是否需要升级」，也用于前端展示在线版本。
+	if err := db.ensureColumn("agents", "agent_version", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	// load_known：该设备所在平台是否提供负载（Windows 之外为 1）。
+	// 与"负载恰好为 0"区分开，避免公开页把"无此指标"显示成"负载 0.00"。
+	if err := db.ensureColumn("agents", "load_known", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	// 依赖上述列的索引（放在补列之后执行）

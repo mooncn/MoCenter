@@ -42,6 +42,9 @@ const (
 	TypeVncInstallResp    = "VncInstallResp"   // Agent->Server VNC 安装/启动结果
 	TypePkgFetchReq       = "PackageFetchReq"  // Agent->Server 请求拉取服务端托管的安装包
 	TypePkgFetchResp      = "PackageFetchResp" // Server->Agent 安装包拉取结果（分片之后回执）
+	TypeEnrollReq         = "EnrollReq"        // Agent->Server 注册凭证交换请求（换取客户端证书）
+	TypeEnrollResp        = "EnrollResp"       // Server->Agent 注册凭证交换结果
+	TypeEnrollRequired    = "EnrollRequired"   // Server->Agent 需重新换取证书（现有证书不被认可）
 )
 
 // Envelope 是所有消息的通用信封：Type 用于路由，Data 为具体负载。
@@ -116,6 +119,28 @@ type ProbeDataReq struct {
 	MemUsedBytes   int64   `json:"mem_used_bytes,omitempty"`
 	DiskTotalBytes int64   `json:"disk_total_bytes,omitempty"`
 	DiskUsedBytes  int64   `json:"disk_used_bytes,omitempty"`
+	// 系统负载（1/5/15 分钟平均）。Unix 来自 /proc/loadavg 或 sysctl；
+	// Windows 无此概念（取处理器队列长度近似），LoadKnown=false 表示平台不提供，
+	// 前端应显示「—」而不是 0.00。
+	// 用指针 + omitempty：0.00 是**合法负载**（空闲机器），不能因 omitempty 被丢弃，
+	// 否则公开页会把"负载 0.00"显示成"—"（看起来像不支持该指标）。
+	// nil = 平台不提供（Windows 未取到队列长度）或旧版 Agent 未上报。
+	Load1  *float64 `json:"load1,omitempty"`
+	Load5  *float64 `json:"load5,omitempty"`
+	Load15 *float64 `json:"load15,omitempty"`
+
+	// 相邻采样之间的收发字节增量（**仅服务端填写**，Agent 上报报文里没有这两个字段）。
+	// 与 NetInBytes（网卡自启动以来的累计值）语义不同：增量用于趋势与公开页流量统计。
+	NetInDeltaBytes  int64 `json:"net_in_delta_bytes,omitempty"`
+	NetOutDeltaBytes int64 `json:"net_out_delta_bytes,omitempty"`
+	// NetDeltaKnown 增量是否可信（首点 / 计数器回绕时为 false，下游应跳过该点）
+	NetDeltaKnown bool `json:"net_delta_known,omitempty"`
+
+	// LatencyMS 各延迟目标的往返延迟（毫秒），key 为 "ICMP:1.1.1.1" 形式的目标标识。
+	// 缺失的 key 表示"本次未探测或探测失败"——不能当成 0。
+	LatencyMS map[string]float64 `json:"latency_ms,omitempty"`
+	// LatencyTargets 本机生效的延迟探测目标（服务端据此知道该上报哪些目标）。
+	LatencyTargets []string `json:"latency_targets,omitempty"`
 }
 
 // ProbeDataResp Server -> Agent 探针确认
@@ -158,6 +183,22 @@ type AgentInfo struct {
 	// 网络速率（字节/秒），由服务端根据相邻探针累计值差计算
 	NetRateIn  int64 `json:"net_rate_in,omitempty"`
 	NetRateOut int64 `json:"net_rate_out,omitempty"`
+	// Latency 各探测目标的最新延迟（毫秒），key 为目标标识。
+	// 缺失的 key 表示"未探测/失败"，前端显示「超时」而不是 0ms。
+	Latency map[string]float64 `json:"latency,omitempty"`
+	// LatencyTargets 生效的探测目标列表（用于前端按固定顺序渲染，避免列跳动）。
+	LatencyTargets []string `json:"latency_targets,omitempty"`
+	// AgentVersion Agent 自报的版本号（如 "1.0.1"）。
+	// 服务端用它判断"该主机是否需要升级"，前端在主机详情里展示。
+	// 旧版 Agent 不上报此字段，为空串表示"未知版本"（前端显示「—」，
+	// 升级判定时按"需升级"处理 —— 未知版本一定不是当前版本）。
+	AgentVersion string `json:"agent_version,omitempty"`
+	// 系统负载（1/5/15 分钟平均）。用指针：nil = 平台不提供（如 Windows 未取到
+	// 队列长度）；非 nil 时 0 是合法值（空闲机器），必须如实下发给前端 ——
+	// 用 float64 + omitempty 会把 0 当成"没有数据"丢掉，前端只能显示「—」。
+	Load1  *float64 `json:"load1,omitempty"`
+	Load5  *float64 `json:"load5,omitempty"`
+	Load15 *float64 `json:"load15,omitempty"`
 
 	// 注册鉴权（应用层，见 internal/agentauth）：proof = HMAC-SHA256(key, agentID|nonce|ts)
 	// 服务端据此确认对端持有预共享密钥，防止未授权主机注册与身份冒用。
@@ -395,4 +436,47 @@ type PackageFetchResp struct {
 	OK        bool   `json:"ok"`
 	Message   string `json:"message"`
 	Size      int64  `json:"size"`
+}
+
+// EnrollReq Agent->Server：注册凭证交换请求（"简单模式"：用注册密钥换取客户端证书）。
+//
+// 与 TypeOnline 使用同一套 HMAC 证明算法（agentauth.Proof）。请求到达时连接尚未进入
+// 正常消息循环，服务端在完成校验后立即签发证书并回 EnrollResp。
+// 该报文允许在没有客户端证书的 TLS 连接上发送（兼容尚未持有证书的 Agent）。
+type EnrollReq struct {
+	AgentID string `json:"agent_id"`
+	Nonce   string `json:"nonce"`
+	Proof   string `json:"proof"`
+	TS      int64  `json:"ts"`
+	// CSR Agent 自己生成的密钥对对应的证书请求（PEM，DER 的 base64 亦可）。
+	// 服务端只签发**证书**，私钥永远留在 Agent 本机 —— 服务端不保管、也无法代签。
+	CSR string `json:"csr,omitempty"`
+}
+
+// EnrollRequiredResp Server->Agent：要求 Agent 重新换取客户端证书。
+//
+// 用在应用层拒绝连接之前 —— Agent 通道的客户端证书是"请求但不强制"，
+// 证书不被认可时**握手本身不会失败**，客户端只会看到"连上立刻断开"。
+// 显式下发这条消息，客户端才能把"服务端换过 CA / 证书过期"与"网络故障"区分开，
+// 并在获得运维授权时自动重新换取证书（否则只能登录每台被控机手工删 creds/）。
+type EnrollRequiredResp struct {
+	Reason string `json:"reason,omitempty"`
+	Hint   string `json:"hint,omitempty"`
+	// Identity / Fingerprint：服务端当前部署身份，供 Agent 比对与运维核对。
+	Identity    string `json:"identity,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+}
+
+// EnrollResp Server->Agent：注册凭证交换结果。
+type EnrollResp struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
+	// CertPEM 客户端证书链（PEM）。Agent 落盘为 client.crt，后续连接直接复用。
+	CertPEM string `json:"cert_pem,omitempty"`
+	// CAPEM 服务端身份 CA 证书（PEM），Agent 可落盘为 ca.crt 便于排查。
+	CAPEM string `json:"ca_pem,omitempty"`
+	// ServerFingerprint 服务端身份公钥指纹，便于运维核对与写进 Agent 配置。
+	ServerFingerprint string `json:"server_fingerprint,omitempty"`
+	// Identity 部署身份名（安装时生成，可辨识"这台机器连的是哪套总控"）。
+	Identity string `json:"identity,omitempty"`
 }

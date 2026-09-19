@@ -2,16 +2,19 @@
 ; MoCenter Windows 图形安装向导（Inno Setup 6）
 ;
 ; 构建前置：
-;   1) 运行 scripts\build-all.bat
-;      —— 它会编译 agent / server / 安装引擎，并复制到 installer\payload\
+;   1) 运行 scripts\build-all.bat --type=installer
+;      —— 它会编译 agent / server / 安装引擎到 installer\payload\，再调用本脚本
 ;   2) 编译本脚本：
 ;        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\setup.iss
-;      产物：build\MoCenter-Setup-<版本>.exe
+;      产物：build\setup\MoCenter-Setup-<版本>.exe
 ;
 ; 设计说明：
 ;   - 向导只负责「收集参数 + 摆放文件」，真正的服务注册、配置落盘、
 ;     单实例与日志重定向仍由 mocenter-deploy.exe 完成，避免两套逻辑各写一遍。
 ;   - 因此本脚本里没有任何服务注册代码，只有界面与参数拼装。
+;   - 向导**不**做「全新安装 / 升级」的区分：引擎会按"配置是否存在"自动判断 ——
+;     已装过的机器上重跑向导只会替换二进制与服务，配置与账号原样保留。
+;     需要清理重装时用命令行引擎加 -force。
 ;
 ; 关于中文界面：
 ;   向导自定义页面（标题、说明、字段）全部是中文；框架按钮（下一步/安装等）
@@ -19,7 +22,10 @@
 ; =============================================================
 
 #define AppName "MoCenter"
-#define AppVersion "1.0.0"
+; 版本号在本文件与 Go 源码 internal/version 中**必须一致**。
+; 发布纪律：只在明确发版时修改，且 server / agent 共用同一版本号。
+; 一致性由 server/internal/version 的单元测试守护（含对 agent 源码的比对）。
+#define AppVersion "1.0.1"
 #define AppPublisher "MoCenter"
 
 [Setup]
@@ -32,7 +38,7 @@ DefaultDirName={autopf}\MoCenter
 DisableProgramGroupPage=yes
 ; 注册服务、写 Program Files 都需要管理员
 PrivilegesRequired=admin
-OutputDir=..\build
+OutputDir=..\build\setup
 OutputBaseFilename=MoCenter-Setup-{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes
@@ -105,6 +111,36 @@ begin
   Result := r;
 end;
 
+// PasswordPath 口令文件路径。安装引擎读完即删，因此全程只在 ssPostInstall 期间存在。
+var
+  PasswordPath: String;
+
+// WritePasswordFile 把 Server 口令写入仅管理员可读的临时文件，返回其路径。
+//
+// 为什么不用命令行传口令：安装向导进程的命令行在安装期间可被同机其他用户读到
+// （`wmic process get commandline`、任务管理器"命令行"列），
+// 而服务本身的 binPath 我们是不放口令的 —— 若这里用命令行传，等于把前面的防护绕过去了。
+//
+// 写失败时**不降级**为命令行传参：那正好是我们要避免的那条路。
+// 宁可让安装停下并提示原因。
+function WritePasswordFile(const Password: String): String;
+var
+  p: String;
+begin
+  Result := '';
+  if Password = '' then
+    Exit;
+  p := ExpandConstant('{tmp}\mc-admin-pw');
+  if not SaveStringToFile(p, Password, False) then
+  begin
+    MsgBox('无法写入临时口令文件：' + p + #13#10#13#10 +
+           '请不要用 -password 之类的命令行方式绕过（那会让口令对同机其他用户可见）。',
+           mbCriticalError, MB_OK);
+    Abort;
+  end;
+  Result := p;
+end;
+
 // BuildInstallParams 把向导收集的参数拼成 mocenter-deploy.exe 的命令行。
 function BuildInstallParams(Param: String): String;
 var
@@ -124,7 +160,12 @@ begin
   if Pos('server', role) > 0 then
   begin
     s := s + ' -user "' + SafeVal(PageBasic.Values[1]) + '"';
-    s := s + ' -password "' + SafeVal(PageBasic.Values[2]) + '"';
+    // 口令**不拼进命令行**，改由口令文件传递（见 WritePasswordFile）。
+    // 命令行在安装进行的那几秒里对其他本地进程可见
+    // （wmic process get commandline / 任务管理器"命令行"列），
+    // 等于把后台口令广播出去；写成仅管理员可读的文件则没有这个窗口。
+    if PasswordPath <> '' then
+      s := s + ' -password-file "' + PasswordPath + '"';
     s := s + ' -listen "' + SafeVal(PageAdv.Values[1]) + '"';
     s := s + ' -http "' + SafeVal(PageAdv.Values[2]) + '"';
     if DirExists(ExpandConstant('{app}\web')) then
@@ -181,6 +222,20 @@ begin
 end;
 
 // NextButtonClick 在离开"必要项"页时校验必填项，避免装完才发现参数缺失。
+// InstalledRoleHasConfig 判断某角色是否已装过（配置存在）。
+// 已装过时向导不再强制填写连接参数 —— 引擎会按「升级」处理并保留原配置，
+// 硬性拦截只会让运维在升级时卡在"必须重新输入服务端地址"这一页。
+function InstalledRoleHasConfig(role: String): Boolean;
+var
+  base: String;
+begin
+  base := SafeVal(PageAdv.Values[0]);
+  if Pos('agent', role) > 0 then
+    Result := FileExists(base + '\agent\mocenter-agent.json')
+  else
+    Result := FileExists(base + '\server\mocenter-server.json');
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   role: String;
@@ -189,6 +244,12 @@ begin
   if CurPageID = PageBasic.ID then
   begin
     role := GetRoleStr('');
+    if InstalledRoleHasConfig(role) then
+    begin
+      // 升级路径：配置与账号都沿用既有的，无需重复填写
+      Result := True;
+      Exit;
+    end;
     if (Pos('agent', role) > 0) and (SafeVal(PageBasic.Values[0]) = '') then
     begin
       MsgBox('安装 Agent 必须填写服务端地址（host:port）。', mbError, MB_OK);
@@ -228,6 +289,9 @@ begin
   if CurStep = ssPostInstall then
   begin
     WizardForm.StatusLabel.Caption := '正在注册系统服务并启动...';
+    // 口令先落文件（仅本次安装有效；安装引擎读完会立即删除）
+    if Pos('server', GetRoleStr('')) > 0 then
+      PasswordPath := WritePasswordFile(SafeVal(PageBasic.Values[2]));
     if not Exec(ExpandConstant('{app}\mocenter-deploy.exe'), BuildInstallParams(''),
                 ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, rc) then
     begin

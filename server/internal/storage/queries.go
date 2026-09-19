@@ -281,7 +281,8 @@ func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step in
 	if step == 1 {
 		rows, err = db.Query(`SELECT agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
 			os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
-			mem_total, mem_used, disk_total, disk_used
+			mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta,
+			load1, load5, load15
 			FROM probe_history WHERE agent_id = ? AND timestamp >= ?
 			ORDER BY timestamp DESC LIMIT ?`, agentID, since, limit)
 	} else {
@@ -289,7 +290,8 @@ func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step in
 		rows, err = db.Query(`SELECT agent_id, MAX(timestamp) AS ts,
 			AVG(cpu_usage), AVG(mem_usage), AVG(disk_usage), MAX(net_in_bytes), MAX(net_out_bytes),
 			MAX(os_type), MAX(kernel_version), MAX(uptime), MAX(public_ip), MAX(os_version), MAX(cpu_model), AVG(cpu_mhz),
-			MAX(mem_total), AVG(mem_used), MAX(disk_total), AVG(disk_used)
+			MAX(mem_total), AVG(mem_used), MAX(disk_total), AVG(disk_used), SUM(net_in_delta), SUM(net_out_delta),
+			AVG(load1), AVG(load5), AVG(load15)
 			FROM probe_history WHERE agent_id = ? AND timestamp >= ?
 			GROUP BY (timestamp / ?) ORDER BY ts DESC LIMIT ?`, agentID, since, step, limit)
 	}
@@ -302,7 +304,8 @@ func (db *DB) QueryProbeHistorySince(agentID string, since int64, limit, step in
 		var r ProbeHistoryRow
 		if err := rows.Scan(&r.AgentID, &r.Timestamp, &r.CPUUsage, &r.MemUsage, &r.DiskUsage, &r.NetInBytes, &r.NetOutBytes,
 			&r.OSType, &r.KernelVersion, &r.Uptime, &r.PublicIP, &r.OSVersion, &r.CPUModel, &r.CPUMHz,
-			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed); err != nil {
+			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed, &r.NetInDelta, &r.NetOutDelta,
+			&r.Load1, &r.Load5, &r.Load15); err != nil {
 			return nil, err
 		}
 		out = append(out, &r)
@@ -327,6 +330,26 @@ func (db *DB) CountProbeHistory(agentID string, since int64) (int64, error) {
 	return n, nil
 }
 
+// ProbeNetTotals 统计某 Agent 在时间窗内的收发字节增量总和（公开页"历史窗口累计"口径）。
+//
+// 用 SUM(delta) 而不是 MAX(累计)-MIN(累计)：降采样/留存裁剪会让窗口内的
+// 首尾累计值缺失，差值口径会低估；而增量在写入时已算好，求和与步长无关。
+func (db *DB) ProbeNetTotals(agentID string, since int64) (int64, int64, error) {
+	var in, out int64
+	err := db.QueryRow(`SELECT COALESCE(SUM(net_in_delta), 0), COALESCE(SUM(net_out_delta), 0)
+		FROM probe_history WHERE agent_id = ? AND timestamp >= ?`, agentID, since).Scan(&in, &out)
+	if err != nil {
+		return 0, 0, fmt.Errorf("统计窗口流量失败: %w", err)
+	}
+	if in < 0 {
+		in = 0
+	}
+	if out < 0 {
+		out = 0
+	}
+	return in, out, nil
+}
+
 // ProbeHistoryRow 探针历史持久化行。
 type ProbeHistoryRow struct {
 	AgentID       string
@@ -347,6 +370,14 @@ type ProbeHistoryRow struct {
 	MemUsed       int64
 	DiskTotal     int64
 	DiskUsed      int64
+	// NetInDelta / NetOutDelta 本次采样相对上次采样的收发字节增量。
+	// 0 = 未知（计数器回绕、首点、或旧版记录），公开页趋势会跳过该点。
+	NetInDelta  int64
+	NetOutDelta int64
+	// Load1/5/15 系统平均负载；全为 0 表示该平台不提供（Windows）或旧库记录。
+	Load1  float64
+	Load5  float64
+	Load15 float64
 }
 
 // InsertProbeHistory 插入一条探针历史记录。
@@ -354,11 +385,13 @@ func (db *DB) InsertProbeHistory(p *ProbeHistoryRow) error {
 	_, err := db.Exec(`INSERT INTO probe_history
 		(agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
 		 os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
-		 mem_total, mem_used, disk_total, disk_used)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta,
+		 load1, load5, load15)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.AgentID, p.Timestamp, p.CPUUsage, p.MemUsage, p.DiskUsage, p.NetInBytes, p.NetOutBytes,
 		p.OSType, p.KernelVersion, p.Uptime, p.PublicIP, p.OSVersion, p.CPUModel, p.CPUMHz,
-		p.MemTotal, p.MemUsed, p.DiskTotal, p.DiskUsed)
+		p.MemTotal, p.MemUsed, p.DiskTotal, p.DiskUsed, p.NetInDelta, p.NetOutDelta,
+		p.Load1, p.Load5, p.Load15)
 	if err != nil {
 		return fmt.Errorf("插入探针历史失败: %w", err)
 	}
@@ -372,7 +405,8 @@ func (db *DB) QueryProbeHistory(agentID string, since int64, limit int) ([]*Prob
 	}
 	rows, err := db.Query(`SELECT agent_id, timestamp, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes,
 		os_type, kernel_version, uptime, public_ip, os_version, cpu_model, cpu_mhz,
-		mem_total, mem_used, disk_total, disk_used
+		mem_total, mem_used, disk_total, disk_used, net_in_delta, net_out_delta,
+		load1, load5, load15
 		FROM probe_history WHERE agent_id = ? AND timestamp >= ?
 		ORDER BY timestamp ASC LIMIT ?`, agentID, since, limit)
 	if err != nil {
@@ -384,7 +418,8 @@ func (db *DB) QueryProbeHistory(agentID string, since int64, limit int) ([]*Prob
 		var r ProbeHistoryRow
 		if err := rows.Scan(&r.AgentID, &r.Timestamp, &r.CPUUsage, &r.MemUsage, &r.DiskUsage, &r.NetInBytes, &r.NetOutBytes,
 			&r.OSType, &r.KernelVersion, &r.Uptime, &r.PublicIP, &r.OSVersion, &r.CPUModel, &r.CPUMHz,
-			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed); err != nil {
+			&r.MemTotal, &r.MemUsed, &r.DiskTotal, &r.DiskUsed, &r.NetInDelta, &r.NetOutDelta,
+			&r.Load1, &r.Load5, &r.Load15); err != nil {
 			return nil, err
 		}
 		out = append(out, &r)
@@ -432,6 +467,19 @@ type AgentRow struct {
 	DiskUsed      int64
 	NetRateIn     int64
 	NetRateOut    int64
+	// Load1/5/15 系统平均负载；LoadKnown=false 表示该平台不提供负载指标
+	Load1     float64
+	Load5     float64
+	Load15    float64
+	LoadKnown bool
+	// AgentVersion Agent 自报版本号；空串 = 未知（旧版 Agent 未上报）
+	AgentVersion string
+	// Latency 各延迟目标的最新延迟（毫秒），key 为目标标识。
+	// 仅内存态维护（不落库）：延迟是高频瞬时指标，落库的意义在于历史曲线，
+	// 历史由 latency_history 表承担，当前值从上报直接覆盖即可。
+	Latency map[string]float64
+	// LatencyTargets 当前生效的延迟探测目标（服务端下发或 Agent 配置）
+	LatencyTargets []string
 }
 
 // UpsertAgent 插入或更新主机信息。
@@ -456,12 +504,19 @@ func (db *DB) UpsertAgent(a *AgentRow) error {
 			return err
 		}
 	}
+	loadKnown := 0
+	if a.LoadKnown {
+		loadKnown = 1
+	}
+	// agent_version 用 "空值不覆盖" 语义：旧版 Agent 不上报版本号（空串），
+	// 若直接写空会把已知版本抹掉，表现为"升级后版本号又变未知"。
 	_, err := db.Exec(`INSERT INTO agents
 		(agent_id, uuid, hostname, os_type, arch, kernel_version, online, last_seen, last_offline_at,
 		 uptime, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes, remote_addr,
 		 public_ip, public_ipv6, os_version, cpu_model, cpu_mhz, mem_total, mem_used,
-		 disk_total, disk_used, net_rate_in, net_rate_out, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 disk_total, disk_used, net_rate_in, net_rate_out, load1, load5, load15, load_known,
+		 agent_version, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(agent_id) DO UPDATE SET
 			uuid = excluded.uuid, hostname = excluded.hostname, os_type = excluded.os_type,
 			arch = excluded.arch, kernel_version = excluded.kernel_version, online = excluded.online,
@@ -474,11 +529,16 @@ func (db *DB) UpsertAgent(a *AgentRow) error {
 			mem_total = excluded.mem_total, mem_used = excluded.mem_used,
 			disk_total = excluded.disk_total, disk_used = excluded.disk_used,
 			net_rate_in = excluded.net_rate_in, net_rate_out = excluded.net_rate_out,
+			load1 = excluded.load1, load5 = excluded.load5, load15 = excluded.load15,
+			load_known = excluded.load_known,
+			agent_version = CASE WHEN excluded.agent_version = '' THEN agents.agent_version
+			                     ELSE excluded.agent_version END,
 			updated_at = excluded.updated_at`,
 		a.AgentID, uuid, a.Hostname, a.OSType, a.Arch, a.KernelVersion, online, a.LastSeen, a.LastOfflineAt,
 		a.Uptime, a.CPUUsage, a.MemUsage, a.DiskUsage, a.NetInBytes, a.NetOutBytes, a.RemoteAddr,
 		a.PublicIP, a.PublicIPv6, a.OSVersion, a.CPUModel, a.CPUMHz, a.MemTotal, a.MemUsed,
-		a.DiskTotal, a.DiskUsed, a.NetRateIn, a.NetRateOut, time.Now().Unix())
+		a.DiskTotal, a.DiskUsed, a.NetRateIn, a.NetRateOut,
+		a.Load1, a.Load5, a.Load15, loadKnown, a.AgentVersion, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("保存主机信息失败: %w", err)
 	}
@@ -523,7 +583,8 @@ func (db *DB) LoadAgents() ([]*AgentRow, error) {
 	rows, err := db.Query(`SELECT agent_id, uuid, hostname, os_type, arch, kernel_version, online, last_seen, last_offline_at,
 		uptime, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes, remote_addr,
 		public_ip, public_ipv6, os_version, cpu_model, cpu_mhz, mem_total, mem_used,
-		disk_total, disk_used, net_rate_in, net_rate_out
+		disk_total, disk_used, net_rate_in, net_rate_out, load1, load5, load15, load_known,
+		agent_version
 		FROM agents ORDER BY last_seen DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("查询主机信息失败: %w", err)
@@ -532,14 +593,16 @@ func (db *DB) LoadAgents() ([]*AgentRow, error) {
 	var out []*AgentRow
 	for rows.Next() {
 		var a AgentRow
-		var online int
+		var online, loadKnown int
 		if err := rows.Scan(&a.AgentID, &a.UUID, &a.Hostname, &a.OSType, &a.Arch, &a.KernelVersion, &online, &a.LastSeen, &a.LastOfflineAt,
 			&a.Uptime, &a.CPUUsage, &a.MemUsage, &a.DiskUsage, &a.NetInBytes, &a.NetOutBytes, &a.RemoteAddr,
 			&a.PublicIP, &a.PublicIPv6, &a.OSVersion, &a.CPUModel, &a.CPUMHz, &a.MemTotal, &a.MemUsed,
-			&a.DiskTotal, &a.DiskUsed, &a.NetRateIn, &a.NetRateOut); err != nil {
+			&a.DiskTotal, &a.DiskUsed, &a.NetRateIn, &a.NetRateOut,
+			&a.Load1, &a.Load5, &a.Load15, &loadKnown, &a.AgentVersion); err != nil {
 			return nil, err
 		}
 		a.Online = online == 1
+		a.LoadKnown = loadKnown == 1
 		out = append(out, &a)
 	}
 	return out, rows.Err()
@@ -592,16 +655,17 @@ func (db *DB) UpdateAgentIdentity(oldID, newID, uuid string) error {
 // LoadAgent 加载单个主机信息。
 func (db *DB) LoadAgent(agentID string) (*AgentRow, error) {
 	var a AgentRow
-	var online int
+	var online, loadKnown int
 	err := db.QueryRow(`SELECT agent_id, uuid, hostname, os_type, arch, kernel_version, online, last_seen, last_offline_at,
 		uptime, cpu_usage, mem_usage, disk_usage, net_in_bytes, net_out_bytes, remote_addr,
 		public_ip, public_ipv6, os_version, cpu_model, cpu_mhz, mem_total, mem_used,
-		disk_total, disk_used, net_rate_in, net_rate_out
+		disk_total, disk_used, net_rate_in, net_rate_out, load1, load5, load15, load_known
 		FROM agents WHERE agent_id = ?`, agentID).Scan(
 		&a.AgentID, &a.UUID, &a.Hostname, &a.OSType, &a.Arch, &a.KernelVersion, &online, &a.LastSeen, &a.LastOfflineAt,
 		&a.Uptime, &a.CPUUsage, &a.MemUsage, &a.DiskUsage, &a.NetInBytes, &a.NetOutBytes, &a.RemoteAddr,
 		&a.PublicIP, &a.PublicIPv6, &a.OSVersion, &a.CPUModel, &a.CPUMHz, &a.MemTotal, &a.MemUsed,
-		&a.DiskTotal, &a.DiskUsed, &a.NetRateIn, &a.NetRateOut)
+		&a.DiskTotal, &a.DiskUsed, &a.NetRateIn, &a.NetRateOut,
+		&a.Load1, &a.Load5, &a.Load15, &loadKnown)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -609,6 +673,7 @@ func (db *DB) LoadAgent(agentID string) (*AgentRow, error) {
 		return nil, fmt.Errorf("查询主机信息失败: %w", err)
 	}
 	a.Online = online == 1
+	a.LoadKnown = loadKnown == 1
 	return &a, nil
 }
 
@@ -669,4 +734,115 @@ func (db *DB) InitDefaultBlacklist(patterns []string) error {
 		}
 	}
 	return nil
+}
+
+// --- 延迟历史（ICMP/TCP/HTTP 探测结果） ---
+
+// LatencyRow 一条延迟采样（一行一个 "时间+目标"）。
+type LatencyRow struct {
+	AgentID   string
+	Timestamp int64
+	Target    string
+	Kind      string
+	LatencyMS float64
+	OK        bool
+}
+
+// InsertLatencyHistory 批量写入一轮延迟探测结果。
+//
+// 用批量插入（单事务多行）而不是逐行 Exec：一轮探测最多 8 个目标，
+// 每个采样周期一次；逐行提交在 SQLite 上会明显放大写放大。
+//
+// 失败的探测（OK=false）**也写库**：只有把"超时"落成显式记录，
+// 才能统计可用率（丢包率）与"这段时间是不是一直在超时"。
+// 延迟值仍写 0，但 OK=false 让下游必须区分处理。
+func (db *DB) InsertLatencyHistory(rows []*LatencyRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("开始延迟历史事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT INTO latency_history
+		(agent_id, timestamp, target, kind, latency_ms, ok) VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("准备延迟历史插入失败: %w", err)
+	}
+	defer stmt.Close()
+	for _, r := range rows {
+		if r == nil || r.AgentID == "" || r.Target == "" {
+			continue
+		}
+		ok := 0
+		if r.OK {
+			ok = 1
+		}
+		if _, err := stmt.Exec(r.AgentID, r.Timestamp, r.Target, r.Kind, r.LatencyMS, ok); err != nil {
+			return fmt.Errorf("写入延迟历史失败: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交延迟历史事务失败: %w", err)
+	}
+	return nil
+}
+
+// QueryLatencyHistory 查询某主机在指定时间之后、指定目标的历史延迟。
+//
+// target 为空表示"全部目标"。limit 为上返回行数上限（按时间倒序取后正序返回），
+// 避免历史很长的主机一次把整表拉出来。
+func (db *DB) QueryLatencyHistory(agentID string, since int64, target string, limit int) ([]*LatencyRow, error) {
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+	q := `SELECT agent_id, timestamp, target, kind, latency_ms, ok FROM latency_history
+		WHERE agent_id = ? AND timestamp >= ?`
+	args := []interface{}{agentID, since}
+	if target != "" {
+		q += ` AND target = ?`
+		args = append(args, target)
+	}
+	q += ` ORDER BY timestamp DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("查询延迟历史失败: %w", err)
+	}
+	defer rows.Close()
+	var out []*LatencyRow
+	for rows.Next() {
+		var r LatencyRow
+		var ok int
+		if err := rows.Scan(&r.AgentID, &r.Timestamp, &r.Target, &r.Kind, &r.LatencyMS, &ok); err != nil {
+			return nil, err
+		}
+		r.OK = ok == 1
+		out = append(out, &r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 查询用倒序（配合 LIMIT 取"最近的 N 条"），返回前翻正序：
+	// 趋势图按时间递增绘制，交给调用方前统一口径，避免每个调用点各翻一次。
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
+// CleanupOldLatencyHistory 清理超过 maxDays 天的延迟历史，返回删除行数。
+func (db *DB) CleanupOldLatencyHistory(maxDays int) (int64, error) {
+	if maxDays <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-time.Duration(maxDays) * 24 * time.Hour).Unix()
+	res, err := db.Exec(`DELETE FROM latency_history WHERE timestamp < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("清理延迟历史失败: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }

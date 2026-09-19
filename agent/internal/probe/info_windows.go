@@ -199,3 +199,21 @@ func isDigits(s string) bool {
 	}
 	return true
 }
+
+// loadAvg 返回处理器队列长度的近似负载（Windows 没有 Unix 意义上的平均负载）。
+//
+// 口径说明：Win32_PerfFormattedData_PerfOS_System 的 ProcessorQueueLength 是
+// "当前就绪队列长度"，不是 1/5/15 分钟滑动平均 —— 但它是 Windows 上最接近
+// "负载"的指标，且 > 逻辑核数即表示 CPU 排队。因此三个值都填同一个数，
+// 前端只展示 Load1，不会造成误导。查询不可用时返回 ok=false。
+func loadAvg() (l1, l5, l15 float64, ok bool) {
+	v := wmicValue("path", "Win32_PerfFormattedData_PerfOS_System", "get", "ProcessorQueueLength")
+	if v == "" || !isDigits(strings.TrimSpace(v)) {
+		return 0, 0, 0, false
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	return n, n, n, true
+}
