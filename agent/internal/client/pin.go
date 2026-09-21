@@ -113,9 +113,9 @@ func trustNewCAError(oldFP, newFP string, hasSecret bool) error {
 	b.WriteString("  这是**身份变化**，不会自动信任对方。三选一即可恢复：\n")
 	b.WriteString("    1) 确认服务端指纹无误后，把上面「服务端」指纹填进本机配置 server_fingerprint（最长效，不需登录被控机即可远程下发配置文件）；\n")
 	if hasSecret {
-		b.WriteString("    2) 确认这是你自己的总控：删除本机 creds/ 目录（或只删掉其中的 ca.crt）后重启 Agent，将用注册密钥重新换取证书；\n")
+		b.WriteString("    2) 确认这是你自己的总控：删除本机 creds/ 里的 client.crt 与 ca.crt（**保留 client.key**：服务端按证书公钥指纹做首次信任绑定，换掉私钥就要重新出示一次性注册令牌）后重启 Agent，将用注册凭据重新换取证书；\n")
 	} else {
-		b.WriteString("    2) 本机已没有注册密钥（换取后被清空）：把服务端 <data>/agent.key 的内容填进配置 agent_key 后再重启，Agent 会自动重新换取证书；\n")
+		b.WriteString("    2) 本机已没有注册凭据（换取后被清空）：在控制台为该主机签发一次性注册令牌（或服务端 <data>/agent.key 的共享密钥）填进配置 agent_key 后重启，Agent 会自动重新换取证书；\n")
 	}
 	b.WriteString("    3) 服务端确实是新的总控 → 按运维流程重新接入这台主机。")
 	return &trustError{msg: b.String(), newFP: newFP}

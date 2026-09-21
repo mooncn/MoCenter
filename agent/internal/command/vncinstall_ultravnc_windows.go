@@ -33,10 +33,8 @@ const (
 	// uvncSetupBaseURL UltraVNC 官方下载地址前缀
 	// （Inno Setup 安装包，来源 winget-pkgs 清单 uvncbvba.UltraVNC）。
 	uvncSetupBaseURL = "https://uvnc.eu/download/1800/"
-	// 安装包文件名。该名称同时用作「服务端托管包名」——Agent 优先从服务端拉取时按此名查找，
-	// 因此服务端 packages 目录中的文件名必须与此完全一致（见 README「安装包由服务端分发」）。
-	uvncSetupX64Name = "UltraVNC_1824_x64_Setup.exe"
-	uvncSetupX86Name = "UltraVNC_1824_x86_Setup.exe"
+	// 安装包文件名常量（uvncSetupX64Name / uvncSetupX86Name）定义在 vncinstall_common.go，
+	// 与服务端托管包名、钉扎表的键共用同一份定义。
 	// 官方下载地址由前缀 + 文件名派生，保证与托管包名不会写歪
 	uvncSetupX64URL = uvncSetupBaseURL + uvncSetupX64Name
 	uvncSetupX86URL = uvncSetupBaseURL + uvncSetupX86Name
@@ -195,7 +193,7 @@ func installAndStartUltraVNCApp(port int, cfg VncConfig, res *VncInstallResult) 
 
 // startWinvncDirect 以独立进程方式启动 winvnc.exe（继承 Agent 当前会话）。
 func startWinvncDirect(exe string) {
-	psCmd := fmt.Sprintf("Start-Process -FilePath '%s' -WindowStyle Hidden", strings.ReplaceAll(exe, "'", "''"))
+	psCmd := "Start-Process -FilePath " + psQuote(exe) + " -WindowStyle Hidden"
 	_ = exec.Command("powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", psCmd).Run()
 }
 
@@ -243,22 +241,41 @@ func findWinvncExe() string {
 	return ""
 }
 
-// installUltraVNC 安装 UltraVNC：依次尝试 winget / choco / 官方安装包直下。
+// installUltraVNC 取并安装 UltraVNC 安装包。
+//
+// 取包顺序即信任顺序：
+//  1. 服务端托管包（默认路径）：走 Agent↔服务端已 mutual-TLS 的长连接，源与版本都由运维掌握；
+//  2. 公网取包（winget / choco / 厂商直连 / https 加速代理）：仅当运维在本机显式解锁。
+//
+// 无论哪条，执行前都按 installPins 的 SHA-256 校验；校验不通过**不会回退到下一条**——
+// 静默改用别的源会把「内容被替换」伪装成「安装方式不同」，正是要防的事。
 func installUltraVNC(cfg VncConfig) (string, bool) {
-	// 0) 优先从服务端拉取托管安装包：走 Agent 与服务端既有的长连接，
-	//    既避开公网限速，也避免下载被劫持/篡改（该通道可启用 TLS/mTLS）。
-	//    服务端未托管该包时（返回错误）静默回退到下面的公网方式。
+	name := uvncSetupName()
+	want := pinnedDigest(name)
+	if want == "" {
+		// 钉扎缺失通常是包名常量改了而忘了同步摘要：宁可拒装，也不执行未钉扎的安装器。
+		return "缺少 " + name + " 的内置钉扎摘要，已拒绝安装（请同步 installPins 后重新发布 Agent）", false
+	}
+	// 1) 服务端托管
 	if cfg.FetchPackage != nil {
-		name := uvncSetupName()
-		if path, err := cfg.FetchPackage(name); err != nil {
-			log.Printf("[vnc-install] 服务端未提供安装包 %s（%v），回退其它安装方式", name, err)
-		} else if msg, ok := installUltraVNCFromLocal(path); ok {
-			return "已通过服务端下发的安装包完成安装。", true
+		path, err := cfg.FetchPackage(name)
+		if err != nil {
+			log.Printf("[vnc-install] 服务端未托管安装包 %s（%v）", name, err)
 		} else {
-			log.Printf("[vnc-install] 服务端下发的安装包安装失败: %s", msg)
+			msg, ok := installUltraVNCFromLocal(path, want)
+			if ok {
+				msg = "已通过服务端下发的安装包完成安装。"
+			}
+			return msg, ok
 		}
 	}
-	// 1) winget（Windows 10 1809+ 自带 App Installer）
+	// 2) 公网取包（需显式解锁）
+	if !cfg.AllowPublicDownload {
+		return "服务端未托管安装包 " + name + publicDownloadHint(cfg) +
+			"。准备托管包：bash scripts/fetch-packages.sh <服务端 packages 目录> win", false
+	}
+	// 2a) winget（Windows 10 1809+ 自带 App Installer）/ Chocolatey：
+	//     二者各自校验清单摘要，但选源与选版本都不由我们决定，故同样只在解锁后可用。
 	if tryInstall("winget", []string{"install", "--id", "uvncbvba.UltraVNC", "-e", "--silent",
 		"--accept-package-agreements", "--accept-source-agreements"}) {
 		if findWinvncExe() != "" {
@@ -271,12 +288,12 @@ func installUltraVNC(cfg VncConfig) (string, bool) {
 			return "已通过 choco 安装 UltraVNC。", true
 		}
 	}
-	// 直连/代理下载官方安装包并静默安装
-	return installUltraVNCByDownload(cfg)
+	// 2b) 直连/https 代理下载官方安装包并静默安装
+	return installUltraVNCByDownload(cfg, want)
 }
 
-// installUltraVNCByDownload 下载官方安装包（Inno Setup）并静默安装。
-func installUltraVNCByDownload(cfg VncConfig) (string, bool) {
+// installUltraVNCByDownload 下载官方安装包（Inno Setup）并静默安装，下载结果先按 want 校验摘要。
+func installUltraVNCByDownload(cfg VncConfig, want string) (string, bool) {
 	base := uvncSetupX64URL
 	if is32BitWindows() {
 		base = uvncSetupX86URL
@@ -286,13 +303,10 @@ func installUltraVNCByDownload(cfg VncConfig) (string, bool) {
 	if cfg.DownloadBase != "" && strings.Contains(strings.ToLower(cfg.DownloadBase), "ultravnc") {
 		candidates = append(candidates, cfg.DownloadBase)
 	}
-	if cfg.Proxy != "" {
-		candidates = append(candidates, proxyURL(cfg.Proxy, base))
+	if p := httpsProxyOrEmpty(cfg.Proxy, "UltraVNC 安装包下载"); p != "" {
+		candidates = append(candidates, proxyURL(p, base))
 	}
 	candidates = append(candidates, base)
-	if cfg.Proxy == "" {
-		candidates = append(candidates, proxyURL(defaultProxy, base))
-	}
 	seen := map[string]bool{}
 	var urls []string
 	for _, u := range candidates {
@@ -305,7 +319,8 @@ func installUltraVNCByDownload(cfg VncConfig) (string, bool) {
 	var setup string
 	var lastErr error
 	for i, u := range urls {
-		tmp := filepath.Join(os.TempDir(), "ultravnc-setup.exe")
+		// 落盘名用规范包名：出错时看目录就知道是哪个包，也避免多架构共用一个含糊的临时名。
+		tmp := filepath.Join(os.TempDir(), uvncSetupName())
 		log.Printf("[vnc-install] 尝试下载 UltraVNC %s", u)
 		var err error
 		if i == len(urls)-1 {
@@ -314,29 +329,37 @@ func installUltraVNCByDownload(cfg VncConfig) (string, bool) {
 			err = downloadFile(u, tmp)
 		}
 		if err == nil {
-			setup = tmp
-			break
+			// 摘要不符时换下一个源继续试：某个源失效（下回错误页/半截文件）不该阻断安装，
+			// 但无论如何都不会执行不符的包。
+			if verr := verifyDigest(tmp, want, uvncSetupName()); verr != nil {
+				err = verr
+			} else {
+				setup = tmp
+				break
+			}
 		}
-		lastErr = fmt.Errorf("下载失败: %w", err)
+		lastErr = err
 		_ = os.Remove(tmp)
 	}
 	if setup == "" {
 		return fmt.Sprintf("UltraVNC 下载失败：%v。可手动安装：%s", lastErr, base), false
 	}
-	if msg, ok := installUltraVNCFromLocal(setup); ok {
-		return "已下载并安装 UltraVNC。", true
-	} else {
+	msg, ok := installUltraVNCFromLocal(setup, want)
+	if !ok {
 		return msg, false
 	}
+	return "已下载并安装 UltraVNC。", true
 }
 
 // installUltraVNCFromLocal 用本地已就绪的 UltraVNC 安装包静默安装
 // （Inno Setup 参数），安装结束后删除安装包。
-// 服务端下发的包与公网下载的包共用本函数，保证安装参数一致。
-func installUltraVNCFromLocal(setup string) (string, bool) {
-	// 执行前确认拿到的是真正的 PE 可执行文件：
-	// 既能拦住「URL 已失效、下回来一个 HTML 错误页」这类静默失败，
-	// 也能拦住中间人替换 —— 与「防劫持/防篡改」的目标一致。
+// 服务端下发的包与公网下载的包共用本函数，保证「执行前校验 + 安装参数」一致。
+func installUltraVNCFromLocal(setup, want string) (string, bool) {
+	// 执行前的两道闸：魔数挡掉「下回一个 HTML 错误页」这类静默失败，摘要挡掉内容被替换。
+	if err := verifyDigest(setup, want, filepath.Base(setup)); err != nil {
+		_ = os.Remove(setup)
+		return err.Error(), false
+	}
 	if !isPEExecutable(setup) {
 		_ = os.Remove(setup)
 		return "安装包不是有效的 Windows 可执行文件（可能下载到了错误页面或被篡改），已拒绝执行", false
@@ -381,9 +404,15 @@ func writeUltraVNCIni(installDir string, port int, password string) error {
 			lastErr = err
 			continue
 		}
-		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+		// 0600 只是 Unix 语义；Windows 上必须显式收紧 DACL，否则继承 %ProgramData%
+		// 默认的 BUILTIN\Users 读权限 —— 文件里是可用公开固定密钥还原的 VNC 口令。
+		// 收紧失败不阻断安装（UltraVNC 仍需工作），但必须留在日志与回执里。
+		if err := os.WriteFile(p, []byte(content), 0600); err != nil {
 			lastErr = err
 			continue
+		}
+		if err := restrictPathToPrivileged(p); err != nil {
+			log.Printf("[vnc-install] 警告: %s 的 VNC 口令仍可被本机其他用户读取: %v", p, err)
 		}
 		log.Printf("[vnc-install] 已写入 UltraVNC 配置: %s", p)
 		wrote = true

@@ -60,6 +60,13 @@ type publicTrack struct {
 	wmu        sync.Mutex // 保护 pconn 写入
 }
 
+// 越权隧道回传的留痕状态（每台 Agent 一条，限频用）。
+// 归属校验本身在 publicTrack.agentID 上，这里只是防止被高频伪造回传刷满日志。
+var (
+	mismatchMu sync.Mutex
+	mismatchAt = make(map[string]time.Time)
+)
+
 // Manager 端口映射管理器，负责隧道建立、连接跟踪与双向转发。
 type Manager struct {
 	mu          sync.RWMutex
@@ -235,7 +242,14 @@ func (m *Manager) GetRule(publicPort int) *Rule {
 	return m.rules[publicPort]
 }
 
-// CreateRule 创建并启动一条端口映射规则。
+// CreateRule 创建或覆盖一条端口映射规则，并让其立即按新规则转发。
+//
+// "改一条已存在的映射"是最容易做错的路径：必须先停旧监听、监听成功后才提交
+// 规则，否则会出现"界面显示已收紧、实际还在按旧规则放行"（M-7）：
+//   - 旧实现先覆盖 m.rules 再 Listen，端口还被自己的旧监听占着 → Listen 必然失败，
+//     而旧 accept 循环闭包里握着**旧** *Rule，继续按旧 SourceIP 白名单放行；
+//   - 现在改成「停旧 → 起新 → 提交」：Listen 失败时规则与库里都保持旧值，
+//     在跑的转发与看到的配置不可能分叉。
 func (m *Manager) CreateRule(r *Rule) error {
 	if r.PublicPort <= 0 || r.LocalPort <= 0 {
 		return fmt.Errorf("invalid public/local port")
@@ -244,6 +258,19 @@ func (m *Manager) CreateRule(r *Rule) error {
 		r.LocalHost = "127.0.0.1"
 	}
 	r.Enabled = true
+
+	prev := m.GetRule(r.PublicPort)
+	m.StopRule(r.PublicPort)
+	if err := m.ServeRule(r); err != nil {
+		// 起不来就把旧监听还原：否则这次失败的修改会把原本在跑的端口一起弄没
+		if prev != nil {
+			if err2 := m.ServeRule(prev); err2 != nil {
+				log.Printf("[portmap] 规则 %d 修改失败（%v）且旧监听恢复失败，端口已停止对外服务: %v",
+					r.PublicPort, err, err2)
+			}
+		}
+		return err
+	}
 	m.mu.Lock()
 	m.rules[r.PublicPort] = r
 	m.mu.Unlock()
@@ -262,7 +289,7 @@ func (m *Manager) CreateRule(r *Rule) error {
 			log.Printf("[portmap] 规则 %d 持久化失败: %v", r.PublicPort, err)
 		}
 	}
-	return m.ServeRule(r)
+	return nil
 }
 
 // DeleteRule 删除规则并停止监听。
@@ -280,11 +307,16 @@ func (m *Manager) DeleteRule(publicPort int) {
 }
 
 // DisableRule 停用规则：停止公网监听，但保留规则供后续重新启用。
+//
+// 规则对象会被 Rules() 交给 API 层并发序列化，因此状态变更一律"换对象"而不是
+// 原地改字段 —— 原地写会与读取者构成数据竞争（-race 可直接报出）。
 func (m *Manager) DisableRule(publicPort int) {
 	m.StopRule(publicPort)
 	m.mu.Lock()
-	if r, ok := m.rules[publicPort]; ok {
-		r.Enabled = false
+	if r, ok := m.rules[publicPort]; ok && r != nil {
+		next := *r
+		next.Enabled = false
+		m.rules[publicPort] = &next
 	}
 	m.mu.Unlock()
 	// 更新 SQLite 中的启用状态
@@ -300,18 +332,23 @@ func (m *Manager) DisableRule(publicPort int) {
 func (m *Manager) EnableRule(publicPort int) error {
 	m.mu.Lock()
 	r, ok := m.rules[publicPort]
+	enabled := ok && r != nil && r.Enabled
 	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("规则 %d 不存在", publicPort)
 	}
-	if r.Enabled {
+	if enabled {
 		return nil
 	}
 	if err := m.ServeRule(r); err != nil {
 		return err
 	}
 	m.mu.Lock()
-	r.Enabled = true
+	if cur := m.rules[publicPort]; cur != nil {
+		next := *cur
+		next.Enabled = true
+		m.rules[publicPort] = &next
+	}
 	m.mu.Unlock()
 	// 更新 SQLite 中的启用状态
 	if m.db != nil {
@@ -448,11 +485,17 @@ func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, r *Rule)
 }
 
 // DeliverTunnelData 将 Agent 回传的隧道数据写回公网连接。
-func (m *Manager) DeliverTunnelData(tunnelID string, data []byte) {
+// agentID 必须是回传方的**连接身份**：隧道 ID 由服务端生成但可被其他 Agent 猜到或
+// 重放，不校验归属就等于任一台被攻陷的主机能往别人的公网连接里塞数据。
+func (m *Manager) DeliverTunnelData(tunnelID, agentID string, data []byte) {
 	m.mu.RLock()
-	pt, ok := m.pub[tunnelID]
+	pt := m.pub[tunnelID]
 	m.mu.RUnlock()
-	if !ok || pt == nil {
+	if pt == nil {
+		return
+	}
+	if pt.agentID != agentID {
+		m.logMismatch(agentID, pt.agentID, tunnelID, "隧道数据")
 		return
 	}
 	pt.wmu.Lock()
@@ -466,9 +509,40 @@ func (m *Manager) DeliverTunnelData(tunnelID string, data []byte) {
 }
 
 // NotifyTunnelClosed 处理 Agent 本地隧道关闭的通知。
-func (m *Manager) NotifyTunnelClosed(tunnelID string, _ string) {
+// reason 目前不落审计，只保留在协议字段里；归属校验以 agentID 为准。
+func (m *Manager) NotifyTunnelClosed(tunnelID, agentID, _ string) {
+	m.mu.RLock()
+	pt := m.pub[tunnelID]
+	m.mu.RUnlock()
+	if pt == nil {
+		return
+	}
+	if pt.agentID != agentID {
+		m.logMismatch(agentID, pt.agentID, tunnelID, "隧道关闭")
+		return
+	}
 	m.removePublic(tunnelID)
 	m.CloseTrack(tunnelID)
+}
+
+// mismatchLogInterval 越权隧道回传的留痕频率：每台伪造方 Agent 每分钟一条。
+const mismatchLogInterval = time.Minute
+
+// logMismatch 记录一次"用别人的隧道 ID 回传"，按伪造方 agentID 限频。
+func (m *Manager) logMismatch(from, owner, tunnelID, kind string) {
+	log.Printf("[portmap] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）", from, kind, tunnelID, owner)
+	mismatchMu.Lock()
+	defer mismatchMu.Unlock()
+	now := time.Now()
+	if last, seen := mismatchAt[from]; seen && now.Sub(last) < mismatchLogInterval {
+		return
+	}
+	mismatchAt[from] = now
+	for k, t := range mismatchAt {
+		if now.Sub(t) > 10*time.Minute {
+			delete(mismatchAt, k)
+		}
+	}
 }
 
 // sendTunnelClose 通过 Agent 长连接下发隧道关闭通知。

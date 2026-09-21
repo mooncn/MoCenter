@@ -1,8 +1,10 @@
 package auth
 
 import (
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestTokenExpires Token 必须有过期时间，且过期后立即失效。
@@ -271,6 +273,188 @@ func TestLoginGuardPrunesState(t *testing.T) {
 	}
 	if nFail > 1 {
 		t.Errorf("过期失败记录未清理: %d", nFail)
+	}
+}
+
+// TestLoginGuardUsernameKeyCapped 用户名作为 map 键必须限长，避免用超长键占驻内存。
+func TestLoginGuardUsernameKeyCapped(t *testing.T) {
+	long := strings.Repeat("x", loginUserKeyMax*40)
+	key := loginUserKey("  " + strings.ToUpper(long) + "  ")
+	if utf8.RuneCountInString(key) > loginUserKeyMax {
+		t.Fatalf("键应截断到 %d 个字符，实际 %d", loginUserKeyMax, utf8.RuneCountInString(key))
+	}
+	// 前缀相同的两个超长用户名共用一条记录：键集合有界，退避依然生效
+	g := newTestGuard(&time.Time{})
+	for i := 0; i < loginMaxFails; i++ {
+		g.Fail(long + "a")
+	}
+	if ok, _ := g.Allow("1.2.3.4:1", long+"b"); ok {
+		t.Fatal("超长用户名同样应受按用户名退避的约束")
+	}
+	// 多字节输入截断后必须是合法 UTF-8（截在半个 rune 上会让键变得不可比对）
+	if !utf8.ValidString(loginUserKey(strings.Repeat("中", loginUserKeyMax*2))) {
+		t.Fatal("截断结果破坏了 UTF-8 编码")
+	}
+}
+
+// TestLoginGuardFailsMapCapped 失败计数表需有容量上限，且回收不牺牲仍在生效的退避。
+func TestLoginGuardFailsMapCapped(t *testing.T) {
+	now := time.Unix(5000, 0)
+	g := newTestGuard(&now)
+	for i := 0; i < loginMaxFails; i++ {
+		g.Fail("locked") // 进入退避，nextAllowed 在当前时钟之后
+	}
+	for i := 0; i < loginFailMapLimit+10; i++ {
+		g.Fail("u" + itoa(i)) // 未达阈值、当前不拦任何人
+	}
+	if ok, _ := g.Allow("1.2.3.4:1", "locked"); ok {
+		t.Fatal("仍在退避中的用户名必须继续被拦")
+	}
+	g.mu.Lock()
+	n := len(g.fails)
+	_, kept := g.fails[loginUserKey("locked")]
+	g.mu.Unlock()
+	if n > loginFailMapLimit {
+		t.Fatalf("失败表应封顶在 %d，实际 %d", loginFailMapLimit, n)
+	}
+	if !kept {
+		t.Fatal("回收时不得丢弃仍在生效的退避记录")
+	}
+}
+
+// ---- M-12：匿名端点的独立限流桶 ----
+
+// TestPublicRouteBucket 匿名桶按 (route, ip) 计数：单桶封顶，换路由/换 IP 互不影响。
+func TestPublicRouteBucket(t *testing.T) {
+	now := time.Unix(6000, 0)
+	g := newTestGuard(&now)
+
+	allowed := 0
+	var wait time.Duration
+	for i := 0; i < publicRouteMax+5; i++ {
+		if ok, w := g.AllowPublicRoute("1.2.3.4:1000", "nodes"); ok {
+			allowed++
+		} else {
+			wait = w
+		}
+	}
+	if allowed != publicRouteMax {
+		t.Fatalf("单 (route, ip) 应只放行 %d 次，实际 %d", publicRouteMax, allowed)
+	}
+	if wait <= 0 || wait > publicRouteWin {
+		t.Fatalf("拒绝时的等待时长应落在 (0, %v]，实际 %v", publicRouteWin, wait)
+	}
+	// 另一条路由自成一桶：打满 /nodes 不该把 /state 一起锁死
+	if ok, _ := g.AllowPublicRoute("1.2.3.4:1000", "state"); !ok {
+		t.Fatal("不同路由不应共用额度（一处刷满会误伤整站公开页）")
+	}
+	// 其它访客不受牵连
+	if ok, _ := g.AllowPublicRoute("5.6.7.8:1000", "nodes"); !ok {
+		t.Fatal("其它 IP 不应被牵连")
+	}
+	// 窗口滑过后恢复
+	now = now.Add(publicRouteWin + time.Second)
+	if ok, _ := g.AllowPublicRoute("1.2.3.4:1000", "nodes"); !ok {
+		t.Fatal("窗口滑过后应恢复放行")
+	}
+}
+
+// TestPublicRouteBudgetSeparateFromLogin 匿名流量与登录额度必须互不吃亏（M-12 的正题）。
+//
+// 共用一个桶时，多开几个公开页标签（或反代后共享同一出口 IP 的整站访客）就能
+// 把管理员的登录尝试次数耗光 —— 那是把 DoS 做成了功能。
+func TestPublicRouteBudgetSeparateFromLogin(t *testing.T) {
+	now := time.Unix(7000, 0)
+	g := newTestGuard(&now)
+
+	for i := 0; i < publicRouteMax*3; i++ {
+		g.AllowPublicRoute("1.2.3.4:1", "nodes")
+	}
+	if ok, _ := g.AllowPublicRoute("1.2.3.4:1", "nodes"); ok {
+		t.Fatal("前置条件失效：匿名桶未打满")
+	}
+	for i := 0; i < loginIPMax; i++ {
+		if ok, _ := g.Allow("1.2.3.4:1", "admin"); !ok {
+			t.Fatalf("第 %d 次登录被匿名访客挤掉：匿名流量吃了登录额度", i+1)
+		}
+	}
+
+	// 反向同理：登录洪泛不得让访客看不到状态页
+	g2 := newTestGuard(&now)
+	for i := 0; i < loginIPMax+10; i++ {
+		g2.Allow("1.2.3.4:1", "admin")
+	}
+	if ok, _ := g2.AllowPublicRoute("1.2.3.4:1", "state"); !ok {
+		t.Fatal("登录尝试耗尽了匿名端点额度")
+	}
+}
+
+// TestPublicRouteStateBounded 匿名桶既会回收过期项，也有容量兜底。
+func TestPublicRouteStateBounded(t *testing.T) {
+	now := time.Unix(8000, 0)
+	g := newTestGuard(&now)
+	// 未过期但数量超限：整表作废，宁可丢计数精度也不放任内存无界增长
+	g.mu.Lock()
+	for i := 0; i < publicRouteMapLimit+16; i++ {
+		g.perPublic["nodes|"+itoa(i)] = []time.Time{now}
+	}
+	g.mu.Unlock()
+	if ok, _ := g.AllowPublicRoute("1.2.3.4:1", "nodes"); !ok {
+		t.Fatal("回收后应可正常放行")
+	}
+	g.mu.Lock()
+	n := len(g.perPublic)
+	g.mu.Unlock()
+	if n > publicRouteMapLimit {
+		t.Fatalf("匿名桶应封顶在 %d，实际 %d", publicRouteMapLimit, n)
+	}
+
+	// 全部过期时逐条回收，而不是只靠容量兜底
+	now = now.Add(2 * time.Hour)
+	g.AllowPublicRoute("9.9.9.9:1", "state")
+	g.mu.Lock()
+	n = len(g.perPublic)
+	g.mu.Unlock()
+	if n > 1 {
+		t.Fatalf("过期的匿名记录未清理: %d", n)
+	}
+}
+
+// TestAuthRateMapCapped 速率表要封顶，且回收触发点不能依赖"有 Token 校验成功"。
+//
+// 原实现只在 `ValidateToken` 成功时清理 —— 而"拿假 Token 猛刷"这条路径恰恰
+// 永远不会成功，既能无限增表又永远不触发回收（M-12）。
+func TestAuthRateMapCapped(t *testing.T) {
+	a := NewAuth(nil)
+	for i := 0; i < rateMapLimit+64; i++ {
+		a.AllowRequest("faked-ip-" + itoa(i) + ":1")
+	}
+	a.mu.Lock()
+	n := len(a.rate)
+	a.mu.Unlock()
+	if n > rateMapLimit {
+		t.Fatalf("速率表应封顶在 %d，实际 %d", rateMapLimit, n)
+	}
+}
+
+// TestAuthRatePruneRunsOnEntry 过期 Token 由请求入口回收，与登录是否成功无关。
+func TestAuthRatePruneRunsOnEntry(t *testing.T) {
+	a := NewAuth(nil)
+	a.SetTokenTTL(10 * time.Millisecond)
+	a.RegisterToken("stale", "admin")
+	time.Sleep(30 * time.Millisecond)
+
+	// 让"上次回收"退回到一个窗口之前，模拟只靠入口驱动的常态
+	a.mu.Lock()
+	a.lastRatePrune = time.Time{}
+	a.mu.Unlock()
+	a.AllowRequest("1.2.3.4:1")
+
+	a.mu.Lock()
+	_, still := a.tokens["stale"]
+	a.mu.Unlock()
+	if still {
+		t.Fatal("AllowRequest 未回收过期 Token：假 Token 洪泛路径下回收永远不会发生")
 	}
 }
 

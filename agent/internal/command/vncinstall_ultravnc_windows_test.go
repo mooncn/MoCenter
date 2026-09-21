@@ -3,6 +3,7 @@
 package command
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,6 +26,45 @@ func TestUltraVNCPackageNameMatchesURL(t *testing.T) {
 	}
 	if !strings.HasSuffix(uvncSetupX86Name, "x86_Setup.exe") {
 		t.Errorf("x86 包名不符合预期: %q", uvncSetupX86Name)
+	}
+}
+
+// 公网取包默认关闭：服务端未托管时必须**明确失败并给出办法**，而不是悄悄改用第三方源。
+//
+// 这条用例只走「取不到包 → 拒装」的分支，不会真的下载或安装任何东西。
+func TestUltraVNCRefusesPublicDownloadByDefault(t *testing.T) {
+	msg, ok := installUltraVNC(VncConfig{})
+	if ok {
+		t.Fatal("默认配置下不应成功安装（公网取包未解锁）")
+	}
+	if !strings.Contains(msg, uvncSetupX64Name) && !strings.Contains(msg, uvncSetupX86Name) {
+		t.Errorf("失败消息应点明缺哪个包: %q", msg)
+	}
+	if !strings.Contains(msg, "fetch-packages.sh") {
+		t.Errorf("失败消息应给出托管包的准备方式: %q", msg)
+	}
+	if !strings.Contains(msg, "allow_public_package_download") {
+		t.Errorf("失败消息应说明解锁开关: %q", msg)
+	}
+}
+
+// 执行前的钉扎闸：托管/下载来的包只要摘要不符，就必须拒装且不执行。
+// 这里给一个内容不是 PE 的小文件，摘要必然不符 —— 断言的是「拒绝 + 删文件」，不会安装任何东西。
+func TestUltraVNCRejectsUnpinnedPackage(t *testing.T) {
+	dir := t.TempDir()
+	setup := filepath.Join(dir, uvncSetupX64Name)
+	if err := os.WriteFile(setup, []byte("not the pinned installer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	msg, ok := installUltraVNCFromLocal(setup, pinnedDigest(uvncSetupX64Name))
+	if ok {
+		t.Fatal("摘要不符必须拒装")
+	}
+	if !strings.Contains(msg, "installPins") {
+		t.Errorf("消息应指明钉扎表位置: %q", msg)
+	}
+	if _, err := os.Stat(setup); !os.IsNotExist(err) {
+		t.Error("被拒的包应就地删除，不留在校验失败的路径上")
 	}
 }
 

@@ -228,6 +228,39 @@ func TestProbeBackfillsUUIDOnlyWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestResolveUUIDIsFirstBound 注册路径的设备身份同样按 TOFU 裁决（M-4）。
+//
+// 探针侧早已"只在缺失时补齐"，注册侧却照单全收自报 uuid —— 于是任一条通过
+// 注册鉴权的连接都能：① 用别人的 UUID 顶掉那台机器的在线会话，② 把别人的
+// 设备记录（历史、备注）并进自己上报的信息里。这里断言绑定只发生一次。
+func TestResolveUUIDIsFirstBound(t *testing.T) {
+	s := NewStore(nil)
+
+	// 首次上报：采纳并钉死
+	trusted, conflict := s.ResolveUUID("a1", "uuid-own")
+	if conflict || trusted != "UUID-OWN" {
+		t.Fatalf("首次声明应被采纳（归一化大写），实得 trusted=%q conflict=%v", trusted, conflict)
+	}
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", UUID: trusted, Hostname: "h1", Online: true})
+
+	// 之后申报别人的 UUID：作废
+	if trusted, conflict = s.ResolveUUID("a1", "UUID-VICTIM"); !conflict || trusted != "UUID-OWN" {
+		t.Fatalf("冲突声明应被拒并回落到已绑定值，实得 trusted=%q conflict=%v", trusted, conflict)
+	}
+	// 大小写/空白差异仍是同一台机器，不该报冲突
+	if trusted, conflict = s.ResolveUUID("a1", " uuid-own\n"); conflict || trusted != "UUID-OWN" {
+		t.Fatalf("归一化后相同的声明不应判为冲突，实得 trusted=%q conflict=%v", trusted, conflict)
+	}
+	// 没带 UUID 的旧版 Agent：沿用绑定值
+	if trusted, conflict = s.ResolveUUID("a1", ""); conflict || trusted != "UUID-OWN" {
+		t.Fatalf("未上报 UUID 应沿用已绑定值，实得 trusted=%q conflict=%v", trusted, conflict)
+	}
+	// 未知 agent_id 首次上线：采纳
+	if trusted, conflict = s.ResolveUUID("a2", "UUID-B"); conflict || trusted != "UUID-B" {
+		t.Fatalf("新 agent_id 的首次声明应被采纳，实得 trusted=%q conflict=%v", trusted, conflict)
+	}
+}
+
 // TestNoBlindHostnameAdoption 回归：不能因"全库只有一条无 UUID 记录"就把它
 // 认领给任意首次上报 UUID 的机器 —— 多机环境会因此合并不同主机的历史/备注/端口映射。
 func TestNoBlindHostnameAdoption(t *testing.T) {
@@ -513,6 +546,55 @@ func TestAllKicksOffAsyncGeoLookup(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if n := atomic.LoadInt32(&calls); n != 1 {
 		t.Fatalf("缓存命中后不应重复解析，实得 %d 次", n)
+	}
+}
+
+// TestAllCachedNeverTriggersGeoOutbound 匿名读路径不得驱动外呼 GeoIP（M-13）。
+//
+// 原来公开页的列表/详情也走 All()，于是"访客量"与"免费地理接口的额度"之间
+// 一个闸门都没有：一组无节流的公开页请求就能把 -proxy-ip 的配额打空，
+// 顺带在服务端堆协程。缓存由后台仪表盘那条 All() 路径负责填，两处读同一份。
+func TestAllCachedNeverTriggersGeoOutbound(t *testing.T) {
+	s := NewStore(nil)
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_, _ = w.Write([]byte(`{"code":200,"data":{"country":"美国","as_country":"US"}}`))
+	}))
+	defer srv.Close()
+
+	r := geo.NewResolver()
+	r.SetEndpoints(srv.URL+"/%s", srv.URL+"/%s", srv.URL+"/%s")
+	s.SetGeoResolver(r)
+	notified := make(chan struct{}, 8)
+	s.SetGeoNotify(func() { notified <- struct{}{} })
+	s.UpsertAgent(&protocol.AgentInfo{AgentID: "a1", Online: true, PublicIP: "8.8.4.4"})
+
+	for i := 0; i < 20; i++ {
+		if got := s.AllCached()[0].Geo; got != nil {
+			t.Fatalf("AllCached 不得读取到未准备好的外呼结果，实得 %+v", got)
+		}
+	}
+	// 稍等一拍：若实现走的是 All()，外呼此刻早已发生
+	time.Sleep(100 * time.Millisecond)
+	if n := atomic.LoadInt32(&calls); n != 0 {
+		t.Fatalf("AllCached 触发了 %d 次外呼解析：匿名访客可以消耗出网额度", n)
+	}
+
+	// 后台路径暖好缓存后，匿名读应当看到同一份数据（分桶不该造成口径差异）。
+	// 这里等回调而不是 WaitBackground：解析协程由 geo 内部再起一个，不属于 store.wg。
+	s.All()
+	select {
+	case <-notified:
+	case <-time.After(3 * time.Second):
+		t.Fatal("后台解析未回调，测试无法继续")
+	}
+	cached := s.AllCached()[0].Geo
+	if cached == nil || cached.CountryCode != "US" {
+		t.Fatalf("缓存就绪后 AllCached 应读到地理位置，实得 %+v", cached)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("外呼应只发生一次，实得 %d 次", n)
 	}
 }
 

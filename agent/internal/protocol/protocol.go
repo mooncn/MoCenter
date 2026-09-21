@@ -197,9 +197,11 @@ type UpgradeReq struct {
 	MD5 string `json:"md5,omitempty"`
 	// SHA256 升级包摘要，**必填**。为空则拒绝升级。
 	SHA256 string `json:"sha256,omitempty"`
-	// Signature Ed25519 签名（hex）。未配置公钥时必须提供。
+	// Signature Ed25519 签名（hex），对「目标版本号 + 包内容」签名。必填。
 	Signature string `json:"signature,omitempty"`
-	Force     bool   `json:"force"`
+	Force     bool   `json:"force"` // 同版本时强制重装
+	// AllowDowngrade 显式允许装回比当前版本更低的包（默认拒绝降级）。
+	AllowDowngrade bool `json:"allow_downgrade,omitempty"`
 }
 
 // UpgradeResp Agent -> Server

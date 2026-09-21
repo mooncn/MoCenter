@@ -63,7 +63,7 @@ func main() {
 	flag.StringVar(&o.agentID, "agentid", "", "Agent 名称标识（可变，仅用于显示与路由；留空则回退为设备 UUID/主机名）")
 	flag.StringVar(&o.agentUUID, "uuid", "", "设备硬件 UUID（设备身份，留空则由 Agent 自动探测并写入配置）")
 	flag.StringVar(&o.proxyIP, "proxy-ip", "", "国内加速代理前缀（可选）")
-	flag.StringVar(&o.agentKey, "agent-key", "", "Agent 注册预共享密钥（取服务端 <data>\\agent.key 的内容；role 含 agent 时必填）")
+	flag.StringVar(&o.agentKey, "agent-key", "", "Agent 注册凭据：优先用控制台「Agent 接入」页签发的一次性注册令牌（一台一份、用后即废）；服务端 <data>\\agent.key 的共享密钥仍可用一个过渡版本（role 含 agent 时必填）")
 	flag.StringVar(&o.adminUser, "user", "", "Server 的登录用户名（role 含 server 时必填）")
 	flag.StringVar(&o.adminPass, "password", "", "Server 的登录密码（role 含 server 时必填）")
 	flag.StringVar(&o.adminPassFile, "password-file", "", "从文件读取 Server 登录密码（优先于 -password；图形安装程序走这条路径，避免口令出现在命令行里）")
@@ -142,15 +142,73 @@ func main() {
 // 为什么必须这么做：图形安装器（Inno）以隐藏窗口调用本引擎，stdout/stderr 没有
 // 任何去处，用户只能看到一句「退出码 1」—— 排错完全没有依据。落盘一份日志后，
 // 无论谁调用（Inno / 计划任务 / CI），失败原因都留得下来。
+//
+// 但命令行本身不能原样落盘：-agent-key / -password / -extra 里就是凭据，
+// 而这份日志躺在用户可自选、通常也对普通用户可写的安装目录里
+// （安全评估 H-9：一处脱敏漏在这里，等于把安装时输入的口令又写回磁盘）。
 func logFailure(cmd string, err error) {
 	path := filepath.Join(exeDir(), "mocenter-deploy.log")
-	f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if ferr != nil {
 		return // 日志写不了不是主要错误，不要覆盖真正的失败原因
 	}
+	_ = hardenCredentialPath(path, false) // 0600 在 Windows 上没有 ACL 语义，显式收紧
 	defer f.Close()
 	fmt.Fprintf(f, "%s  cmd=%s  argv=%v\n  [错误] %v\n",
-		time.Now().Format("2006-01-02 15:04:05"), cmd, os.Args[1:], err)
+		time.Now().Format("2006-01-02 15:04:05"), cmd, redactedArgs(os.Args[1:]), err)
+}
+
+// secretFlags 是值不得落盘的旗标：注册密钥、登录口令，以及可能夹带凭据的追加参数。
+// -password-file 只记路径（口令在文件里），不列入。
+var secretFlags = map[string]bool{
+	"agent-key": true,
+	"password":  true,
+	"extra":     true,
+}
+
+const redactedValue = "***"
+
+// redactedArgs 复制命令行参数并把敏感旗标的值替换为 ***。
+//
+// 同时支持 `-flag value` 与 `-flag=value`（Go 的 flag 包两种都收），
+// 单破折号与双破折号等价处理。-extra 是整串追加参数，脱敏后无法据此复现命令，
+// 这是刻意的取舍：宁可少一点可复现性，也不把凭据写进一个继承来可读的文件。
+func redactedArgs(args []string) []string {
+	out := make([]string, len(args))
+	secretNext := false
+	for i, a := range args {
+		if secretNext {
+			out[i] = redactedValue
+			secretNext = false
+			continue
+		}
+		name := flagName(a)
+		switch {
+		case name == "":
+			out[i] = a
+		case secretFlags[name] && strings.Contains(a, "="):
+			out[i] = a[:strings.Index(a, "=")+1] + redactedValue
+		case secretFlags[name]:
+			out[i] = a
+			secretNext = true // 下一个位置参数就是它的值
+		default:
+			out[i] = a
+		}
+	}
+	return out
+}
+
+// flagName 取参数里的旗标名：去掉 - / -- 前缀与等号后的值。
+// 非旗标参数（不以 - 开头）返回空串。
+func flagName(arg string) string {
+	if !strings.HasPrefix(arg, "-") {
+		return ""
+	}
+	s := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+	if i := strings.IndexByte(s, '='); i >= 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 // exeDir 返回可执行文件所在目录；取不到时退回当前工作目录。

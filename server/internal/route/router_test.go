@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"mocenter/server/internal/protocol"
 	"mocenter/server/internal/session"
@@ -32,7 +33,7 @@ func TestIsBlocked(t *testing.T) {
 
 func TestDispatchOffline(t *testing.T) {
 	r := NewRouter(session.NewManager(), nil)
-	ok, msg := r.Dispatch(&protocol.CommandReq{AgentID: "ghost", Command: "echo hi"}, "u", "1.1.1.1")
+	ok, msg := r.Dispatch(&protocol.CommandReq{AgentID: "ghost", Command: "echo hi"}, "u", "1.1.1.1", "sess-A")
 	if ok {
 		t.Fatal("dispatch to offline agent should fail")
 	}
@@ -47,7 +48,7 @@ func TestDispatchOffline(t *testing.T) {
 
 func TestBlacklistBlocksAndAudits(t *testing.T) {
 	r := NewRouter(session.NewManager(), nil)
-	ok, _ := r.Dispatch(&protocol.CommandReq{AgentID: "a1", Command: "rm -rf /"}, "u", "1.1.1.1")
+	ok, _ := r.Dispatch(&protocol.CommandReq{AgentID: "a1", Command: "rm -rf /"}, "u", "1.1.1.1", "sess-A")
 	if ok {
 		t.Fatal("blacklisted command should be rejected")
 	}
@@ -158,8 +159,81 @@ func TestCompleteByCommand(t *testing.T) {
 		t.Fatalf("回填不应丢失操作人，实得 %q", logs[0].Operator)
 	}
 	// 回填后映射应被清理
-	if r.auditIDFor(cmdID) != 0 {
+	if r.auditIDFor(cmdID, "a1") != 0 {
 		t.Fatal("回填后 command_id 映射应被清理")
+	}
+}
+
+// TestCommandOriginRejectsOtherAgent 归属校验：命令只认当初接令的那台 Agent。
+// 背景：command_id 由浏览器生成（'push-'+Date.now()），完全可猜；不校验归属时
+// 任一已接入的 Agent 都能替别人的主机伪造审计结果。
+func TestCommandOriginRejectsOtherAgent(t *testing.T) {
+	r := NewRouter(session.NewManager(), nil)
+	r.auditMu.Lock()
+	r.cmdAudit[cmdKey("c-1", "a1")] = &cmdBinding{agentID: "a1", session: "sess-A", last: time.Now()}
+	r.auditMu.Unlock()
+
+	if _, ok := r.CommandOrigin("c-1", "a1"); !ok {
+		t.Fatal("a1 下发给它的命令应当可归属")
+	}
+	if _, ok := r.CommandOrigin("c-1", "evil"); ok {
+		t.Fatal("evil 从未接令 c-1，不应归属成功")
+	}
+	// 空 ID 一律不可归属（避免零值键互相撞上）
+	if _, ok := r.CommandOrigin("", "a1"); ok {
+		t.Fatal("空 command_id 不应归属")
+	}
+	if _, ok := r.CommandOrigin("c-1", ""); ok {
+		t.Fatal("空 agent_id 不应归属")
+	}
+}
+
+// TestCompleteByCommandIgnoresOtherAgent 别的 Agent 不得回填（并清掉）他人命令的结果。
+func TestCompleteByCommandIgnoresOtherAgent(t *testing.T) {
+	r := NewRouter(session.NewManager(), nil)
+	const cmdID = "cmd-shared"
+	r.Audit(&AuditLog{Time: 1, Operator: "alice", AgentID: "a1", CommandID: cmdID, Command: "uptime"})
+	r.auditMu.Lock()
+	r.cmdAudit[cmdKey(cmdID, "a1")] = &cmdBinding{agentID: "a1", last: time.Now()}
+	r.auditMu.Unlock()
+
+	// evil 用同样的 ID 伪造结果
+	r.CompleteByCommand(cmdID, "evil", "forged", 0, 1)
+	if got := r.Audits()[0].Result; got != "" {
+		t.Fatalf("伪造的回填不应改写 a1 的审计结果，实得 %q", got)
+	}
+	// a1 自己回填才生效
+	r.CompleteByCommand(cmdID, "a1", "real", 0, 7)
+	if got := r.Audits()[0]; got.Result != "real" {
+		t.Fatalf("a1 的回填应生效，实得 %q", got.Result)
+	}
+}
+
+// TestBatchCommandsKeepSeparateBindings 批量下发共用一个 command_id，
+// 每台机器的归属必须各占一条，否则后写入的会顶掉前面的。
+func TestBatchCommandsKeepSeparateBindings(t *testing.T) {
+	sess := session.NewManager()
+	r := NewRouter(sess, nil)
+	r.auditMu.Lock()
+	for _, a := range []string{"a1", "a2", "a3"} {
+		r.cmdAudit[cmdKey("batch-1", a)] = &cmdBinding{agentID: a, session: "sess-A", last: time.Now()}
+	}
+	r.auditMu.Unlock()
+	for _, a := range []string{"a1", "a2", "a3"} {
+		if _, ok := r.CommandOrigin("batch-1", a); !ok {
+			t.Fatalf("%s 的回执应可归属", a)
+		}
+	}
+	r.CompleteByCommand("batch-1", "a2", "done", 0, 1)
+	r.auditMu.Lock()
+	_, a2Exists := r.cmdAudit[cmdKey("batch-1", "a2")]
+	_, a1Exists := r.cmdAudit[cmdKey("batch-1", "a1")]
+	r.auditMu.Unlock()
+	if a2Exists {
+		t.Fatal("a2 已结束，其映射应被清理")
+	}
+	if !a1Exists {
+		t.Fatal("清理 a2 不应波及 a1 的映射")
 	}
 }
 

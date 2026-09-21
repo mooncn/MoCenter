@@ -293,24 +293,41 @@ export default function VncPage({ agents }) {
   }
 
   // 一键安装/启动 VNC；成功后自动回填服务端下发的口令。
-  // 若安装较慢导致本次请求超时，轮询 /vnc/status 补取口令。
+  // 若安装较慢导致本次请求超时，轮询 /vnc/status 补取结果，再按需向 /vnc/password 取口令。
   const install = async () => {
     if (!host) { setNotice('请先选择目标主机'); return }
     setInstalling(true)
     setNotice('正在下发安装/启动指令，请稍候...')
-    const apply = (r) => {
+    // 状态接口只说"有口令可用"，取的动作必须显式做一次（服务端据此留痕）
+    const takePassword = async () => {
+      try {
+        const r = await Api.vncPassword(host)
+        if (r && r.ok && r.password) {
+          setPassword(r.password)
+          sessionStorage.setItem(pwKey(), r.password)
+          return true
+        }
+      } catch { /* 取不到就保留手工输入 */ }
+      return false
+    }
+    const apply = async (r) => {
       const modeLabel = r.mode === 'service' ? '服务模式' : r.mode === 'interactive' ? '交互会话模式' : ''
-      setNotice((r.ok ? '✅ ' : '❌ ') + (modeLabel ? `[${modeLabel}] ` : '') + (r.msg || r.message || '执行完成') + (r.password ? '（已获取口令）' : ''))
-      if (r.password) { setPassword(r.password); sessionStorage.setItem(pwKey(), r.password) }
+      let tail = ''
+      if (r.password) {
+        setPassword(r.password); sessionStorage.setItem(pwKey(), r.password)
+      } else if (r.has_password && await takePassword()) {
+        tail = '（口令已按需获取）'
+      }
+      setNotice((r.ok ? '✅ ' : '❌ ') + (modeLabel ? `[${modeLabel}] ` : '') + (r.msg || r.message || '执行完成') + tail)
       setVncUp(!!r.ok)
     }
-    // 轮询 /vnc/status 补取安装结果（含口令），最多等 5 分钟
+    // 轮询 /vnc/status 补取安装结果（口令不在其中），最多等 5 分钟
     const pollStatus = async () => {
       for (let i = 0; i < 60; i++) {
         await new Promise((res) => setTimeout(res, 3000))
         try {
           const r = await Api.vncStatus(host)
-          if (r && (r.password || r.ok)) return r
+          if (r && (r.has_password || r.ok)) return r
           // 安装明确失败时也提前退出
           if (r && r.ok === false && r.msg && /失败|错误|不支持/.test(r.msg)) return r
         } catch { /* retry */ }
@@ -319,17 +336,17 @@ export default function VncPage({ agents }) {
     }
     try {
       let r = await Api.vncInstall({ agent_id: host, port, mode })
-      // 请求成功但未带口令时，轮询补取
+      // 请求成功但未带回口令时，轮询补取最终结果
       if (!r.password) {
         r = await pollStatus() || r
       }
-      apply(r)
+      await apply(r)
     } catch (ex) {
       // 请求超时或网络错误：安装可能仍在后台进行，轮询补取结果
       setNotice('请求超时或网络异常，正在轮询安装结果...')
       const r = await pollStatus()
       if (r) {
-        apply(r)
+        await apply(r)
       } else {
         setNotice('下发失败：' + (ex.response?.data?.msg || ex.message) + '。可稍后点击"一键安装VNC"重试，或以管理员身份运行 Agent。')
       }

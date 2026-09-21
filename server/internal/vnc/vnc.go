@@ -5,6 +5,11 @@
 //
 // 复用既有端口映射隧道消息（TunnelOpen/Data/Close）：查看器隧道 ID 以
 // "v-" 开头、探测隧道以 "vp-" 开头，便于服务端 Agent 消息循环按前缀分发。
+//
+// 两条硬约束（本包内所有入口共用，不各自放水）：
+//   - 隧道目标端口必须落在 CheckPort 放行的范围内（默认 5900-5999），
+//     否则这条"连到被管主机回环"的通道就是任意端口的内网代理；
+//   - 安装结果里的 VNC 口令不随状态接口批量下发，只由调用方显式取一次。
 package vnc
 
 import (
@@ -12,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,25 +32,53 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  256 * 1024,
 	WriteBufferSize: 256 * 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
-	Subprotocols:    []string{ws.WSSubprotocolName},
+	// 与 /ws 同口径认来源（见 ws.SameOrigin）：这条通道直达桌面，
+	// 跨站劫持成功的后果是"别人的页面能往运维的 VNC 会话里发键鼠"。
+	CheckOrigin:  func(r *http.Request) bool { return ws.SameOrigin(r) },
+	Subprotocols: []string{ws.WSSubprotocolName},
 }
+
+// defaultVNCPort RFB 的显示号 0 对应端口，也是 Agent 侧端口缺省时的归一值。
+const defaultVNCPort = 5900
 
 // tunnelEstablishTimeout 隧道建立超时：超过该时间未收到 Agent 的 TunnelOpenResp
 // 视为隧道建立失败，关闭查看器避免浏览器一直等待。
 const tunnelEstablishTimeout = 15 * time.Second
+
+const (
+	// maxViewersPerSession 单个操作员会话的并发远程桌面上限。
+	//
+	// 每条查看器隧道都会在目标机的回环上开一个 TCP 连接并常驻两个泵。
+	// 没有上限时，一枚泄漏的 Token 就能把整片机群的 5900/自定义端口逐个连开，
+	// 而这条路径当时连 IP 白名单与限流都不走（见 main.go 的 guardWS）。
+	// 取 8：多屏/多机并排操作的实际用量在 4 以内，留出翻倍余量。
+	maxViewersPerSession = 8
+	// viewerReadLimit 浏览器→服务端单帧上限。RFB 的客户端消息（按键、指针、
+	// 剪贴板 cut-text）都在 KB 量级，1 MiB 足够宽，只是关掉"声明超长帧让
+	// gorilla 按长度分配"这条无上限路径。
+	viewerReadLimit = 1 << 20
+	// viewerPendingLimit 隧道就绪前浏览器数据的缓冲上限。
+	// 隧道建立要等 Agent 回执（最长 15s），这期间收到的帧先暂存以免丢掉 RFB
+	// 握手；无上限时客户端掐着这个窗口猛灌就能吃满内存。
+	viewerPendingLimit = 4 << 20
+	// viewerWriteWait 向浏览器写一帧的超时。写是在 Agent 消息循环里做的，
+	// 浏览器不收就会把这台主机的整条隧道处理链堵住。
+	viewerWriteWait = 10 * time.Second
+)
 
 // viewerConn 浏览器查看器连接。包含 pending 缓冲，用于解决
 // 「浏览器 RFB 数据先于隧道建立到达」导致的 RFB 握手数据丢失（黑屏）问题。
 type viewerConn struct {
 	ws       *websocket.Conn
 	agentID  string
+	session  string // 发起方会话键，用于并发名额归还
 	tunnelID string
 	wmu      sync.Mutex
 	// ready 隧道已就绪（Agent 回传 TunnelOpenResp OK=true）。
 	// ready==false 时浏览器数据暂存入 pending，待就绪后统一转发。
-	ready   bool
-	pending [][]byte
+	ready        bool
+	pending      [][]byte
+	pendingBytes int
 }
 
 type probeResult struct {
@@ -52,29 +86,167 @@ type probeResult struct {
 	msg string
 }
 
+// probeWaiter 一次探测的等待登记。
+//
+// 必须连"应答该由谁给出"一起记：只有发起 TunnelOpen 的那条 Agent 连接的回执
+// 才算数，否则任意一台在线主机都能替别人伪造"VNC 可连/不可连"。
+type probeWaiter struct {
+	agentID string
+	ch      chan probeResult
+}
+
 // Mgr VNC 远程桌面管理器。
 type Mgr struct {
 	mu          sync.Mutex
 	sess        *session.Manager
-	viewer      map[string]*viewerConn                      // tunnelID -> 查看器连接
-	probeWait   map[string]chan probeResult                 // tunnelID("vp-") -> 探测结果
-	installWait map[string]chan *protocol.VncInstallResp    // agentID -> 安装结果
-	last        map[string]*protocol.VncInstallResp         // agentID -> 最近一次安装/启动结果（口令）
-	seq         uint64
+	viewer      map[string]*viewerConn                   // tunnelID -> 查看器连接
+	viewersBySs map[string]int                           // 操作员会话键 -> 并发查看器数
+	probeWait   map[string]*probeWaiter                  // tunnelID("vp-") -> 探测结果 + 归属 Agent
+	installWait map[string]chan *protocol.VncInstallResp // agentID -> 安装结果
+	last        map[string]*protocol.VncInstallResp      // agentID -> 最近一次安装/启动结果（口令）
+	ports       []portRange                              // 允许作为隧道目标的目标端口（空=不限制）
+	portSpec    string                                   // 端口清单原文，只用于错误提示
+	// mismatchAt 记录每台 Agent 上一次"越权隧道回传"的留痕时间，用于限频。
+	mismatchAt map[string]time.Time
+	seq        uint64
 }
 
 // NewMgr 创建 VNC 管理器。
 func NewMgr(sess *session.Manager) *Mgr {
+	// 端口闸门默认就是开的：漏配 -vnc-ports 的后果应当是"连不上非常规端口"，
+	// 而不是"退回任意端口代理"。
+	def, _ := parsePortSpec(DefaultPortSpec)
 	return &Mgr{
 		sess:        sess,
 		viewer:      make(map[string]*viewerConn),
-		probeWait:   make(map[string]chan probeResult),
+		viewersBySs: make(map[string]int),
+		probeWait:   make(map[string]*probeWaiter),
 		installWait: make(map[string]chan *protocol.VncInstallResp),
 		last:        make(map[string]*protocol.VncInstallResp),
+		mismatchAt:  make(map[string]time.Time),
+		ports:       def,
 	}
 }
 
+// acquireViewer 为该操作员会话占用一个远程桌面并发名额；已达上限返回 false。
+//
+// 名额按会话（Token 派生）而非按 IP 计：同机的多个运维人员各自有独立的额度，
+// 一个共享出口 IP 后面也不会因为别人在开桌面而被误限。
+// 空会话键（拿不到 Token）单独共用一份额度而不是免除限制：生产路径上
+// HandleViewer 已先校验过 Token，这里只会兜住测试/内部调用。
+func (m *Mgr) acquireViewer(session string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.viewersBySs[session] >= maxViewersPerSession {
+		return false
+	}
+	m.viewersBySs[session]++
+	return true
+}
+
+// releaseViewer 归还一个名额。计数归零即删键，避免长期运行后 map 只增不减。
+func (m *Mgr) releaseViewer(session string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.viewersBySs[session] <= 1 {
+		delete(m.viewersBySs, session)
+		return
+	}
+	m.viewersBySs[session]--
+}
+
+// DefaultPortSpec VNC 端口的默认允许范围。
+//
+// RFB 的端口约定是 5900+显示号（:0 → 5900，:1 → 5901…），UltraVNC 与 x11vnc
+// 都落在这个区间内。把它作为闸门是因为：VNC 隧道的目标是**被管主机的回环地址**，
+// 不限制端口就等于给每个登录会话发了一台"打到任意机器的任意端口代理"——
+// 目标机上的 Redis、SSH、各类调试端口都会顺带变成可连的内网服务。
+// 跑在非常规端上的部署用 -vnc-ports 显式放行，而不是把闸门整体放开。
+const DefaultPortSpec = "5900-5999"
+
+// portRange 一段闭区间端口。
+type portRange struct{ lo, hi int }
+
+// parsePortSpec 解析 "5900-5999,6900" 形式的端口清单。
+// 空串表示"不限制"（返回 nil 与 true）—— 只在运维显式配置时出现。
+func parsePortSpec(spec string) ([]portRange, bool) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, true
+	}
+	var out []portRange
+	for _, item := range strings.Split(spec, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		loS, hiS := item, item
+		if i := strings.IndexByte(item, '-'); i >= 0 {
+			loS, hiS = strings.TrimSpace(item[:i]), strings.TrimSpace(item[i+1:])
+		}
+		lo, err := strconv.Atoi(loS)
+		if err != nil {
+			return nil, false
+		}
+		hi, err := strconv.Atoi(hiS)
+		if err != nil {
+			return nil, false
+		}
+		if lo < 1 || hi < lo || hi > 65535 {
+			return nil, false
+		}
+		out = append(out, portRange{lo, hi})
+	}
+	return out, true
+}
+
+// portAllowed 判断端口是否落在允许范围内；范围表为空表示不限制。
+func portAllowed(ranges []portRange, port int) bool {
+	if len(ranges) == 0 {
+		return true
+	}
+	for _, r := range ranges {
+		if port >= r.lo && port <= r.hi {
+			return true
+		}
+	}
+	return false
+}
+
+// SetAllowedPorts 配置 VNC 隧道/探测可指向的目标端口。解析失败时保持原值并返回错误，
+// 让服务端启动阶段就把配错的清单暴露出来，而不是静默变成"全部放行"。
+// 空清单表示不限制（只在运维显式配置时出现）。
+func (m *Mgr) SetAllowedPorts(spec string) error {
+	ranges, ok := parsePortSpec(spec)
+	if !ok {
+		return fmt.Errorf("VNC 端口清单 %q 无法解析（形如 5900-5999,6900）", spec)
+	}
+	m.mu.Lock()
+	m.ports = ranges
+	m.portSpec = strings.TrimSpace(spec)
+	m.mu.Unlock()
+	return nil
+}
+
+// CheckPort 报告该端口能否作为 VNC 隧道目标；不允许时返回给操作员看的说明。
+func (m *Mgr) CheckPort(port int) error {
+	m.mu.Lock()
+	ranges, spec := m.ports, m.portSpec
+	m.mu.Unlock()
+	if portAllowed(ranges, port) {
+		return nil
+	}
+	if spec == "" {
+		spec = DefaultPortSpec
+	}
+	return fmt.Errorf("端口 %d 不在允许的 VNC 端口范围内（当前 %s）；确需使用该端口请用 -vnc-ports 放行", port, spec)
+}
+
 // LastResult 返回该主机最近一次 VNC 安装/启动结果（含口令），无则返回 nil。
+//
+// 注意：口令只应经 `/api/vnc/password` 这一个"按需 + 留痕"的端点交付，
+// 不要顺手塞进可轮询的状态响应里 —— 状态接口会被前端每几秒拉一次，
+// 口令进了它就等于长期驻留在浏览器与访问日志能触及的响应体中。
 func (m *Mgr) LastResult(agentID string) *protocol.VncInstallResp {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -102,6 +274,31 @@ func (m *Mgr) sendTunnelClose(tunnelID, agentID, reason string) {
 	}
 }
 
+// mismatchLogInterval 越权隧道回传的留痕频率：每台伪造方 Agent 每分钟一条。
+// 被攻陷的主机可以拿猜出来的隧道 ID 高频回传，每条都写日志就等于把修复本身
+// 变成灌满日志的 DoS 面。
+const mismatchLogInterval = time.Minute
+
+// logMismatch 记录一次"用别人的隧道 ID 回传"，按 agentID 限频。
+func (m *Mgr) logMismatch(from, owner, tunnelID, kind string) {
+	log.Printf("[vnc] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）", from, kind, tunnelID, owner)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mismatchAt == nil {
+		m.mismatchAt = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if last, seen := m.mismatchAt[from]; seen && now.Sub(last) < mismatchLogInterval {
+		return
+	}
+	m.mismatchAt[from] = now
+	for k, t := range m.mismatchAt {
+		if now.Sub(t) > 10*time.Minute {
+			delete(m.mismatchAt, k)
+		}
+	}
+}
+
 // closeViewer 关闭查看器连接并清理。注意：调用方不应持有 vw.wmu 锁。
 func (m *Mgr) closeViewer(tunnelID string) {
 	m.mu.Lock()
@@ -111,6 +308,7 @@ func (m *Mgr) closeViewer(tunnelID string) {
 	}
 	m.mu.Unlock()
 	if ok && vw != nil {
+		m.releaseViewer(vw.session)
 		vw.wmu.Lock()
 		_ = vw.ws.Close()
 		vw.wmu.Unlock()
@@ -123,6 +321,12 @@ func (m *Mgr) Probe(agentID string, port int) (bool, string) {
 	if agentID == "" {
 		return false, "未指定目标主机"
 	}
+	if port <= 0 {
+		port = defaultVNCPort
+	}
+	if err := m.CheckPort(port); err != nil {
+		return false, err.Error()
+	}
 	a := m.sess.Get(agentID)
 	if a == nil {
 		return false, "目标主机离线"
@@ -130,7 +334,7 @@ func (m *Mgr) Probe(agentID string, port int) (bool, string) {
 	tunnelID := m.nextTunnel("vp")
 	ch := make(chan probeResult, 1)
 	m.mu.Lock()
-	m.probeWait[tunnelID] = ch
+	m.probeWait[tunnelID] = &probeWaiter{agentID: agentID, ch: ch}
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
@@ -165,6 +369,15 @@ func (m *Mgr) Install(agentID string, port int, mode string) *protocol.VncInstal
 	if agentID == "" {
 		return nf("未指定目标主机")
 	}
+	// 与 Agent 侧 `VncInstallCfg` 的口径保持一致：端口缺省即 5900。
+	// 闸门必须校验"最终会被连的那个端口"，否则 0/负数会绕过范围检查后又
+	// 被 Agent 归一成 5900。
+	if port <= 0 {
+		port = defaultVNCPort
+	}
+	if err := m.CheckPort(port); err != nil {
+		return nf(err.Error())
+	}
 	a := m.sess.Get(agentID)
 	if a == nil {
 		return nf("目标主机离线")
@@ -195,14 +408,20 @@ func (m *Mgr) Install(agentID string, port int, mode string) *protocol.VncInstal
 }
 
 // DeliverTunnelData 将 Agent 回传的 VNC 数据写回浏览器查看器 WebSocket。
-func (m *Mgr) DeliverTunnelData(tunnelID string, data []byte) {
+// agentID 必须是本条报文的**连接身份**（取自 session.Conn），不是报文里的自报字段。
+func (m *Mgr) DeliverTunnelData(tunnelID, agentID string, data []byte) {
 	m.mu.Lock()
 	vw, ok := m.viewer[tunnelID]
 	m.mu.Unlock()
 	if !ok || vw == nil {
 		return
 	}
+	if vw.agentID != agentID {
+		m.logMismatch(agentID, vw.agentID, tunnelID, "帧数据")
+		return
+	}
 	vw.wmu.Lock()
+	_ = vw.ws.SetWriteDeadline(time.Now().Add(viewerWriteWait))
 	if err := vw.ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
 		vw.wmu.Unlock()
 		m.closeViewer(tunnelID)
@@ -213,53 +432,72 @@ func (m *Mgr) DeliverTunnelData(tunnelID string, data []byte) {
 
 // DeliverOpenResp 处理 VNC 隧道的建立响应。
 // 隧道建立成功后，flush 缓冲的浏览器 RFB 数据。
-func (m *Mgr) DeliverOpenResp(tunnelID string, ok bool, msg string) {
+// agentID 为回传方的连接身份：隧道归属只认发起它的那台 Agent，否则一台被攻陷的
+// 主机可以给别人的桌面会话回"就绪"，把浏览器缓冲的数据灌进它的隧道。
+func (m *Mgr) DeliverOpenResp(tunnelID, agentID string, ok bool, msg string) {
 	m.mu.Lock()
-	ch, isProbe := m.probeWait[tunnelID]
-	vw, isViewer := m.viewer[tunnelID]
+	pw := m.probeWait[tunnelID]
+	vw := m.viewer[tunnelID]
 	m.mu.Unlock()
-	if isProbe {
-		ch <- probeResult{ok: ok, msg: msg}
+	if pw != nil {
+		if pw.agentID != agentID {
+			m.logMismatch(agentID, pw.agentID, tunnelID, "探测结果")
+			return
+		}
+		pw.ch <- probeResult{ok: ok, msg: msg}
 		return
 	}
-	if isViewer && !ok {
+	if vw == nil {
+		return
+	}
+	if vw.agentID != agentID {
+		m.logMismatch(agentID, vw.agentID, tunnelID, "隧道建立响应")
+		return
+	}
+	if !ok {
 		vw.wmu.Lock()
+		_ = vw.ws.SetWriteDeadline(time.Now().Add(viewerWriteWait))
 		_ = vw.ws.WriteMessage(websocket.TextMessage, []byte("{\"type\":\"vnc_unavailable\",\"message\":\""+msg+"\"}"))
 		vw.wmu.Unlock()
 		m.closeViewer(tunnelID)
 		return
 	}
-	if isViewer && ok {
-		// 隧道就绪：标记 ready 并 flush 缓冲的浏览器数据
-		var pending [][]byte
-		vw.wmu.Lock()
-		vw.ready = true
-		pending = vw.pending
-		vw.pending = nil
-		vw.wmu.Unlock()
+	// 隧道就绪：标记 ready 并 flush 缓冲的浏览器数据
+	var pending [][]byte
+	vw.wmu.Lock()
+	vw.ready = true
+	pending = vw.pending
+	vw.pending = nil
+	vw.pendingBytes = 0
+	vw.wmu.Unlock()
 
-		agent := m.sess.Get(vw.agentID)
-		if agent == nil {
+	agent := m.sess.Get(vw.agentID)
+	if agent == nil {
+		m.closeViewer(tunnelID)
+		return
+	}
+	for _, d := range pending {
+		if err := agent.Write(protocol.TypeTunnelData, &protocol.TunnelData{TunnelID: tunnelID, Data: d}); err != nil {
 			m.closeViewer(tunnelID)
 			return
-		}
-		for _, d := range pending {
-			if err := agent.Write(protocol.TypeTunnelData, &protocol.TunnelData{TunnelID: tunnelID, Data: d}); err != nil {
-				m.closeViewer(tunnelID)
-				return
-			}
 		}
 	}
 }
 
 // NotifyTunnelClosed 处理 Agent 本地 VNC 隧道关闭通知。
-func (m *Mgr) NotifyTunnelClosed(tunnelID string) {
+// 只有发起该隧道的 Agent 才能关闭它：否则一台主机能靠猜隧道 ID 掐断别人的桌面。
+func (m *Mgr) NotifyTunnelClosed(tunnelID, agentID string) {
 	m.mu.Lock()
-	_, isViewer := m.viewer[tunnelID]
+	vw := m.viewer[tunnelID]
 	m.mu.Unlock()
-	if isViewer {
-		m.closeViewer(tunnelID)
+	if vw == nil {
+		return
 	}
+	if vw.agentID != agentID {
+		m.logMismatch(agentID, vw.agentID, tunnelID, "隧道关闭通知")
+		return
+	}
+	m.closeViewer(tunnelID)
 }
 
 // NotifyInstall 接收 Agent 回传的 VNC 安装/启动结果（始终缓存最近结果，便于口令补发）。
@@ -281,32 +519,61 @@ func (m *Mgr) NotifyInstall(agentID string, resp *protocol.VncInstallResp) {
 // 确认隧道就绪后再转发，避免 RFB 握手数据丢失导致黑屏。
 func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken func(string) bool) {
 	// Token 优先取子协议头（避免出现在 URL 里被日志留存），兼容旧 query 传参
-	if !validateToken(ws.WSToken(r)) {
+	token := ws.WSToken(r)
+	if !validateToken(token) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	agentID := agentOf(r)
-	port := portOf(r, 5900)
+	port := portOf(r, defaultVNCPort)
 	if agentID == "" {
 		http.Error(w, "missing agent", http.StatusBadRequest)
 		return
 	}
+	// 目标端口闸门：放在握手与名额之前。VNC 隧道连的是被管主机的回环，
+	// 放开任意端口就等于给每个登录会话一台内网端口代理（Redis/SSH/调试端口）。
+	if err := m.CheckPort(port); err != nil {
+		log.Printf("[vnc] 拒绝隧道请求 agent=%s port=%d: %s", agentID, port, err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// 并发上限必须在 Upgrade 之前判：一旦回了 101 就无法再改口发 429。
+	// 这里与"真正登记隧道"之间还有 upgrade/查 Agent 两步，最坏情况是同一会话
+	// 瞬时多开一条——窗口毫秒级，不足以防住刷隧道。
+	session := ws.SessionKey(token)
+	if !m.acquireViewer(session) {
+		log.Printf("[vnc] 会话 %s… 远程桌面并发数已达上限 %d，拒绝握手（来自 %s）",
+			ws.SessionPrefix(session), maxViewersPerSession, r.RemoteAddr)
+		http.Error(w, "too many viewers", http.StatusTooManyRequests)
+		return
+	}
+	// 名额先记在 HandleViewer 手上；登记进 viewer 表后交接给 closeViewer 归还。
+	acquired := true
+	defer func() {
+		if acquired {
+			m.releaseViewer(session)
+		}
+	}()
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("[vnc] upgrade error: %v", err)
 		return
 	}
+	conn.SetReadLimit(viewerReadLimit)
 	a := m.sess.Get(agentID)
 	if a == nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(viewerWriteWait))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte("{\"type\":\"error\",\"message\":\"目标主机离线\"}"))
 		_ = conn.Close()
 		return
 	}
 	tunnelID := m.nextTunnel("v")
-	vw := &viewerConn{ws: conn, agentID: agentID, tunnelID: tunnelID}
+	vw := &viewerConn{ws: conn, agentID: agentID, session: session, tunnelID: tunnelID}
 	m.mu.Lock()
 	m.viewer[tunnelID] = vw
 	m.mu.Unlock()
+	acquired = false
 
 	if err := a.Write(protocol.TypeTunnelOpen, &protocol.TunnelOpenReq{
 		TunnelID: tunnelID, AgentID: agentID, LocalHost: "127.0.0.1", LocalPort: port,
@@ -355,8 +622,14 @@ func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken
 				break
 			}
 		} else {
+			vw.pendingBytes += len(data)
+			over := vw.pendingBytes > viewerPendingLimit
 			vw.pending = append(vw.pending, data)
 			vw.wmu.Unlock()
+			if over {
+				log.Printf("[vnc] 隧道 %s 建立前缓冲超过 %d 字节，关闭查看器", tunnelID, viewerPendingLimit)
+				break
+			}
 		}
 	}
 	m.closeViewer(tunnelID)

@@ -12,46 +12,25 @@
 
 ## 二、部署方式
 
-### 方式一：基于 Docker 容器化部署
+> 仓库里保留着 `server/Dockerfile`，但**容器不是本项目的交付形态**：不发镜像、不做兼容性维护，
+> 因此下面不写 Docker 步骤。真要自己起容器请自行核对参数（尤其**别把口令放进 `-e`/命令行**，
+> 它会出现在 `ps -ef` 与 shell 历史里；服务端支持 `-password-file`）。
+> 支持的部署方式只有下面两种：单进程物理机直跑，或一键脚本装成 systemd 服务。
 
-仓库自带 `server/Dockerfile`，多阶段构建为单进程镜像（同时提供 :9000 与 :8080）。
-
-```bash
-# 1) 先构建 Web 前端（可选；不构建则容器不含 Web 界面）
-bash web/build.sh
-
-# 2) 构建镜像 —— 构建上下文是仓库根目录（镜像需 web/dist），故用 -f 指定 Dockerfile
-docker build -f server/Dockerfile -t mocenter-server:latest .
-
-# 3) 运行（数据挂载到持久卷，否则重建容器会重新生成 agent.key，
-#    已注册的 Agent 需要改用新密钥重新注册）
-docker run -d --name mocenter-server \
-  -p 9000:9000 -p 8080:8080 \
-  -v mocenter-data:/var/lib/mocenter \
-  -e MOCENTER_USER=admin -e MOCENTER_PASSWORD='强口令' \
-  mocenter-server:latest
-
-docker logs -f mocenter-server      # 查看启动日志（含托管安装包清单）
-```
-
-启动参数通过环境变量注入（镜像内已全部展开）：`MOCENTER_USER` / `MOCENTER_PASSWORD` /
-`MOCENTER_LISTEN` / `MOCENTER_HTTP` / `MOCENTER_WHITELIST` / `MOCENTER_TLS_CERT` /
-`MOCENTER_TLS_KEY` / `MOCENTER_CA_CERT`；其它参数可用 `MOCENTER_EXTRA_ARGS` 透传。
-未提供用户名/口令时，容器内会自动创建 `admin` 并生成随机强口令写入
-`/var/lib/mocenter/initial-password.txt`（权限 0600），可用
-`docker exec mocenter-server cat /var/lib/mocenter/initial-password.txt` 查看后删除。
-
-### 方式二：物理机直接部署（单进程托管 Web）
+### 方式一：物理机直接部署（单进程托管 Web）
 
 ```bash
 # 1. 构建前端并交由服务端托管
 cd web && bash build.sh   # 生成 dist/
 cd ../server && bash build.sh
 # 2. 启动（同时托管 Web 静态资源，单进程部署）
-./mocenter-server -listen :9000 -http :8080 -user admin -password your-password -web ../web/dist
+#    口令走文件而不是 -password：后者会出现在 ps -ef 与 shell 历史里
+install -d -m 700 /etc/mocenter
+printf '%s' '强口令' > /etc/mocenter/admin-password && chmod 600 /etc/mocenter/admin-password
+./mocenter-server -listen :9000 -http :8080 -user admin -password-file /etc/mocenter/admin-password -web ../web/dist
 ```
 
-### 方式三：Linux 一键构建 + 安装包（推荐）
+### 方式二：Linux 一键构建 + 安装包（推荐）
 
 构建与打包统一由 **`scripts/build-linux-all.sh`** 完成（`scripts/packaging/` 下的零碎脚本已合并进它），
 产物只按用途分类一次落到 `build/`（平台体现在文件名与 `bin/<角色>/<平台>/` 这一层）：
@@ -91,7 +70,7 @@ bash scripts/build-linux-all.sh --type=agent,server --platform=windows --package
 | 二进制 | `/usr/local/bin/mocenter-server` |
 | 启动参数 | `/etc/mocenter/mocenter-server.conf`（**请修改口令与白名单**） |
 | 全量配置 | `/etc/mocenter/mocenter-server.json`（首次启动自动生成） |
-| 数据目录 | `/var/lib/mocenter/data`（审计日志、`users.json`、`agent.key`） |
+| 数据目录 | `/var/lib/mocenter/data`（审计日志、`users.json`、`agent.key`、`ca.key`、`node.key`、`ssh_known_hosts`） |
 | 托管安装包 | `/var/lib/mocenter/packages` |
 | Web 前端 | `/usr/share/mocenter/web` |
 | 装卸说明 | `/etc/mocenter/README.server` |
@@ -103,7 +82,7 @@ bash scripts/build-linux-all.sh --type=agent,server --platform=windows --package
 bash scripts/build-linux-all.sh --type=server --package=none
 sudo bash scripts/deploy/install-linux.sh --role=server \
      --bin=build/bin/server/linux/mocenter-server-amd64 \
-     --user=admin --password='强口令'
+     --user=admin --password-file=/root/admin-pw.txt   # 口令走文件；也可 printf '%s' "$pw" | ... --password
 sudo bash scripts/deploy/install-linux.sh --role=all status
 sudo bash scripts/deploy/install-linux.sh --role=server uninstall      # 加 --purge 连配置数据一起删
 ```
@@ -113,7 +92,7 @@ sudo bash scripts/deploy/install-linux.sh --role=server uninstall      # 加 --p
 ```bash
 sudo bash scripts/deploy/install-linux.sh upgrade --role=server \
      --bin=build/bin/server/linux/mocenter-server-amd64
-# 升级时无需重复提供 --user/--password；要清理重装（删除既有配置）加 --force
+# 升级时无需重复提供 --user/--password-file；要清理重装（删除既有配置）加 --force
 ```
 
 **保活自启**（脚本按环境自动选择）：
@@ -179,13 +158,25 @@ server {
     location /ws {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
+        # Host 必须透传：三条 WebSocket 端点都按 Origin 与服务端看到的 Host 判同源，
+        # 不透传时 Host 会是 127.0.0.1:8080，浏览器握手一律被判跨站（403）。
+        proxy_set_header Host $host;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
     }
-    # 公开状态页的实时推送（免登录）；同样需要 WebSocket 升级头
+    # 远程桌面隧道（同样是 WebSocket 升级）
+    location /vnc-ws {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    # 公开状态页的实时推送（免登录）；同样需要 Host 与 WebSocket 升级头
     location /api/public/ws {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
+        proxy_set_header Host $host;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
     }
@@ -348,21 +339,48 @@ npm run check:flag   # 校验字形数据与解码逻辑是否自洽（无需网
 - **页脚内容**：支持 HTML，用于写版权、备案号与备案链接。`{year}` 会替换为当前年份，
   默认值 `{year}©MOONCN` 因此不需要每年手工改。
 
-安全处理：页脚内容由**已登录运维**在后台配置（保存接口 `/api/site/config` 需要鉴权），
-属于受信内容；渲染前仍会剥离 `<script>`/`<iframe>` 等可执行标签与 `on*` 事件属性、
-`javascript:` 协议（见 `web/src/utils/siteBranding.js`），防止误粘贴带脚本的片段。
-品牌文案通过免鉴权的 `GET /api/public/enabled` 一并下发（登录页在登录前就要用正确标题），
+安全处理：页脚是**全站唯一**一处把服务端下发的字符串交给 `dangerouslySetInnerHTML`
+的地方，而它的读者包括未登录访客（公开页）与其他运维的会话（后台），所以
+"能写配置的人"可信、"写进来的那段内容"不可信。服务端按原样存储（保留备案链接这类
+正常用法），**净化在渲染入口做**：`web/src/utils/siteBranding.js` 的 `sanitizeFooterHTML`
+是**白名单重建** —— 只有展示型标签（`a/b/strong/i/em/p/br/img/ul/li/…`）与
+`href/src/target/title/alt` 这几个属性会被重新拼出，其余标签连内容一起丢，
+事件属性与 `style` 根本没有出现的通道；链接协议限定 `http/https/mailto/tel/ftp` 与相对路径，
+图片只认 `http(s)` 与位图 `data:`（**相对路径的图片会被丢掉**，需要引图的请用绝对地址）。
+判定协议前会先解码实体并去掉控制符，`&#106;avascript:`、`java\tscript:` 这类写法穿不过去。
+兜底是整站 `Content-Security-Policy`（`script-src 'self'`，无 `unsafe-inline`），
+即使净化被绕过也执行不了脚本。白名单的每一条都有回归用例：`npm run check:footer`。
+品牌文案通过免鉴权的 `GET /api/branding` 下发（登录页在登录前就要用正确标题），
 该端点**只**返回标题与页脚，不返回 `host_ids`/`fields` 等公开策略信息。
+"公开页是否启用"是另一个端点 `GET /api/public/enabled` 的事，它跟着开关走：
+关掉时直接 404，不留一个可被扫描器反复确认的探针点。
 
 安全设计（部署前请知悉）：
 
-1. **主机标识不公开**：对外只有服务端派生的节点编号 `n-xxxxxxxx`（SHA-256 前 4 字节），
-   无法反推 `agent_id`、硬件 UUID 或内网地址 —— 这些字段在公开响应结构里根本不存在。
+1. **主机标识不公开**：对外只有服务端派生的节点编号 `n-` + 16 位十六进制，
+   它用**本机部署私钥** `<data>/node.key`（首次启动随机生成，0600）做 HMAC-SHA256 后再截断，
+   外部拿候选主机名离线穷举也命中不了；`agent_id`、硬件 UUID、内网地址在公开响应结构里根本不存在。
+   - 换编号的方式：删除 `<data>/node.key` 并重启，服务端会重新生成一把，所有公开编号整体变更。
+     历史数据不受影响（库内按 `agent_id` 存），但已分享出去的 `/public/node/…` 链接会全部失效。
+   - 该密钥**刻意不进入自动备份**：备份一旦外发，攻击者就同时拿到"主机名候选 + 派生规则"，
+     公开编号的不可枚举性随之失效。需要跨机迁移时请单独手工保管。
 2. **敏感项默认关闭**：主机名、系统版本、内核版本、公网 IP 默认不可见，可显式开启；
    公网 IP 即使开启也会做部分掩码（`203.0.*.*`），精确经纬度永不公开。
-3. **独立限流**：公开端点为匿名入口，另有独立于登录的限流（每路由独立计数），
-   避免被扫描器滥用；单次历史趋势最多返回 300 点、回溯窗口上限 30 天。
-4. **审计留痕**：每次修改展示配置都会写入操作审计（分类 `op`）。
+3. **独立限流**：公开端点为匿名入口，另有独立于登录的限流 —— 按「来源 IP × 路由」
+   计数，每条路由 30 次/分钟（详情页 15s 轮询 × 三个标签页 ≈ 12 次/分钟，留一倍余量），
+   被拒时返回 `429 + Retry-After`。**它与登录额度完全分开**：访客刷公开页不会把
+   管理员挡在自己的后台外面。**注意**：计数只看 TCP 对端地址（不信任
+   `X-Forwarded-For`），因此反向代理之后全站访客共用一个源 IP、共享这 30 次/分钟；
+   对外访问量级大时请把公开页的轮询频率调低，或为 `/api/public/*` 单独加一层缓存。
+   单次历史趋势最多返回 300 点、回溯窗口上限 30 天。
+4. **匿名请求不出网**：公开页读的是地理位置**缓存**（`AllCached`），不会替访客去
+   请求外部 GeoIP 接口 —— 额度只由后台仪表盘的推送路径消耗，访客再多也打不空它。
+   未命中缓存的主机在公开页上就是没有地区，直到后台那次正常推送把它暖起来。
+5. **开关是"真关"**：`Enabled:false` 时 `/api/public/*`（含 `/api/public/enabled`）
+   一律 404，对外**不存在**；已经连上的匿名 WebSocket 会在配置落库的瞬间自己结束，
+   不需要等访客关掉标签页。品牌文案（标题/页脚）走常开的 `GET /api/branding`，
+   因为它服务的是登录页，与公开页开关无关。
+6. **审计留痕**：每次修改展示配置都会写入操作审计（分类 `op`）。
 
 对外发布前建议自查：
 
@@ -390,14 +408,15 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
    - 自动签发 Agent 通道的服务端证书 → 该通道**开箱即 TLS**；
    - 自动签发 Web 控制台"当前部署临时证书" → 控制台**默认 HTTPS/WSS**（并附带 HSTS）。
 
-   Agent 只需要服务端的注册密钥，其余全自动：
+   Agent 只需要一份注册凭据，其余全自动：
 
    ```bash
    # 服务端（不给任何证书参数）
    ./mocenter-server -listen :9000 -http :8080 -user admin -password <密码> -web ../web/dist
 
-   # Agent（只给注册密钥；首次连接自动换取客户端证书，之后走 mTLS）
-   ./mocenter-agent -server your.server.com:9000 -agentid host-01 -agent-key <服务端 <data>/agent.key 的内容>
+   # Agent（只给注册凭据；首次连接自动换取客户端证书，之后走 mTLS）
+   # 推荐用 Web「Agent 接入」页签发的**一次性注册令牌**（一台一份、用后即废），见下节
+   ./mocenter-agent -server your.server.com:9000 -agentid host-01 -agent-key <一次性注册令牌>
    ```
 
    浏览器访问 `https://<总控>:8080` 会提示自签名证书，**接受即可**；若要受信任证书，
@@ -432,39 +451,71 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
    | 参数 | 作用 |
    |------|------|
    | `-require-agent-cert`（服务端） | 强制 Agent 必须携带客户端证书（不再接受"先换取"）。**建议在全量 Agent 换取完成后再开启** |
-   | `-allow-unauthenticated-agents`（服务端） | **危险**，迁移期临时关闭注册鉴权 |
+   | `-allow-unauthenticated-agents`（服务端） | **危险**，迁移期临时关闭注册鉴权。同时允许"无凭据注册"和"无凭据签发证书" |
+   | `-disable-shared-agent-key`（服务端） | 关闭部署级共享注册密钥，**只接受一次性注册令牌**。现网全部迁移到令牌后再开 |
    | `-server-name`（服务端） | 部署身份名，写入 CA，用于区分多套总控 |
    | `-server-fingerprint`（Agent） | 公钥指纹固定，免 CA 文件、不受服务端换 IP/证书影响 |
-   | `-enroll-secret`（Agent） | 换取证书用的注册密钥（默认取 `agent_key`，换取成功后自动清空） |
+   | `-enroll-secret`（Agent） | 换取证书用的注册凭据（默认取 `agent_key`，换取成功后自动清空） |
    | `-creds-dir`（Agent） | 客户端证书落盘目录（默认 `<配置目录>/creds`） |
+   | `-upgrade-pubkey`（服务端 / Agent） | 升级包验签公钥（Ed25519 hex）。服务端配了就随「一键部署」写进 Agent 配置；**Agent 没配它就不接受任何升级指令**，没有跳过验签的开关 |
+   | `-file-roots`（Agent） | 文件分发/取回允许的根目录（逗号分隔），默认 `<配置目录>/files`；只认本机配置与命令行，服务端指令改不了 |
+
+   **注册凭据：优先用一次性令牌**
+
+   Web「Agent 接入」页（或 `POST /api/enroll/tokens`）可为指定 `agent_id` 签发**一次性注册令牌**：
+   绑定主机名、默认 24 小时过期、用后即废，泄露只影响那一台那一次。相关的存储与行为：
+
+   - `<data>/enroll.json`（0600）：待用令牌 + 每台主机的 `agent_id → 客户端公钥指纹(SPKI)` 绑定。
+     令牌以明文存储是必要的 —— 注册凭证要拿去做 HMAC，服务端必须能还原原文；
+     安全收益来自"按台绑定 + 短有效期 + 单次消费"，而不是存储形态。
+   - **TOFU 绑定**：首次注册记下公钥指纹；同一 `agent_id` 换不同密钥的证书再来注册会被拒，
+     除非带上一份新签发的**一次性令牌**（`enroll.json` 记录 `rebinds` 次数，控制台可清除绑定）。
+   - **在线 `agent_id` 拒发**：目标主机已有活动会话时不签发证书，避免"趁在线冒名顶替"。
+     凭据校验在这一步**之前**完成（否则这里就成了"某主机是否在线"的探测口），
+     所以被拒时那枚令牌也已经消耗掉，需要重新签发。
+   - 共享注册密钥（`<data>/agent.key`）仍可用**一个过渡版本**：它是一把钥匙认全网，
+     泄露任一台即可冒名注册任意主机，且**必须轮换 `<data>/ca.key` 并让所有 Agent 重新换取证书**才能彻底清除。
+     迁移期内每次使用它注册都会在服务端日志里告警；迁完后用 `-disable-shared-agent-key` 关掉。
+   - **`agent.key` 的明文不出现在控制台**：「Agent 接入」页只给指纹 + 文件路径。要拿明文只能
+     「轮换共享密钥」（`POST /api/enroll/shared-key/rotate`，body `{"confirm":true}`），
+     它写入新密钥（0600）、进操作审计（只记新旧指纹）、**新明文只回显这一次**，旧密钥对新注册立刻失效。
+     已凭证书在线的主机不受影响。注意：若密钥来自 `-agent-key`/配置文件 `agent_key`/`MOCENTER_AGENT_KEY`，
+     下次启动那个值会盖掉 `agent.key`，轮换响应会告警 —— 要长期生效须先删掉那个配置项。
+   - Agent 换取到证书后，后续连接以证书身份（CA 校验 + CN＝自报 `agent_id`）为准，
+     **不再需要任何注册凭据**，重启/重连都不会要求重发令牌。
 
    **信任模型（三类角色各管一件事）**
 
    | 凭据 | 位置 | 作用 | 生命周期 |
    |------|------|------|----------|
-   | 注册密钥 `agent.key` | 服务端 `<data>/`，Agent 配置文件 | 让 Agent 被接纳 | 一次性：换取证书后从 Agent 配置清空 |
+   | 注册凭据（一次性令牌 / `agent.key`） | 服务端 `<data>/enroll.json`、`agent.key`，Agent 命令行或配置 | 让 Agent 被接纳 | 一次性：换取证书后从 Agent 配置清空；令牌用后即废 |
    | CA 证书/私钥 `ca.crt`/`ca.key` | 服务端 `<data>/`（0600） | 让双方确认属于同一套总控 | 长期；**变更即需重新换取**，建议备份 |
    | 客户端证书 `client.crt`/`client.key` | Agent `<配置目录>/creds/`（0600） | 让每次连接可验证 | 自动签发（默认 3650 天），私钥仅存本机 |
 
    升级/迁移注意：
 
    - Agent 换取过证书后，配置里 `enrollment_secret` 会被清空，`agent_key` 可保留（便于
-     服务端 CA 重建后重新换取）。要重新换取：删除 `creds/` 并把密钥填回
-     `enroll-secret`（或 `agent_key`）。
+     服务端 CA 重建后重新换取）。要重新换取：删除 `creds/client.crt` 与 `creds/ca.crt`
+     （保留 `client.key`，见下条 TOFU 说明）并把凭据填回 `enroll-secret`（或 `agent_key`）。
    - 服务端重装/更换 CA 后，Agent 会自动识别并重新换取证书（见下条），**不再需要人肉登录每台被控机**。
      **服务端重装前请备份 `<data>/ca.key`。**
    - **服务端换过部署身份 CA 时的行为**（`server_fingerprint` 决定是否自动收敛）：
 
      | 场景 | Agent 行为 |
      |------|-----------|
-     | 本机没有 CA 记录（首次接入） | 直接换取证书（信任根是注册密钥） |
+     | 本机没有 CA 记录（首次接入） | 直接换取证书（信任根是注册凭据） |
      | CA 与本机记录的一致 | 正常连接，无需干预 |
      | CA 变化且**已配置** `server_fingerprint`＝新指纹 | **自动**丢弃旧证书、重新换取、恢复连接 |
      | CA 变化且**未配置** `server_fingerprint` | **拒绝**自动重换并报错，给出新旧指纹 |
 
-     最后一行为什么默认拒绝：换取请求里带着注册密钥的 HMAC 证明。若"换个地址就自动重换"，
+     最后一行为什么默认拒绝：换取请求里带着注册凭据的 HMAC 证明。若"换个地址就自动重换"，
      等于任何能让 Agent 连上自己的对端都能拿到它的注册凭据 —— 证书锁定会被彻底架空。
      因此自动恢复必须由运维显式授权（填一次 `server_fingerprint` 即可，之后远程下发配置文件就行）。
+
+     TOFU 绑定为什么不会挡住这条自动恢复：Agent 重新换取时**复用本机私钥**（`creds/client.key`），
+     公钥指纹不变，服务端按同一台机器放行。因此手工清理时只删 `client.crt` 与 `ca.crt`，
+     **保留 `client.key`**；把整个 `creds/` 删掉等于自造一次"换机器身份"，
+     此时必须为该 `agent_id` 重新签发一次性注册令牌（或在控制台「清除绑定」）才能重签。
 
      服务端侧的识别与诊断：应用层会**显式校验客户端证书是否由本套 CA 签发**（不是只看有没有证书），
      不认可时记录明确日志并主动下发 `EnrollRequired` 告知 Agent。这条通路很关键 ——
@@ -483,6 +534,50 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
 
 4. **命令黑名单**：高危命令（`rm -rf /`、`mkfs`、`sudo` 等）由服务端拦截并记录审计。
 
+5. **响应安全头与 WebSocket 同源（挂反向代理前必读）**：
+
+   服务端对每个响应下发下列头（`server/main.go` 的 `securityHeaders`）：
+
+   | 头 | 取值 | 为什么 |
+   |----|------|--------|
+   | `Content-Security-Policy` | `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; frame-ancestors 'none'; form-action 'self'; base-uri 'none'; object-src 'none'` | XSS 的最后一道：注入进来的 HTML 拿不到执行脚本的能力 |
+   | `X-Frame-Options: DENY` + `frame-ancestors 'none'` | | 后台与公开页都不允许被嵌入，防点击劫持 |
+   | `X-Content-Type-Options: nosniff` | | 不把上传的文件当脚本嗅探执行 |
+   | `Referrer-Policy: no-referrer` | | Token 不会经 `Referer` 漏给第三方 |
+   | `Cache-Control: no-store` | 仅 `/api/*` | 登录响应带 Token、审计响应带命令结果、备份响应带文件，中间代理存一份就多一处泄露点；`/assets/*` 仍是内容哈希 + 长缓存 |
+   | `Strict-Transport-Security` | 仅 TLS 请求 | 明文态下发会把同主机的明文站点一起锁死 |
+
+   CSP 的 `script-src 'self'` **刻意不含** `'unsafe-inline'` / `'unsafe-eval'`：构建产物全是外链
+   脚本，且产物里没有 `eval`/`new Function`/`new Worker`（`npm run build` 后 grep 三平台产物确认）。
+   `style-src` 留 `'unsafe-inline'` 是因为 `web/index.html` 的首屏内联底色是有意为之
+   （样式表被企业代理拦掉时不会白屏）；`img-src` 留 `data:` 是因为国旗是运行时画到 canvas
+   再取 `toDataURL` 的。`connect-src` 写死 `ws: wss:` 而不只靠 `'self'`：`'self'` 对
+   `ws://` 同源是否算匹配各家浏览器口径不一，写死才不会把终端与远程桌面拍死。
+
+   三条 WebSocket 端点（`/ws`、`/vnc-ws`、`/api/public/ws`）现在都：
+
+   - **校验 `Origin` 同源**（`server/internal/ws/origin.go`）：浏览器发起的跨站 WebSocket
+     握手不受 CORS 约束，唯一能挡的地方是服务端认来源。**不带 `Origin` 的请求放行**
+     （那只能是 curl/探活脚本等非浏览器客户端，而跨站劫持必然带 Origin）。端口只在
+     两侧都显式写出时才参与比对，协议不参与比对，所以 TLS 终止型代理**不需要**透传
+     `X-Forwarded-Proto`；
+   - **只从 `Sec-WebSocket-Protocol` 子协议头取 Token**：`?token=` 回退已删除，因为 URL 会进
+     反向代理访问日志、浏览器历史与截图。
+
+   由此对反向代理只有一条硬要求：**透传原始 `Host`**（nginx `proxy_set_header Host $host;`，
+   见「四、Web 前端部署」的示例）。不透传时服务端看到的 `Host` 是 `127.0.0.1:8080`，
+   浏览器写的 `Origin` 是对外域名，握手会被判跨站返回 403，表现为"终端 / 远程桌面 /
+   公开页推送全断"。部署后可用一条请求自查：
+
+   ```bash
+   # 期望 101；若为 403 就是 Host 没透传，若为 401 是 Token 没走子协议头
+   curl -s -o /dev/null -w '%{http_code}\n' \
+     -H "Origin: https://mocenter.example.com" -H "Host: mocenter.example.com" \
+     -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+     -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+     -H "Sec-WebSocket-Protocol: mocenter,<会话Token>" https://mocenter.example.com/ws
+   ```
+
 ## 六、高级运维能力
 
 ### 1. 交互式 PTY 终端
@@ -492,7 +587,46 @@ Web「远程终端」页面选择在线主机并执行交互式命令（如 `bas
 Web「运维操作」页面勾选多台在线主机，批量下发同一命令；服务端逐一审计留痕。REST 接口：`POST /api/command/batch`。
 
 ### 3. 远程升级 Agent
-Web「运维操作」页面填写升级包 URL 与 MD5 校验和，下发升级指令。Agent 依次执行：下载升级包 → MD5 校验 → 备份旧版本 → 替换二进制 → 自动重启；失败自动回滚。REST 接口：`POST /api/upgrade`。
+
+升级包**必须有 Ed25519 签名**，Agent 侧没有"跳过验签"的开关：配了公钥才可能升级，
+没配公钥则一律拒绝（这是默认安全态，不是故障）。
+
+一次升级的完整链路：
+
+```bash
+# ① 发布机上生成一次密钥对（私钥 0600，只留在发布机，永远不分发）
+cd scripts/signpkg && go run . -gen -key-out /root/mocenter-upgrade.key -pub-out /root/mocenter-upgrade.pub
+#   -> 打印公钥 hex，填进服务端/Agent 的 -upgrade-pubkey
+
+# ② 每次发版：对"目标版本号 + 升级包内容"签名，并拿到摘要
+go run . -sign -key /root/mocenter-upgrade.key -version 1.1.0 <升级包路径>
+#   -> 打印 sha256 / signature，以及一段可直接粘进 POST /api/upgrade 的 JSON
+#   发布前自检：go run . -verify -pubkey /root/mocenter-upgrade.pub \
+#                    -version 1.1.0 -sha256 <摘要> -signature <签名> <同一个包>
+
+# ③ 下发：Web「运维操作 → 远程升级」填 目标版本 / https 下载地址 / SHA-256 / 签名
+#    或直接调接口
+curl -X POST https://<总控>:8080/api/upgrade -H "Authorization: Bearer <token>" -d '{
+  "agent_id":"host-a","version":"1.1.0","url":"https://dl.example.com/mocenter-agent-1.1.0",
+  "sha256":"<64位hex>","signature":"<256位hex>","force":false,"allow_downgrade":false}'
+```
+
+Agent 侧的执行顺序（`agent/internal/upgrade`）：先确认本机配了公钥 → 判定该不该装
+（同版本需 `force`，低于当前版本属降级需 `allow_downgrade`）→ 只允许 **https** 取包 →
+**一次读入内存**（上限 256 MiB）→ 用同一份字节同时做 SHA-256 比对与 Ed25519 验签
+（签名消息 = `"MoCenter-Upgrade-v1\n" + 目标版本 + "\n" + 包内容`）→ 落盘为 0600 临时文件
+并**复核盘上字节**→ 备份旧二进制 → 换入新二进制 → 重新拉起 → 失败回滚。
+"读入即校验、校验即落盘"是为了不给"两次读文件之间被动过"留窗口；签名把版本号钉进去，
+则保证同一份包不能被冒充成别的版本。
+
+服务端配置公钥（同时会写进「一键部署」生成的 Agent 配置）：
+
+```bash
+./mocenter-server ... -upgrade-pubkey <64字节公钥的hex>
+```
+
+Agent 单独配置时是 `-upgrade-pubkey`（或环境变量 `MOCENTER_UPGRADE_PUBKEY`）。
+REST 接口：`POST /api/upgrade`。
 
 ### 4. 端口映射
 Web「端口映射」页面创建规则（公网端口 → 内网服务端口），服务端反向代理实时转发到目标 Agent，支持源 IP 白名单、连接跟踪与流量统计。REST 接口：`GET/POST /api/portmap/rules`、`POST /api/portmap/op`。
@@ -503,34 +637,79 @@ Web「端口映射」页面创建规则（公网端口 → 内网服务端口）
 ### 6. 文件分发到主机
 Web「运维操作」页面选择目标在线主机与 Agent 端目标路径，上传本地文件分片经服务端中转、MD5 校验后写入 Agent 指定路径。适用于批量下发部署包、配置文件、脚本等场景。
 
-### 7. VNC 安装包由服务端分发
-
-Agent 一键安装 VNC 时，默认从公网下载安装包（UltraVNC，约 4–5MB）。为规避公网限速与
-下载被劫持/篡改的风险，可把安装包放到服务端托管目录：
+**路径被限制在文件根目录内**（`agent/internal/client/fileroots.go`）：Agent 只允许读写
+`-file-roots`（或配置 `file_roots`、环境变量 `MOCENTER_FILE_ROOTS`）列出的目录及其子目录，
+默认是**配置目录下的 `files/`**（systemd 部署即 `/etc/mocenter/files`）。
+这条闸门只认本机配置与命令行参数，服务端指令改不了它 —— 否则"总控被拿下"就等于
+"所有被控机的任意路径可写"。越界的路径（含相对路径、`..`、指向根外的软链）会被拒绝，
+在「操作审计」与分发提示里能看到 `rejected`。要放开某个目录：
 
 ```bash
-bash scripts/fetch-packages.sh ./packages                 # 下载安装包到托管目录
+./mocenter-agent ... -file-roots=/etc/mocenter/files,/srv/deploy
+```
+
+### 7. VNC 安装包由服务端分发
+
+Agent 一键安装的 Windows 包最终以 **SYSTEM 静默执行**（UltraVNC 安装器）或**内核驱动**
+（无头虚拟机需要的 VDD 虚拟显示驱动）方式落地，因此**服务端托管是默认且唯一免配置的取包方式**：
+
+```bash
+bash scripts/fetch-packages.sh ./packages                 # 下载并逐个核对内置摘要
 ./mocenter-server ... -data ./data -pkg-dir ./packages    # 指向该目录（不指定则默认 <data>/packages）
 ```
 
 启动日志会打印已托管的包清单（`[pkg] 安装包目录 ... 已托管: ...`）。
-Agent 会**优先通过它与服务端之间既有的长连接**拉取（该通道可启用 TLS/mTLS），
-服务端未托管该包时自动回退公网下载，因此托管是可选增强、不影响可用性。
+Agent 通过它与服务端之间**既有的长连接**拉取（该通道已 mutual-TLS），
+落盘后先比对 Agent 内置的 SHA-256 钉扎摘要，**执行/解压前**校验不过就拒装并把实际摘要写进错误消息。
 
-托管文件名须与 Agent 期望的一致（`scripts/fetch-packages.sh` 会按此命名下载 Windows 包，
-也可加参数只下某平台：`bash scripts/fetch-packages.sh ./packages win`）：
+服务端未托管某个包时**不会**悄悄改用公网 —— 安装失败并回传原因。确需公网取包
+（winget / choco / 厂商直连 / 加速代理）时，在**目标机本机**的 Agent 配置里设
+`allow_public_package_download: true`（或启动参数 `-allow-public-package-download`）；
+该开关服务端无法下发，因为它一开就把「装哪个版本的什么内容」交给了第三方源。
 
-| 文件名 | 平台 |
-|--------|------|
-| `UltraVNC_1824_x64_Setup.exe` / `UltraVNC_1824_x86_Setup.exe` | Windows |
-| `x11vnc-linux-amd64` / `-arm64` / `-arm` / `-386` | Linux（需自备） |
+托管文件名须与 Agent 期望的一致（`scripts/fetch-packages.sh` 会按此命名下载并校验）：
 
-> **Linux 说明**：x11vnc 官方只发布源码、无任何预编译产物，因此脚本不代为下载。
+| 文件名 | 平台 | 内置摘要 |
+|--------|------|----------|
+| `UltraVNC_1824_x64_Setup.exe` / `UltraVNC_1824_x86_Setup.exe` | Windows | 有 |
+| `VirtualDisplayDriver-x86.Driver.Only.zip` | Windows（仅无头虚拟机需要） | 有 |
+| `x11vnc-linux-amd64` / `-arm64` / `-arm` / `-386` | Linux（需自备） | 无 |
+
+> **Linux 说明**：x11vnc 官方只发布源码、无任何预编译产物，因此没有可内置的摘要，脚本也不代为下载。
 > Linux 侧优先由 Agent 用发行版包管理器安装（RHEL/Rocky/Alma 走 EPEL，Debian/Ubuntu 直接有）；
-> 仅当目标机无法访问软件源时，才需自行构建/自备二进制并按上表命名放入托管目录。
+> 仅当目标机无法访问软件源时，才需自行构建/自备二进制并按上表命名放入托管目录 —— 这条包的来源由你保证，
+> Agent 只校验 `ELF` 魔数。
 
-服务端会校验包名以防目录穿越；Agent 会校验可执行文件魔数（`MZ`/`ELF`），
-拒绝执行错误页或被替换的内容；安装包拉取属于内部行为，不会出现在「文件分发」列表中。
+若给安装包下载配了加速代理，**只有 `https://` 前缀会被使用**（明文前缀忽略并留日志）。
+服务端会校验包名以防目录穿越；Agent 另有魔数校验（`MZ`/`ELF`）挡掉"下回一个 HTML 错误页"；
+安装包拉取属于内部行为，不会出现在「文件分发」列表中。
+
+### 8. VNC 隧道端口闸门与口令交付
+
+远程桌面隧道连的是**被管主机的回环地址**：如果不限制端口，每个登录会话就等价于拿到一台
+"打到该机任意端口"的内网代理（Redis、SSH、调试端口都会顺带可连）。因此服务端默认只放行
+RFB 约定区间：
+
+| 参数 | 默认 | 作用 |
+|------|------|------|
+| `-vnc-ports`（服务端）/ 配置 `vnc_ports` | `5900-5999` | 隧道与探测可指向的目标端口，逗号分隔并支持区间（如 `5900-5999,6900`） |
+
+- 跑在非常规端口的部署**用该参数显式放行需要的那几个**，而不是整体放开：传空串表示不限制，
+  且这个"不限制"状态**不会写进配置文件**（必须每次启动显式给出），避免一次误操作被永久固化。
+- 清单解析失败会在启动阶段直接退出，不会静默退化成"全部放行"。
+- 越界端口的表现：`/api/vnc/probe`、`/api/vnc/install` 返回带区间和放行办法的失败原因，
+  `/vnc-ws` 在握手前直接拒绝（不落 101），并记一条 `[vnc] 拒绝隧道请求` 日志。
+
+VNC 口令（一键安装在目标机上生成的随机口令）只走**按需 + 留痕**两条路径：
+
+| 接口 | 是否带出口令 | 审计 |
+|------|--------------|------|
+| `POST /api/vnc/install` | 是（谁下的指令谁取一次，用于自动回填） | 记「VNC 安装/启动」+ 端口/模式/结果 |
+| `GET /api/vnc/status` | **否**，只回 `has_password` | 无（前端每 3s 轮询） |
+| `POST /api/vnc/password` | 是 | 记「获取 VNC 口令」，结果只写"取到了没有" |
+
+状态接口是轮询的，口令一旦进它的响应体就等于长期驻留在浏览器里；审计里存"取过"而不是口令本身，
+否则审计库会变成第二份明文凭据存储。
 
 ## 七、延迟监测（ICMP / TCP / HTTP）
 
@@ -621,12 +800,16 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/version | jq '{
 | `users.json` | 账号与口令哈希、OTP 密钥 | 是 |
 | `remarks.json` | 主机备注（用户输入的唯一副本） | — |
 | `public-site.json` | 公开展示配置 | — |
-| `agent.key` | Agent 注册预共享密钥（丢了所有 Agent 都连不上） | 是 |
+| `agent.key` | Agent 注册预共享密钥。**默认不打包**，勾「包含凭据文件」/`{"include_secrets":true}` 才带上 | 是 |
 
 **刻意不备份**：`packages/`（安装包，可从上游重下，动辄上百 MB）、`uploads/`（临时文件）、
-日志、SQLite 的 `-wal`/`-shm`。
+日志、SQLite 的 `-wal`/`-shm`，以及 `<data>/node.key`（公开节点编号的派生私钥，
+见「公开状态页 → 安全设计」）和 `<data>/ca.key`（注册 CA，丢失需所有 Agent 重新换取证书）。
 
-> 备份包**含凭据**。请按"等同口令文件"对待，不要随意外发。
+> 备份包**含凭据**（口令哈希与 OTP 密钥）。请按"等同口令文件"对待，不要随意外发；
+> 备份接口能下载到的包默认不再带全网身份根 —— `agent.key` 只在显式勾选时进包，
+> 且这一次选择会写进操作审计。恢复后如果需要它，直接在新服务端「Agent 接入」页
+> 轮换一把新的更稳妥（旧的很可能已随外流的包泄露）。
 
 ### 关键实现细节
 
@@ -679,17 +862,38 @@ systemd 可用性探测，**不做任何改动**。建议先探测确认，再�
 1. SSH 连接与认证（密码 / 键盘交互 / 私钥 / 私钥+passphrase）
 2. 探测目标机环境（`uname -m` → GOARCH、`/etc/os-release`、`id -u`、`sudo -n`、是否 systemd）
 3. 上传 Agent 二进制（走 stdin 的 `cat > file`，不依赖目标机是否启用 sftp 子系统）
-4. 写入 Agent 配置（服务端地址、Agent 名称、注册密钥、代理、延迟目标，权限 0600）
+4. 写入 Agent 配置（服务端地址、Agent 名称、注册凭据、代理、延迟目标，权限 0600）
 5. 安装为 systemd 服务并启动（配置与二进制分离：`/etc/mocenter/mocenter-agent.json` + `/usr/local/bin/mocenter-agent`）
 6. 回读状态确认（`is-active` / `is-enabled` / `-version`）
 
 ### 安全约束
 
-- **凭证不落盘、不入日志**。密码/私钥只在单次请求内存中存在；审计日志只记"谁在何时部署了哪个地址"。
+- **凭证不落盘、不入日志**。密码/私钥只在单次请求内存中存在；审计日志只记"谁在何时部署了哪个地址"与该机的**主机密钥指纹**（指纹是公开信息，用于事后核对）。
+- **主机密钥必须校验**（known_hosts TOFU，见下一小节）。
 - **命令注入防护（纵深防御）**：AgentID 过白名单（`[A-Za-z0-9._-]{1,64}`）、安装目录与服务名过格式校验、
   所有拼进 shell 的变量经 POSIX 单引号转义。即使上游校验有疏漏，也不会因一个引号变成命令注入。
 - **上传体积上限** 200 MB；安装包文件名拒绝目录成分。
 - 接口需登录（与其它后台接口同一套 Token + IP 白名单 + 限流）。
+
+### 主机密钥信任（known_hosts TOFU）
+
+一键部署是**服务端主动去连别人的机器**，并且连的时候手里握着注册密钥和操作员的口令/私钥。
+如果握手时不校验对方是谁，路径上的中间人就能同时收下这三样东西。因此这条通道没有
+"忽略主机密钥"的开关（也没有对应的命令行参数）：
+
+| 情况 | 行为 |
+|------|------|
+| 第一次连接某个 `主机[:端口]` | 记录密钥并放行，结果里回显指纹 + 前端标黄提示"请核对" |
+| 之后密钥与记录一致 | 正常放行 |
+| 之后密钥变了 | **中止部署**，错误信息里同时给出记录指纹与实际指纹（可能是中间人，也可能该机真重装过） |
+| 表单填了 `主机密钥指纹` | 强制钉扎：与该值不一致就中止，不走首次信任（省略 `SHA256:` 前缀也可以） |
+| 记账文件读不了/数据目录缺失 | 中止部署（fail-closed），不会退回不校验 |
+
+- 记账文件：`<数据目录>/ssh_known_hosts`，权限 0600，OpenSSH known_hosts 格式，只追加不重写。
+  与运维个人的 `~/.ssh/known_hosts` 分开，避免互相污染。
+- 撤销信任：直接删掉该文件里对应的那一行，再重新部署并核对指纹。
+- 指纹来源：目标机上 `ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub`。
+- 新机器建议先点「测试连接与探测环境」（仅探测、不改动）拿到指纹，核对后再填入执行部署。
 
 > **Windows 未实现**：OpenSSH for Windows 虽然存在，但凭证、服务注册与权限模型与 Linux 差异大，
 > 按需求"没有类似方案则略过"。Windows 侧请继续用图形安装程序（`MoCenter-Setup-<版本>.exe`）或
@@ -713,10 +917,22 @@ systemd 可用性探测，**不做任何改动**。建议先探测确认，再�
 > - 计划任务通过 `mocenter-deploy.exe run -role <角色> -exe … -config …` 拉起进程，
 >   目的是让子进程带 `CREATE_NO_WINDOW`，避免每次拉起都闪一个黑窗口。
 > - `mocenter-deploy.exe uninstall` 会一并删除这两个任务；`status` 会打印它们是否存在。
+> - **注册前会检查路径可写性，检查不过就不注册**：这两个任务以 `SYSTEM` + 最高权限运行，
+>   跑的是安装目录里的 `mocenter-deploy.exe` 与被守护的二进制，读的是那份配置文件。
+>   如果这三者中任何一个所在的目录允许非管理员写入（把 `-dir` 指到公共可写位置就会这样），
+>   本机任意用户改掉那个文件即等于拿到 SYSTEM —— 安装器此时**拒绝注册**，打印受影响路径与
+>   一条可直接执行的 `icacls` 整改命令，然后继续完成安装（服务本身不受影响，只是少了这道保险）。
+>   整改后重跑一次安装即可启用。装到默认的 `C:\Program Files\MoCenter` 不会被拦。
+> - **数据目录（`%ProgramData%\MoCenter\<角色>`）与配置文件写入后会显式收紧 ACL**，
+>   只留 SYSTEM / Administrators / 安装时的登录用户。Go 在 Windows 上的 `0600` 不产生任何
+>   ACL 语义（对象只继承父目录授权），所以这一步不能省：配置里是注册密钥与客户端私钥。
+>   升级安装会顺带把该目录下**已存在**的旧文件逐个补紧。
+> - 一键安装的 VNC 同理：`ultravnc.ini` 里那份 VNC 口令用的是厂商公开的固定 DES 密钥混淆，
+>   **读到文件就等于读到口令**，因此写完也会立即收紧为仅特权身份可读。
 
 ### Linux：systemd timer 或 cron
 
-见「方式三」中的**保活自启**表：有 systemd 时注册 `watchdog.timer`，
+见「方式二」中的**保活自启**表：有 systemd 时注册 `watchdog.timer`，
 无 systemd 时写 `/etc/cron.d/mocenter-<角色>`，两者共用
 `scripts/deploy/mocenter-keepalive.sh`（幂等，进程在跑就直接退出）。
 
@@ -769,10 +985,15 @@ Agent 在注册时把版本号写入 `AgentInfo.AgentVersion` 并落库，仪表
 **空版本**表示旧版 Agent 未上报，前端显示「未知」，升级判定按"需升级"处理（它一定不是当前版本）。
 
 远程升级时，升级包声明的 `version` 表示「本次要升到哪个版本」，**与当前服务端版本无关**：
-可以高于、等于或低于服务端版本，接口不会因此拒绝。
-不填时自动取服务端版本，只是为"服务端与 Agent 同步发版"这一常见场景顺手给个默认值。
+可以高于、等于或低于服务端版本，接口不会因此拒绝。它**必填** —— 版本号参与升级包签名，
+服务端替操作者补一个默认值只会让 Agent 报"签名校验失败"，看起来像包被动过。
 
-Agent 侧的判定逻辑很简单：目标版本 == 自身版本则跳过（除非勾选强制），否则执行升级。
+Agent 侧的判定（`decideUpgrade`）：
+- 目标版本 == 自身版本 → 跳过，除非勾了「同版本强制重装」（`force`）；
+- 目标版本 < 自身版本 → 按**降级**拒绝，除非显式带 `allow_downgrade`；
+  `force` 不再顺带放开降级，它只管"同版本重装"；
+- 版本号无法解析（如 `latest`）→ 直接报错，不做模糊比较。
+
 因此这个字段只需要在**同一台机器的历史序列**里有意义，不需要跨端对齐。
 
 ## 十三、单实例保护
@@ -855,7 +1076,7 @@ Agent 与 Server **同一份配置只允许一个实例**。跨平台实现不�
 | 节点地区/国旗不显示 | ① 是否有外网出口；无外网请配 `-mmdb` 离线库。② 看日志里的 `[geo]` 行（会区分"限流 / 网络不通 / 不支持该地址族 / 该 IP 无数据"）。③ 后台「展示配置」总开关是否开、地区字段是否勾选。④ 直连 ip-api.com 不稳时配 `-proxy-ip` |
 | 延迟目标一直显示"超时" | ICMP 依赖目标机的 `ping` 命令（极简容器可能没有），换 `tcp:` 目标验证链路；`http:` 目标缺 scheme 时按 https 处理，自签证书不受影响（探测忽略证书校验） |
 | 一键部署报 `sudo: not found` | 已修复：当前用户是 root 时不再使用 sudo。若版本较旧请升级服务端 |
-| 一键部署报服务启动成功但 Agent 不上线 | 检查写入的注册密钥是否与服务端一致（`/etc/mocenter/mocenter-agent.json` 的 `agent_key`）、服务端地址是否从目标机可达；`systemctl status mocenter-agent` 看日志 |
+| 一键部署报服务启动成功但 Agent 不上线 | 检查写入的注册凭据是否有效（`/etc/mocenter/mocenter-agent.json` 的 `agent_key`：一次性令牌要用对应该 `agent_id` 且未过期未使用的）、服务端地址是否从目标机可达；`systemctl status mocenter-agent` 看日志 |
 | 恢复备份后数据没变 | 恢复后需**重启服务端**；被覆盖的旧文件在 `<文件名>.before-restore` |
 | 日志出现「已有一个使用同一配置的 Agent 在运行，本次启动终止」 | **这是保护生效，不是故障**：已有实例持有单实例锁。用 `systemctl status mocenter-agent` / `ps -ef \| grep mocenter-agent` 确认。若确实是上次断电遗留（日志会提示锁文件多久没被刷新、PID 是否来自上一次开机），删掉锁文件后重启即可，**不要**去杀那个 PID（可能已被复用）。详见「单实例保护」 |
 | 日志出现「无法打开锁文件 … 本次启动**未启用**单实例保护」 | 锁文件所在目录对运行用户不可写。锁文件与 `-config` 指定的配置文件同目录，请确保该目录可写（systemd 单元里是 `/etc/mocenter`，见「单实例保护」） |
@@ -899,4 +1120,12 @@ systemctl restart mocenter-server
 
 ## 十五、远程升级 Agent
 
-服务端发布新版本 → Agent 检测到新版本 → 下载升级包 → 校验签名 → 停止旧进程 → 替换二进制 → 重启新进程 → 上报版本信息。支持差分升级、失败自动回滚、灰度升级（规划书 12.4）。
+规划书 12.4 的原始表述，落地后的实际形态如下（细节与操作见「六、高级运维能力 → 3. 远程升级 Agent」）：
+
+- **触发**：由操作者在 Web「运维操作」或 `POST /api/upgrade` 下发，**不是** Agent 自己探测新版本；
+  灰度就是"只对选中的一批主机下发"，天然支持。
+- **校验**：升级包必须是 https 来源，且同时通过 SHA-256 摘要与 Ed25519 签名
+  （签名覆盖"目标版本号 + 包内容"）；Agent 侧没有跳过验签的开关。
+- **落地**：一次性读入内存 → 校验 → 0600 临时文件落盘并复核摘要 → 备份旧二进制 →
+  替换 → 以分离进程重新拉起 → 旧进程退出；替换失败会回滚备份。
+- **不支持**：差分升级（未实现，走整包替换）。

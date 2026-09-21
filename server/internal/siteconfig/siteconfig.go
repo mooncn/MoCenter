@@ -51,7 +51,7 @@ type Field struct {
 var FieldCatalog = []Field{
 	{Key: "remark", Label: "备注名", Group: "主机", Default: true, Description: "运维填写的主机备注"},
 	{Key: "hostname", Label: "主机名", Group: "主机", Default: false, Sensitive: true, Description: "可能包含内网命名规范/业务信息"},
-	{Key: "node_id", Label: "节点编号", Group: "主机", Default: true, Description: "随机节点标识（n-xxxxxxxx），与 agent_id 无对应关系"},
+	{Key: "node_id", Label: "节点编号", Group: "主机", Default: true, Description: "部署私钥派生的节点标识（n-+16 位 hex），单向不可反推 agent_id；换密钥（删 <data>/node.key 重启）即整体变更"},
 	{Key: "online", Label: "在线状态", Group: "主机", Default: true, Description: "在线 / 离线"},
 	{Key: "last_seen", Label: "最后在线时间", Group: "主机", Default: true, Description: "最近一次心跳时间"},
 	{Key: "uptime", Label: "运行时长", Group: "主机", Default: true, Description: "系统已运行时长"},
@@ -142,9 +142,11 @@ type Config struct {
 	SiteTitle string `json:"site_title"`
 	// SiteFooter 页脚自定义内容，**支持 HTML**（如版权、备案号、备案链接）。
 	//
-	// 安全边界：该字段由**已登录运维**在后台配置，属于受信内容（与"未登录访客
-	// 可控的输入"不同），因此允许 HTML 并按原样渲染；渲染入口只有页脚一处，
-	// 且不会把它当模板引擎执行（见 Frontend 的 PublicStatus/SiteConfig 实现）。
+	// 安全边界：写这段的人可信，但写进来的内容不可信。它在后台与公开页都按 HTML
+	// 渲染，读者里既有匿名访客也有其他运维的会话 —— 一次误粘贴或一个被拿下的账号，
+	// 载荷就正好投递到权限更高的一批读者身上。服务端按原样存（保留备案链接这类
+	// 正常用法），**执行净化的是前端白名单重建**（web/src/utils/siteBranding.js 的
+	// sanitizeFooterHTML），另有整站 CSP 禁内联脚本兜底。
 	// 留空回退 DefaultSiteFooter()。
 	SiteFooter string `json:"site_footer"`
 

@@ -307,7 +307,7 @@ export default function SiteConfig() {
       <div className="card">
         <h3>安全说明</h3>
         <ul className="public-tips">
-          <li>公开接口从来不返回主机标识：节点对外只有派生编号（<code>n-xxxxxxxx</code>），无法反推 <code>agent_id</code>、硬件 UUID 与内网地址。</li>
+          <li>公开接口从来不返回主机标识：节点对外只有用本机部署私钥派生的编号（<code>n-</code> + 16 位十六进制），无法反推 <code>agent_id</code>、硬件 UUID 与内网地址，外部也无法靠猜主机名离线算出有效编号。</li>
           <li>网络统计只下发**速率**与**按口径裁剪后的累计量**；网卡累计原始计数器不出现在公开响应中，趋势图的流量由服务端按相邻采样差值计算。</li>
           <li>公网 IP 即使开启也会做部分掩码（<code>203.0.*.*</code>），精确经纬度永不公开。</li>
           <li>公开页的实时推送与查询走独立限流，且总开关关闭时端点直接 404。</li>

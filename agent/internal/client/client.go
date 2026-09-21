@@ -39,14 +39,22 @@ type Config struct {
 	ClientCert string        // mTLS 客户端证书路径
 	ClientKey  string        // mTLS 客户端私钥路径
 	CACert     string        // 校验服务端证书的 CA 证书路径
-	// ProxyIP 国内加速代理前缀（用于公网 IP 探测等境外服务，如 http://fa.mooncn.win/?url= ）
+	// ProxyIP 国内加速代理前缀（用于公网 IP 探测等境外服务，如 http://fa.mooncn.win/?url= ）。
+	// 注意：安装包下载这条链只接受 **https://** 前缀（见 command.httpsProxyOrEmpty），
+	// 因为它的产物会以 SYSTEM 执行；明文代理等于让中间人替换安装器。
 	ProxyIP string
 	// AgentKey 与服务端预共享的注册密钥；为空则无法通过服务端的注册鉴权。
 	AgentKey string
-	// UpgradePubKey 升级包 Ed25519 公钥（hex 或文件路径）。
+	// UpgradePubKey 升级包 Ed25519 公钥（hex 或文件路径）。**必填**：
+	// 没有公钥就无法验签，远程升级一律拒绝（没有"跳过校验"的开关）。
 	UpgradePubKey string
-	// UpgradeAllowUnsigned 显式允许无签名升级（危险，仅迁移期使用）。
-	UpgradeAllowUnsigned bool
+	// FileRoots 允许服务端下发读写的本地目录（文件分发/文件下载）。
+	// 留空则由 New 落到默认沙箱 <配置目录>/files。
+	FileRoots []string
+	// AllowPublicDownload 解锁「从公网取安装包」（winget / choco / 厂商直连 / https 代理）。
+	// 默认关闭：安装包只从服务端托管目录经长连接下发，除非本机显式解锁。
+	// 该开关**只从本机配置文件读**，服务端指令无法打开它。
+	AllowPublicDownload bool
 	// LatencyTargets 延迟探测目标（ICMP/TCP/HTTP）。
 	LatencyTargets []string
 	// ServerFingerprint 服务端身份公钥指纹（可带分隔符）。配置后按指纹校验服务端，
@@ -94,6 +102,9 @@ func New(cfg Config) *Client {
 	}
 	if cfg.ProbeEvery <= 0 {
 		cfg.ProbeEvery = 10 * time.Second
+	}
+	if len(cfg.FileRoots) == 0 {
+		cfg.FileRoots = []string{DefaultFileRoot(cfg.ConfigPath)}
 	}
 	c := &Client{
 		cfg:         cfg,
@@ -275,7 +286,7 @@ func (c *Client) handleEnrollRequired(env protocol.Envelope) error {
 		old := firstNonEmptyStr(firstOf(pinned), firstOf(known))
 		return fmt.Errorf("服务端不认可本机现有客户端证书%s：%s。本机记下的身份是 %s，"+
 			"为避免把注册密钥交给陌生对端，不会自动重换 —— 确认无误后请把上面的服务端指纹填进配置 "+
-			"server_fingerprint（或删除本机 %s 目录后重启）",
+			"server_fingerprint（或删除本机 %s 里的 client.crt 与 ca.crt、保留 client.key 后重启）",
 			where, req.Reason, DisplayFingerprint(old), c.credDir())
 	}
 	log.Printf("[agent] 服务端不认可本机证书%s；已授权，自动丢弃旧证书并重新换取", where)
@@ -461,10 +472,13 @@ func (c *Client) canTrustNewCA() bool {
 	return len(pinned) > 0
 }
 
-// discardServerIssuedCreds 删除本机由服务端签发的凭据（client.crt/client.key/ca.crt）。
+// discardServerIssuedCreds 删除本机由服务端签发的证书与旧 CA（client.crt/ca.crt）。
+//
+// client.key **保留**：服务端按 agent_id → 公钥指纹做 TOFU 绑定，丢掉私钥就等于自造一次
+// "换机器身份"，重签时会被自己的绑定挡住（只能靠重新签发一次性令牌恢复）。
 func (c *Client) discardServerIssuedCreds() error {
 	dir := c.credDir()
-	for _, name := range []string{"client.crt", "client.key", "ca.crt"} {
+	for _, name := range []string{"client.crt", "ca.crt"} {
 		p := filepath.Join(dir, name)
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			return err
@@ -694,8 +708,7 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 			return
 		}
 		go upgrade.Perform(&up, upgrade.Policy{
-			PubKey:        c.cfg.UpgradePubKey,
-			AllowUnsigned: c.cfg.UpgradeAllowUnsigned,
+			PubKey: c.cfg.UpgradePubKey,
 		}, func(resp *protocol.UpgradeResp) {
 			_ = c.write(protocol.TypeUpgradeResp, resp)
 		})
@@ -818,12 +831,14 @@ func (c *Client) closeSession(req protocol.InteractiveCloseReq) {
 
 // handleVncInstall 处理 VNC 安装/启动指令并回传结果。
 func (c *Client) handleVncInstall(req protocol.VncInstallReq) {
-	// 默认：若配置了公网 IP 探测代理，则同样用于 VNC 安装包的国内加速。
-	// FetchPackage 让安装包优先从服务端拉取（走既有长连接，避开公网限速与劫持），
-	// 服务端未托管时自动回退到 winget/choco/公网下载。
+	// 取包默认只走服务端托管（既有长连接，已 mutual-TLS，避开公网限速与劫持）；
+	// 公网取包（winget/choco/厂商直连/加速代理）要本机配置显式解锁，服务端指令改不了这个开关。
+	// 无论哪条路，执行/解压前都按内置 SHA-256 钉扎校验（见 command.installPins）。
+	// 若配置了 https 的公网 IP 探测代理，安装包下载也复用它（仅限 https，明文代理会被忽略）。
 	resp := command.VncInstallCfg(req.Port, command.VncConfig{
-		Proxy: c.cfg.ProxyIP,
-		Mode:  req.Mode,
+		Proxy:               c.cfg.ProxyIP,
+		Mode:                req.Mode,
+		AllowPublicDownload: c.cfg.AllowPublicDownload,
 		FetchPackage: func(name string) (string, error) {
 			dest := filepath.Join(os.TempDir(), name)
 			if _, err := c.fetchPackage(name, dest); err != nil {
@@ -847,6 +862,17 @@ func (c *Client) handleFilePush(req protocol.FilePushReq) {
 			Ack: ok, Status: status, Message: msg,
 		})
 	}
+	// 路径闸门：越界的指令在碰文件系统之前就被拒掉，并把原因回给操作者
+	//（不静默丢弃 —— 静默丢弃的表现是"传输一直卡在进行中"，最难排查）。
+	// 归一后的绝对路径同时充当 pushFiles 的键，避免同一路径的两种写法
+	// 各开一个句柄互相截断。
+	path, gerr := c.guardPath(req.FilePath)
+	if gerr != nil {
+		log.Printf("[agent] 拒绝文件分发 %q: %v", req.FilePath, gerr)
+		ack(false, "rejected", gerr.Error())
+		return
+	}
+	req.FilePath = path
 	// 分发失败通知
 	if req.FileSize < 0 {
 		ack(false, "failed", "服务端取消分发")
@@ -914,7 +940,16 @@ func (c *Client) pushClose(filePath string) {
 // sendFileChunks 将本地文件分片回传给服务端（文件下载）。
 func (c *Client) sendFileChunks(req protocol.FileDownloadReq) {
 	log.Printf("[agent] 收到文件下载请求: %s", req.FilePath)
-	f, err := os.Open(req.FilePath)
+	path, gerr := c.guardPath(req.FilePath)
+	if gerr != nil {
+		// 与读失败走同一条上报：否则服务端会一直等到超时
+		log.Printf("[agent] 拒绝文件下载 %q: %v", req.FilePath, gerr)
+		_ = c.write(protocol.TypeFileUploadReq, protocol.FileUploadReq{
+			AgentID: c.cfg.AgentID, FilePath: req.FilePath, FileSize: -1,
+		})
+		return
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		// 上报失败
 		_ = c.write(protocol.TypeFileUploadReq, protocol.FileUploadReq{

@@ -1,13 +1,13 @@
 module mocenter/server
 
-go 1.24.0
+go 1.26.6
 
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/maxmind/mmdbwriter v1.0.0
 	github.com/oschwald/maxminddb-golang v1.13.1
-	golang.org/x/crypto v0.31.0
-	golang.org/x/sys v0.28.0
+	golang.org/x/crypto v0.56.0
+	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.34.5
 )
 

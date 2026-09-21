@@ -65,6 +65,12 @@ type fileSpec struct {
 	Required bool
 	// Sensitive 是否含凭据（manifest 里标注，恢复时给出提醒）。
 	Sensitive bool
+	// ExplicitOnly 凭据类文件：只有调用方显式要求时才打包。
+	//
+	// 备份接口对任何已登录会话可达，且下载下来的 zip 会被拷来拷去（工单、网盘、
+	// 别的机器）。把"全网身份根"放进这种默认流转的产物里，等于让日常备份变成
+	// 一条稳定的凭据外泄通道（M-1）。因此它必须是一次带审计的显式选择。
+	ExplicitOnly bool
 }
 
 // backupFiles 备份文件白名单。
@@ -77,7 +83,7 @@ var backupFiles = []fileSpec{
 	{Name: "users.json", Label: "账号与口令哈希、OTP 密钥", Sensitive: true},
 	{Name: "remarks.json", Label: "主机备注"},
 	{Name: "public-site.json", Label: "公开展示配置"},
-	{Name: "agent.key", Label: "Agent 注册预共享密钥", Sensitive: true},
+	{Name: "agent.key", Label: "Agent 注册预共享密钥（默认不打包）", Sensitive: true, ExplicitOnly: true},
 }
 
 // Entry manifest 中的一个文件条目。
@@ -118,11 +124,23 @@ type Result struct {
 	Duration string   `json:"duration"`
 }
 
-// Create 把数据目录备份为 destPath 指向的 zip 文件。
+// CreateOptions 备份行为的可选项。
+type CreateOptions struct {
+	// IncludeSecrets 连 ExplicitOnly 类凭据文件（目前是 agent.key）一起打包。
+	// 默认 false：日常备份不该顺手带走全网身份根。
+	IncludeSecrets bool
+}
+
+// Create 把数据目录备份为 destPath 指向的 zip 文件（默认不含需显式要求的凭据）。
+func Create(dataDir, destPath, appVersion string) (*Result, error) {
+	return CreateWithOptions(dataDir, destPath, appVersion, CreateOptions{})
+}
+
+// CreateWithOptions 按 opts 生成备份包。
 //
 // appVersion 写入 manifest（由调用方从 internal/version 传入，
 // 避免本包反向依赖版本包）。
-func Create(dataDir, destPath, appVersion string) (*Result, error) {
+func CreateWithOptions(dataDir, destPath, appVersion string, opts CreateOptions) (*Result, error) {
 	start := time.Now()
 	if strings.TrimSpace(dataDir) == "" {
 		return nil, fmt.Errorf("数据目录为空")
@@ -170,6 +188,10 @@ func Create(dataDir, destPath, appVersion string) (*Result, error) {
 	defer cleanup()
 
 	for _, spec := range backupFiles {
+		if spec.ExplicitOnly && !opts.IncludeSecrets {
+			manifest.Skipped = append(manifest.Skipped, spec.Name+"（凭据文件，需显式要求才打包）")
+			continue
+		}
 		srcPath := filepath.Join(dataDir, spec.Name)
 		if spec.Name == "mocenter.db" && sqliteTmp != "" {
 			srcPath = sqliteTmp

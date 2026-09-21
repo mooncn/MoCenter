@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "check:vnc": "node scripts/check-vnc-pointer.mjs",
     "check:flag": "node scripts/check-flag-sprite.mjs",
+    "check:footer": "node scripts/check-footer-sanitize.mjs",
     "gen:flag": "node scripts/gen-flag-sprite.mjs"
   },
   "dependencies": {

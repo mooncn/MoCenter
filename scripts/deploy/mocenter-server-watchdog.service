@@ -1,0 +1,14 @@
+# MoCenter Server 保活巡检（oneshot）—— 由 mocenter-server-watchdog.timer 每 5 分钟触发。
+# 与 install-linux.sh 生成的 cron 版共用同一个巡检脚本，逻辑只有一份。
+#
+# 为什么单独一份而不是复用 agent 的模板：巡检脚本的角色是**写死在 ExecStart 里**的，
+# 复用会让"名字叫 server 的单元在看护 agent"—— server 本身反而没有任何保活。
+[Unit]
+Description=MoCenter Server 保活巡检（进程不在则拉起）
+After=mocenter-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mocenter-keepalive server
+# 巡检本身很轻，失败不影响 systemd 服务本体
+SuccessExitStatus=0 1

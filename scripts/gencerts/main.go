@@ -220,7 +220,13 @@ func saveConfig(path string, m map[string]any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	// 配置里有 agent_key 与服务端令牌，必须是 0600。
+	// 单独 Chmod 不可省：os.WriteFile 的 mode 只在新建时生效，
+	// 覆盖一份历史遗留的 0644 配置会把它原样留在原地。
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }
 
 func genCA(dir string) {

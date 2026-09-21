@@ -1,6 +1,6 @@
 module mocenter/agent
 
-go 1.25.0
+go 1.26.6
 
 require github.com/creack/pty v1.1.21
 

@@ -9,7 +9,7 @@ import SiteFooter, { useSiteTitle } from '../components/SiteFooter.jsx'
 // 数据来源与安全边界：
 //   - 只调用 /api/public/*，响应由服务端 publicview 脱敏后生成，
 //     未开启的字段在 JSON 里"根本不存在"，因此这里无需（也不能）自行判断脱敏。
-//   - 节点标识是服务端派生的 node_id（n-xxxxxxxx），前端拿不到 agent_id。
+//   - 节点标识是服务端用部署私钥派生的 node_id（n- + 16 位 hex），前端拿不到 agent_id。
 //   - 总开关关闭时接口返回 404，本页显示"未开放"，不做任何兜底猜测。
 export default function PublicStatus() {
   // snapshot 是一次完整的展示快照：config + fields + nodes + summary。

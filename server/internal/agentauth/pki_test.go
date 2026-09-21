@@ -4,6 +4,7 @@ import (
 	"crypto/x509"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -20,12 +21,12 @@ func TestIdentityPersistAndReload(t *testing.T) {
 	if len(fp) != 16 {
 		t.Fatalf("指纹长度应为 16，得到 %d (%q)", len(fp), fp)
 	}
-	// 私钥权限必须收紧
 	fi, err := os.Stat(filepath.Join(dir, CAKeyFileName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0600 {
+	// 私钥权限须收紧；NTFS 不看 mode 位（收紧靠 ACL，见 H-9），故只在类 Unix 上断言。
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0600 {
 		t.Fatalf("CA 私钥权限应为 0600，得到 %v", fi.Mode().Perm())
 	}
 	// 再次加载应复用同一 CA（指纹不变），否则所有 Agent 的 pin 会失效

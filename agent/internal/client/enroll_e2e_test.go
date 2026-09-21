@@ -290,6 +290,10 @@ func TestRecoverFromRotatedCA(t *testing.T) {
 	if fp := c.credCAFingerprint(); fp != srvA.caFP {
 		t.Fatalf("creds/ca.crt 应是 CA-A 的指纹: %s != %s", fp, srvA.caFP)
 	}
+	keyAfterFirst := readFileOrEmpty(dir, "client.key")
+	if keyAfterFirst == "" {
+		t.Fatal("首次换取后应落下客户端私钥")
+	}
 
 	// --- 步骤 2：服务端换 CA（CA-B），Agent 手上仍是 CA-A 签发的证书 ---
 	srvB := newFakeServer(t)
@@ -317,6 +321,11 @@ func TestRecoverFromRotatedCA(t *testing.T) {
 	// 本机凭据应已换成 CA-B 的一套
 	if fp := c.credCAFingerprint(); fp != srvB.caFP {
 		t.Fatalf("恢复后 creds/ca.crt 应为 CA-B: %s != %s", fp, srvB.caFP)
+	}
+	// 私钥必须复用：服务端按 agent_id→公钥指纹做 TOFU 绑定，重签换新钥就等于
+	// "换了台机器"，共享密钥路径会被自己的绑定挡死，现网自动恢复随之失效。
+	if got := readFileOrEmpty(dir, "client.key"); got != keyAfterFirst {
+		t.Fatal("重新换取必须复用本机私钥，否则公钥指纹变化会被服务端 TOFU 拒发")
 	}
 }
 

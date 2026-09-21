@@ -9,7 +9,7 @@
 #
 # 用法:
 #   sudo bash scripts/deploy/install-linux.sh --role=agent  --bin=./mocenter-agent --server=host:9000
-#   sudo bash scripts/deploy/install-linux.sh --role=server --bin=./mocenter-server --user=admin --password=***
+#   sudo bash scripts/deploy/install-linux.sh --role=server --bin=./mocenter-server --user=admin --password-file=/root/pw.txt
 #   sudo bash scripts/deploy/install-linux.sh --role=all    --bin-dir=./dist
 #   sudo bash scripts/deploy/install-linux.sh --role=agent status
 #   sudo bash scripts/deploy/install-linux.sh --role=agent uninstall
@@ -24,10 +24,14 @@
 #   --server=host:port          Agent 要连接的服务端地址（默认 your.server.com:9000）
 #   --agentid=名称              Agent 标识（留空回退为设备 UUID/主机名）
 #   --proxy-ip=前缀             国内加速代理前缀（可选）
-#   --user= / --password=       Server 后台登录账号
-#                               ⚠️ 口令**不写入服务单元**：本脚本会把它落成 0600 的
-#                                  /etc/mocenter/initial-password，服务单元只引用该文件。
-#                                  未提供时自动生成 16 位随机强口令并打印一次。
+#   --user=名称               Server 后台登录账号（默认 admin）
+#   --password-file=路径      Server 初始口令取自该文件（建议 0600，装完可删）
+#   --password                从**标准输入**读一行口令：printf '%s' "$pw" | ... --password
+#                             ⚠️ 不提供 --password=*** 写法：命令行参数对任意本地
+#                             用户可见（ps -ef），还会落进 shell 历史。
+#                             两者都不给时自动生成 16 位随机强口令并打印一次。
+#                             无论哪种来源，最终都落成 0600 的
+#                             /etc/mocenter/initial-password，服务单元只引用该文件。
 #   --listen= / --http=         Server 监听地址（默认 :9000 / :8080）
 #   --web-dir=路径              Server 托管的 Web 静态资源目录
 #   --force-config              覆盖已存在的配置文件（默认保留现场修改）
@@ -39,7 +43,7 @@
 #   检测到配置文件已存在即视为「已安装」，按**升级**处理：
 #      · 只替换二进制、服务单元与保活任务；
 #      · 服务端地址、注册密钥、账号、数据目录**原样保留**；
-#      · 因此升级时不必重复提供 --server / --user / --password。
+#      · 因此升级时不必重复提供 --server / --user / --password-file。
 #   要推倒重来必须显式加 --force（会删除既有配置后重新生成）。
 #
 # 保活自启策略（自动选择）:
@@ -64,6 +68,8 @@ S_USER="${MOCENTER_USER:-admin}"
 # 默认**不再是 change-me**：固定默认口令写在脚本里等于公开口令，
 # "忘了改"就是一次现成的入侵路径。留空 = 安装时生成随机强口令。
 S_PASS="${MOCENTER_PASSWORD:-}"
+S_PASS_FILE=""
+READ_PASS_STDIN=0
 S_LISTEN="${MOCENTER_LISTEN:-:9000}"
 S_HTTP="${MOCENTER_HTTP:-:8080}"
 S_WEB_DIR="${MOCENTER_WEB_DIR:-/usr/share/mocenter/web}"
@@ -84,7 +90,14 @@ die() { printf '** %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*"; }
 ok() { printf '✓ %s\n' "$*"; }
 
-usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
+# usage：打印文件头那段注释（两条 `# ====` 分隔线之间的内容）。
+# 不写死行号：加一行说明就让 --help 少一截，是这类脚本最容易烂掉的地方。
+usage() {
+  awk 'NR==1 { next }
+       /^# ={5,}[[:space:]]*\r?$/ { seen++; if (seen >= 2) exit; next }
+       seen >= 1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+  exit 0
+}
 
 # ---------------------------------------------------------------- 解析参数
 while [ $# -gt 0 ]; do
@@ -103,8 +116,12 @@ while [ $# -gt 0 ]; do
     --proxy-ip)    shift; PROXY_IP="${1:-}" ;;
     --user=*)      S_USER="${1#*=}" ;;
     --user)        shift; S_USER="${1:-}" ;;
-    --password=*)  S_PASS="${1#*=}" ;;
-    --password)    shift; S_PASS="${1:-}" ;;
+    --password-file=*) S_PASS_FILE="${1#*=}" ;;
+    --password-file)   shift; S_PASS_FILE="${1:-}" ;;
+    # 只接受"从 stdin 读"这一种交互形态；=value 形式一律拒绝（见文件头说明）
+    --password)    READ_PASS_STDIN=1 ;;
+    --password=*)  die "--password 不接受命令行取值（会出现在 ps 与 shell 历史里）。
+     改用：--password-file=<路径>，或 printf '%s' \"\$pw\" | $0 --password" ;;
     --listen=*)    S_LISTEN="${1#*=}" ;;
     --listen)      shift; S_LISTEN="${1:-}" ;;
     --http=*)      S_HTTP="${1#*=}" ;;
@@ -194,8 +211,13 @@ install_keepalive() {
 
   if have_systemd; then
     local wd="mocenter-${role}-watchdog"
-    run install -m 0644 "$TPL_DIR/mocenter-agent-watchdog.service" "/etc/systemd/system/${wd}.service"
-    run install -m 0644 "$TPL_DIR/mocenter-agent-watchdog.timer" "/etc/systemd/system/${wd}.timer"
+    # 模板必须按角色取：巡检脚本看护哪个进程写死在单元的 ExecStart 里，
+    # 早先这里恒用 agent 模板，结果是"--role=server 装出来的 watchdog 其实在看护
+    # agent，而 server 自己根本没有保活"。缺模板就直接报错，不要静默装个错的。
+    [ -f "$TPL_DIR/${wd}.service" ] && [ -f "$TPL_DIR/${wd}.timer" ] \
+      || die "缺少保活单元模板：$TPL_DIR/${wd}.{service,timer}"
+    run install -m 0644 "$TPL_DIR/${wd}.service" "/etc/systemd/system/${wd}.service"
+    run install -m 0644 "$TPL_DIR/${wd}.timer" "/etc/systemd/system/${wd}.timer"
     if [ "$DRY_RUN" = 0 ]; then
       systemctl daemon-reload
       systemctl enable --now "${wd}.timer" >/dev/null 2>&1 \
@@ -278,22 +300,40 @@ render_conf() {
 # 于是"口令只告诉了我"这件事并不成立。文件方式下只有 root 能读。
 #
 # 生成策略：
-#   · 用户显式给了 --password：用它；
+#   · 用户显式给了 --password-file / --password(stdin)：用它；
 #   · 没给：生成 16 位随机强口令（避免出现"两边都是默认口令"的部署），
 #     并在安装结束打印一次，提示登录后立即修改。
 #
 # 已存在**任何账号**时服务端会忽略该文件内容，所以重复安装不会把口令重置回去；
 # 但本脚本也不覆盖已存在的口令文件，避免把运维刚改好的口令顶掉。
 write_password_file() {
+  local mode
   if [ -f "$PASS_FILE" ]; then
     info "  保留现有口令文件：$PASS_FILE（如已登录过，该文件可安全删除）"
     return 0
+  fi
+  # 口令在这里汇合成一个值，来源按 --password-file > --password(stdin) > 环境变量 排序，
+  # 都不给时才随机生成。刻意不接受 --password=xxx：那会把口令暴露在 ps 与 shell 历史里。
+  if [ -n "$S_PASS_FILE" ]; then
+    [ -r "$S_PASS_FILE" ] || die "无法读取 --password-file=$S_PASS_FILE"
+    # 只提示不阻断：这份文件是操作者自己准备的，读完就不再需要它
+    mode="$(stat -c '%a' "$S_PASS_FILE" 2>/dev/null || true)"
+    if [ -n "$mode" ] && [ "${mode: -1}" != "0" ]; then
+      info "  !! 口令文件 mode=$mode，其他用户可读；建议 chmod 600 后再继续"
+    fi
+    S_PASS="$(tr -d '\r\n' < "$S_PASS_FILE")"
+    [ -n "$S_PASS" ] || die "--password-file=$S_PASS_FILE 内容为空"
+  elif [ "$READ_PASS_STDIN" = 1 ]; then
+    printf '请输入 Server 初始口令（输入不回显，可用管道传入）: '
+    IFS= read -r -s S_PASS || true
+    printf '\n'
+    [ -n "$S_PASS" ] || die "标准输入未读到口令"
   fi
   local generated=0
   if [ -z "$S_PASS" ]; then
     # tr 只取字母数字，避免生成带 $/`/\ 的口令在后续脚本里被二次解析
     S_PASS="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16 || true)"
-    [ -n "$S_PASS" ] || die "随机口令生成失败，请用 --password= 显式指定"
+    [ -n "$S_PASS" ] || die "随机口令生成失败，请用 --password-file= 显式指定"
     generated=1
   fi
   # umask 兜底：即使 install 的 -m 在某些文件系统上被忽略，也不会短暂变成可读文件
@@ -345,8 +385,8 @@ do_install_role() {
 
   if [ "$upgrading" = 1 ]; then
     info "  保留既有配置：$CONF_DIR/mocenter-${role}.conf（升级不动配置；如需重置加 --force）"
-    if [ "$role" = "server" ] && [ -n "$S_PASS" ]; then
-      info "  提示：升级模式下 --password 不会写入 —— 已存在的账号口令以此前设置为准"
+    if [ "$role" = "server" ] && { [ -n "$S_PASS" ] || [ -n "$S_PASS_FILE" ] || [ "$READ_PASS_STDIN" = 1 ]; }; then
+      info "  提示：升级模式下口令不会写入 —— 已存在的账号口令以此前设置为准"
     fi
   else
     if [ "$FORCE" = 1 ]; then

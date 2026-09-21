@@ -63,7 +63,7 @@ function Layout() {
     Api.agents().then((d) => setAgents(Array.isArray(d) ? d : [])).catch(() => {})
 
     // 站点标题：后台页面同样使用「展示配置」里的标题。
-    // 用免鉴权端点（/api/public/enabled 附带品牌文案）读取 —— 登录页与后台
+    // 用免鉴权的 /api/branding 读取（它与公开页开关无关）—— 登录页与后台
     // 共用一份来源，避免"登录前一个标题、登录后又变回去"。
     PublicApi.branding().then((b) => applySiteTitle(b.site_title)).catch(() => {})
 

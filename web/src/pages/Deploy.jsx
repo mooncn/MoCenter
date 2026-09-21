@@ -14,10 +14,12 @@ import { Api } from '../api/api.js'
 //     失败时运维能直接看到卡在哪一步、原始报错是什么。
 //   - **凭证不落任何地方**：密码/私钥只在本次请求里用，前端不写入 localStorage，
 //     页面上也明确写出这一点。
+//   - **主机密钥要看得见**：服务端按 known_hosts TOFU 校验目标机，结果里回显指纹；
+//     首次信任时显式标黄提示"请核对"，否则这条链就退化成"连上就算对"。
 export default function Deploy() {
   const [form, setForm] = useState({
     host: '', port: 22, user: 'root', password: '', private_key: '',
-    agent_id: '', server_addr: '', binary: '', latency: '',
+    agent_id: '', server_addr: '', binary: '', latency: '', host_key_fingerprint: '',
   })
   const [authMode, setAuthMode] = useState('password')
   const [packages, setPackages] = useState([])
@@ -45,6 +47,7 @@ export default function Deploy() {
         agent_id: form.agent_id.trim(),
         server_addr: form.server_addr.trim(),
         binary: form.binary,
+        host_key_fingerprint: form.host_key_fingerprint.trim(),
         probe_only: probeOnly,
         latency_targets: form.latency.split('\n').map((s) => s.trim()).filter(Boolean),
       }
@@ -69,7 +72,8 @@ export default function Deploy() {
         <p className="cell-sub">
           通过 SSH 登录目标 Linux 主机，上传 Agent、写入配置并注册为系统服务。
           需要目标机可 SSH 登录且具备 root 权限（或免密 sudo）。
-          凭证仅用于本次操作，不写入任何存储与日志。
+          凭证仅用于本次操作，不写入任何存储与日志；目标机的主机密钥会记入服务端数据目录的
+          {' '}<code>ssh_known_hosts</code>（首次接触记录，之后变更即拒绝）。
         </p>
         {msg && <div className={`lat-msg ${msg.type}`}>{msg.text}</div>}
 
@@ -115,6 +119,15 @@ export default function Deploy() {
             <input value={form.server_addr} onChange={set('server_addr')} placeholder="1.2.3.4:9000" />
           </label>
           <label className="span2">
+            主机密钥指纹（可选，形如 SHA256:xxx…）
+            <input value={form.host_key_fingerprint} onChange={set('host_key_fingerprint')}
+              placeholder="留空则首次连接自动记录，之后再变更会被拒绝" autoComplete="off" />
+            <span className="cell-sub">
+              填写后即强制钉扎：目标机的密钥与这里不一致就中止部署，不会自动放行。
+              新机器建议先用「测试连接」拿到指纹，核对后再填入。
+            </span>
+          </label>
+          <label className="span2">
             安装包（留空按目标架构自动选择）
             <select value={form.binary} onChange={set('binary')}>
               <option value="">自动选择</option>
@@ -158,6 +171,24 @@ export default function Deploy() {
             <div className="public-fact"><span className="k">root</span><span className="v">{result.target.is_root ? '是' : `否（sudo: ${result.target.sudo_ok ? '可用' : '不可用'}）`}</span></div>
             <div className="public-fact"><span className="k">systemd</span><span className="v">{result.target.has_systemd ? '可用' : '不可用（将用进程守护方式）'}</span></div>
           </div>
+        </div>
+      )}
+
+      {result?.host_key && (
+        <div className="card">
+          <h3>主机密钥</h3>
+          <div className="public-facts">
+            <div className="public-fact"><span className="k">指纹</span><span className="v">{result.host_key}</span></div>
+            <div className="public-fact"><span className="k">信任来源</span>
+              <span className="v">{result.host_key_new_trust ? '本次首次记录' : '与已知记录一致'}</span></div>
+          </div>
+          {result.host_key_new_trust && (
+            <div className="lat-msg warn">
+              这是服务端第一次连接该地址，密钥已被自动记录。请到目标机上执行
+              {' '}<code>ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub</code> 比对指纹；
+              若此处指纹是攻击者提供的，后续部署都会信任它。
+            </div>
+          )}
         </div>
       )}
 

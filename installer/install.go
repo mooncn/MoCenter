@@ -3,8 +3,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -142,7 +140,16 @@ func installRole(m *mgr.Mgr, o options, role string) error {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return fmt.Errorf("创建数据目录失败: %w", err)
 	}
-	// Server 角色：创建后台登录账号（用户名+密码，密码只存 SHA-256 摘要）。
+	// 0755 在 Windows 上不产生任何 ACL：目录只会继承 %ProgramData% 的默认 ACE，
+	// 而那里 BUILTIN\Users 是可读。配置、users.json、数据库、客户端私钥全在这个
+	// 目录下，所以先把目录本身收成「仅管理员+SYSTEM+当前用户」并让它向后新建的
+	// 子项继承，再往里写文件（H-9）。失败只告警：文件已写成功，回滚更糟。
+	if err := hardenCredentialPath(dataDir, true); err != nil {
+		fmt.Printf("  警告: %v\n", err)
+	} else if err := hardenTree(dataDir); err != nil {
+		fmt.Printf("  警告: %v\n", err)
+	}
+	// Server 角色：创建后台登录账号（用户名+密码，密码只存 PBKDF2 摘要）。
 	// 升级或已有账号时保持不动，避免覆盖用户后来改过的密码。
 	if role == "server" && !upgrade {
 		// 口令优先从文件读。
@@ -180,6 +187,7 @@ func installRole(m *mgr.Mgr, o options, role string) error {
 	if err := writeConfig(role, confPath, o); err != nil {
 		return err
 	}
+	hardenQuiet(confPath)
 	fmt.Printf("  [2/5] 已写入配置 %s\n", confPath)
 
 	// 4) 注册服务。命令行只带 -config（Server 另带 -data），
@@ -214,8 +222,9 @@ func installRole(m *mgr.Mgr, o options, role string) error {
 	//    服务能跑时它们是空转的安全网；服务不可用（容器/策略禁服务）时，
 	//    它们就是唯一的自启与防杀通道。失败只告警，不影响安装成功。
 	if err := installKeepAlive(role, exePath, confPath); err != nil {
-		fmt.Printf("  [保活] 警告: 注册计划任务失败（不影响服务本身）: %v\n", err)
-		fmt.Printf("         进程被结束后需手工重启；可重跑安装或改用计划任务方式部署\n")
+		fmt.Printf("  [保活] 警告: 未注册计划任务: %v\n", err)
+		fmt.Printf("         服务本身不受影响，但进程被结束后不会再自动拉起。\n")
+		fmt.Printf("         把二进制装到仅管理员可写的目录（默认 %s）后重跑安装即可启用保活。\n", `C:\Program Files\MoCenter`)
 	} else {
 		watchdog, boot := keepAliveTasks(role)
 		fmt.Printf("  [保活] 已注册计划任务：开机自启（%s）+ 每 5 分钟巡检（%s）\n", boot, watchdog)
@@ -290,8 +299,22 @@ func writeConfig(role, path string, o options) error {
 	if err != nil {
 		return err
 	}
-	// 配置里有注册密钥，权限收紧
+	// 配置里有注册密钥，权限收紧。
+	// 注意 0600 只对 Unix 有意义：Windows 上必须显式设 DACL，否则继承父目录宽授权
+	// （既有安装的旧文件带着继承来的 ACE，只对目录设 DACL 不会追溯改它，
+	//  所以调用方写完后还要补一次 hardenCredentialPath）。
 	return os.WriteFile(path, b, 0600)
+}
+
+// hardenQuiet 收紧文件 DACL，失败只打印告警。
+//
+// 为什么不把它变成硬错误：DACL 设不上（卷未启用 ACL、网络共享、被安全软件拦下）
+// 时文件已经写成功了，让整次安装因此失败回滚比带着告警装完更糟 —— 但绝不静默，
+// 因为「凭据可被普通用户读到」正是这里要防的事。
+func hardenQuiet(path string) {
+	if err := hardenCredentialPath(path, false); err != nil {
+		fmt.Printf("  警告: %v\n", err)
+	}
 }
 
 // ensureServerAccount 在数据目录下创建/补全后台登录账号（users.json）。
@@ -301,9 +324,11 @@ func writeConfig(role, path string, o options) error {
 // 随后以摘要持久化到 users.json；-password-file 是推荐写法，避免口令进命令行）。
 // 因此这里直接写 users.json。
 //
-// 摘要算法：这里仍写**单轮 SHA-256**（三个 module 相互独立、不做包引用，属既有取舍）。
-// 服务端 auth.verifyPassword 兼容该旧格式：首次用它登录成功后会**透明升级**为
-// PBKDF2-HMAC-SHA256，因此兼容性没有问题；users.json 的 {"users":{...}} 结构必须一致。
+// 摘要算法：写 PBKDF2-HMAC-SHA256（pbkdf2$sha256$120000$<盐>$<密钥>），与服务端
+// auth 包逐参数一致（见 password.go 的说明与两侧的成对已知答案测试）。
+// 历史版本这里写的是单轮无盐 SHA-256；服务端仍兼容该格式并在首次登录成功后透明升级，
+// 因此老安装不会被锁在门外，但这里会在检测到弱摘要时显式提醒（不等登录才暴露）。
+// users.json 的 {"users":{...}} 结构必须与服务端保持一致。
 //
 // ⚠️ 已存在账号时**不做任何改动**：重装/升级不能用安装时输入的密码覆盖用户后来
 // 自己修改过的密码。
@@ -317,19 +342,30 @@ func ensureServerAccount(dataDir, username, password string) (created bool, err 
 	// 已有账号：原样保留
 	if b, rerr := os.ReadFile(path); rerr == nil {
 		var cur struct {
-			Users map[string]any `json:"users"`
+			Users map[string]struct {
+				PasswordHash string `json:"password_hash"`
+			} `json:"users"`
 		}
 		if json.Unmarshal(b, &cur) == nil && len(cur.Users) > 0 {
+			for name, u := range cur.Users {
+				if looksLikeWeakHash(u.PasswordHash) {
+					fmt.Printf("  提示: 账号 %s 的口令仍是旧版单轮 SHA-256 摘要，下次登录成功后会自动升级为 PBKDF2\n", name)
+				}
+			}
+			hardenQuiet(path) // 老安装留下的文件继承过宽授权，顺手补紧
 			return false, nil
 		}
 	}
 
-	sum := sha256.Sum256([]byte(password))
+	hash, err := hashServerPassword(password)
+	if err != nil {
+		return false, err
+	}
 	doc := map[string]any{
 		"users": map[string]any{
 			username: map[string]any{
 				"username":      username,
-				"password_hash": hex.EncodeToString(sum[:]),
+				"password_hash": hash,
 			},
 		},
 	}
@@ -340,6 +376,7 @@ func ensureServerAccount(dataDir, username, password string) (created bool, err 
 	if err := os.WriteFile(path, b, 0600); err != nil {
 		return false, fmt.Errorf("写入账号文件失败: %w", err)
 	}
+	hardenQuiet(path)
 	return true, nil
 }
 

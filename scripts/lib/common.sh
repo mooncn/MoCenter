@@ -149,7 +149,7 @@ mc_platform_archs_filtered() {
 
 # ---------- 依赖检查 ----------
 mc_require_go() {
-  command -v go >/dev/null 2>&1 || die "未找到 go。请安装 Go 1.25+（server/agent go.mod 要求），或把它加入 PATH 后重试。"
+  command -v go >/dev/null 2>&1 || die "未找到 go。请安装 Go 1.26.6+（三个模块的 go.mod 均以此为准），或把它加入 PATH 后重试。"
 }
 mc_have_npm() { command -v npm >/dev/null 2>&1; }
 

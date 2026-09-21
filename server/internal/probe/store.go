@@ -199,6 +199,38 @@ func (s *Store) DeviceKey(agentID string) string {
 	return ""
 }
 
+// ResolveUUID 按 TOFU 口径裁决一次「设备身份（UUID）声明」，返回服务端信任的
+// UUID，以及本次声明是否与既有绑定冲突。
+//
+// uuid 永远是 Agent 自报字段：一条通过注册鉴权的连接可以填任意机器码。若照单
+// 全收（旧行为），它就能①用别人的 UUID 顶掉那台机器的在线会话，②把别人的设备
+// 记录（历史指标、备注）并进自己这条连接上报的信息里。UpdateProbe 早已按
+// 「只在缺失时补齐」把住这条口，注册路径漏了同样的闸门。
+//
+// 规则：该 agent_id 尚未绑定 UUID 时采纳本次声明（首次上报即钉死）；已绑定时
+// 一律以绑定值为准，冲突的自报值作废并由调用方留痕。
+// 影响面：同一台机器改了 agent_id 重连仍照常工作（新 ID 没有绑定，采纳其真实
+// UUID）；只有「换过硬件导致 UUID 变了、但沿用旧 agent_id」需要运维删除该主机
+// 记录后重新上线。
+func (s *Store) ResolveUUID(agentID, claimed string) (trusted string, conflict bool) {
+	claimed = normalizeUUID(claimed)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	bound := ""
+	if k, ok := s.byAgent[agentID]; ok {
+		if a := s.devices[k]; a != nil {
+			bound = a.UUID
+		}
+	}
+	if bound == "" || claimed == "" || bound == claimed {
+		if claimed != "" {
+			return claimed, false
+		}
+		return bound, false
+	}
+	return bound, true
+}
+
 // UpsertAgent 注册/更新 Agent 基础信息。
 //
 // 关键行为：若本次上报的 UUID 已对应一台已知设备，则把该设备「重命名」为新
@@ -691,8 +723,23 @@ func (s *Store) GetByUUID(uuid string) *protocol.AgentInfo {
 	return a
 }
 
-// All 返回全部 Agent（含离线）。
+// All 返回全部 Agent（含离线），并对未命中缓存的公网 IP 触发后台 GeoIP 解析。
 func (s *Store) All() []*protocol.AgentInfo {
+	return s.snapshot(true)
+}
+
+// AllCached 与 All 返回同一份快照，但**绝不触发外呼 GeoIP 解析**（只读缓存，
+// 未命中就留空）。
+//
+// 匿名入口必须走它（M-13）：访客量与免费地理接口的额度之间原本没有任何闸门，
+// 一组无节流的公开页请求就能把 `-proxy-ip` 的配额打空，顺带在服务端堆协程。
+// "由访客把缓存暖起来"不是需要的功能 —— 缓存由后台仪表盘的正常推送路径负责填，
+// 而它对地域的展示需求与访客是同一批主机。
+func (s *Store) AllCached() []*protocol.AgentInfo {
+	return s.snapshot(false)
+}
+
+func (s *Store) snapshot(lookupGeo bool) []*protocol.AgentInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*protocol.AgentInfo, 0, len(s.devices))
@@ -714,7 +761,7 @@ func (s *Store) All() []*protocol.AgentInfo {
 		if s.geoResolver != nil && ip != "" {
 			resolver, notify := s.geoResolver, s.geoNotify
 			clone.Geo = resolver.LookupCached(ip)
-			if clone.Geo == nil {
+			if clone.Geo == nil && lookupGeo {
 				s.wg.Add(1)
 				go func() {
 					defer s.wg.Done()

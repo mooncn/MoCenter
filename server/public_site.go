@@ -6,7 +6,8 @@
 // 安全模型（本文件是唯一的对外暴露面，改动必须保持以下不变量）：
 //
 //  1. 公共端点只输出 internal/publicview 的脱敏结构，绝不返回 protocol.AgentInfo；
-//  2. 公共端点的主机标识是派生节点编号 n-xxxxxxxx，agent_id / uuid / 内网地址永不出网；
+//  2. 公共端点的主机标识是用部署私钥派生的节点编号 n-xxxxxxxxxxxxxxxx（见 publicview.NodeKeys），
+//     agent_id / uuid / 内网地址永不出网，编号也无法离线穷举命中；
 //  3. 所有公共端点都先检查总开关，关闭时一律 404 —— 未启用时公开页面对外**不存在**；
 //  4. 公共端点走独立的、更严的限流（与 /api/login 同一套守卫但键前缀不同），
 //     避免匿名的列表/历史查询把服务端拖垮，也避免成为扫描器的免费接口。
@@ -49,6 +50,43 @@ type publicSite struct {
 	hub      *ws.Hub
 	authz    *auth.Auth
 	upgrader websocket.Upgrader
+	// nodeKeys 派生公开 node_id 的部署私钥（见 publicview.NodeKeys）。
+	// 它是**匿名可达接口上唯一的单向性来源**，因此必须来自数据目录、不得写死在代码里。
+	nodeKeys *publicview.NodeKeys
+	// 匿名 WS 并发计数（见 acquireWS）：限流器只管频率，管不住"开一条长期挂着不放"。
+	wsMu    sync.Mutex
+	wsTotal int
+	wsPerIP map[string]int
+	// cfgSigMu/cfgSig 是"公开页配置变了"的广播信号，用在途匿名连接核对开关。
+	cfgSigMu sync.Mutex
+	cfgSig   chan struct{}
+}
+
+// subscribeCfgChange 取当前"配置已变更"信号通道（连接进入时取一次）。
+//
+// 惰性建道：`publicSite` 在测试里以结构体字面量构造，不能要求一定走过构造函数。
+func (p *publicSite) subscribeCfgChange() <-chan struct{} {
+	p.cfgSigMu.Lock()
+	defer p.cfgSigMu.Unlock()
+	if p.cfgSig == nil {
+		p.cfgSig = make(chan struct{})
+	}
+	return p.cfgSig
+}
+
+// noteConfigChange 通知所有在途匿名连接重新核对开关。
+//
+// 只发信号、不搬数据：新状态由调用方紧跟着的那次 broadcastAgents 走原有订阅
+// 通道下发。这里回答的只有一个问题 —— 开关是不是已经关了（M-14：原来"停用"
+// 只挡住新握手，已建立的匿名连接会永远看下去）。
+func (p *publicSite) noteConfigChange() {
+	p.cfgSigMu.Lock()
+	old := p.cfgSig
+	p.cfgSig = make(chan struct{})
+	p.cfgSigMu.Unlock()
+	if old != nil {
+		close(old)
+	}
 }
 
 // publicEnabled 读取总开关。
@@ -69,15 +107,16 @@ func (p *publicSite) requireEnabled(w http.ResponseWriter) bool {
 	return true
 }
 
-// allow 匿名限流：按来源 IP + 路由名限制频率。
+// allow 匿名限流：按「来源 IP + 路由名」限制频率。
 //
-// 复用登录守卫的实现（滑动窗口 + 失败退避），但每个路由用独立计数键，
-// 使"列表轮询"不会消耗"历史查询"的额度，也不会把管理员挡在登录外。
+// 桶与登录**完全分开**（`AllowPublicRoute`，M-12）：公开详情页每 15s 轮询一次，
+// 三个标签页就够把共用 20/分/IP 的登录额度吃光 —— 那等于让访客把管理员挡在
+// 自己的后台外面。分路由还顺带挡住了"一个路由打满全站"的自锁。
 func (p *publicSite) allow(w http.ResponseWriter, r *http.Request, route string) bool {
 	if p.guard == nil {
 		return true
 	}
-	if ok, retry := p.guard.Allow(r.RemoteAddr, "public:"+route); !ok {
+	if ok, retry := p.guard.AllowPublicRoute(r.RemoteAddr, route); !ok {
 		w.Header().Set("Retry-After", auth.RetryAfter(retry))
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return false
@@ -92,7 +131,6 @@ func (p *publicSite) allow(w http.ResponseWriter, r *http.Request, route string)
 func (p *publicSite) stateHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !p.requireEnabled(w) {
-			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 		if !p.allow(w, r, "state") {
@@ -116,7 +154,6 @@ func (p *publicSite) stateHandler() http.HandlerFunc {
 func (p *publicSite) nodesHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !p.requireEnabled(w) {
-			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 		if !p.allow(w, r, "nodes") {
@@ -132,15 +169,14 @@ func (p *publicSite) nodesHandler() http.HandlerFunc {
 	}
 }
 
-// samplesHandler GET /api/public/samples?node=n-xxxxxxxx&range=24h
+// samplesHandler GET /api/public/samples?node=n-xxxxxxxxxxxxxxxx&range=24h
 //
-// 节点历史趋势。node 为派生节点编号 —— 服务端在本文件内把它反查回
-// agent_id（映射只存在于内存中、且只包含**当前可公开**的主机），
+// 节点历史趋势。node 为派生节点编号 —— 服务端在本文件内用部署私钥把它与
+// agent_id 常量时间比对（映射只覆盖**当前可公开**的主机），
 // 因此伪造一个 node 也无法读取未公开主机的历史数据。
 func (p *publicSite) samplesHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !p.requireEnabled(w) {
-			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 		if !p.allow(w, r, "samples") {
@@ -153,11 +189,11 @@ func (p *publicSite) samplesHandler() http.HandlerFunc {
 			return
 		}
 		agentID := ""
-		for _, a := range p.store.All() {
+		for _, a := range p.store.AllCached() {
 			if a == nil || !cfg.HostAllowed(a.AgentID) {
 				continue
 			}
-			if publicview.NodeID(a.AgentID) == nodeID {
+			if p.nodeKeys.Match(a.AgentID, nodeID) {
 				agentID = a.AgentID
 				break
 			}
@@ -180,6 +216,61 @@ func (p *publicSite) samplesHandler() http.HandlerFunc {
 	}
 }
 
+// 匿名公开 WS 的资源上限。
+//
+// 公开页免登录，任何访客都能建长连接，所以这一路必须比登录后的 /ws 更严：
+//   - 设计上客户端**一条上行消息都不发**（读循环只为感知断开），故读上限给到
+//     只够放控制帧即可。不设限时，gorilla 会按对端声明的长度分配内存，
+//     一条巨型帧就是一次未认证 OOM；
+//   - 写不设 deadline 时，一个停止读取的访客会让 WriteMessage 永久阻塞，
+//     把 goroutine 与 hub 的订阅项一起钉住；
+//   - 读不设 deadline 时，静默离开的访客（拔网线/代理悄悄断）会让 ReadMessage
+//     永久挂住，同样泄漏 goroutine + 订阅项。靠 30s 心跳 + pong 续期来收敛。
+const (
+	publicWSReadLimit = 64
+	publicWSWriteWait = 10 * time.Second
+	// publicWSPongWait 必须大于 30s 的心跳周期，留出一整拍余量。
+	publicWSPongWait = 90 * time.Second
+	publicWSMaxTotal = 256
+	// publicWSMaxPerIP 的作用是"公平性下限"：防一个地址吃光全局名额，而不是压到很小。
+	// 取 32 是因为本仓不信任 X-Forwarded-For，计数按 **TCP 对端地址**：
+	// 反代/CDN 之后整站访客会共用一个地址，此时过小的每 IP 上限等于对公网访客锁死；
+	// 频率仍由上面的限流器（同一口径）把关，这里的并发上限是第二道兜底。
+	publicWSMaxPerIP = 32
+)
+
+// acquireWS 占用一个匿名 WS 名额（全局与每 IP 双上限）。
+func (p *publicSite) acquireWS(ip string) bool {
+	p.wsMu.Lock()
+	defer p.wsMu.Unlock()
+	if p.wsTotal >= publicWSMaxTotal {
+		return false
+	}
+	if p.wsPerIP == nil {
+		p.wsPerIP = make(map[string]int)
+	}
+	if p.wsPerIP[ip] >= publicWSMaxPerIP {
+		return false
+	}
+	p.wsTotal++
+	p.wsPerIP[ip]++
+	return true
+}
+
+// releaseWS 归还名额。计数归零即删键，否则这张表会随访问过的 IP 单调增长。
+func (p *publicSite) releaseWS(ip string) {
+	p.wsMu.Lock()
+	defer p.wsMu.Unlock()
+	if p.wsTotal > 0 {
+		p.wsTotal--
+	}
+	if n := p.wsPerIP[ip] - 1; n > 0 {
+		p.wsPerIP[ip] = n
+	} else {
+		delete(p.wsPerIP, ip)
+	}
+}
+
 // publicWSHandler GET /api/public/ws
 //
 // 免登录实时推送：让公开页的卡片/指标自动刷新，而无需高频轮询。
@@ -187,19 +278,30 @@ func (p *publicSite) samplesHandler() http.HandlerFunc {
 func (p *publicSite) publicWSHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !p.requireEnabled(w) {
-			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 		// 匿名长连接成本高于普通请求，用更小的限额（同一 guard 的独立键）
 		if !p.allow(w, r, "ws") {
 			return
 		}
+		ip := auth.ClientIP(r.RemoteAddr)
+		if !p.acquireWS(ip) {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "too many connections", http.StatusTooManyRequests)
+			return
+		}
+		defer p.releaseWS(ip)
 		conn, err := p.upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("[public] ws upgrade error: %v", err)
 			return
 		}
 		defer conn.Close()
+		conn.SetReadLimit(publicWSReadLimit)
+		_ = conn.SetReadDeadline(time.Now().Add(publicWSPongWait))
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(publicWSPongWait))
+		})
 		send := make(chan []byte, 8)
 		// 关闭 stop 必须幂等：读循环（对端断开）与函数返回（defer）都会触发一次，
 		// 直接 close 两次会 panic（"close of closed channel"），表现为连接从
@@ -215,10 +317,21 @@ func (p *publicSite) publicWSHandler() http.HandlerFunc {
 		}, stop)
 		defer closeStop()
 
+		// 先取信号通道、再读开关：这样任何一次停用要么 close 了手里这条通道，
+		// 要么已经体现在下面读到的 cfg 里。顺序反了会漏事件 —— 停用正好落在
+		// "读配置"与"订阅"之间时，close 打在上一代通道上，本连接却握住了新的，
+		// 于是公开页已关、在访客还在看，直到下一次配置再变才收敛。
+		cfgChanged := p.subscribeCfgChange()
+
 		// 先推一次当前状态，避免客户端等待第一个探针周期
 		cfg := p.cfg.Get()
+		if cfg == nil || !cfg.Enabled {
+			return // 握手与建道之间被停用
+		}
 		nodes := p.visibleNodes(cfg)
-		writePublicWS(conn, cfg, nodes)
+		if err := writePublicWS(conn, cfg, nodes); err != nil {
+			return
+		}
 
 		// 读循环：只为感知断开（客户端不需要发送任何数据）
 		go func() {
@@ -230,16 +343,29 @@ func (p *publicSite) publicWSHandler() http.HandlerFunc {
 			}
 		}()
 
-		// 心跳：部分反向代理会掐掉长时间无数据的空闲连接
+		// 心跳：既防反向代理掐空闲连接，也是死访客的探测器
+		//（对端不回 pong → 读 deadline 到期 → 读循环退出）
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
+		// 配置开关的即时核对：握手时查过一次不代表之后一直有效，
+		// 运维在后台关掉公开页时，在途连接要自己结束（不等下一拍心跳）。
 		for {
 			select {
 			case payload := <-send:
+				_ = conn.SetWriteDeadline(time.Now().Add(publicWSWriteWait))
 				if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 					return
 				}
+			case <-cfgChanged:
+				// 先换道、再核对开关。顺序反了会漏事件：若在"核对"与"换道"之间
+				// 运维完成了停用，那次 close 打在旧通道上，而本连接已经握住了
+				// 新通道 —— 结果是公开页关了、在途访客还在看，直到下次配置再变。
+				cfgChanged = p.subscribeCfgChange()
+				if !p.publicEnabled() {
+					return
+				}
 			case <-ticker.C:
+				_ = conn.SetWriteDeadline(time.Now().Add(publicWSWriteWait))
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 					return
 				}
@@ -275,7 +401,9 @@ func publicConfigPayload(cfg *siteconfig.Config) map[string]interface{} {
 }
 
 // writePublicWS 生成并下发一条公开 WS 消息。
-func writePublicWS(conn *websocket.Conn, cfg *siteconfig.Config, nodes []*publicview.Node) {
+//
+// 首帧同样要设写超时：连接刚建立时对端就可能已经不读了。
+func writePublicWS(conn *websocket.Conn, cfg *siteconfig.Config, nodes []*publicview.Node) error {
 	payload, err := json.Marshal(map[string]interface{}{
 		"ok":      true,
 		"nodes":   nodes,
@@ -283,17 +411,22 @@ func writePublicWS(conn *websocket.Conn, cfg *siteconfig.Config, nodes []*public
 		"config":  publicConfigPayload(cfg),
 	})
 	if err != nil {
-		return
+		return err
 	}
-	_ = conn.WriteMessage(websocket.TextMessage, payload)
+	_ = conn.SetWriteDeadline(time.Now().Add(publicWSWriteWait))
+	return conn.WriteMessage(websocket.TextMessage, payload)
 }
 
 // visibleNodes 取出当前可公开的主机并脱敏（含流量口径装配）。
+//
+// 用 `AllCached` 而不是 `All`：这条链是**匿名可达**的，访客不该有能力驱动出站
+// GeoIP 查询（M-13）。缓存由后台仪表盘那条 `store.All()` 的推送路径负责填，
+// 两处读的是同一份。
 func (p *publicSite) visibleNodes(cfg *siteconfig.Config) []*publicview.Node {
 	if cfg == nil || !cfg.Enabled || !cfg.HostsEnabled {
 		return []*publicview.Node{}
 	}
-	return p.attachTraffic(publicview.BuildNodes(p.store.All(), cfg), cfg)
+	return p.attachTraffic(publicview.BuildNodes(p.store.AllCached(), cfg, p.nodeKeys), cfg)
 }
 
 // publicTrafficWindow 公开页"窗口累计流量"的回溯窗口（与历史留存一致，30 天）。
@@ -314,9 +447,9 @@ func (p *publicSite) attachTraffic(nodes []*publicview.Node, cfg *siteconfig.Con
 	// boot 口径：BuildNode 已带速率，这里只补累计值，避免二次遍历 store
 	if cfg.TrafficModeOrDefault() != siteconfig.TrafficModeWindow {
 		agents := make(map[string]*protocol.AgentInfo)
-		for _, a := range p.store.All() {
+		for _, a := range p.store.AllCached() {
 			if a != nil {
-				agents[publicview.NodeID(a.AgentID)] = a
+				agents[p.nodeKeys.ID(a.AgentID)] = a
 			}
 		}
 		for _, n := range nodes {
@@ -331,11 +464,11 @@ func (p *publicSite) attachTraffic(nodes []*publicview.Node, cfg *siteconfig.Con
 	// window 口径：按 node_id 反查设备（映射只包含当前可公开主机），再查增量历史
 	nodeIDToAgent := make(map[string]string, len(nodes))
 	agentByNode := make(map[string]*protocol.AgentInfo, len(nodes))
-	for _, a := range p.store.All() {
+	for _, a := range p.store.AllCached() {
 		if a == nil || !cfg.HostAllowed(a.AgentID) {
 			continue
 		}
-		id := publicview.NodeID(a.AgentID)
+		id := p.nodeKeys.ID(a.AgentID)
 		nodeIDToAgent[id] = a.AgentID
 		agentByNode[id] = a
 	}
@@ -452,8 +585,7 @@ func siteConfigHandler(store *siteconfig.Store, authz *auth.Auth, audit AuditFun
 			})
 		case http.MethodPost, http.MethodPut:
 			var body siteconfig.Config
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				http.Error(w, "bad request", http.StatusBadRequest)
+			if !decodeJSON(w, r, maxJSONBody, &body) {
 				return
 			}
 			// 字段白名单：只接受目录内的 key，其余忽略（normalize 会重建 fields）
@@ -531,22 +663,40 @@ func siteHostOptionsHandler(store *probe.Store, authz *auth.Auth) http.HandlerFu
 
 // publicConfigStateHandler GET /api/public/enabled
 //
-// 供前端在**登录前**判断公开页是否启用（例如登录页给出"查看公开状态页"入口）。
-// 刻意只返回一个布尔值：该端点本身必须免鉴权，因此不泄露任何其它信息。
-// 除 enabled 外，还会带上**站点品牌文案**（标题 / 页脚）。
+// 只回答一件事：公开状态页开没开。开关关掉时它**直接 404**（M-14）——
+// 与其余 /api/public/* 同一口径：功能对外应当"不存在"，而不是留一个
+// 永远应答 `{"enabled":false}` 的探针点。
 //
-// 为什么把品牌文案放在这个免鉴权端点上：管理后台的登录页在登录前就要用正确的
-// 站点标题（浏览器标签），而登录前的页面拿不到任何需要鉴权的接口。标题与页脚
-// 本身就是"给所有人看"的内容（页脚展示在公开页），不构成信息泄露。
+// 品牌文案（标题 / 页脚）不在此处，见 brandingHandler：那份内容登录页在
+// 登录前就要渲染，与公开页开关无关；把它挤在本端点里，等于"关掉公开页之后，
+// 匿名请求仍然能读到本站的品牌配置"。
 //
 // 仍然刻意**不**返回 host_ids / catalog_enabled / fields 等公开策略 —— 那些是
-// "哪些机器对外可见"的决策信息，不属于品牌文案。
+// "哪些机器对外可见"的决策信息。
 func publicConfigStateHandler(store *siteconfig.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		cfg := store.Get()
+		if cfg == nil || !cfg.Enabled {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]interface{}{"ok": true, "enabled": true})
+	}
+}
+
+// brandingHandler GET /api/branding —— 登录前就要显示的品牌文案。
+//
+// 免鉴权、且**不受公开页开关影响**：后台登录页要用正确的浏览器标签标题与页脚，
+// 而登录前的页面拿不到任何需要鉴权的接口。这两项本来就是给所有人看的内容
+// （页脚同样渲染在公开页），放在这里不构成额外暴露 —— 构成暴露的是"顺带回答
+// 公开页开没开"，那已经挪回 /api/public/enabled 并由开关把关。
+//
+// 只出文案，不出字段开关、主机白名单等任何公开策略。
+func brandingHandler(store *siteconfig.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cfg := store.Get()
 		writeJSON(w, map[string]interface{}{
 			"ok":          true,
-			"enabled":     cfg != nil && cfg.Enabled,
 			"site_title":  cfg.SiteTitleOrDefault(),
 			"site_footer": cfg.SiteFooterOrDefault(),
 		})

@@ -64,10 +64,30 @@ type Config struct {
 	// 默认 false：允许 Agent 先用注册密钥在 TLS 连接上换取证书（"简单模式"），
 	// 换取成功即必须携带证书，故默认配置下依然收敛到 mTLS。
 	RequireAgentCert bool `json:"require_agent_cert"`
+	// DisableSharedAgentKey 关闭"部署级共享注册密钥"这条注册路径，只认 per-agent 一次性令牌。
+	//
+	// 这是双轨过渡的**终点开关**：共享密钥是"一把钥匙认全网"，泄露任意一台即可冒名
+	// 注册任意主机。等现网主机全部改用一次性令牌（或已持有效证书）后再打开；
+	// 提前打开会让未迁移的主机无法重新注册。
+	DisableSharedAgentKey bool `json:"disable_shared_agent_key"`
 	// AdminTLSDays Web 控制台自动 HTTPS 证书有效期（天）；0 关闭自动 HTTPS。
 	AdminTLSDays int `json:"admin_tls_days"`
 	// ServerName 部署身份名：写入服务端 CA，用于区分多套总控（防止 Agent 连错机器）。
 	ServerName string `json:"server_name"`
+	// VncPorts VNC 隧道/探测可指向的目标端口（逗号分隔，支持区间，如 5900-5999,6900）。
+	//
+	// VNC 隧道的目标是**被管主机的回环地址**，端口不限制就等于给每个登录会话
+	// 发了一台内网任意端口代理（目标机上的 Redis/SSH/调试端口顺带可连）。
+	// 空串 = 不限制：这个状态**不会存进配置文件**（空值即"用内置默认"），
+	// 放开限制属于危险配置，需要每次启动显式给出。
+	VncPorts string `json:"vnc_ports"`
+	// UpgradePubKey 升级包 Ed25519 公钥（hex 或文件路径），与服务端无关的**离线**签名密钥配对。
+	//
+	// 两个用途：① 一键部署时写进 Agent 配置，让装出来的 Agent 默认就能验签
+	//（Agent 侧没有"跳过验签"的开关，不配就是升级不了）；
+	// ② 下发升级指令时提前拦下"没带签名"的请求，不让它变成一次静默失败的升级。
+	// 留空 = 本套总控不参与升级包签名体系（下发时只提示，不阻断）。
+	UpgradePubKey string `json:"upgrade_pubkey"`
 }
 
 // DefaultPath 返回默认配置文件路径（便携态：与可执行文件同目录）。

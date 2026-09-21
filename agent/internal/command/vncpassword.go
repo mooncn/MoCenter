@@ -33,12 +33,15 @@ func vncObfuscatePassword(pw string) []byte {
 }
 
 // generateRandomPassword 生成用于 VNC 的随机口令（去易混淆字符，长度 8=VNC 上限）。
+//
+// 旧实现在 rand.Read 出错时回退成常量 "mocenter"：那是比失败更糟的结果 ——
+// 全机群会静默共用同一个 VNC 口令，而回执上写着「已设置随机口令」。
+// 现在不留任何回退：自 Go 1.24 起 crypto/rand.Read 在系统熵源故障时直接终止进程，
+// 不会返回错误，所以这里既没有可写的失败分支，也不可能产出可预测的口令。
 func generateRandomPassword() string {
 	const charset = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789"
 	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "mocenter"[:8]
-	}
+	rand.Read(b) // 见上：熵源故障时进程已终止，此处 err 恒为 nil 且无需处理
 	for i := range b {
 		b[i] = charset[int(b[i])%len(charset)]
 	}

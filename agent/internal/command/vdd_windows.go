@@ -8,11 +8,13 @@
 //
 // 本项目选用 VirtualDrivers/Virtual-Display-Driver 的原因：
 //   - 开源、可商用、无授权风险；
-//   - 属于「显示器仿真」型驱动，DXGI Desktop Duplication 可正常抓取（区别于纯 IDD）。
+//   - 它实现的 IDD（Indirect Display Driver）在系统里表现为一块真正的显示器，
+//     DXGI Desktop Duplication 能正常抓取到桌面内容（无头 VM 里物理显示器缺席时才需要它）。
 //
 // 安装流程：
 //  1. 检测系统是否有活动显示器（无头检测）；
-//  2. 若无显示器，下载 VDD 驱动包并安装（pnputil /add-driver）；
+//  2. 若无显示器，取得 VDD 驱动包（服务端托管优先，公网下载需显式解锁）并校验内置摘要，
+//     再安装驱动（pnputil /add-driver）；
 //  3. 通过 PowerShell 创建/激活虚拟显示器；
 //  4. 返回结果供 VNC 启动流程使用。
 package command
@@ -28,11 +30,12 @@ import (
 	"time"
 )
 
-// vddReleaseBase VirtualDrivers/Virtual-Display-Driver 的 GitHub Release 地址。
-// 若内置地址不可用，可通过 VncConfig.DownloadBase 或 Proxy 覆盖。
+// vddReleaseURL VirtualDrivers/Virtual-Display-Driver 的 GitHub Release 直下地址。
+// 包名（vddZipName）与内置摘要（installPins）定义在 vncinstall_common.go；
+// 地址可用 VncConfig.DownloadBase 或 https 的 VncConfig.Proxy 覆盖（需显式解锁公网取包）。
 const (
-	vddReleaseURL   = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VirtualDisplayDriver-x86.Driver.Only.zip"
-	vddReleaseProxy = "http://fa.mooncn.win/?url="
+	vddReleaseBaseURL = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/"
+	vddReleaseURL     = vddReleaseBaseURL + vddZipName
 )
 
 // hasActiveDisplay 检测系统是否已有活动显示器。
@@ -96,8 +99,11 @@ public class DisplayConfig {
 	return false
 }
 
-// installVirtualDisplayDriver 下载并安装 VirtualDrivers/Virtual-Display-Driver。
+// installVirtualDisplayDriver 取得并安装 VirtualDrivers/Virtual-Display-Driver。
 // 返回安装是否成功。若已安装则直接返回 true。
+//
+// 取包策略与 UltraVNC 完全一致：服务端托管优先、公网下载需本机显式解锁，
+// 且在解压 / 交给 pnputil 之前必须先通过内置摘要校验 —— 解压出来的是**内核模式驱动**。
 func installVirtualDisplayDriver(cfg VncConfig) bool {
 	// 先检查是否已安装 Virtual Display Driver
 	if isVDDInstalled() {
@@ -105,65 +111,31 @@ func installVirtualDisplayDriver(cfg VncConfig) bool {
 		return true
 	}
 
-	// 构建下载候选地址列表
-	var urls []string
-	if cfg.DownloadBase != "" && strings.Contains(cfg.DownloadBase, "VirtualDisplayDriver") {
-		urls = append(urls, cfg.DownloadBase)
-	}
-	if cfg.Proxy != "" {
-		urls = append(urls, proxyURL(cfg.Proxy, vddReleaseURL))
-	}
-	urls = append(urls, vddReleaseURL)
-	if cfg.Proxy == "" {
-		urls = append(urls, proxyURL(vddReleaseProxy, vddReleaseURL))
-	}
-	// 去重
-	seen := map[string]bool{}
-	var unique []string
-	for _, u := range urls {
-		if !seen[u] {
-			seen[u] = true
-			unique = append(unique, u)
-		}
-	}
-
-	// 下载 VDD 驱动包
-	zipPath := filepath.Join(os.TempDir(), "vdd-driver.zip")
 	extractDir := filepath.Join(os.TempDir(), "vdd-driver")
-	var lastErr error
-	for _, u := range unique {
-		log.Printf("[vdd] 尝试下载 Virtual Display Driver: %s", u)
-		if err := downloadPlain(u, zipPath); err != nil {
-			lastErr = err
-			continue
-		}
-		// 检查下载文件是否有效
-		fi, err := os.Stat(zipPath)
-		if err != nil || fi.Size() < 1024 {
-			lastErr = fmt.Errorf("下载文件无效或过小")
-			_ = os.Remove(zipPath)
-			continue
-		}
+	// 先清空上一轮的解压结果：否则本轮一个包都没取到时，findDriverINF 仍会命中
+	// 旧目录里的 INF，于是把一份**没经过本轮校验**的驱动交给 pnputil 加载。
+	_ = os.RemoveAll(extractDir)
 
-		// 解压到临时目录
-		_ = os.RemoveAll(extractDir)
-		if err := os.MkdirAll(extractDir, 0700); err != nil {
-			lastErr = err
-			continue
-		}
-		if err := extractZip(zipPath, extractDir); err != nil {
-			lastErr = fmt.Errorf("解压 VDD 驱动失败: %w", err)
-			_ = os.Remove(zipPath)
-			continue
-		}
-		break
+	zipPath, err := fetchVDDPackage(cfg)
+	if err != nil {
+		log.Printf("[vdd] 获取 VDD 驱动包失败: %v", err)
+		return false
 	}
-	_ = os.Remove(zipPath)
+	defer os.Remove(zipPath)
+
+	if err := os.MkdirAll(extractDir, 0700); err != nil {
+		log.Printf("[vdd] 创建解压目录失败: %v", err)
+		return false
+	}
+	if err := extractZip(zipPath, extractDir); err != nil {
+		log.Printf("[vdd] 解压 VDD 驱动失败: %v", err)
+		return false
+	}
 
 	// 在解压目录中查找 .inf 驱动文件
 	infFile := findDriverINF(extractDir)
 	if infFile == "" {
-		log.Printf("[vdd] 未找到 VDD 驱动 INF 文件: %v", lastErr)
+		log.Printf("[vdd] 未找到 VDD 驱动 INF 文件")
 		return false
 	}
 
@@ -189,6 +161,73 @@ func installVirtualDisplayDriver(cfg VncConfig) bool {
 		return false
 	}
 	return true
+}
+
+// fetchVDDPackage 取到一份「已通过内置摘要校验」的 VDD 驱动包，返回其落盘路径。
+// 调用方负责在使用后删除该文件。
+func fetchVDDPackage(cfg VncConfig) (string, error) {
+	want := pinnedDigest(vddZipName)
+	if want == "" {
+		return "", fmt.Errorf("缺少 %s 的内置钉扎摘要，已拒绝加载（请同步 installPins 后重新发布 Agent）", vddZipName)
+	}
+	// 1) 服务端托管：走 Agent↔服务端已 mutual-TLS 的长连接
+	if cfg.FetchPackage != nil {
+		path, err := cfg.FetchPackage(vddZipName)
+		if err != nil {
+			log.Printf("[vdd] 服务端未托管 %s（%v）", vddZipName, err)
+		} else {
+			if verr := verifyDigest(path, want, vddZipName); verr != nil {
+				_ = os.Remove(path)
+				return "", verr
+			}
+			return path, nil
+		}
+	}
+	// 2) 公网取包需本机显式解锁
+	if !cfg.AllowPublicDownload {
+		return "", fmt.Errorf("服务端未托管 %s%s。准备托管包：bash scripts/fetch-packages.sh <服务端 packages 目录> win",
+			vddZipName, publicDownloadHint(cfg))
+	}
+	var candidates []string
+	if cfg.DownloadBase != "" && strings.Contains(cfg.DownloadBase, "VirtualDisplayDriver") {
+		candidates = append(candidates, cfg.DownloadBase)
+	}
+	if p := httpsProxyOrEmpty(cfg.Proxy, "VDD 驱动包下载"); p != "" {
+		candidates = append(candidates, proxyURL(p, vddReleaseURL))
+	}
+	candidates = append(candidates, vddReleaseURL)
+	seen := map[string]bool{}
+	var urls []string
+	for _, u := range candidates {
+		if !seen[u] {
+			seen[u] = true
+			urls = append(urls, u)
+		}
+	}
+
+	var lastErr error
+	for _, u := range urls {
+		tmp := filepath.Join(os.TempDir(), vddZipName)
+		log.Printf("[vdd] 尝试下载 Virtual Display Driver: %s", u)
+		if err := downloadPlain(u, tmp); err != nil {
+			lastErr = err
+			_ = os.Remove(tmp)
+			continue
+		}
+		if fi, e := os.Stat(tmp); e != nil || fi.Size() < 1024 {
+			lastErr = fmt.Errorf("下载文件无效或过小")
+			_ = os.Remove(tmp)
+			continue
+		}
+		// 摘要不符时继续试下一个源（某源失效不该阻断），但绝不解压未通过的包
+		if err := verifyDigest(tmp, want, vddZipName); err != nil {
+			lastErr = err
+			_ = os.Remove(tmp)
+			continue
+		}
+		return tmp, nil
+	}
+	return "", fmt.Errorf("未能取到与内置钉扎一致的 VDD 驱动包: %v", lastErr)
 }
 
 // isVDDInstalled 检查 Virtual Display Driver 是否已安装。
@@ -343,7 +382,7 @@ func findDriverINF(dir string) string {
 
 // extractZip 使用 PowerShell 的 Expand-Archive 解压 ZIP 文件。
 func extractZip(zipPath, dest string) error {
-	psCmd := fmt.Sprintf("Expand-Archive -Path '%s' -DestinationPath '%s' -Force", zipPath, dest)
+	psCmd := "Expand-Archive -Path " + psQuote(zipPath) + " -DestinationPath " + psQuote(dest) + " -Force"
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	return exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd).Run()

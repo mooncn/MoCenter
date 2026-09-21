@@ -87,12 +87,15 @@ func TestBaseTLSConfigMinVersion(t *testing.T) {
 }
 
 func TestCredDirDefaults(t *testing.T) {
-	c := &Client{cfg: Config{ConfigPath: "/etc/mocenter/agent.json"}}
-	if got := c.credDir(); got != "/etc/mocenter/creds" {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "agent.json")
+	c := &Client{cfg: Config{ConfigPath: cfgPath}}
+	if got := c.credDir(); got != filepath.Join(dir, "creds") {
 		t.Fatalf("凭证目录应在配置目录下: %s", got)
 	}
-	c2 := &Client{cfg: Config{ConfigPath: "/etc/mocenter/agent.json", CredDir: "/tmp/x"}}
-	if got := c2.credDir(); got != "/tmp/x" {
+	custom := filepath.Join(dir, "elsewhere")
+	c2 := &Client{cfg: Config{ConfigPath: cfgPath, CredDir: custom}}
+	if got := c2.credDir(); got != custom {
 		t.Fatalf("显式 CredDir 应优先: %s", got)
 	}
 }

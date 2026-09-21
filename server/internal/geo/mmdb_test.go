@@ -166,6 +166,7 @@ func TestResolverMMDBFirst(t *testing.T) {
 	if err := r.SetMMDB(path); err != nil {
 		t.Fatalf("挂载离线库失败: %v", err)
 	}
+	t.Cleanup(r.mmdb.Close)
 	if !r.MMDBLoaded() {
 		t.Fatal("解析器应报告离线库已加载")
 	}
@@ -192,6 +193,7 @@ func TestResolverMMDBFallback(t *testing.T) {
 	if err := r.SetMMDB(path); err != nil {
 		t.Fatalf("挂载离线库失败: %v", err)
 	}
+	t.Cleanup(r.mmdb.Close)
 	// 9.9.9.9 不在测试库中
 	g := r.Lookup("9.9.9.9")
 	if g == nil || g.CountryCode != "JP" {

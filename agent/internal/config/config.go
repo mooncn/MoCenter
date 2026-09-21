@@ -30,15 +30,24 @@ type Config struct {
 	ClientCert string `json:"client_cert"` // mTLS 客户端证书
 	ClientKey  string `json:"client_key"`  // mTLS 客户端私钥
 	CACert     string `json:"ca_cert"`     // 校验服务端证书的 CA
-	ProxyIP    string `json:"proxy_ip"`    // 国内加速代理前缀
+	ProxyIP    string `json:"proxy_ip"`    // 国内加速代理前缀（安装包下载只认 https:// 前缀）
+	// AllowPublicPackageDownload 解锁「从公网取安装包」：winget / choco / 厂商直连 / 加速代理。
+	// 默认 false —— 安装包（以 SYSTEM 执行的安装器、内核驱动包）只从服务端托管目录经长连接下发。
+	// 刻意**不接受服务端下发**：否则等于让服务端一键放弃这条防护；只能改本机配置或命令行。
+	AllowPublicPackageDownload bool `json:"allow_public_package_download"`
 	// AgentKey 与服务端预共享的注册密钥（应用层鉴权）。
 	// 服务端在数据目录生成 agent.key 并打印，Agent 侧填同一个值。
 	AgentKey string `json:"agent_key"`
 	// UpgradePubKey 升级包 Ed25519 公钥（hex 或文件路径）。
-	// 配置后升级必须携带有效签名；未配置时默认**拒绝升级**。
+	// 配置后升级必须携带有效签名；未配置时**拒绝升级**。
+	// 这里刻意没有"允许无签名升级"的开关：升级是"下载即执行"，能关掉校验就等于没有校验。
 	UpgradePubKey string `json:"upgrade_pubkey"`
-	// UpgradeAllowUnsigned 显式允许无签名升级（危险，仅用于迁移期）。
-	UpgradeAllowUnsigned bool `json:"upgrade_allow_unsigned"`
+	// FileRoots 允许服务端下发读写的本地目录（文件分发写入、文件下载读取）。
+	// 留空 = 只用默认沙箱 <配置目录>/files。
+	//
+	// 与 AllowPublicPackageDownload 同类：**只认本机命令行/配置文件**，服务端指令打不开它。
+	// 扩大范围是运维决定，不该由被攻击的那条通道代劳。
+	FileRoots []string `json:"file_roots"`
 	// LatencyTargets 延迟探测目标（ICMP/TCP/HTTP）。
 	// 规格形如 "icmp:1.1.1.1" / "tcp:1.1.1.1:443" / "http:https://example.com"，
 	// 省略 kind 前缀时按 icmp 处理。留空 = 不探测（不影响任何其它功能）。

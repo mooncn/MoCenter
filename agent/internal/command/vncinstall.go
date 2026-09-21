@@ -34,16 +34,20 @@ const (
 
 // VncConfig VNC 安装/启动配置。
 type VncConfig struct {
-	// Proxy 国内加速代理前缀（如 http://fa.mooncn.win/?url= ），为空则不使用。
+	// Proxy 国内加速代理前缀（**只接受 https://**，如 https://mirror.example.com/?url= ），
+	// 为空或不合规则不使用。
 	Proxy string
 	// DownloadBase 下载地址前缀（如官方或镜像），为空使用默认地址。
 	DownloadBase string
 	// Mode 安装模式：VncModeInteractive（默认）/ VncModeService。
 	Mode string
 	// FetchPackage 从服务端拉取托管的安装包，返回本地落盘路径（由 client 注入）。
-	// 走 Agent 与服务端既有的长连接，避免公网下载慢或被劫持；
-	// 为 nil 或返回错误时，安装流程回退到 winget/choco/公网下载。
+	// 走 Agent 与服务端既有的长连接，避免公网下载慢或被劫持；这是**默认**取包方式。
 	FetchPackage func(name string) (string, error)
+	// AllowPublicDownload 运维显式解锁公网取包（winget / choco / 厂商直连 / 加速代理）。
+	// 默认关闭：这些通道由不得我们选源与版本；执行前虽仍比对内置钉扎摘要，
+	// 但"上游换版本 → 拒装并报错"才是可信默认，需要连通性时显式打开而不是默认兜底。
+	AllowPublicDownload bool
 }
 
 // VncInstall 安装并按需启动 VNC 服务，返回结果。port<=0 时默认 5900。

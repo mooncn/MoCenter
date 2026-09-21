@@ -69,8 +69,11 @@ func (c *Client) tryEnroll() (*enrollmentCredential, error) {
 	if secret == "" {
 		return nil, fmt.Errorf("未配置注册密钥（enrollment_secret / agent_key 均为空），无法换取客户端证书")
 	}
-	// 本地生成密钥对：私钥永不离开本机
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// 客户端私钥：本机有则复用，没有才新生成（私钥永不离开本机）。
+	// 复用不是省事：服务端按 agent_id → 证书公钥指纹(SPKI) 做 TOFU 绑定，
+	// 换私钥就等于换机器身份。若每次重签都换新钥，服务端换过 CA 之后
+	// 本机再也换不回证书（现网自动恢复路径会被自己的防护挡住）。
+	key, err := c.clientKey()
 	if err != nil {
 		return nil, err
 	}
@@ -321,6 +324,20 @@ func (c *Client) saveCredential(cred *enrollmentCredential, certPEM, caPEM strin
 		c.onEnrolledFiles(CredentialFiles{CertFile: cred.CertFile, KeyFile: cred.KeyFile, CAFile: cred.CAFile})
 	}
 	return nil
+}
+
+// clientKey 取本机客户端私钥：优先复用 <creds>/client.key（上次换取留下的），
+// 读不到或解析不了才生成新密钥对。公钥稳定才能让服务端 TOFU 绑定在
+// 证书到期重签、服务端换 CA 等场景下继续认这台机器。
+func (c *Client) clientKey() (*ecdsa.PrivateKey, error) {
+	if b, err := os.ReadFile(filepath.Join(c.credDir(), "client.key")); err == nil {
+		if blk, _ := pem.Decode(b); blk != nil {
+			if k, kerr := x509.ParseECPrivateKey(blk.Bytes); kerr == nil {
+				return k, nil
+			}
+		}
+	}
+	return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 }
 
 // credDir 凭证落盘目录：配置文件所在目录下的 creds/。

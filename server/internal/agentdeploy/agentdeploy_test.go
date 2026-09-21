@@ -79,7 +79,7 @@ func TestInstallScriptQuotesInputs(t *testing.T) {
 // 字段名一旦对不上，Agent 读到的就是一份"有内容但全零值"的配置，
 // 表现为"装完了却连不上服务端"—— 这是最难排查的一类问题。
 func TestBuildAgentConfig(t *testing.T) {
-	d := New(Options{AgentKey: "K3Y", ProxyIP: "http://p/?url="})
+	d := New(Options{AgentKeyFunc: func() string { return "K3Y" }, ProxyIP: "http://p/?url=", UpgradePubKey: " PUBHEX "})
 	conf := d.buildAgentConfig(&Request{
 		AgentID:        "web-01",
 		LatencyTargets: []string{"icmp:1.1.1.1", "tcp:1.1.1.1:443"},
@@ -96,7 +96,8 @@ func TestBuildAgentConfig(t *testing.T) {
 		"tls": false, "insecure": false, "daemon": false,
 		"client_cert": "", "client_key": "", "ca_cert": "",
 		"proxy_ip": "http://p/?url=", "agent_key": "K3Y",
-		"upgrade_pubkey": "", "upgrade_allow_unsigned": false,
+		// 公钥去空白后原样写入：Agent 侧接受 hex 或文件路径，部署器不该改动它
+		"upgrade_pubkey": "PUBHEX",
 	}
 	for k, want := range wants {
 		got, ok := got[k]
@@ -112,9 +113,41 @@ func TestBuildAgentConfig(t *testing.T) {
 	if !ok || len(lt) != 2 {
 		t.Fatalf("latency_targets 不正确: %v", got["latency_targets"])
 	}
+	// 逃生口已删除：配置里不能再出现"允许无签名升级"这个键
+	if _, exists := got["upgrade_allow_unsigned"]; exists {
+		t.Fatal("不应再写 upgrade_allow_unsigned —— Agent 侧已删除该开关")
+	}
+	// 文件根目录留空数组 = 让 Agent 用本机默认沙箱，服务端不自作主张扩大
+	if fr, ok := got["file_roots"].([]interface{}); !ok || len(fr) != 0 {
+		t.Fatalf("file_roots 应为空数组，实际 %v", got["file_roots"])
+	}
 	// 配置里不能出现明文密码字段（我们只写 agent_key）
 	if strings.Contains(conf, "password") {
 		t.Fatalf("配置里不应出现 password 字段:\n%s", conf)
+	}
+}
+
+// TestBuildAgentConfigFollowsRotation 写进目标机的必须是"当前"密钥。
+//
+// 服务端密钥现在可以运行期轮换（M-1）。部署器若抄一份启动快照，症状是
+// "部署一路报成功、目标机拿着旧密钥永远注册不上"，且没有任何一处会报错。
+func TestBuildAgentConfigFollowsRotation(t *testing.T) {
+	current := "key-v1"
+	d := New(Options{AgentKeyFunc: func() string { return current }})
+	keyOf := func(conf string) string {
+		var got map[string]interface{}
+		if err := jsonUnmarshal([]byte(conf), &got); err != nil {
+			t.Fatalf("配置不合法: %v", err)
+		}
+		s, _ := got["agent_key"].(string)
+		return s
+	}
+	if k := keyOf(d.buildAgentConfig(&Request{AgentID: "a"}, "h:1")); k != "key-v1" {
+		t.Fatalf("应写入当前密钥，实际 %q", k)
+	}
+	current = "key-v2" // 运维在控制台上点了轮换
+	if k := keyOf(d.buildAgentConfig(&Request{AgentID: "a"}, "h:1")); k != "key-v2" {
+		t.Fatalf("轮换后仍写入旧密钥 %q，部署出去的主机会永远连不上", k)
 	}
 }
 

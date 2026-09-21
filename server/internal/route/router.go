@@ -1,4 +1,4 @@
-// Package route 实现命令路由、命令黑名单拦截与操作审计日志。
+// Package route 实现命令路由、命令黑名单拦截、在途命令归属与操作审计日志。
 package route
 
 import (
@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,8 +28,8 @@ type Router struct {
 	// 审计日志
 	auditMu sync.Mutex
 	audits  []*AuditLog
-	// command_id -> 审计记录 ID 映射（用于命令结果回填）
-	cmdAudit map[string]int64
+	// command_id -> 在途命令归属（审计记录、接令 Agent、发起方会话）
+	cmdAudit map[string]*cmdBinding
 	// 持久化文件（可选）：追加写入 JSONL
 	auditFile *os.File
 	// SQLite 持久化（可选）
@@ -37,6 +38,33 @@ type Router struct {
 	imu    sync.Mutex
 	iguard *InteractiveGuard
 }
+
+// cmdBinding 一条在途命令的归属。
+//
+// 存在的理由：Agent 回传的 command_id 是它自己填的，早先只按这个 ID 找审计记录、
+// 找发起方，于是任一已接入的 Agent 都能替别人的命令写"执行成功"，或往别人正开着
+// 的终端里塞文本。这里把"当初下发给了谁、是谁下发的"钉住，回传时逐条比对。
+type cmdBinding struct {
+	auditID int64  // 待回填结果的审计记录 ID（落库异步，可能暂时为 0）
+	agentID string // 接令 Agent：回传连接的身份（证书或注册密钥证明）必须与之一致
+	session string // 发起方会话键：命令输出只回投给它
+	// last 为最近一次被回执触及的时间。一条交互命令可以跑上几小时并持续回显，
+	// 容量驱逐因此按"最久未触及"下手：随机删会误伤活跃终端的绑定，
+	// 让那个终端从此静默失联。
+	last time.Time
+}
+
+// CommandOrigin 一条在途命令的归属信息（回传给发起方会话时需要两者都匹配）。
+type CommandOrigin struct {
+	AgentID string // 当初接令的 Agent
+	Session string // 发起方操作员会话键（空表示无法定向）
+}
+
+// 在途命令映射的容量上下限：超过 cmdAuditCapMax 时驱逐到 cmdAuditCapMin。
+const (
+	cmdAuditCapMax = 20000
+	cmdAuditCapMin = 10000
+)
 
 // AuditLog 操作审计日志。
 type AuditLog struct {
@@ -71,14 +99,19 @@ func NewRouter(sess *session.Manager, db *storage.DB, auditPaths ...string) *Rou
 	r := &Router{
 		sessions:  sess,
 		blacklist: append([]string{}, DefaultBlacklistPatterns...),
-		cmdAudit:  make(map[string]int64),
+		cmdAudit:  make(map[string]*cmdBinding),
 		db:        db,
 	}
 	if len(auditPaths) > 0 && auditPaths[0] != "" {
-		if err := os.MkdirAll(filepath.Dir(auditPaths[0]), 0755); err == nil {
+		if err := os.MkdirAll(filepath.Dir(auditPaths[0]), 0700); err == nil {
 			// 导入历史 JSONL 审计（在打开文件追加句柄之前完成，避免读到未落盘内容）
 			r.importLegacyAudits(auditPaths[0])
-			if f, err := os.OpenFile(auditPaths[0], os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			if f, err := os.OpenFile(auditPaths[0], os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); err == nil {
+				// 再显式 Chmod 一次：os.OpenFile 的权限位**只在创建时**生效，
+				// 而旧版本留下的 0644 文件会一路保持下去 —— 里面是审计明文。
+				if cerr := f.Chmod(0600); cerr != nil {
+					log.Printf("[audit] 收紧 %s 权限失败: %v（审计含命令与结果，请手工改为 0600）", auditPaths[0], cerr)
+				}
 				r.auditFile = f
 			}
 		}
@@ -253,7 +286,8 @@ func (r *Router) IsBlocked(cmd string) (bool, string) {
 
 // Dispatch 将命令下发到指定 Agent。
 // interactive 为 true 时进入交互模式（通过 WebSocket 实时转发）。
-func (r *Router) Dispatch(req *protocol.CommandReq, operator, operatorIP string) (bool, string) {
+// session 为发起方操作员会话键（见 ws.SessionKey）：命令输出只回投给这一会话。
+func (r *Router) Dispatch(req *protocol.CommandReq, operator, operatorIP, session string) (bool, string) {
 	if blocked, reason := r.IsBlocked(req.Command); blocked {
 		r.Audit(&AuditLog{
 			Time: time.Now().Unix(), Operator: operator, OperatorIP: operatorIP,
@@ -271,22 +305,19 @@ func (r *Router) Dispatch(req *protocol.CommandReq, operator, operatorIP string)
 	// 先落审计（命令下发即留痕，操作人明确），结果由 CommandResp 回填
 	id := r.Audit(&AuditLog{Time: time.Now().Unix(), Operator: operator, OperatorIP: operatorIP,
 		AgentID: req.AgentID, CommandID: req.CommandID, Command: req.Command})
-	// 记录 command_id -> 审计ID 映射，供结果回填
+	// 记录 command_id -> 归属（审计 ID + 接令 Agent + 发起方会话），供结果回填与回投
 	if req.CommandID != "" {
 		r.auditMu.Lock()
 		if r.cmdAudit == nil {
-			r.cmdAudit = make(map[string]int64)
+			r.cmdAudit = make(map[string]*cmdBinding)
 		}
-		r.cmdAudit[req.CommandID] = id
-		// 防止映射无限增长
-		if len(r.cmdAudit) > 20000 {
-			for k := range r.cmdAudit {
-				delete(r.cmdAudit, k)
-				if len(r.cmdAudit) <= 10000 {
-					break
-				}
-			}
+		r.cmdAudit[cmdKey(req.CommandID, req.AgentID)] = &cmdBinding{
+			auditID: id,
+			agentID: req.AgentID,
+			session: session,
+			last:    time.Now(),
 		}
+		r.evictCmdAuditLocked()
 		r.auditMu.Unlock()
 	}
 	if err := conn.Write(protocol.TypeCommandReq, req); err != nil {
@@ -296,22 +327,91 @@ func (r *Router) Dispatch(req *protocol.CommandReq, operator, operatorIP string)
 	return true, ""
 }
 
+// cmdKey 在途命令的索引键。
+//
+// 必须带上 agentID：批量下发时 N 台机器共用同一个由浏览器生成的 command_id，
+// 只按 ID 索引会让后写入的归属覆盖前 N-1 台，届时既回填错审计记录，
+// 又把其余 Agent 的正常回执误判成"身份不符"。
+func cmdKey(commandID, agentID string) string {
+	return agentID + "|" + commandID
+}
+
+// evictCmdAuditLocked 限制在途命令映射的规模，按"最久未触及"整批驱逐。
+// 调用方需持有 auditMu。
+//
+// 一次性排好序删到下限，而不是每次删一条最旧的：后者在触发阈值后是 O(n²)
+// （n=2 万时约 2 亿次比较），会卡在命令下发路径上。
+func (r *Router) evictCmdAuditLocked() {
+	if len(r.cmdAudit) <= cmdAuditCapMax {
+		return
+	}
+	keys := make([]string, 0, len(r.cmdAudit))
+	for k := range r.cmdAudit {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return r.cmdAudit[keys[i]].last.Before(r.cmdAudit[keys[j]].last)
+	})
+	for _, k := range keys {
+		if len(r.cmdAudit) <= cmdAuditCapMin {
+			return
+		}
+		delete(r.cmdAudit, k)
+	}
+}
+
+// CommandOrigin 查询"这条命令当初是不是下发给了这台 Agent"，并给出发起方会话。
+//
+// 回传侧（Agent → 服务端）的身份取自连接证书，不取报文里的自报字段；
+// 查不到绑定 = 这条 command_id 从未下发给该 Agent，调用方应丢弃并留痕。
+func (r *Router) CommandOrigin(commandID, agentID string) (CommandOrigin, bool) {
+	if commandID == "" || agentID == "" {
+		return CommandOrigin{}, false
+	}
+	r.auditMu.Lock()
+	defer r.auditMu.Unlock()
+	b := r.cmdAudit[cmdKey(commandID, agentID)]
+	if b == nil {
+		return CommandOrigin{}, false
+	}
+	// 交互终端的一条命令可以跑很久：每次被触及就续期，避免被容量驱逐
+	b.last = time.Now()
+	return CommandOrigin{AgentID: b.agentID, Session: b.session}, true
+}
+
 // auditIDFor 返回某条命令对应的审计记录 ID（不存在返回 0）。
-func (r *Router) auditIDFor(commandID string) int64 {
+func (r *Router) auditIDFor(commandID, agentID string) int64 {
 	if commandID == "" {
 		return 0
 	}
 	r.auditMu.Lock()
 	defer r.auditMu.Unlock()
-	return r.cmdAudit[commandID]
+	if b := r.cmdAudit[cmdKey(commandID, agentID)]; b != nil {
+		return b.auditID
+	}
+	return 0
 }
 
-// CompleteByCommand 按 command_id 回填命令执行结果（供 Agent 回传 CommandResp 时调用）。
+// CompleteByCommand 按 (command_id, agent_id) 回填命令执行结果。
+// agentID 必须与当初接令的一致，否则既不回填也不清除绑定（那是别人的命令）。
 func (r *Router) CompleteByCommand(commandID, agentID, result string, exitCode int, duration int64) {
-	if commandID == "" {
+	if commandID == "" || agentID == "" {
 		return
 	}
-	r.completeByCommandID(commandID, result, exitCode, duration)
+	r.completeByCommandID(commandID, agentID, result, exitCode, duration)
+}
+
+// ReleaseCommand 结束一条交互会话的归属登记。
+//
+// 交互终端不会回 CommandResp（它只发 InteractiveOutput{type:exit}），
+// 若不在此处收口，这条映射要等到容量驱逐才消失。
+func (r *Router) ReleaseCommand(commandID, agentID string) {
+	if commandID == "" || agentID == "" {
+		return
+	}
+	r.auditMu.Lock()
+	delete(r.cmdAudit, cmdKey(commandID, agentID))
+	r.auditMu.Unlock()
 }
 
 // BatchResult 批量命令单台结果。
@@ -322,12 +422,13 @@ type BatchResult struct {
 }
 
 // DispatchBatch 将同一命令批量下发到多台在线 Agent。
-func (r *Router) DispatchBatch(req *protocol.CommandReq, agentIDs []string, operator, operatorIP string) []*BatchResult {
+// 各台共用一个 command_id（由浏览器生成），因此归属只能按 (command_id, agent_id) 记录。
+func (r *Router) DispatchBatch(req *protocol.CommandReq, agentIDs []string, operator, operatorIP, session string) []*BatchResult {
 	results := make([]*BatchResult, 0, len(agentIDs))
 	for _, id := range agentIDs {
 		clone := *req
 		clone.AgentID = id
-		ok, msg := r.Dispatch(&clone, operator, operatorIP)
+		ok, msg := r.Dispatch(&clone, operator, operatorIP, session)
 		results = append(results, &BatchResult{AgentID: id, OK: ok, Msg: msg})
 	}
 	return results
@@ -362,23 +463,29 @@ func (r *Router) Audit(l *AuditLog) int64 {
 			}
 		}
 	}
+	var row *storage.AuditLogRow
+	if r.db != nil {
+		// 行必须在持锁期间抄好：交给协程去读 l 的字段，就等于让它在
+		// Complete 改写 Result/ExitCode/Duration 的同时裸读同一批字段。
+		row = &storage.AuditLogRow{
+			Time:        l.Time,
+			Operator:    l.Operator,
+			OperatorIP:  l.OperatorIP,
+			AgentID:     l.AgentID,
+			CommandID:   l.CommandID,
+			Command:     l.Command,
+			Result:      l.Result,
+			ExitCode:    l.ExitCode,
+			Blocked:     l.Blocked,
+			BlockReason: l.BlockReason,
+			Duration:    l.Duration,
+		}
+	}
 	r.auditMu.Unlock()
 	// 异步写入 SQLite（避免阻塞命令转发）
-	if r.db != nil {
+	if row != nil {
 		go func() {
-			id, err := r.db.InsertAuditLog(&storage.AuditLogRow{
-				Time:        l.Time,
-				Operator:    l.Operator,
-				OperatorIP:  l.OperatorIP,
-				AgentID:     l.AgentID,
-				CommandID:   l.CommandID,
-				Command:     l.Command,
-				Result:      l.Result,
-				ExitCode:    l.ExitCode,
-				Blocked:     l.Blocked,
-				BlockReason: l.BlockReason,
-				Duration:    l.Duration,
-			})
+			id, err := r.db.InsertAuditLog(row)
 			if err != nil {
 				log.Printf("[audit] 写入 SQLite 失败: %v", err)
 				return
@@ -393,6 +500,10 @@ func (r *Router) Audit(l *AuditLog) int64 {
 	if writeErr != nil {
 		log.Printf("[audit] 持久化写入失败: %v", writeErr)
 	}
+	// ID 由上面那个协程回填，读它必须同样持锁 —— 否则会与其写入竞争同一字段
+	// （这里通常仍是 0：落库没回来，回填结果改走 command_id 定位）。
+	r.auditMu.Lock()
+	defer r.auditMu.Unlock()
 	return l.ID
 }
 
@@ -400,6 +511,7 @@ func (r *Router) Audit(l *AuditLog) int64 {
 // 并同步更新内存中的同一条记录，避免产生重复审计条目。
 // 若 ID 为 0（异步落库尚未返回 ID）则按 agent_id 就近匹配尚未有结果的记录。
 func (r *Router) Complete(id int64, agentID, result string, exitCode int, duration int64) {
+	result = MaskCommand(result)
 	r.auditMu.Lock()
 	for i := len(r.audits) - 1; i >= 0; i-- {
 		l := r.audits[i]
@@ -423,14 +535,18 @@ func (r *Router) Complete(id int64, agentID, result string, exitCode int, durati
 	}
 }
 
-// completeByCommandID 按 command_id 回填内存与数据库中的审计记录。
-// 以 command_id 为准定位（比 ID 更可靠，因为 ID 是异步落库后才回填的）。
-func (r *Router) completeByCommandID(commandID, result string, exitCode int, duration int64) {
+// completeByCommandID 按 (command_id, agent_id) 回填内存与数据库中的审计记录。
+//
+// 两个条件都要匹配：只有 command_id 时，一条猜测得到的 ID（浏览器生成的
+// 'push-'+Date.now() 完全可猜）就能改写到别人的审计行；批量下发时同一 ID
+// 又对应多条记录，不看 agent 会回填到任意一条上。
+func (r *Router) completeByCommandID(commandID, agentID, result string, exitCode int, duration int64) {
+	result = MaskCommand(result)
 	r.auditMu.Lock()
 	var id int64
 	for i := len(r.audits) - 1; i >= 0; i-- {
 		l := r.audits[i]
-		if l.CommandID == commandID {
+		if l.CommandID == commandID && l.AgentID == agentID {
 			l.Result = result
 			l.ExitCode = exitCode
 			l.Duration = duration
@@ -438,11 +554,15 @@ func (r *Router) completeByCommandID(commandID, result string, exitCode int, dur
 			break
 		}
 	}
+	key := cmdKey(commandID, agentID)
 	if id == 0 {
-		// 说明落库尚未回填 ID，稍后由 auditIDFor 映射兜底
-		id = r.cmdAudit[commandID]
+		// 说明落库尚未回填 ID，改用下发时记下的审计 ID 兜底
+		if b := r.cmdAudit[key]; b != nil {
+			id = b.auditID
+		}
 	}
-	delete(r.cmdAudit, commandID)
+	// 只删自己这一条：命令已结束，归属映射随之作废
+	delete(r.cmdAudit, key)
 	r.auditMu.Unlock()
 	if r.db != nil && id > 0 {
 		go func() {
@@ -458,7 +578,13 @@ func (r *Router) Audits() []*AuditLog {
 	r.auditMu.Lock()
 	defer r.auditMu.Unlock()
 	out := make([]*AuditLog, len(r.audits))
-	copy(out, r.audits)
+	// 逐条**拷值**而不是拷指针：落库回填 ID 与结果回填都在别的协程里改同一个结构体，
+	// 交出指针就等于把没有锁保护的字段（ID/Result）发给调用方 —— /api/audits 序列化
+	// 与这些写入并发时是真实的数据竞争（-race 可复现）。
+	for i, l := range r.audits {
+		c := *l
+		out[i] = &c
+	}
 	return out
 }
 

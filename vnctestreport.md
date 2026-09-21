@@ -4,8 +4,9 @@
 MoCenter Agent 在 Windows 虚拟机上部署后，VNC 远程桌面显示黑屏。目标是实现**无头（无人连接控制台）Windows 虚拟机的 VNC 远程桌面**。
 
 ## 环境
-- **Win10 VM**: 192.168.117.131, Administrator/123456, VMware NAT
-- **Rocky Linux 8 VM**: 192.168.117.132, root/123456 (作为对照，Linux VNC 已正常工作)
+- **Win10 VM**: 192.168.117.131（Administrator），VMware NAT
+- **Rocky Linux 8 VM**: 192.168.117.132（root），作为对照，Linux VNC 已正常工作
+- 两台测试机的登录口令不记录在本文档（曾随本文件提交进 git 历史，需轮换后才会失效）
 - **服务端**: mocenter-server 运行于宿主机 :9000/:8080
 - **Agent**: 位于 `C:\Users\Administrator\Desktop\MoCenter\mocenter-agent.exe`
 

@@ -27,6 +27,9 @@
 //     AgentID 等还要过 validateAgentID 的白名单校验
 //     —— 否则一个叫 `x; rm -rf /` 的 AgentID 就是一次远程代码执行。
 //   - **上传体积上限**：避免被当作"往目标机写大文件"的通道。
+//   - **主机密钥必须校验**（known_hosts TOFU，见 hostKeyCallback）：本通道是
+//     服务端主动连别人机器，握手时不校验主机密钥就等于把注册密钥和操作员的
+//     口令/私钥交给路径上的中间人。
 //   - 仅管理员可用（REST 层 guard 已覆盖）。
 package agentdeploy
 
@@ -45,10 +48,18 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 // maxUploadSize 单个上传文件的大小上限（200 MB，够放各架构 Agent 二进制）。
 const maxUploadSize = 200 << 20
+
+// knownHostsFileName 部署通道的主机密钥记账文件（位于数据目录下）。
+//
+// 单独一个文件，而不是复用运维自己的 ~/.ssh/known_hosts：
+// 部署用的是表单临时填的账号（常常是 root），把它写进个人配置会污染对方环境，
+// 反过来个人文件里的通配/注释写法也可能让这个包的解析器读不懂。
+const knownHostsFileName = "ssh_known_hosts"
 
 // stepTimeout 单步命令的执行超时。
 const stepTimeout = 60 * time.Second
@@ -62,10 +73,19 @@ type Options struct {
 	// ServerAddr 服务端监听地址（写入 Agent 配置）。
 	// 形如 ":9000" 或 "0.0.0.0:9000" 时，会尝试用本次请求的 Host 推导可路由地址。
 	ServerAddr string
-	// AgentKey Agent 注册预共享密钥。
-	AgentKey string
+	// AgentKeyFunc 实时取当前共享注册密钥（写入目标机的 Agent 配置）。
+	//
+	// 必须是"取"而不是启动时"抄一份"：密钥现在能在运行期轮换（M-1），
+	// 快照会让部署一路报成功、而目标机拿着旧密钥永远注册不上。
+	AgentKeyFunc func() string
 	// ProxyIP 可选的国内加速代理前缀。
 	ProxyIP string
+	// UpgradePubKey 升级包 Ed25519 公钥，写进目标机的 Agent 配置。
+	//
+	// 留空也要照写：Agent 侧没有"跳过验签"的开关，配置里缺这个键的表现是
+	// "装好的主机永远升级不动"，而日志只有一句"未配置 -upgrade-pubkey"。
+	// 空值让运维在生成的配置里直接看见该填什么。
+	UpgradePubKey string
 	// TLS / mTLS 相关：目标 Agent 要连上启用了 TLS 的服务端就必须带上这些文件。
 	TLSCert string
 	TLSKey  string
@@ -101,6 +121,11 @@ type Request struct {
 	ServiceName string `json:"service_name"`
 	// ProbeOnly 仅做连通性与环境探测，不上传、不安装。
 	ProbeOnly bool `json:"probe_only"`
+	// HostKeyFingerprint 目标机主机密钥指纹（SHA256:… 或只写 base64 部分）。
+	//
+	// 填了就是**强制钉扎**：握手时指纹不符直接中止，不再走"首次接触信任"。
+	// 留空则按 TOFU 处理 —— 第一次连接记录密钥并放行，之后变更一律硬失败。
+	HostKeyFingerprint string `json:"host_key_fingerprint"`
 }
 
 // StepResult 单步执行结果（用于前端逐步展示）。
@@ -120,6 +145,12 @@ type Result struct {
 	Message string       `json:"message"`
 	// Target 探测到的目标机信息（架构/权限/发行版），便于运维核对
 	Target *TargetInfo `json:"target,omitempty"`
+	// HostKey 本次连接实际采用的目标机主机密钥指纹（SHA256:…）。
+	// 公开指纹不是秘密：它是给运维**核对**用的，也是审计里能留下的唯一凭据线索。
+	HostKey string `json:"host_key,omitempty"`
+	// HostKeyNewTrust 表示该密钥是本次首次接触时记入 known_hosts 的。
+	// 运维应当把它当成"请核对指纹"的提示，而不是"一切正常"。
+	HostKeyNewTrust bool `json:"host_key_new_trust,omitempty"`
 }
 
 // TargetInfo 目标机探测结果。
@@ -167,6 +198,139 @@ func ValidAgentID(s string) bool { return agentIDRe.MatchString(s) }
 // sshHostRe 允许的主机标识（IPv4 / IPv6 / 域名）。
 var sshHostRe = regexp.MustCompile(`^[A-Za-z0-9._:\[\]-]{1,255}$`)
 
+// fingerprintRe 部署表单里允许的主机密钥指纹写法：可省 "SHA256:" 前缀。
+//
+// 这里做格式校验而不只是 trim：这个值会出现在错误信息与审计摘要里，
+// 放任任意字符串进来就等于开了一个"往审计里写任意内容"的口子。
+var fingerprintRe = regexp.MustCompile(`^(?:SHA256:)?[A-Za-z0-9+/=]{20,88}$`)
+
+// normalizeFingerprint 把用户填写的指纹规整为 ssh.FingerprintSHA256 的写法。
+func normalizeFingerprint(s string) string {
+	s = strings.TrimSpace(strings.Trim(strings.TrimSpace(s), "\"'"))
+	if s == "" || strings.HasPrefix(s, "SHA256:") {
+		return s
+	}
+	return "SHA256:" + s
+}
+
+// hostKeyTrust 一次握手中最终采用的主机密钥信息（用于回显与审计）。
+type hostKeyTrust struct {
+	// Fingerprint 实际收到的密钥指纹。
+	Fingerprint string
+	// NewlyTrusted 首次接触并已记入 known_hosts。
+	NewlyTrusted bool
+}
+
+// knownHostsPath 返回主机密钥记账文件路径，必要时创建数据目录。
+func (d *Deployer) knownHostsPath() (string, error) {
+	dir := strings.TrimSpace(d.opts.DataDir)
+	if dir == "" {
+		return "", errors.New("服务端未配置数据目录，无法记录 SSH 主机密钥；请在部署表单里填写目标机的主机密钥指纹")
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("创建数据目录 %s 失败: %w", dir, err)
+	}
+	return filepath.Join(dir, knownHostsFileName), nil
+}
+
+// hostKeyCallback 构造 known_hosts 校验回调（TOFU：首次接触记账，之后变更硬失败）。
+//
+// 这里的默认取向是 **fail-closed**：任何"读不了记录"的错误都中止部署，而不是退回
+// 忽略主机密钥。退回去不会被任何人察觉 —— 连接照样成功，只是运维的口令、私钥和
+// 注册密钥已经送给了中间人。
+func (d *Deployer) hostKeyCallback(addr, pin string, trust *hostKeyTrust) (ssh.HostKeyCallback, error) {
+	path, err := d.knownHostsPath()
+	if err != nil {
+		return nil, err
+	}
+	// 先确保文件存在（0600）：knownhosts.New 打不开文件是报错而不是当空表处理，
+	// 而"这台服务端还没部署过任何机器"显然不该是失败理由。
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("创建主机密钥记录 %s 失败: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("写入主机密钥记录 %s 失败: %w", path, err)
+	}
+	known, err := knownhosts.New(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取主机密钥记录 %s 失败: %w", path, err)
+	}
+	pin = normalizeFingerprint(pin)
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		fp := ssh.FingerprintSHA256(key)
+		trust.Fingerprint = fp
+		if pin != "" && fp != pin {
+			return fmt.Errorf("目标机 %s 的主机密钥为 %s，与部署时填写的 %s 不一致，已中止。"+
+				"若该机确实换过密钥（重装/重新生成），请核对无误后用新指纹重试", addr, fp, pin)
+		}
+		checkAddr := hostname
+		if checkAddr == "" {
+			checkAddr = addr
+		}
+		err := known(checkAddr, remote, key)
+		if err == nil {
+			return nil
+		}
+		var ke *knownhosts.KeyError
+		if !errors.As(err, &ke) {
+			return fmt.Errorf("主机密钥校验失败: %w", err)
+		}
+		if len(ke.Want) > 0 {
+			// 记过账但密钥对不上 —— 这正是 known_hosts 存在的理由，硬失败。
+			return fmt.Errorf("目标机 %s 的主机密钥与已记录的不一致：记录为 %s，实际为 %s。"+
+				"可能存在中间人，或该机确实重装过；确认无误后删除 %s 中的对应行再部署",
+				addr, ssh.FingerprintSHA256(ke.Want[0].Key), fp, path)
+		}
+		// 首次接触：记账后放行。
+		if err := d.recordHostKey(path, checkAddr, key); err != nil {
+			return err
+		}
+		trust.NewlyTrusted = true
+		return nil
+	}, nil
+}
+
+// recordHostKey 追加一条主机密钥记录。
+//
+// 用追加而不是"读出来改完再整体写回"：并发部署时整体写回会丢掉别人刚记的行。
+func (d *Deployer) recordHostKey(path, addr string, key ssh.PublicKey) error {
+	line := knownhosts.Line([]string{knownhosts.Normalize(addr)}, key)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("打开主机密钥记录 %s 失败: %w", path, err)
+	}
+	defer f.Close()
+	if _, err := io.WriteString(f, line+"\n"); err != nil {
+		return fmt.Errorf("写入主机密钥记录 %s 失败: %w", path, err)
+	}
+	return nil
+}
+
+// trustSummary 生成一句给前端/审计看的话（只含指纹，不含任何凭证）。
+func trustSummary(t *hostKeyTrust) string {
+	if t == nil || t.Fingerprint == "" {
+		return ""
+	}
+	if t.NewlyTrusted {
+		return "主机密钥 " + t.Fingerprint + "（首次接触，已记入 known_hosts，请自行核对）"
+	}
+	return "主机密钥 " + t.Fingerprint + "（与已知记录一致）"
+}
+
+// hostKeyForAudit 审计用的一小段（握手都没走到时记 "-"，便于区分"没连上"和"密钥被拒"）。
+func hostKeyForAudit(t *hostKeyTrust) string {
+	if t == nil || t.Fingerprint == "" {
+		return "-"
+	}
+	if t.NewlyTrusted {
+		return t.Fingerprint + "(首次信任)"
+	}
+	return t.Fingerprint
+}
+
 // Deploy 执行一次部署。
 //
 // operator / operatorIP 仅用于审计。凭证不会被记录。
@@ -186,6 +350,9 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 	}
 	if req.AgentID != "" && !ValidAgentID(req.AgentID) {
 		return nil, errors.New("Agent 名称只允许字母、数字与 . _ -（最长 64 字符）")
+	}
+	if pin := normalizeFingerprint(req.HostKeyFingerprint); pin != "" && !fingerprintRe.MatchString(pin) {
+		return nil, errors.New("主机密钥指纹格式不正确（形如 SHA256:xxxxxxxx…，也允许省略 SHA256: 前缀）")
 	}
 	if req.ProbeOnly && req.Password == "" && req.PrivateKey == "" {
 		return nil, errors.New("探测也需要提供认证方式")
@@ -217,17 +384,24 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 	}
 
 	// --- 1. 连接认证 ---
-	client, err := d.dial(req, host, port)
+	client, trust, err := d.dial(req, host, port)
+	res.HostKey = trust.Fingerprint
+	res.HostKeyNewTrust = trust.NewlyTrusted
 	if err != nil {
 		// 认证失败的具体原因可能是"密码错"或"网络不通"，两者对运维意义不同，
 		// 因此把原始错误保留在步骤里（不含凭证内容）。
 		addStep(StepResult{Name: "SSH 连接与认证", OK: false, Error: err.Error()})
 		res.Message = "SSH 连接失败"
-		d.auditf(operator, operatorIP, "一键部署 Agent 失败（SSH 连接）: %s@%s:%d", req.User, host, port)
+		d.auditf(operator, operatorIP, "一键部署 Agent 失败（SSH 连接）: %s@%s:%d 主机密钥=%s",
+			req.User, host, port, hostKeyForAudit(trust))
 		return res, nil
 	}
 	defer client.Close()
-	addStep(StepResult{Name: "SSH 连接与认证", OK: true, Output: "已连接"})
+	connectOut := "已连接"
+	if s := trustSummary(trust); s != "" {
+		connectOut += " / " + s
+	}
+	addStep(StepResult{Name: "SSH 连接与认证", OK: true, Output: connectOut})
 
 	// 部署过程中若 SSH 连接中断（网络抖动、目标机被重启），后续每一步都会失败，
 	// 这里给出整体提示，避免运维只看到"最后一步失败"而无从判断。
@@ -274,8 +448,8 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 		res.OK = true
 		res.Message = "探测完成（未安装）"
 		addStep(StepResult{Name: "探测模式", OK: true, Output: "仅探测，未做任何改动"})
-		d.auditf(operator, operatorIP, "一键部署 Agent 环境探测: %s@%s:%d (%s/%s)",
-			req.User, host, port, info.OSName, info.Arch)
+		d.auditf(operator, operatorIP, "一键部署 Agent 环境探测: %s@%s:%d (%s/%s) 主机密钥=%s",
+			req.User, host, port, info.OSName, info.Arch, hostKeyForAudit(trust))
 		return res, nil
 	}
 
@@ -386,13 +560,17 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 
 	res.OK = true
 	res.Message = "Agent 已安装并启动"
-	d.auditf(operator, operatorIP, "一键部署 Agent 成功: %s@%s:%d agent_id=%s arch=%s",
-		req.User, host, port, req.AgentID, info.GOARCH)
+	d.auditf(operator, operatorIP, "一键部署 Agent 成功: %s@%s:%d agent_id=%s arch=%s 主机密钥=%s",
+		req.User, host, port, req.AgentID, info.GOARCH, hostKeyForAudit(trust))
 	return res, nil
 }
 
 // dial 建立 SSH 连接。
-func (d *Deployer) dial(req *Request, host string, port int) (*ssh.Client, error) {
+//
+// 返回的 hostKeyTrust 在失败时也可能有值（握手阶段已收到密钥），调用方可以据此
+// 在审计里留下"哪台机、哪个密钥被拒了"这条线索。
+func (d *Deployer) dial(req *Request, host string, port int) (*ssh.Client, *hostKeyTrust, error) {
+	trust := &hostKeyTrust{}
 	var auths []ssh.AuthMethod
 	if req.Password != "" {
 		auths = append(auths, ssh.Password(req.Password))
@@ -416,18 +594,29 @@ func (d *Deployer) dial(req *Request, host string, port int) (*ssh.Client, error
 			signer, err = ssh.ParsePrivateKey([]byte(key))
 		}
 		if err != nil {
-			return nil, fmt.Errorf("解析私钥失败: %w", err)
+			return nil, trust, fmt.Errorf("解析私钥失败: %w", err)
 		}
 		auths = append(auths, ssh.PublicKeys(signer))
+	}
+	addr := net.JoinHostPort(host, fmt.Sprint(port))
+	// 主机密钥校验是**强制**的：没有"忽略校验"的开关可退。
+	// 加一个 -deploy-ssh-insecure 之类的逃生口，等于把这里刚修掉的洞原样留下，
+	// 而且它一旦被某次部署用上，就不会有人再关回去。
+	cb, err := d.hostKeyCallback(addr, req.HostKeyFingerprint, trust)
+	if err != nil {
+		return nil, trust, err
 	}
 	cfg := &ssh.ClientConfig{
 		User:            req.User,
 		Auth:            auths,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // 目标机多为自建/内网机器，无预置 known_hosts
+		HostKeyCallback: cb,
 		Timeout:         15 * time.Second,
 	}
-	addr := net.JoinHostPort(host, fmt.Sprint(port))
-	return ssh.Dial("tcp", addr, cfg)
+	client, err := ssh.Dial("tcp", addr, cfg)
+	if err != nil {
+		return nil, trust, err
+	}
+	return client, trust, nil
 }
 
 // probeTarget 探测目标机的架构与权限。
@@ -560,6 +749,15 @@ func basenames(paths []string) []string {
 	return out
 }
 
+// agentKey 取当前共享注册密钥。
+// 返回空串表示这条路径当前不可用（已关闭或未配置）—— 写空串比写一把旧密钥更诚实。
+func (d *Deployer) agentKey() string {
+	if d.opts.AgentKeyFunc == nil {
+		return ""
+	}
+	return d.opts.AgentKeyFunc()
+}
+
 // buildAgentConfig 生成 Agent 的 JSON 配置。
 //
 // 字段名必须与 agent/internal/config.Config 的 json tag 完全一致，
@@ -582,9 +780,11 @@ func (d *Deployer) buildAgentConfig(req *Request, serverAddr string) string {
 	fmt.Fprintf(&b, "  %q: %q,\n", "ca_cert", "")
 	fmt.Fprintf(&b, "  %q: %q,\n", "proxy_ip", d.opts.ProxyIP)
 	// 注册密钥：没有它 Agent 会被服务端拒绝注册（表现为"装好了却一直不上线"）
-	fmt.Fprintf(&b, "  %q: %q,\n", "agent_key", d.opts.AgentKey)
-	fmt.Fprintf(&b, "  %q: %q,\n", "upgrade_pubkey", "")
-	fmt.Fprintf(&b, "  %q: %v,\n", "upgrade_allow_unsigned", false)
+	fmt.Fprintf(&b, "  %q: %q,\n", "agent_key", d.agentKey())
+	fmt.Fprintf(&b, "  %q: %q,\n", "upgrade_pubkey", strings.TrimSpace(d.opts.UpgradePubKey))
+	// 文件读写根目录：留空即 Agent 用默认沙箱 <配置目录>/files（M-9）。
+	// 这里刻意不给服务端下发扩大范围的能力 —— 那等于让被攻击的通道自己放开自己。
+	fmt.Fprintf(&b, "  %q: %s,\n", "file_roots", jsonStringArray(nil))
 	// 延迟目标：把服务端配置的目标直接写进 Agent 配置，装完立刻开始探测
 	fmt.Fprintf(&b, "  %q: %s\n", "latency_targets", jsonStringArray(req.LatencyTargets))
 	b.WriteString("}\n")

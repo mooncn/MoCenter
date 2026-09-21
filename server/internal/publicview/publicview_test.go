@@ -54,7 +54,7 @@ func TestBuildNodeNeverLeaksIdentifiers(t *testing.T) {
 	for _, f := range siteconfig.FieldCatalog {
 		cfg.Fields[f.Key] = true
 	}
-	node := BuildNode(sampleAgent(), cfg)
+	node := BuildNode(sampleAgent(), cfg, testKeys)
 	raw, err := json.Marshal(node)
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +86,7 @@ func TestBuildNodeNeverLeaksIdentifiers(t *testing.T) {
 func TestDisabledFieldsAbsentFromJSON(t *testing.T) {
 	cfg := siteconfig.Default() // 默认已关闭 hostname / os_version / public_ip
 	cfg.Enabled = true
-	node := BuildNode(sampleAgent(), cfg)
+	node := BuildNode(sampleAgent(), cfg, testKeys)
 	raw, _ := json.Marshal(node)
 	var m map[string]interface{}
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -104,20 +104,21 @@ func TestDisabledFieldsAbsentFromJSON(t *testing.T) {
 	}
 }
 
-// node_id 必须稳定（同一 agent_id 多次派生一致）且与 agent_id 单向。
+// node_id 必须稳定（同一 agent_id + 同一部署密钥多次派生一致）且与 agent_id 单向。
 func TestNodeIDStableAndOpaque(t *testing.T) {
-	a := NodeID("host-1")
-	if a != NodeID("host-1") {
+	a := testKeys.ID("host-1")
+	if a != testKeys.ID("host-1") {
 		t.Fatal("node_id 不稳定")
 	}
-	if a == NodeID("host-2") {
+	if a == testKeys.ID("host-2") {
 		t.Fatal("不同主机不应得到相同 node_id")
 	}
 	if strings.Contains(a, "host-1") {
 		t.Fatal("node_id 不应包含原始 agent_id")
 	}
-	if !strings.HasPrefix(a, "n-") || len(a) != 10 {
-		t.Fatalf("node_id 格式不符合约定: %q", a)
+	// n- + 16 位 hex（8 字节摘要）：长度掉回 4 字节就等于把暴力成本降到可枚举
+	if !strings.HasPrefix(a, "n-") || len(a) != 2+nodeIDBytes*2 {
+		t.Fatalf("node_id 格式不符合约定: %q（期望 n- 前缀 + %d 位 hex）", a, nodeIDBytes*2)
 	}
 }
 
@@ -133,7 +134,7 @@ func TestBuildNodesFiltersAndSorts(t *testing.T) {
 		{AgentID: "b", Remark: "B", Online: false},
 		{AgentID: "c", Remark: "C", Online: true},
 	}
-	nodes := BuildNodes(agents, cfg)
+	nodes := BuildNodes(agents, cfg, testKeys)
 	if len(nodes) != 2 {
 		t.Fatalf("应只输出白名单内的 2 台主机，实际 %d", len(nodes))
 	}
@@ -153,7 +154,7 @@ func TestBuildSummaryCountsVisibleOnly(t *testing.T) {
 		{AgentID: "b", CPUUsage: 100, Online: true},
 		{AgentID: "c", CPUUsage: 40, Online: true, MemTotalBytes: 100, MemUsedBytes: 50},
 	}
-	s := BuildSummary(BuildNodes(agents, cfg), 0)
+	s := BuildSummary(BuildNodes(agents, cfg, testKeys), 0)
 	if s.Total != 1 || s.Online != 1 || s.AvgCPU != 40 {
 		t.Fatalf("汇总未按可见节点计算: %+v", s)
 	}
@@ -207,13 +208,13 @@ func TestRemarkFallback(t *testing.T) {
 	cfg.Enabled = true
 	a := sampleAgent()
 	a.Remark = ""
-	node := BuildNode(a, cfg)
+	node := BuildNode(a, cfg, testKeys)
 	if node.Remark != "" {
 		t.Fatalf("备注为空且 hostname 关闭时不应输出名称，实际 %q", node.Remark)
 	}
 
 	cfg.Fields["hostname"] = true
-	node = BuildNode(a, cfg)
+	node = BuildNode(a, cfg, testKeys)
 	if node.Remark != a.Hostname {
 		t.Fatalf("备注为空应降级用主机名，实际 %q", node.Remark)
 	}
@@ -224,7 +225,7 @@ func TestNetworkFieldGate(t *testing.T) {
 	cfg := siteconfig.Default()
 	cfg.Enabled = true
 
-	node := BuildNode(sampleAgent(), cfg)
+	node := BuildNode(sampleAgent(), cfg, testKeys)
 	if node.NetRateIn != 1024 || node.NetRateOut != 2048 {
 		t.Fatalf("默认应公开网络速率，实际 in=%d out=%d", node.NetRateIn, node.NetRateOut)
 	}
@@ -235,7 +236,7 @@ func TestNetworkFieldGate(t *testing.T) {
 
 	// 关闭 network：速率与累计全部消失
 	cfg.Fields["network"] = false
-	node = BuildNode(sampleAgent(), cfg)
+	node = BuildNode(sampleAgent(), cfg, testKeys)
 	raw, _ = json.Marshal(node)
 	var m map[string]interface{}
 	_ = json.Unmarshal(raw, &m)
@@ -251,7 +252,7 @@ func TestAttachTrafficModes(t *testing.T) {
 	cfg := siteconfig.Default()
 	cfg.Enabled = true
 	a := sampleAgent()
-	node := BuildNode(a, cfg)
+	node := BuildNode(a, cfg, testKeys)
 
 	AttachTraffic(node, a, cfg)
 	if node.NetTotalIn != a.NetInBytes || node.NetTotalOut != a.NetOutBytes {
@@ -259,7 +260,7 @@ func TestAttachTrafficModes(t *testing.T) {
 	}
 
 	cfg.TrafficMode = siteconfig.TrafficModeWindow
-	node = BuildNode(a, cfg)
+	node = BuildNode(a, cfg, testKeys)
 	AttachTraffic(node, a, cfg)
 	if node.NetTotalIn != 0 || node.NetTotalOut != 0 {
 		t.Fatal("window 口径不应由 AttachTraffic 填写（需查历史）")
@@ -326,7 +327,7 @@ func TestBuildSummaryTraffic(t *testing.T) {
 		{AgentID: "a", NetRateIn: 999, NetRateOut: 999},
 		{AgentID: "c", NetRateIn: 100, NetRateOut: 200},
 	}
-	nodes := BuildNodes(agents, cfg)
+	nodes := BuildNodes(agents, cfg, testKeys)
 	if len(nodes) != 1 {
 		t.Fatalf("可见节点数错误: %d", len(nodes))
 	}
@@ -364,12 +365,12 @@ func TestLoadFieldGate(t *testing.T) {
 	cfg := siteconfig.Default()
 	cfg.Enabled = true
 	cfg.Fields["load"] = false
-	if raw, _ := json.Marshal(BuildNode(a, cfg)); strings.Contains(string(raw), "load1") {
+	if raw, _ := json.Marshal(BuildNode(a, cfg, testKeys)); strings.Contains(string(raw), "load1") {
 		t.Fatalf("负载开关关闭时不应出现 load1: %s", raw)
 	}
 
 	cfg.Fields["load"] = true
-	node := BuildNode(a, cfg)
+	node := BuildNode(a, cfg, testKeys)
 	if node.Load1 == nil || *node.Load1 != 0.42 || node.Load5 == nil || *node.Load5 != 0.31 {
 		t.Fatalf("负载应被下发且保留两位小数: %+v", node)
 	}
@@ -380,7 +381,7 @@ func TestLoadFieldGate(t *testing.T) {
 
 	// 平台不提供负载：字段整体消失（而不是 0）
 	a.Load1, a.Load5, a.Load15 = nil, nil, nil
-	node2 := BuildNode(a, cfg)
+	node2 := BuildNode(a, cfg, testKeys)
 	raw2, _ := json.Marshal(node2)
 	if strings.Contains(string(raw2), `"load1"`) {
 		t.Fatalf("LoadKnown=false 时不应下发负载: %s", raw2)
@@ -394,7 +395,7 @@ func TestLoadRounded(t *testing.T) {
 	cfg := siteconfig.Default()
 	cfg.Enabled = true
 	cfg.Fields["load"] = true
-	n := BuildNode(a, cfg)
+	n := BuildNode(a, cfg, testKeys)
 	if *n.Load1 != 0.15 || *n.Load5 != 1 || *n.Load15 != 13 {
 		t.Fatalf("负载取整异常: %v / %v / %v", *n.Load1, *n.Load5, *n.Load15)
 	}
@@ -408,7 +409,7 @@ func TestLoadZeroIsValidValue(t *testing.T) {
 	cfg := siteconfig.Default()
 	cfg.Enabled = true
 	cfg.Fields["load"] = true
-	node := BuildNode(a, cfg)
+	node := BuildNode(a, cfg, testKeys)
 	if node.Load1 == nil || *node.Load1 != 0 {
 		t.Fatalf("负载 0 应被下发: %+v", node.Load1)
 	}
@@ -435,7 +436,7 @@ func TestOfflineStateSerializedExplicitly(t *testing.T) {
 	a := sampleAgent()
 	a.Online = false
 
-	node := BuildNode(a, cfg)
+	node := BuildNode(a, cfg, testKeys)
 	if node.Online == nil {
 		t.Fatal("「在线状态」开启时 Online 不应为 nil")
 	}
@@ -461,7 +462,7 @@ func TestOnlineFieldGate(t *testing.T) {
 	cfg := siteconfig.Default()
 	cfg.Enabled = true
 	cfg.Fields = map[string]bool{}
-	node := BuildNode(sampleAgent(), cfg)
+	node := BuildNode(sampleAgent(), cfg, testKeys)
 	if node.Online != nil {
 		t.Fatal("关闭「在线状态」后 Online 应为 nil")
 	}
@@ -486,7 +487,7 @@ func TestSummaryOnlineOfflineCounts(t *testing.T) {
 		{AgentID: "b", Online: false},
 		{AgentID: "c", Online: false},
 	}
-	s := BuildSummary(BuildNodes(agents, cfg), 0)
+	s := BuildSummary(BuildNodes(agents, cfg, testKeys), 0)
 	if s.Total != 3 || s.Online != 1 || s.Offline != 2 {
 		t.Fatalf("在线/离线统计错误: total=%d online=%d offline=%d", s.Total, s.Online, s.Offline)
 	}

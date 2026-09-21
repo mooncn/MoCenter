@@ -34,9 +34,34 @@ api.interceptors.response.use(
 )
 
 export const Api = {
-  // Agent 接入信息（服务端地址/身份指纹/注册密钥），用于生成"一条命令"接入新主机
+  // Agent 接入信息（服务端地址/身份指纹/共享密钥指纹），用于生成"一条命令"接入新主机
   async serverInfo() {
     const { data } = await api.get('/server-info')
+    return data
+  },
+  // 一次性注册令牌：列出（不含明文）+ 证书 TOFU 绑定 + 共享密钥是否仍可用
+  async enrollTokens() {
+    const { data } = await api.get('/enroll/tokens')
+    return data
+  },
+  // 签发一枚绑定某台主机的注册令牌；明文只在本次响应里出现
+  async issueEnrollToken(payload) {
+    const { data } = await api.post('/enroll/tokens', payload)
+    return data
+  },
+  // 吊销令牌：传 id 单条吊销，传 agent_id 清掉该机全部未使用令牌
+  async revokeEnrollToken(payload) {
+    const { data } = await api.post('/enroll/token/revoke', payload)
+    return data
+  },
+  // 清除某台主机的证书公钥绑定（误绑定/迁移旧数据时的显式授权口）
+  async resetEnrollBinding(agentId) {
+    const { data } = await api.post('/enroll/cert/reset', { agent_id: agentId })
+    return data
+  },
+  // 轮换部署级共享注册密钥：新明文只在这次响应里出现一次
+  async rotateSharedKey() {
+    const { data } = await api.post('/enroll/shared-key/rotate', { confirm: true })
     return data
   },
   // 获取全部主机（含离线）
@@ -139,9 +164,14 @@ export const Api = {
     const { data } = await api.post('/vnc/install', payload, { timeout: 120000 })
     return data
   },
-  // 查询最近一次 VNC 安装/启动结果（含口令，供超时后补取）
+  // 查询最近一次 VNC 安装/启动结果（不含口令；has_password 表示服务端有口令可取）
   async vncStatus(agent) {
     const { data } = await api.get('/vnc/status', { params: { agent } })
+    return data
+  },
+  // 按需取回某主机最近一次安装生成的 VNC 口令；服务端每次都留审计
+  async vncPassword(agent) {
+    const { data } = await api.post('/vnc/password', { agent_id: agent })
     return data
   },
   // 设置/更新主机备注
@@ -207,9 +237,9 @@ export const Api = {
     const { data } = await api.get('/backup')
     return data
   },
-  // 创建备份
-  async createBackup() {
-    const { data } = await api.post('/backup', null, { timeout: 300000 })
+  // 创建备份；withSecrets=true 时把 agent.key 这类凭据文件一起打包（默认不含）
+  async createBackup(withSecrets = false) {
+    const { data } = await api.post('/backup', { include_secrets: !!withSecrets }, { timeout: 300000 })
     return data
   },
   // 查看备份包清单（恢复前确认）
@@ -251,8 +281,14 @@ export const Api = {
 // 不带 Authorization 头，绝不调用带 token 的实例，避免把会话凭据带到匿名页面。
 const publicApi = axios.create({ baseURL: '/api/public', timeout: 10000 })
 
+// 品牌文案用的裸实例：与 publicApi 一样**绝不带 Authorization**（登录前调用，
+// 带了就是把会话凭据往匿名页面上送），但它的 baseURL 是 /api ——
+// /api/branding 不属于公开页功能，也就不该跟着公开页开关一起消失。
+const brandingApi = axios.create({ baseURL: '/api', timeout: 10000 })
+
 export const PublicApi = {
-  // 公开页是否已启用（只返回布尔值，供登录页给出入口）
+  // 公开页是否已启用（只返回布尔值，供登录页给出入口）。
+  // 关掉时服务端直接 404，走 catch 返回 false —— 与"没连上"同样处理。
   async enabled() {
     try {
       const { data } = await publicApi.get('/enabled')
@@ -261,11 +297,12 @@ export const PublicApi = {
       return false
     }
   },
-  // 站点品牌文案（标题 / 页脚）。与 enabled 同一个免鉴权端点：
-  // 登录页在**登录前**就要显示正确的站点标题，这是它存在的理由。
+  // 站点品牌文案（标题 / 页脚）。它在**独立的** /api/branding 上，
+  // 不跟公开页开关绑在一起：登录页在登录前就要显示正确的标签页标题，
+  // 而那时候公开页可能压根没启用。
   async branding() {
     try {
-      const { data } = await publicApi.get('/enabled')
+      const { data } = await brandingApi.get('/branding')
       return {
         site_title: data?.site_title || '',
         site_footer: data?.site_footer || '',

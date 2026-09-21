@@ -16,21 +16,26 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/var/lib/mocenter
 EnvironmentFile=-/etc/mocenter/mocenter-server.conf
+# 参数一律写成 "${VAR}"：${} 在 systemd 里本就不做分词，但引号让"这里是一个整体"
+# 这件事显式可见，也挡住将来有人把它改成 $VAR 后带入分词/通配的坑。
 ExecStart=/usr/local/bin/mocenter-server \
-  -listen ${MOCENTER_LISTEN} \
-  -http ${MOCENTER_HTTP} \
-  -user ${MOCENTER_USER} \
-  -password-file ${MOCENTER_PASSWORD_FILE} \
-  -data ${MOCENTER_DATA} \
-  -config ${MOCENTER_CONFIG} \
+  -listen "${MOCENTER_LISTEN}" \
+  -http "${MOCENTER_HTTP}" \
+  -user "${MOCENTER_USER}" \
+  -password-file "${MOCENTER_PASSWORD_FILE}" \
+  -data "${MOCENTER_DATA}" \
+  -config "${MOCENTER_CONFIG}" \
   -pkg-dir /var/lib/mocenter/packages \
-  -web ${MOCENTER_WEB_DIR}
+  -web "${MOCENTER_WEB_DIR}"
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
 # 服务只应读写自己的配置与数据目录
 NoNewPrivileges=yes
 PrivateTmp=yes
+# 刻意不加 ProtectSystem/ReadOnlyPaths：Web 静态目录、包目录与数据目录都在
+# 挂载点之外，一旦收成全量只读，症状是"服务起来了但上传/备份/写配置全失败"，
+# 排查成本远高于这里的收益。
 
 [Install]
 WantedBy=multi-user.target

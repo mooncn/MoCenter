@@ -22,9 +22,6 @@ import (
 	"time"
 )
 
-// defaultProxy 国内加速代理前缀，直连失败时自动回退（用户可经 VncConfig 覆盖）。
-const defaultProxy = "http://fa.mooncn.win/?url="
-
 // vncInstallWindows 安装并启动 VNC，并写入随机口令。
 //
 // 按 cfg.Mode 分流：
@@ -119,7 +116,7 @@ func ensureVncLogonTask(exe string) {
 // downloadFile 下载文件到目标路径（PowerShell Invoke-WebRequest）。
 func downloadFile(url, out string) error {
 	return downloadSlowAware(out, minVNCBps, func(ctx context.Context) error {
-		ps := fmt.Sprintf("Invoke-WebRequest -Uri '%s' -OutFile '%s' -UseBasicParsing", url, out)
+		ps := "Invoke-WebRequest -Uri " + psQuote(url) + " -OutFile " + psQuote(out) + " -UseBasicParsing"
 		return exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps).Run()
 	})
 }
@@ -128,7 +125,7 @@ func downloadFile(url, out string) error {
 func downloadPlain(url, out string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
-	ps := fmt.Sprintf("Invoke-WebRequest -Uri '%s' -OutFile '%s' -UseBasicParsing", url, out)
+	ps := "Invoke-WebRequest -Uri " + psQuote(url) + " -OutFile " + psQuote(out) + " -UseBasicParsing"
 	if err := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps).Run(); err != nil {
 		return err
 	}

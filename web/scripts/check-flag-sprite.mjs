@@ -17,10 +17,12 @@
 import zlib from 'node:zlib'
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const mod = await import(path.resolve(HERE, '../src/utils/flagSprite.js'))
+// 必须是 file:// URL：Windows 下直接把绝对路径交给 import() 会以 'd:' 当协议，
+// 抛 ERR_UNSUPPORTED_ESM_URL_SCHEME（自检脚本在本地跑不了 = 等于没有自检）。
+const mod = await import(pathToFileURL(path.resolve(HERE, '../src/utils/flagSprite.js')).href)
 
 const { FLAG_SIZE, FLAG_COLORS, FLAG_PALETTE, FLAG_CODES, FLAG_DATA } = mod
 

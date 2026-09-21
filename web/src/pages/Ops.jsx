@@ -18,7 +18,10 @@ export default function Ops({ agents }) {
   const [upAgent, setUpAgent] = useState('')
   const [upVersion, setUpVersion] = useState('')
   const [upUrl, setUpUrl] = useState('')
-  const [upMd5, setUpMd5] = useState('')
+  const [upSha256, setUpSha256] = useState('')
+  const [upSignature, setUpSignature] = useState('')
+  const [upForce, setUpForce] = useState(false)
+  const [upDowngrade, setUpDowngrade] = useState(false)
   const [upNotice, setUpNotice] = useState('')
 
   const toggleSelect = (id) => {
@@ -58,12 +61,23 @@ export default function Ops({ agents }) {
       setUpNotice('请选择目标主机')
       return
     }
+    if (!upVersion.trim()) {
+      setUpNotice('请填写目标版本：签名覆盖版本号，留空无法验签')
+      return
+    }
+    if (!upUrl.trim()) {
+      setUpNotice('请填写升级包下载地址（仅支持 https）')
+      return
+    }
     try {
       const res = await Api.upgrade({
         agent_id: upAgent,
-        version: upVersion,
-        url: upUrl,
-        md5: upMd5,
+        version: upVersion.trim(),
+        url: upUrl.trim(),
+        sha256: upSha256.trim(),
+        signature: upSignature.trim(),
+        force: upForce,
+        allow_downgrade: upDowngrade,
       })
       setUpNotice(res.ok ? '升级指令已下发，等待 Agent 执行...' : res.msg)
     } catch (ex) {
@@ -201,25 +215,47 @@ export default function Ops({ agents }) {
               </select>
             </div>
             <div className="form-row">
-              <label>目标版本（Agent 版本，可留空）</label>
-              <input value={upVersion} onChange={(e) => setUpVersion(e.target.value)} placeholder="如 1.1.0，留空则用服务端版本" />
+              <label>目标版本（必填）</label>
+              <input value={upVersion} onChange={(e) => setUpVersion(e.target.value)} placeholder="如 1.1.0，签名包含此版本号" />
             </div>
-            <div className="form-row" style={{ gridColumn: '1 / -1' }}>
-              <label>升级包下载地址</label>
+            <div className="form-row">
+              <label>升级包下载地址（仅 https）</label>
               <input value={upUrl} onChange={(e) => setUpUrl(e.target.value)} placeholder="https://example.com/mocenter-agent" />
             </div>
             <div className="form-row">
-              <label>升级包 MD5（可选）</label>
-              <input value={upMd5} onChange={(e) => setUpMd5(e.target.value)} placeholder="校验升级包完整性" />
+              <label>升级包 SHA-256（必填）</label>
+              <input value={upSha256} onChange={(e) => setUpSha256(e.target.value)} placeholder="64 位十六进制摘要，signpkg 可打印" />
+            </div>
+            <div className="form-row">
+              <label>Ed25519 签名（必填）</label>
+              <input value={upSignature} onChange={(e) => setUpSignature(e.target.value)} placeholder="256 位十六进制签名，由 scripts/signpkg -sign 生成" />
+            </div>
+            <div className="form-row">
+              <label>升级策略</label>
+              <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', paddingTop: 6 }}>
+                <label className="checkbox-item">
+                  <input type="checkbox" checked={upForce} onChange={(e) => setUpForce(e.target.checked)} />
+                  同版本强制重装
+                </label>
+                <label className="checkbox-item">
+                  <input type="checkbox" checked={upDowngrade} onChange={(e) => setUpDowngrade(e.target.checked)} />
+                  允许降级回退
+                </label>
+              </div>
             </div>
           </div>
           <button type="submit">下发升级</button>
         </form>
         {upNotice && <div className={`notice ${upNotice.includes('失败') ? 'err' : 'ok'}`} style={{ marginTop: 12 }}>{upNotice}</div>}
         <div className="sub" style={{ marginTop: 12 }}>
-          升级流程：Agent 下载升级包 → 校验 SHA-256/签名 → 备份旧版本 → 替换二进制 → 自动重启（失败自动回滚）。
-          Agent 版本与服务端版本互相独立：此处填写的版本只表示"本次要升到哪个版本"，
-          与当前服务端版本不同也能下发；若与目标 Agent 当前版本相同则会跳过（可用强制升级覆盖）。
+          升级流程：Agent 一次读入升级包 → 按 SHA-256 与 Ed25519 签名校验同一份字节 → 落盘复核 → 备份旧版本 → 替换二进制 → 自动重启（失败自动回滚）。
+          摘要与签名都必须由签名工具生成：<code>scripts/signpkg -sign -pkg &lt;升级包&gt; -key &lt;私钥&gt; -version &lt;目标版本&gt;</code>
+          会打印可直接使用的 sha256 / signature；私钥只留在发布机，配置给 Agent 的只有公钥。
+          未配置公钥的 Agent 会直接拒绝升级，这里没有任何跳过验签的开关。
+        </div>
+        <div className="sub" style={{ marginTop: 6 }}>
+          Agent 版本与服务端版本互相独立：此处填写的版本只表示"本次要升到哪个版本"，与当前服务端版本不同也能下发；
+          低于目标 Agent 当前版本会被当作降级拒绝（需勾选「允许降级回退」），同版本需勾选「同版本强制重装」才会真正执行。
         </div>
       </div>
 
@@ -238,8 +274,8 @@ export default function Ops({ agents }) {
               </select>
             </div>
             <div className="form-row">
-              <label>Agent 端目标路径</label>
-              <input value={pushPath} onChange={(e) => setPushPath(e.target.value)} placeholder="如 /tmp/deploy.tar.gz 或 C:\\temp\\app.zip" />
+              <label>Agent 端目标路径（必须是绝对路径）</label>
+              <input value={pushPath} onChange={(e) => setPushPath(e.target.value)} placeholder="如 /etc/mocenter/files/deploy.tar.gz 或 C:\mocenter\files\app.zip" />
             </div>
             <div className="form-row" style={{ gridColumn: '1 / -1' }}>
               <label>选择要分发的文件</label>
@@ -259,6 +295,8 @@ export default function Ops({ agents }) {
         {pushNotice && <div className={`notice ${pushNotice.includes('失败') ? 'err' : 'ok'}`} style={{ marginTop: 12 }}>{pushNotice}</div>}
         <div className="sub" style={{ marginTop: 12 }}>
           文件通过服务端中转，分片 + MD5 校验传输至目标主机指定路径，完成写入后回传确认。
+          Agent 侧的文件读写被限制在它的文件根目录内（默认是配置目录下的 <code>files/</code>，可用 <code>-file-roots</code> 扩大），
+          越界路径会被 Agent 直接拒绝，下发成功的提示不代表目标机会落盘。
         </div>
       </div>
     </div>

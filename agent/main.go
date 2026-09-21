@@ -40,16 +40,21 @@ func main() {
 	clientKey := flag.String("client-key", "", "mTLS 客户端私钥文件路径")
 	caCert := flag.String("ca-cert", "", "用于校验服务端证书的 CA 证书路径（不指定则用 -insecure 跳过校验）")
 	configPath := flag.String("config", config.DefaultPath(), "配置文件路径（首次启动自动生成）")
-	proxyIP := flag.String("proxy-ip", os.Getenv("MOCENTER_PROXY_IP"), "国内加速代理前缀（用于公网 IP 探测等境外服务，如 http://fa.mooncn.win/?url= ）")
+	proxyIP := flag.String("proxy-ip", os.Getenv("MOCENTER_PROXY_IP"), "国内加速代理前缀（用于公网 IP 探测等境外服务；安装包下载只接受 https:// 前缀）")
+	allowPublicPkg := flag.Bool("allow-public-package-download", false, "允许从公网取 VNC/驱动安装包（winget/choco/厂商直连）。默认关闭：只从服务端托管目录经长连接下发")
 	agentKey := flag.String("agent-key", os.Getenv("MOCENTER_AGENT_KEY"), "与服务端预共享的注册密钥（服务端 agent.key 的内容）")
 	enrollSecret := flag.String("enroll-secret", os.Getenv("MOCENTER_ENROLL_SECRET"), "首次换取客户端证书用的注册密钥（换取成功后自动清空）")
 	serverFingerprint := flag.String("server-fingerprint", os.Getenv("MOCENTER_SERVER_FINGERPRINT"), "服务端身份公钥指纹（免 CA 文件校验服务端，服务端换地址/证书都不必更新）")
 	credsDir := flag.String("creds-dir", "", "客户端证书落盘目录（默认 <配置目录>/creds）")
-	upgradePubKey := flag.String("upgrade-pubkey", "", "升级包 Ed25519 公钥（hex 或文件路径）；未配置则拒绝升级，除非加 -upgrade-allow-unsigned")
-	upgradeAllowUnsigned := flag.Bool("upgrade-allow-unsigned", false, "允许无签名升级（危险：任何人拿到通道即可让本机执行任意二进制）")
+	upgradePubKey := flag.String("upgrade-pubkey", os.Getenv("MOCENTER_UPGRADE_PUBKEY"), "升级包 Ed25519 公钥（hex 或文件路径）；未配置则拒绝一切远程升级")
+	fileRoots := flag.String("file-roots", os.Getenv("MOCENTER_FILE_ROOTS"), "允许服务端下发读写的目录（逗号分隔），默认仅 <配置目录>/files")
 	latencyTargets := flag.String("latency-targets", "", "延迟探测目标，逗号分隔（如 icmp:1.1.1.1,tcp:1.1.1.1:443,http:https://example.com ）")
 	showVersion := flag.Bool("version", false, "打印版本号并退出")
 	flag.Parse()
+
+	// 空串参数归一（原因见 flags.go）：mocenter-agent.service 用 "${MOCENTER_*}" 引号插值
+	// 传参，EnvironmentFile 里缺键时传进来的是空 argv，会把配置文件里的地址/ID 回写成空。
+	blankFlags := normalizeBlankFlags(flag.CommandLine)
 
 	// -version：打印后立即退出，不读配置文件、不探测硬件、不连服务端。
 	// 放在最前面是为了让打包脚本能快速取版本，也不会因环境缺配置而失败。
@@ -66,24 +71,26 @@ func main() {
 	if cfg == nil {
 		// 首次启动：用当前参数生成配置
 		cfg = &config.Config{
-			Server:               *server,
-			AgentID:              *agentID,
-			UUID:                 *agentUUID,
-			Heartbeat:            *hb,
-			ProbeEvery:           *probe,
-			TLS:                  *tlsEnabled,
-			Insecure:             *insecure,
-			Daemon:               *daemonize,
-			ClientCert:           *clientCert,
-			ClientKey:            *clientKey,
-			CACert:               *caCert,
-			ProxyIP:              *proxyIP,
-			AgentKey:             *agentKey,
-			ServerFingerprint:    *serverFingerprint,
-			EnrollmentSecret:     firstNonEmpty(*enrollSecret, *agentKey),
-			UpgradePubKey:        *upgradePubKey,
-			UpgradeAllowUnsigned: *upgradeAllowUnsigned,
-			LatencyTargets:       splitList(*latencyTargets),
+			Server:     *server,
+			AgentID:    *agentID,
+			UUID:       *agentUUID,
+			Heartbeat:  *hb,
+			ProbeEvery: *probe,
+			TLS:        *tlsEnabled,
+			Insecure:   *insecure,
+			Daemon:     *daemonize,
+			ClientCert: *clientCert,
+			ClientKey:  *clientKey,
+			CACert:     *caCert,
+			ProxyIP:    *proxyIP,
+			// 公网取包解锁只认本机命令行/配置，不接受服务端下发（见 config 字段注释）
+			AllowPublicPackageDownload: *allowPublicPkg,
+			AgentKey:                   *agentKey,
+			ServerFingerprint:          *serverFingerprint,
+			EnrollmentSecret:           firstNonEmpty(*enrollSecret, *agentKey),
+			UpgradePubKey:              *upgradePubKey,
+			FileRoots:                  splitList(*fileRoots),
+			LatencyTargets:             splitList(*latencyTargets),
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
 			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
@@ -137,11 +144,16 @@ func main() {
 		if cfg.EnrollmentSecret != "" && *enrollSecret == os.Getenv("MOCENTER_ENROLL_SECRET") {
 			*enrollSecret = cfg.EnrollmentSecret
 		}
-		if cfg.UpgradePubKey != "" && *upgradePubKey == "" {
+		if cfg.UpgradePubKey != "" && *upgradePubKey == os.Getenv("MOCENTER_UPGRADE_PUBKEY") {
 			*upgradePubKey = cfg.UpgradePubKey
 		}
-		if cfg.UpgradeAllowUnsigned && !*upgradeAllowUnsigned {
-			*upgradeAllowUnsigned = true
+		if len(cfg.FileRoots) > 0 && strings.TrimSpace(*fileRoots) == "" {
+			*fileRoots = strings.Join(cfg.FileRoots, ",")
+		}
+		// 注意 flagWasSet 判断：显式传 -allow-public-package-download=false 必须能关掉，
+		// 不能被配置里的 true 顶回去 —— 收紧用的开关不能 fail-open。
+		if cfg.AllowPublicPackageDownload && !*allowPublicPkg && !flagWasSet("allow-public-package-download") {
+			*allowPublicPkg = true
 		}
 		if len(cfg.LatencyTargets) > 0 && strings.TrimSpace(*latencyTargets) == "" {
 			*latencyTargets = strings.Join(cfg.LatencyTargets, ",")
@@ -153,28 +165,32 @@ func main() {
 	{
 		explicit := map[string]bool{}
 		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+		// 传空串的参数已按「未配置」归一，不能再算「显式给出」：
+		// 否则 -server "" 会把配置文件里已存的服务端地址抹掉（服务单元缺键时就会这样）。
+		clearBlankExplicit(explicit, blankFlags)
 		field := map[string]func(){
-			"server":                 func() { cfg.Server = *server },
-			"agentid":                func() { cfg.AgentID = *agentID },
-			"uuid":                   func() { cfg.UUID = *agentUUID },
-			"hb":                     func() { cfg.Heartbeat = *hb },
-			"probe":                  func() { cfg.ProbeEvery = *probe },
-			"tls":                    func() { cfg.TLS = *tlsEnabled },
-			"insecure":               func() { cfg.Insecure = *insecure },
-			"daemon":                 func() { cfg.Daemon = *daemonize },
-			"client-cert":            func() { cfg.ClientCert = *clientCert },
-			"client-key":             func() { cfg.ClientKey = *clientKey },
-			"ca-cert":                func() { cfg.CACert = *caCert },
-			"proxy-ip":               func() { cfg.ProxyIP = *proxyIP },
-			"agent-key":              func() { cfg.AgentKey = *agentKey },
-			"enroll-secret":          func() { cfg.EnrollmentSecret = *enrollSecret },
-			"server-fingerprint":     func() { cfg.ServerFingerprint = *serverFingerprint },
-			"upgrade-pubkey":         func() { cfg.UpgradePubKey = *upgradePubKey },
-			"upgrade-allow-unsigned": func() { cfg.UpgradeAllowUnsigned = *upgradeAllowUnsigned },
-			"latency-targets":        func() { cfg.LatencyTargets = splitList(*latencyTargets) },
+			"server":                        func() { cfg.Server = *server },
+			"agentid":                       func() { cfg.AgentID = *agentID },
+			"uuid":                          func() { cfg.UUID = *agentUUID },
+			"hb":                            func() { cfg.Heartbeat = *hb },
+			"probe":                         func() { cfg.ProbeEvery = *probe },
+			"tls":                           func() { cfg.TLS = *tlsEnabled },
+			"insecure":                      func() { cfg.Insecure = *insecure },
+			"daemon":                        func() { cfg.Daemon = *daemonize },
+			"client-cert":                   func() { cfg.ClientCert = *clientCert },
+			"client-key":                    func() { cfg.ClientKey = *clientKey },
+			"ca-cert":                       func() { cfg.CACert = *caCert },
+			"proxy-ip":                      func() { cfg.ProxyIP = *proxyIP },
+			"allow-public-package-download": func() { cfg.AllowPublicPackageDownload = *allowPublicPkg },
+			"agent-key":                     func() { cfg.AgentKey = *agentKey },
+			"enroll-secret":                 func() { cfg.EnrollmentSecret = *enrollSecret },
+			"server-fingerprint":            func() { cfg.ServerFingerprint = *serverFingerprint },
+			"upgrade-pubkey":                func() { cfg.UpgradePubKey = *upgradePubKey },
+			"file-roots":                    func() { cfg.FileRoots = splitList(*fileRoots) },
+			"latency-targets":               func() { cfg.LatencyTargets = splitList(*latencyTargets) },
 		}
 		dirty := false
-		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "agent-key", "enroll-secret", "server-fingerprint", "upgrade-pubkey", "upgrade-allow-unsigned", "latency-targets"} {
+		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "allow-public-package-download", "agent-key", "enroll-secret", "server-fingerprint", "upgrade-pubkey", "file-roots", "latency-targets"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -260,7 +276,8 @@ func main() {
 			tls: *tlsEnabled, insecure: *insecure,
 			clientCert: *clientCert, clientKey: *clientKey, caCert: *caCert,
 			proxyIP: *proxyIP, agentKey: *agentKey,
-			upgradePubKey: *upgradePubKey, allowUnsigned: *upgradeAllowUnsigned,
+			allowPublicPkg: *allowPublicPkg,
+			upgradePubKey:  *upgradePubKey, fileRoots: splitList(*fileRoots),
 			latencyTargets:    splitList(*latencyTargets),
 			serverFingerprint: *serverFingerprint,
 			enrollSecret:      firstNonEmpty(*enrollSecret, *agentKey),
@@ -298,44 +315,57 @@ const agentServiceName = "MoCenterAgent"
 
 // runOpts 收敛 runClient 的入参，避免继续往位置参数上堆字段时错位。
 type runOpts struct {
-	server, agentID, agentUUID             string
-	hb, probe                              int
-	tls, insecure                          bool
+	server, agentID, agentUUID string
+	hb, probe                  int
+	tls, insecure              bool
+	// allowPublicPkg 解锁公网取安装包（见 client.Config.AllowPublicDownload）。
+	// 只来自本机命令行/配置文件，服务端无法下发。
+	allowPublicPkg                         bool
 	clientCert, clientKey, caCert, proxyIP string
 	agentKey, upgradePubKey                string
-	allowUnsigned                          bool
-	latencyTargets                         []string
-	serverFingerprint, enrollSecret        string
-	configPath, credsDir                   string
-	onEnrolled                             func(client.CredentialFiles)
+	// fileRoots 允许服务端读写的本机目录；空 = client.DefaultFileRoot 的沙箱。
+	// 只来自命令行/配置文件，服务端指令无法扩大。
+	fileRoots                       []string
+	latencyTargets                  []string
+	serverFingerprint, enrollSecret string
+	configPath, credsDir            string
+	onEnrolled                      func(client.CredentialFiles)
 }
 
 func runClient(o runOpts) {
 	c := client.New(client.Config{
-		ServerAddr:           o.server,
-		AgentID:              o.agentID,
-		UUID:                 o.agentUUID,
-		Heartbeat:            seconds(o.hb),
-		ProbeEvery:           seconds(o.probe),
-		TLS:                  o.tls,
-		Insecure:             o.insecure,
-		ClientCert:           o.clientCert,
-		ClientKey:            o.clientKey,
-		CACert:               o.caCert,
-		ProxyIP:              o.proxyIP,
-		AgentKey:             o.agentKey,
-		UpgradePubKey:        o.upgradePubKey,
-		UpgradeAllowUnsigned: o.allowUnsigned,
-		LatencyTargets:       o.latencyTargets,
-		ServerFingerprint:    o.serverFingerprint,
-		EnrollmentSecret:     o.enrollSecret,
-		ConfigPath:           o.configPath,
-		CredDir:              o.credsDir,
+		ServerAddr:          o.server,
+		AgentID:             o.agentID,
+		UUID:                o.agentUUID,
+		Heartbeat:           seconds(o.hb),
+		ProbeEvery:          seconds(o.probe),
+		TLS:                 o.tls,
+		Insecure:            o.insecure,
+		ClientCert:          o.clientCert,
+		ClientKey:           o.clientKey,
+		CACert:              o.caCert,
+		ProxyIP:             o.proxyIP,
+		AllowPublicDownload: o.allowPublicPkg,
+		AgentKey:            o.agentKey,
+		UpgradePubKey:       o.upgradePubKey,
+		FileRoots:           o.fileRoots,
+		LatencyTargets:      o.latencyTargets,
+		ServerFingerprint:   o.serverFingerprint,
+		EnrollmentSecret:    o.enrollSecret,
+		ConfigPath:          o.configPath,
+		CredDir:             o.credsDir,
 	})
 	if o.onEnrolled != nil {
 		c.SetOnEnrolled(o.onEnrolled)
 	}
 	log.Printf("[agent] 启动 %s，Agent %s，目标服务端 %s", version.Full(), o.agentID, o.server)
+	// 两个"默认收紧、需本机显式放开"的开关都在启动日志里给出生效值：
+	// 出问题时第一手证据就是"它到底以为自己的边界在哪"。
+	log.Printf("[agent] 文件读写根目录: %s（用 -file-roots 扩大）",
+		strings.Join(c.FileRoots(), ", "))
+	if o.upgradePubKey == "" {
+		log.Printf("[agent] 未配置 -upgrade-pubkey：远程升级已被拒绝（这是默认安全态）")
+	}
 	c.Run()
 }
 
@@ -350,6 +380,18 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// flagWasSet 判断某参数是否在命令行显式出现（区别于「只是取到默认值」）。
+// 用于「显式 false 必须能关掉配置里的 true」这类收紧语义。
+func flagWasSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 // firstNonEmpty 返回第一个非空白字符串。

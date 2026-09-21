@@ -32,7 +32,17 @@ type Auth struct {
 	rateMax  int // 窗口内最大请求数
 	rateWin  time.Duration
 	tokenTTL time.Duration
+	// lastRatePrune 上次全表回收速率记录的时刻。
+	//
+	// 回收必须有个**不依赖"有人成功登录"**的触发点：`AllowRequest` 是每个请求都会
+	// 走的入口，而 Token 洪泛恰恰会让 `ValidateToken` 一直失败（M-12）。
+	lastRatePrune time.Time
 }
+
+// rateMapLimit 速率表（按 IP 键）的容量上限：挡住"伪造源 IP 无限增表"。
+// 超限时先清过期项，仍超限就整表作废 —— 与 LoginGuard 同一口径：
+// 计数精度可以让步，内存不可以无界。
+const rateMapLimit = 4096
 
 // NewAuth 创建鉴权器。
 func NewAuth(whitelist []string) *Auth {
@@ -242,11 +252,15 @@ func (a *Auth) IsAllowedIP(remoteAddr string) bool {
 }
 
 // AllowRequest 速率限制：每个 IP 在窗口内限制请求数，超出返回 false。
+//
+// 这里也是速率表的回收点：以前只有 `ValidateToken` 成功才会 `pruneLocked`，
+// 于是"拿假 Token 猛刷"这条路径既能无限增表、又永远不会触发回收。
 func (a *Auth) AllowRequest(remoteAddr string) bool {
 	ipStr := ClientIP(remoteAddr)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
+	a.pruneRateLocked(now)
 	cutoff := now.Add(-a.rateWin)
 	ts := a.rate[ipStr]
 	filtered := ts[:0]
@@ -262,4 +276,18 @@ func (a *Auth) AllowRequest(remoteAddr string) bool {
 	filtered = append(filtered, now)
 	a.rate[ipStr] = filtered
 	return true
+}
+
+// pruneRateLocked 回收过期的速率记录（顺带回收过期 Token），至多每个窗口周期一次；
+// 表仍超限时整表作废。
+func (a *Auth) pruneRateLocked(now time.Time) {
+	if a.lastRatePrune.IsZero() || now.Sub(a.lastRatePrune) >= a.rateWin {
+		a.lastRatePrune = now
+		a.pruneLocked(now)
+	}
+	// 长度检查每次请求都做：它是 O(1)，而全表回收至多每个窗口一次 ——
+	// 两次回收之间仍要有人挡住无限增表，否则上限只是"一分钟内可以涨多少"。
+	if len(a.rate) > rateMapLimit {
+		a.rate = make(map[string][]time.Time)
+	}
 }

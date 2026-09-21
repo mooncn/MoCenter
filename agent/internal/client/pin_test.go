@@ -201,7 +201,8 @@ func TestKnownServerFingerprints(t *testing.T) {
 	}
 }
 
-// TestDiscardServerIssuedCreds 自动恢复要能安全地删掉旧证书，且不动其它文件。
+// TestDiscardServerIssuedCreds 自动恢复要能安全地删掉旧证书：证书与旧 CA 清掉，
+// 私钥与无关文件必须留着（私钥一丢，服务端 TOFU 绑定就把重签路径挡死了）。
 func TestDiscardServerIssuedCreds(t *testing.T) {
 	dir := t.TempDir()
 	for _, n := range []string{"client.crt", "client.key", "ca.crt"} {
@@ -219,6 +220,9 @@ func TestDiscardServerIssuedCreds(t *testing.T) {
 	}
 	if c.credCAFingerprint() != "" || c.clientCert() != nil {
 		t.Fatal("旧证书应已被删除")
+	}
+	if readFileOrEmpty(dir, "client.key") != "x" {
+		t.Fatal("client.key 必须保留，否则重签时公钥指纹变化会被 TOFU 拒发")
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Fatal("不应删除无关文件")

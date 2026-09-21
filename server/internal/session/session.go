@@ -141,7 +141,18 @@ func NewConn(nc net.Conn) *Conn {
 	return &Conn{NetConn: nc, Online: true, LastSeen: time.Now(), enc: json.NewEncoder(nc)}
 }
 
+// agentWriteWait 向 Agent 写一条消息的超时。
+//
+// 没有写超时的时候，一条"只收不发"的连接（或被中间设备悄悄掐掉、TCP 还在闷头
+// 重传的连接）会让 Write 永久持有 c.mu：调用方既有 HTTP 处理协程，也有端口映射
+// 的转发泵，最坏情况是整条隧道连同该主机后续的全部下发一起挂死。
+// 取 30s：安装包分片这类较大的单次写，在弱网下也远用不到。
+const agentWriteWait = 30 * time.Second
+
 // Write 线程安全地向该连接写一条消息。
+//
+// 写失败一律关闭连接：一帧 JSON 可能只写出去一半，留在流里的残帧会让 Agent 的
+// 按行解析从此一直错位。关掉让对端重连，比留着一条"看起来还在线"的脏连接安全。
 func (c *Conn) Write(typ string, payload interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -149,7 +160,15 @@ func (c *Conn) Write(typ string, payload interface{}) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.enc.Encode(protocol.Envelope{Type: typ, Data: data})
+	if c.NetConn == nil {
+		return fmt.Errorf("agent %s: 连接已关闭", c.AgentID)
+	}
+	_ = c.NetConn.SetWriteDeadline(time.Now().Add(agentWriteWait))
+	if err := c.enc.Encode(protocol.Envelope{Type: typ, Data: data}); err != nil {
+		_ = c.NetConn.Close()
+		return err
+	}
+	return nil
 }
 
 // DefaultStaleAfter 判定「旧连接已死」的阈值：超过它仍无心跳才允许被新连接替换。
@@ -261,6 +280,17 @@ func (m *Manager) Get(agentID string) *Conn {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.conns[agentID]
+}
+
+// Busy 报告该 agent_id 是否正被一条**仍存活**（未超过 staleAfter 未心跳）的连接占用。
+//
+// 用途：签发客户端证书前拒发"在线主机"的身份（评估项 C-1）。判定口径与 Upsert
+// 拒绝顶替时完全一致 —— 复用 isStaleLocked，避免两处对"是否还活着"给出不同答案。
+func (m *Manager) Busy(agentID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	c := m.conns[agentID]
+	return c != nil && !m.isStaleLocked(c, time.Now())
 }
 
 // Remove 移除 Agent 连接。

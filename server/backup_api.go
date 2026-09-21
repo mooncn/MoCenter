@@ -67,6 +67,8 @@ func backupHandler(dataDir string, authz *auth.Auth, audit AuditFunc) http.Handl
 				}
 				w.Header().Set("Content-Type", "application/zip")
 				w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+				// 备份包里有口令哈希、TOTP 密钥乃至注册密钥：不许浏览器/反代缓存这份响应。
+				w.Header().Set("Cache-Control", "no-store")
 				http.ServeContent(w, r, name, fi.ModTime(), mustOpen(p))
 				return
 			}
@@ -82,14 +84,37 @@ func backupHandler(dataDir string, authz *auth.Auth, audit AuditFunc) http.Handl
 			action := strings.TrimSpace(r.URL.Query().Get("action"))
 			switch action {
 			case "", "create":
-				res, err := backup.Create(dataDir, filepath.Join(backupDir, backupFileName()), version.Version)
+				// include_secrets：把 agent.key 这类"凭据文件"一起打包。
+				// 默认不打（备份包会被下载到处流转），但保留显式选项，
+				// 因为"整机迁移要带着注册密钥"确实是真实需求。
+				// 这里手写读取而不是 decodeJSON：老前端发的是空请求体。
+				raw, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBody+1))
+				if err != nil || len(raw) > maxJSONBody {
+					writeJSON(w, map[string]interface{}{"ok": false, "msg": "请求体过大或读取失败"})
+					return
+				}
+				var body struct {
+					IncludeSecrets bool `json:"include_secrets"`
+				}
+				if s := strings.TrimSpace(string(raw)); s != "" && s != "null" {
+					if err := json.Unmarshal([]byte(s), &body); err != nil {
+						writeJSON(w, map[string]interface{}{"ok": false, "msg": "请求格式不合法"})
+						return
+					}
+				}
+				res, err := backup.CreateWithOptions(dataDir, filepath.Join(backupDir, backupFileName()),
+					version.Version, backup.CreateOptions{IncludeSecrets: body.IncludeSecrets})
 				if err != nil {
 					writeJSON(w, map[string]interface{}{"ok": false, "msg": "创建备份失败: " + err.Error()})
 					return
 				}
 				if audit != nil {
-					audit(r, fmt.Sprintf("创建数据备份 %s（%d 个文件, %s）",
-						filepath.Base(res.Path), res.Files, humanSize(res.Size)))
+					secrets := "默认不"
+					if body.IncludeSecrets {
+						secrets = "已应要求"
+					}
+					audit(r, fmt.Sprintf("创建数据备份 %s（%d 个文件, %s，凭据文件%s打包）",
+						filepath.Base(res.Path), res.Files, humanSize(res.Size), secrets))
 				}
 				writeJSON(w, map[string]interface{}{
 					"ok": true, "msg": "备份已创建",

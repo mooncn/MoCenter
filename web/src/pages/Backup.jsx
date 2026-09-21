@@ -9,8 +9,8 @@ import { Api } from '../api/api.js'
 //     而不是凭文件名直接点恢复；
 //   - 恢复需要手动输入 "RESTORE" 才能执行，且明确提示要重启服务端。
 //
-// 备份包内**含账号口令哈希与 Agent 注册密钥**，页面会把这一点写出来，
-// 避免运维当成普通配置文件随手分享出去。
+// 备份包内**默认不含 Agent 注册密钥**（勾选"包含凭据文件"才会打包），但仍含账号口令哈希
+// 与 TOTP 密钥，页面会把这一点写出来，避免运维当成普通配置文件随手分享出去。
 export default function Backup() {
   const [items, setItems] = useState([])
   const [loading, setLoading] = useState(true)
@@ -20,6 +20,8 @@ export default function Backup() {
   const [manifestFile, setManifestFile] = useState('')
   const [confirmName, setConfirmName] = useState('')
   const [version, setVersion] = useState(null)
+  // 注册密钥是"一把认全网"的身份根，而备份包会被下载到处流转 —— 默认不带。
+  const [withSecrets, setWithSecrets] = useState(false)
 
   const load = () => {
     setLoading(true)
@@ -38,11 +40,12 @@ export default function Backup() {
     setBusy('create')
     setMsg(null)
     try {
-      const d = await Api.createBackup()
+      const d = await Api.createBackup(withSecrets)
       setMsg({
         type: d.ok ? 'ok' : 'err',
         text: d.ok
-          ? `备份已创建：${d.file}（${fmtBytes(d.size)}，${d.files} 个文件，耗时 ${d.duration}）`
+          ? `备份已创建：${d.file}（${fmtBytes(d.size)}，${d.files} 个文件，耗时 ${d.duration}）。` +
+            (withSecrets ? '本次已应要求打入凭据文件。' : '凭据文件（agent.key）默认未打入，需要它请勾选后再备一次。')
           : (d.msg || '创建失败'),
       })
       load()
@@ -140,9 +143,14 @@ export default function Backup() {
             {busy === 'create' ? '备份中…' : '立即备份'}
           </button>
         </div>
+        <label className="checkbox-item" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
+          <input type="checkbox" checked={withSecrets} onChange={(e) => setWithSecrets(e.target.checked)} />
+          包含凭据文件 <code>agent.key</code>（整机迁移时才需要）
+        </label>
         <p className="cell-sub">
-          备份内容：主机与历史数据、账号、备注、展示配置、Agent 注册密钥。不含安装包与日志。
-          备份包含**凭据**（口令哈希与注册密钥），请妥善保管，不要随意外发。
+          备份内容：主机与历史数据、账号、备注、展示配置。<strong>默认不含</strong> <code>agent.key</code>
+          （Agent 注册密钥是一把认全网的身份根，而备份包会被下载到处流转）；不含安装包与日志。
+          包里仍有账号口令哈希与 TOTP 密钥，属凭据，请妥善保管，不要随意外发。
           {version?.server_version ? ` 当前版本 ${version.server_version}。` : ''}
         </p>
         {msg && <div className={`lat-msg ${msg.type}`}>{msg.text}</div>}

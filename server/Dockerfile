@@ -1,13 +1,21 @@
-# MoCenter Server 容器镜像
+# MoCenter Server 容器镜像 —— **容器不是本项目的交付形态**
+#
+# 本文件保留在仓库里仅为历史可追溯：不出镜像、不做兼容性维护，README 与
+# `docs/deployment.md` 也不再给 Docker 用法。支持的部署方式是"单进程物理机直跑"
+# 与 `scripts/deploy/install-linux.sh`（装成 systemd 服务）。
+#
+# 自行使用请注意下面这条已知缺陷（未随"不发 Docker"修掉）：ENTRYPOINT 走 shell 形式，
+# 把 `$MOCENTER_PASSWORD` 展开进 argv，因此宿主上任意本地用户 `ps -ef` 就能看到口令，
+# 且口令会留在 shell 历史里。要用就改走服务端已有的 `-password-file`（0600 文件），
+# 别照抄 `-e MOCENTER_PASSWORD=…`。
 #
 # 用法（在仓库根目录执行，需同时构建前端才有 Web 控制台）：
 #   bash web/build.sh
 #   docker build -f server/Dockerfile -t mocenter-server:latest .
-#   docker run -d --name mocenter-server \
-#     -p 9000:9000 -p 8080:8080 \
-#     -v mocenter-data:/var/lib/mocenter \
-#     -e MOCENTER_PASSWORD='强口令' \
-#     mocenter-server:latest
+#   docker run -d --name mocenter-server -p 9000:9000 -p 8080:8080 \
+#     -v mocenter-data:/var/lib/mocenter mocenter-server:latest
+#   # 不给用户名/口令时服务端自动建 admin 并生成随机强口令（见文件末尾说明）——
+#   # 这条路径比 -e 传口令安全，容器重建记得挂持久卷，否则 agent.key / node.key 会整体更换。
 #
 # 说明：
 #   - 构建上下文是**仓库根目录**（需要 web/dist），因此用 -f 指定本文件。
@@ -16,7 +24,7 @@
 #     否则容器重建会重新生成 agent.key，已注册的 Agent 将全部需要重新注册。
 
 # ---------- 构建阶段 ----------
-FROM golang:1.25 AS build
+FROM golang:1.26 AS build
 WORKDIR /src
 # 先只拷 go.mod/go.sum，让依赖层可被缓存复用
 COPY server/go.mod server/go.sum ./server/

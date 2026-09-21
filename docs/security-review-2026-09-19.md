@@ -1,0 +1,718 @@
+# MoCenter 安全评估报告（第二轮）
+
+**日期**：2026-09-19　**基线提交**：`d4acc30`（master，工作区干净）
+**范围**：`server/`、`agent/`、`web/`、`installer/`、`scripts/`、`.cnb.yml`、`server/Dockerfile`、仓库历史
+**方法**：逐文件读码（不采信 README 与上一轮报告的结论，均回源码复核）+ `govulncheck`（DB 2026-09-16）实测三个 Go 模块 + `npm audit`（官方源）实测前端锁定版本 + `git rev-list --objects --all` 全量对象扫描密钥
+
+**一句话结论**：上一轮的 CRITICAL/HIGH 修复都还在、没有被推翻；但**本轮把审计重心从"外部访客"移到"已入网的 Agent 与已登录的账号"这条内部信任边界后，发现了 2 个 CRITICAL 与 9 个 HIGH**，其中最重要的两条（注册即可冒充任意主机、Windows 侧经明文 HTTP 下载并以 SYSTEM 执行）**都是上一轮"零配置 mTLS"和"一键安装 VNC"两项易用性改造引入的副作用** —— 易用性把凭据变成了身份本身，而凭据一旦泄露就是全网。
+
+依赖侧：`golang.org/x/crypto v0.31.0` 的 **8 条 `ssh` 漏洞全部被真实调用到**（`govulncheck` 给出可达调用链，入口是后台"一键部署 Agent"），一次 `go get` 即可全清。前端生产依赖基本干净，只有 `react-router` 两条 moderate。
+
+> **修复进度（断点恢复看这里）**：§10 是逐项状态表，§10.1 是按"攻击主体"重排后的待办顺序与单人模型判定，§3 是每批的落地细节与**残留**。
+> 截至 2026-09-22：**P0 7/7、P1 7/7 全修**；P2/P3 按 §10.1 C 的四批推进，**四批已全部完成**（M-4/M-5/M-6/M-7/M-8 + 写 deadline → M-12/M-13/M-14 → M-9/M-10/M-16 + 删 `AllowUnsigned`）；**H-9 + M-11（Windows 本机提权链）已于 2026-09-22 修完**，见 §2「H-9 + M-11 · 修复落地」。
+> **仍待做**只剩：H-5 的另一半（`.deb`/`.rpm`/`.exe` 签名与私钥轮换，需要构建链之外的证书）、L 系列与构建镜像 digest 钉扎；另有 §9 第 6 条列出的 **Linux 侧实机复测清单**（第四批的 systemd/watchdog 改动只过了静态检查）。**H-9 的实机安装复测仍开着**（Win10 测试机未开机，见 §9 第 1 条）。
+
+---
+
+## 0. 信任模型（本轮的评判基准）
+
+| 通道 | 当前默认 | 本轮认定的攻击者 |
+|------|----------|------------------|
+| 匿名 → Web/公开页 | 免鉴权端点仅 `/api/login`、`/api/health`、`/api/public/*` | 任意网络位置，可持久访问 |
+| 操作员 → 控制台 | 单一角色，**无 RBAC**：任一有效 Token = 全部主机的命令执行权 | 拿到任一账号、或任一浏览器 XSS |
+| Agent → Server | 全部署**共用一个注册密钥**；证书 CN 由申请方自选 | **已 root 的某一台被管主机**（现实中最常见的第一块跳板） |
+| Server → Agent | Agent 无本地校验，服务端说什么都执行 | DNS 劫持 / 服务端私钥泄露 / 注册通道被冒充 |
+| 本地 → Agent 主机 | 服务以 SYSTEM/root 运行，配置与凭据落在共享目录 | 目标机上的任意非特权本地用户 |
+
+**核心问题**：第 3、4 行这两条边界上，"一个凭据"换来了"整个机群的身份"，而这条边界上的凭据恰恰是最容易在单台机器上被读到的。
+
+---
+
+## 1. CRITICAL
+
+### C-1　注册即身份铸造：持有任一注册密钥者可换取**任意主机**的合法证书　✅ 已修（2026-09-20，双轨过渡）
+
+- `server/internal/agentauth/agentauth.go:125-152` —— `Verify` 的期望值是 `Proof(v.key, agentID, nonce, ts)`，而 `v.key` 是**全部署唯一的共享注册密钥**；`agentID` 完全由申请方提供。
+- `server/main.go:1163` → `server/internal/agentauth/pki.go:421-430` —— 通过校验后直接用**这个自选的 `er.AgentID`** 写入证书 CN 并签名。没有 per-agent 令牌、没有 ID 白名单、不拒绝为"当前已在线的 ID"发证、也没有指纹固定。
+
+**影响**：任何一台被 root 的机器（`agent.key` 是 0600，但 root 可读）即可向注册通道申请一张 CN = 受害者 `agent_id` 的 CA 合法证书，从此被当作那台主机：收到发给它的全部命令、VNC 隧道、文件分发，并以它的身份回报探针与命令结果。上一轮的"身份以连接为准"修复（`main.go:1310` 的 `connOwns`）在这里被绕过 —— 因为它防的是"报文自报"，而攻击者拿到的是**证书自报**。
+
+**修复**（按优先级）：① 改成**每台一次性注册令牌**，服务端持 `agent_id → token` 表，证明值绑定到具体 ID（当前结构只差按 ID 取 key 一步）；② 签发前拒绝"该 `agent_id` 已有活动会话"；③ 记录 `证书指纹 → agent_id → 公钥` 的 TOFU 绑定，二次注册指纹不符即拒绝并审计告警；④ README 明确"注册密钥＝全网身份根，泄露即需轮换全部证书"。
+
+### C-2　Windows 侧经**明文 HTTP** 下载安装包与内核驱动并以 SYSTEM 静默执行，无任何完整性校验　✅ 已修（2026-09-20，托管下发设为唯一默认路径 + 执行前摘要钉扎）
+
+- `agent/internal/command/vncinstall_windows.go:26` —— `const defaultProxy = "http://fa.mooncn.win/?url="`。
+- `agent/internal/command/vncinstall_ultravnc_windows.go:293-295` —— **未配置代理时自动追加**该 http 前缀作为候选；`:346` 以 `/VERYSILENT /SP-` 执行下载结果；服务由 `installer/install.go:375` 创建且未设 `ServiceAccount` → **LocalSystem**。
+- `agent/internal/command/vdd_windows.go:35`（同一 http 前缀）、`:117`（`pnputil /add-driver`，**内核模式驱动**）。
+- 全链路只有 `MZ`/`ELF` 魔数判断，无 Authenticode、无钉扎摘要。
+
+**影响**：候选顺序是"厂商直连 → 该 http 前缀"，但**在国内目标机上厂商直连常常正是失败的那一个**，所以这条明文回退在实践中往往是主路径。命中者由此获得：任意网络位置、或 **`fa.mooncn.win` 这个个人域名一旦过期/被抢注**，即可在全网 Windows Agent 上以 SYSTEM 执行代码并加载驱动。这是当前仓库里唯一的"匿名者 → 全机群 RCE"路径，也是把产品可用性绑在一个人维护的第三方域名上。
+
+**修复**：① 删除 `defaultProxy` 硬编码，代理必须显式配置且只允许 `https://`；② 下载后按钉扎 SHA-256（或 Windows 上校验 Authenticode 发布方）验证再执行，失败即拒装；③ 把"服务端托管目录优先"（`README.md:741`）从建议改成**默认强制**，公网下载仅作运维显式解锁；④ 该域名若要保留，应由项目侧持有证书与钉扎摘要。
+
+---
+
+## 2. HIGH
+
+### H-1　Agent 回传的命令结果广播给全部会话，且按 `command_id` 无归属校验回填审计　✅ 已修（2026-09-20，命令归属绑定 + 输出定向回投）
+`server/main.go:1321-1330`：`TypeCommandResp` 携带 Agent 自选的 `command_id`/`stdout` 直接 `hub.Broadcast` 给**所有** WS 客户端；`server/internal/route/router.go:305-315 → 428-446` 按 `command_id` 匹配**任意**一条审计记录，从不校验这条命令是否下发给了本连接，`delete(r.cmdAudit, commandID)` 还会清掉别的 Agent 的待回填映射。ID 由浏览器生成且可猜（`web/src/pages/Ops.jsx:101` 的 `'push-'+Date.now()`）。
+**得到**：在审计留痕里伪造"执行成功"、向他人正在看的终端里注入任意文本。
+**修复**：维护 `command_id → {agentID, client}` 绑定，不匹配即丢弃并审计；输出只回投发起方会话。
+
+**修复落地（行号为 2026-09-20 现状，上文引用的旧行号已因 C-1 改动漂移）**：
+- **绑定**：`Router.cmdAudit` 从 `map[string]int64` 改为 `map[string]*cmdBinding`（`router.go:47`，含 `auditID/agentID/session/last`），索引键是 `cmdKey(commandID, agentID)`（`:330`）—— **必须带 agentID**：批量下发时 N 台机器共用浏览器生成的同一个 `command_id`，只按 ID 索引会让后写入的顶掉前 N-1 台。下发侧 `Dispatch(..., session)`（`:284`）写入绑定；`CommandOrigin`（`:362`）供回传侧查归属；`completeByCommandID`（`:527`）改为按 `(command_id, agent_id)` 双条件回填，只删自己那一条映射。
+- **回传校验**：`main.go:1503`（命令回执）与 `:1517`（终端输出）先 `router.CommandOrigin(cr.CommandID, sessConn.GetAgentID())`，身份取**连接**（证书 CN 或注册密钥证明），不看报文自报字段；查不到绑定即 `rejectUnownedCommand`（`:841`）丢弃 + 日志 + 审计（类别 `op`、`BlockReason=command_ownership`），且**按每台 Agent 每分钟一条限频** —— 否则被攻陷的 Agent 可以用假 `command_id` 洪水把审计库灌满，修复本身就成了新的 DoS 面。
+- **定向回投**：`hub.BroadcastToSession(session, ...)`（`ws/hub.go:215`）取代全量 `Broadcast`，投递范围由 `SessionKey(token)`（`:59`，SHA-256 截断十六串）决定。选"一次登录"而不是"一条 WS 连接"作粒度，是因为交互式终端由 **REST** 建立、输出却从 **WS** 到达 —— 前端两处用的是同一个 `localStorage.mc_token`，按会话键才能把两者接上，同时又把不同设备/不同次登录分开。键用哈希而非 Token 原文：它会长期留在映射里并可能进日志。空键（无法归属的入口）退回广播，避免把结果静默丢掉。
+- **顺带关掉的同族缺口**：交互输入 `InteractiveInputReq`（`main.go:3035`）此前**完全不校验**发起方 —— 任一登录者拿一个可猜的 `it-<时间戳>` 就能往别人正开着的终端里打字，等于借用他人已授权的 shell。现要求 `origin.Session == 本连接会话键` 才转发。`io.Type == "exit"` 时调 `ReleaseCommand`（`router.go:403`）收口，因交互会话从不回 `CommandResp`，否则映射只能等容量驱逐。
+- **容量策略**：原"超过 2 万就随机删一半"改成按 `last` 排序 LRU 整批驱逐（`evictCmdAuditLocked:339`，一次性排序而非逐条求最小，后者在 2 万条时是 O(n²) 且卡在命令下发路径上）。被回执触及即续期，活跃终端不会被误伤。
+- **测试**：`server/internal/route/router_test.go` 新增 3 例（跨 Agent 冒领归属被拒 / 他人回填既不改写审计也不清掉本人映射 / 批量同一 ID 的三条映射互不覆盖），`server/internal/ws/hub_session_test.go` 新增 4 例（会话键稳定且不含 Token 原文、定向只达发起方、空键退回广播、全局广播不受影响，均用内存 `send` 队列不建真连接）。`server/` 全量 `go build && go vet && go test ./...` 全绿，`gofmt` 干净。
+- **残留（如实记录）**：(a) `CommandOrigin` 的查找与 `completeByCommandID` 的删除是两步，同一 `command_id` 被重复下发时**后写覆盖前者**（归属改属），攻击面从"伪造他人结果"缩小到"作废他人一条在途命令"—— 需能下发命令才能做到，属已授权能力的降级使用；(b) 前端未改：`Terminal.jsx:63` 那条 `out.command_id !== sessRef.current.id` 的客户端匹配仍在（现在是服务端已筛过一遍，留着无害）；(c) `FileTransferState` 与端口映射状态**仍是全量广播**（本条范围只覆盖命令结果与终端输出，且传输进度在共享的主机详情页展示属既定产品语义）→ 若要一并收紧应连同 RBAC（H-3）一起做；(d) Agent 断线不回收其在途绑定，靠 LRU 上限兜住（约 2 万条 × ~100 B）。
+
+### H-2　`/ws` 与 `/vnc-ws` 注册在 `guard()` 之外，绕过 IP 白名单与全部限流　✅ 已修（2026-09-20，并入同一闸门 + 按会话并发上限 + 帧/缓冲上限）
+`server/main.go:548-553` 直接调 `hub.HandleUpgrade` / `vncMgr.HandleViewer`，二者只做 `ValidateToken`（`server/internal/ws/hub.go:139-144`、`server/internal/vnc/vnc.go:282-285`）。其余 22 条 `/api/*` 都经 `guard()`（`main.go:2504-2519`：`IsAllowedIP` → `AllowRequest` → `ValidateToken`）。
+**影响**：运维以为 `allow_ips` 已把控制台关进内网，实际这两个最强入口对全网开放，可无限速爆破 Token、无限开 VNC 代理。
+**修复**：两条路由包进 `guard()`；另按操作员加并发上限。
+
+**修复落地（行号为 2026-09-20 现状，上文引用的旧行号已因 C-1/H-1 改动漂移）**：
+- **闸门**：`guard` 拆出与传输方式无关的前置 `guardGate`（`main.go:2741`，`IsAllowedIP` → `AllowRequest`），REST 侧 `guard`（`:2710`）在它之后接 Bearer 校验，WS 侧新增 `guardWS`（`:2728`）在它之后接 `authz.ValidateToken(ws.WSToken(r))` —— 浏览器的 WS 握手带不了 `Authorization`，凭证只能走子协议头。`/ws`（`:584`）与 `/vnc-ws`（`:590`）都改成先 `if !guardWS(...) return`。**为什么不做成"一个 guard 两种凭证都试"**：那等于给 REST 面开出一条"子协议头也能当凭据"的旁路、给 WS 面留下"没带子协议就退回 query"的歧义，收紧点会漏；分成两个函数各认一种，语义是闭合的。
+- **并发上限（按会话，不按 IP）**：`/ws` 侧 `maxConnsPerSession = 8`（`ws/hub.go:37`）由 `sessionFull`（`:226`）判定，位置在 `upgrader.Upgrade` **之前**（`:195`）—— 一旦回了 101 再写 429 只是服务端一行 "WriteHeader on hijacked response" 日志，浏览器什么也看不到。`/vnc-ws` 侧 `maxViewersPerSession = 8`（`vnc/vnc.go:44`）配 `acquireViewer`/`releaseViewer`（`:108`/`:119`），同样在 Upgrade 前拒（`:355`）。计数键取 `ws.SessionKey(token)`（`:354`）。**按会话而非 IP**：反代/公司出口之后一个 IP 后面可能是一整间机房，按 IP 限会把正常运维锁死；按会话的效果是"一枚泄漏的 Token 最多开 8 条通道"。VNC 名额的归还挂在 `closeViewer` 从表中摘除那一步（`:166`），`HandleViewer` 的 defer 只兜登记前的早退路径（`acquired` 标志）—— 两处都归还就会把计数扣成负数，而 `>= max` 对负值恒不成立，等于防线被自己拆掉。
+- **帧与缓冲上限**：`/ws` 加 `SetReadLimit(1 MiB)`（`wsReadLimit:42`，`hub.go:349`）。取值依据是这条链路最大的上行帧 —— 文件分发的 64 KiB 分片 base64 后约 88 KB（`web/src/api/api.js:441-455`），1 MiB 留了近 10 倍余量，只是关掉"声明超长帧让 gorilla 按长度分配"这条路径。`/vnc-ws` 同档 `viewerReadLimit`（`vnc.go:374`）；RFB 客户端消息（按键/指针/剪贴板）本在 KB 量级。VNC 还有一条独立的面：隧道建立要等 Agent 回执（最长 15s），期间浏览器帧先缓冲以免丢掉 RFB 握手，无上限时掐着这个窗口猛灌就能吃满内存 → `viewerPendingLimit = 4 MiB`（`:52`）按 `pendingBytes` 累计，超限即断开（`:436`）。
+- **写超时**：VNC 的 Agent→浏览器方向写是在 Agent 消息循环里做的（`DeliverTunnelData`），浏览器不读就会堵住**这台主机的整条隧道处理链** → 每帧写前 `SetWriteDeadline(10s)`（`viewerWriteWait:55`，`:259`/`:281`/`:377`）。`/ws` 不在此列：它的写在自己的 `writePump` 里，`send` 队列有界（256），队满走既有的摘除路径。
+- **测试**：`server/guard_ws_test.go`（新建 5 例）白名单内 + 子协议 Token 放行、白名单外即使 Token 有效也回 403、猜 Token 回 401、同 IP 连打 200 次触发 429 且不牵连其他 IP、只带 `Authorization` 头不算 WS 凭证；`internal/ws/hub_session_test.go`（新增 2 例）上限按会话计、空会话键不触发上限；`internal/vnc/vnc_viewer_test.go`（新建 3 例，配真实 httptest + 真 WS 握手的辅助函数）名额按会话互不挤占、归还后可再开且计数表删净空键、`closeViewer` 只归还一次。`server/` 全量 `go build && go vet && go test ./...` 全绿，`-race` 下 `internal/ws`、`internal/vnc` 亦绿，`gofmt` 干净。
+- **残留（如实记录）**：(a) ~~两条内部 WS 的 `CheckOrigin` 仍返回 true（`hub.go:48`、`vnc.go:29`）—— 跨站 WS 劫持现在被"凭证必须在子协议头里"挡住了大半（浏览器不会替攻击者页面带上运维的 Token），但 Origin 校验本身属 M-3 的收口项~~　**已于 2026-09-20 随 M-3 + M-18 收口**：三条 WS（含公开页那条）统一走 `ws.SameOrigin`，见 §3 同名单元；(b) 上限判定与实际登记之间有毫秒级窗口，同一会话并发握手可能瞬时超额 1~2 条，换来的是拒绝路径干净；(c) VNC 的 pending 上限只管"隧道就绪前"，就绪后浏览器→Agent 的转发走 `session.Conn.Write`，而**该写没有任何 deadline**（全仓仅 `main.go:1115`/`:1137` 设过 read deadline），Agent 侧 TCP 卡住时会长期持有 `c.mu` 并阻塞这台机器的后续下发 —— 既有问题，不在 H-2 声明的范围（本条只管浏览器侧两条 WS 的闸门与资源上限），归 P2「服务端内部信任」一并处理　**已于 2026-09-21 随 P2 第二批之前的第一批收口**（`agentWriteWait = 30s` + 写失败即关闭，见 §3「`session.Conn.Write` 无 deadline」）；(d) 未做按会话的**消息速率**限制，只限了连接数与帧大小，与 H-2 原表述一致，速率项留在 P2。
+
+### H-3　单个有效 Token = 对全量主机做任意端口内网代理；服务端不校验 RFB 口令且明文回显　🟡 部分已修（2026-09-20：端口闸门 + 口令按需交付；主机级授权与 RFB 服务端挑战校验未做，见 (a)(b)）
+`server/internal/vnc/vnc.go:88-95` 接受任意 `port > 0`，`:311-313` 向持有该 `agent` 的机器发 `TunnelOpenReq{LocalHost:"127.0.0.1", LocalPort:port}`；`HandleViewer` 从不问"这个操作员能不能碰这台机"，口令只是从浏览器透传（`web/src/pages/Vnc.jsx:66-80`）。`/api/vnc/probe`（`main.go:1948-1963`）与 `/api/vnc/status`（`main.go:1996`、`:2013` 返回 `"password": resp.Password`）同理。
+**影响**：在每台被管主机的回环上扫端口、连 Redis/SSH/云元数据；口令在控制台明面上暴露一次。这是"无 RBAC"最集中的体现。
+**修复**：隧道建立前做主机授权；口令改为服务端参与挑战校验；`vncStatusHandler` 去掉 `password` 字段（如需展示用"点击后取"的一次性端点 + 审计）。
+
+**修复落地（行号为 2026-09-20 现状）**：
+- **端口闸门（把"任意端口内网代理"收成"VNC 端口"）**：`vnc.DefaultPortSpec = "5900-5999"`（`internal/vnc/vnc.go:151`）为默认允许区间，`parsePortSpec`（`:158`）解析 `5900-5999,6900` 形式的清单（区间/单端口混排、容忍空白、拒绝 `0`、反向区间与 >65535），`portAllowed`（`:190`）判定，`Mgr.CheckPort`（`:218`）给出带当前区间和放行办法的失败原因。三个入口全部收口：`Probe`（`:288`）、`Install`（`:339`）、`HandleViewer`（`:474`，**在 `Upgrade` 与占用并发名额之前**，所以拒绝是干净的 400 而不是"101 之后再也发不出的 429"，也不会漏名额）。**默认就是开的**：漏配 `-vnc-ports` 的后果应当是"连不上非常规端口"，而不是退回任意端口代理。
+- **配置口径与服务端归一化对齐**：Agent 侧 `VncInstallCfg` 把 `port<=0` 归一成 5900（`agent/internal/command/vncinstall.go:60`），服务端 `Probe`/`Install` 同样先归一（`vnc.go:336`）再过闸门 —— 否则 `port=0` 是一条绕过口（闸门放行 0，Agent 实际去连 5900）。端口缺省常量 `defaultVNCPort` 与 `portOf` 一致。
+- **闸门可配置但不可被远端放开**：`-vnc-ports`（`main.go:101`，默认取 `DefaultPortSpec`，可被 `MOCENTER_VNC_PORTS` 覆盖）→ 配置字段 `vnc_ports`（`internal/config/config.go:83`），首次生成的配置文件里能直接看到它；启动时 `vncMgr.SetAllowedPorts`（`main.go:560`）失败即 `log.Fatalf` —— 配错的闸门应当"起不来"，而不是"以为收紧了、实际全放行"。生效范围打在启动日志里（`[vnc] 隧道目标端口闸门: ...`）。**空串＝不限制这个状态不会持久化**（`cfg.VncPorts != ""` 才回读，`:234`），所以放开必须每次启动显式给出，不会被一次误操作固化。
+- **口令不再挂在可轮询的接口上**：`/api/vnc/status`（`main.go:2261`）改为只回 `has_password`（`:2274`），删掉 `password` 字段；新增 `POST /api/vnc/password`（`vncPasswordHandler:2283`，路由 `:628`）按需交付，且每次取用写审计（`Command:"获取 VNC 口令"`，`Result` 只记 `ok` / `无可用口令`，**不记口令本身** —— 否则审计库变成第二份明文凭据存储）。`GET` 该端点直接 405：口令走 GET 会整段进浏览器历史与代理访问日志。`/api/vnc/install`（`:2209`）仍一次性带回口令（谁下的指令谁取一次，用于自动回填），并补上原来完全缺失的运维审计：`Command` 记录端口与生效模式、`Result` 走 `auditSafeText`、失败置 `ExitCode=1`、`Category:"op"`。
+- **前端跟上**：`web/src/api/api.js` 新增 `vncPassword(agent)`、`vncStatus` 注释订正为"不含口令；`has_password` 表示服务端有口令可取"；`web/src/pages/Vnc.jsx:295-` 的 `install()` 改为 `apply` 时若无口令而 `has_password` 则显式取一次（`takePassword`），轮询判定从 `r.password` 换成 `r.has_password`。**这里原先有个会静默坏掉的坑**：只改服务端不改前端，`pollStatus` 会因 `r.password` 永假而一直轮询到 5 分钟超时后返回 null，安装成功的口令再也填不回来。
+- **文档**：README「隧道端口闸门与口令交付」+ `docs/deployment.md`「### 8. VNC 隧道端口闸门与口令交付」（含 `-vnc-ports` 表、越界表现、三个接口的口令/审计对照表）。
+- **测试**：`internal/vnc/vnc_ports_test.go`（新建 6 例，其中解析表含 9 个子用例）解析表的接受/拒绝集（含"只有逗号等同不限制"）、默认闸门拦得住 22 且提示带区间与放行办法、解析失败保持原清单（不静默放开）、空串=不限制与默认值可区分、`HandleViewer` 越界端口返回 400 且不留并发名额、`Probe`/`Install` 在"查主机在线"之前过闸门 + `port=0` 归一后仍受闸门约束；`server/vnc_password_test.go`（新建 5 例）状态接口整体不含 `password` 键/不含口令字符串、按需端点交付并留痕且审计序列化后不含口令、无口令时明确失败、GET 405、未登录 401 且响应体不含口令。**顺带查出并修掉两处既有缺陷**：`server/public_ws_test.go` 的 `TestPublicWSSubscriptionFreedOnDisconnect` 从测试 goroutine 无锁轮询 `p.wsTotal`（`-race` 判为真实数据竞争，缺陷在测试侧，改走锁内快照 `wsSlotsInUse`）、`public_site.go` 的 `publicWSHandler` 在 `requireEnabled` 已写过 404 之后又 `http.Error` 一次（每次关闭公开站点都刷一条 `superfluous response.WriteHeader` 日志）。验证：`go build`/`go vet`（含 `GOOS=linux`、`GOOS=windows` 交叉）、`go test ./... -count=1`、全模块 `go test -race ./...` 均绿，`gofmt` 干净，`web` 侧 `npm run build` 通过。
+- **残留（如实记录）**：(a) **主机级授权未做**，且本轮不做：项目里根本没有角色/主机归属这一层（`auth.User` 只有用户名/口令/OTP/会话，无任何权限位），要实现"这个操作员能不能碰这台机"得先造出 RBAC 子系统（角色、主机分组、授权面、UI、存量迁移），远超一条 H 级修复的范围；把它留在 P2「服务端内部信任」，与 `FileTransferState`/端口映射状态的广播收紧（H-1 残留 (c) 依赖的正是同一个 RBAC）一并做。**现状的确切边界**：任一有效 Token 仍可对**全部**主机发起 VNC 隧道与命令下发，收紧的是"只能连 VNC 端口"和"每次取口令留痕"。(b) **"口令改为服务端参与挑战校验"未实现**：RFB 的认证握手在浏览器侧完成（noVNC 收到服务端的 security types 后才发出 `VNC Authentication` 子协议的响应），口令要由服务端注入就得在中继路径上自己解析并完成这段握手（且 UltraVNC 的"文件权限"模式根本没有 RFB 口令可对），属协议级改造；因此服务端目前仍不校验口令正确性，只控制它能到达哪些端口、以及它被交付了几次。(c) 口令在浏览器仍以明文存于 `sessionStorage`（键 `mc_vnc_pw_<host>_<port>`，标签页关闭即消失）——同源扩展与该页脚本可读，这是 noVNC 需要凭据的必然结果，不是本轮引入。(d) `-vnc-ports` 是**全局**闸门，不能按主机区分（例如某台跑 5901、某台只该开 5900）；按主机精细化依赖 (a) 的 RBAC。(e) 闸门只管隧道/探测的目标端口，Agent 侧对 `TunnelOpenReq` 仍无本地校验（属 M-9/M-10 范围）。(f) 未做实机在线验证（需要一台真跑 VNC 的被管主机）：端口闸门的实测路径是 `Probe`/`Install`/`HandleViewer` 的拒绝分支，已由单测覆盖到 HTTP 层。
+
+### H-4　全仓没有任何请求体大小上限，登录入口把不定长用户名驻留 30 分钟　✅ 已修（2026-09-20）
+`grep -rn MaxBytesReader server/` → **0 处**，即 `main.go:2239` 等所有 JSON 入口都按不定长读体；`/api/login` 还会把攻击者提供的用户名（`login_guard.go:81` 只 `ToLower`+`TrimSpace`，**不限长**）作为 `fails` 表键保留 `loginFailTTL = 30 * time.Minute`（`:18`）。20 次/分/IP × 数 MB 串 × 30 分钟驻留 = 匿名可打出的内存放大。
+（已核对到位、无需再做的部分：两条监听都已设 `ReadHeaderTimeout: 10 * time.Second`（`main.go:667`、`:812`）；`perIP` 表有 `loginIPMapLimit = 4096` 上限（`login_guard.go:19`、`:137-140`）；`fails` 表在每次 `Allow()` 里按 TTL 清扫（`:142-146`）。）**真正缺的只有体长度上限这一环。**
+**修复**：按端点加 `http.MaxBytesReader`（登录 32 KB 足够，命令/配置类按各自语义定），并在 `LoginGuard` 侧对 key 限长（照 `auditSafeText`（`main.go:2294-2310`）的做法截断归一）。
+
+### H-5　发布物全无签名，逼出 `-upgrade-allow-unsigned` 逃生门　🟡 部分已修（2026-09-21：升级包链已闭环、逃生门已删；`.deb`/`.rpm`/`.exe` 签名与私钥轮换未做，见 §3「M-9 + M-10（升级链）+ M-16」）
+`scripts/build-linux-all.sh`、`scripts/build-all.bat`、`scripts/build-windows-installer.bat`、`.cnb.yml` 中**没有** `debsign`/`rpmsign`/Authenticode/`skopeo sign`。而 `agent/internal/upgrade/upgrade.go` 默认拒绝未签名包（这一条实现是对的），后果是运维会被推向关闭校验，届时升级链退化为"服务端给什么 sha256 都收" —— 服务端一破 = 机群全破。
+**修复**：离线生成 ed25519 签名密钥，CI 内签 `.deb`/`.rpm`/`.exe`/升级包，公钥随安装介质内置；**删掉 allow-unsigned 逃生门**（要退用就要退介质，不要退校验）。
+
+**已落地的一半**：逃生门连同配置键、启动参数、一键部署生成的配置一起删除；升级包改为"必须有 Ed25519 签名，且签名覆盖目标版本号 + 包内容"，配套离线工具 `scripts/signpkg` 负责生成密钥与签名，服务端 `-upgrade-pubkey` 会把公钥带进部署出去的 Agent 配置。逐条落地与残留见 §3「M-9 + M-10（升级链）+ M-16」。
+**未落地的一半**：`.deb`/`.rpm` 的包管理器签名与 Windows `.exe`/安装器的 Authenticode（需要在构建链里引入 `debsign`/`rpmsign`/`signtool` 与一张证书），以及"公钥随安装介质内置"（现在要手工配 `-upgrade-pubkey`）和私钥轮换流程。
+
+### H-6　后台"一键部署 Agent"用 `InsecureIgnoreHostKey()` 上传注册密钥与管理员口令　✅ 已修（2026-09-20）
+`server/internal/agentdeploy/agentdeploy.go:426` 忽略主机指纹，而 `main.go:606-616` 传进来的正是 `Options.AgentKey` 和操作员的口令/私钥。管理网上的 MITM 即可拿走 C-1 的根凭据。
+**修复**：known_hosts TOFU（首次记录、变更硬失败），或在部署表单里要求填目标机指纹。
+
+修复落地（行号为 2026-09-20 现状）：
+
+- **`InsecureIgnoreHostKey()` 已从仓库消失**：`grep -rn InsecureIgnoreHostKey --include=*.go .` 现在只剩测试文件里的注释。全仓也只有这一处 SSH 客户端，没有第二处需要跟进。
+- **校验点**：`dial()` 改为把 `hostKeyCallback()` 塞进 `ssh.ClientConfig`（`agentdeploy.go:232` 定义、`:596` 接线），底层用 `golang.org/x/crypto/ssh/knownhosts`。记账文件 `<数据目录>/ssh_known_hosts`（`knownHostsFileName` `:62`、`knownHostsPath` `:216`），**0600**、只追加不整体重写（`recordHostKey` `:288`，`d.mu` 串行化）—— 整体重写会在并发部署时丢掉别人刚记的行。与运维个人 `~/.ssh/known_hosts` 分开，避免互相污染。
+- **TOFU 语义**：`knownhosts.KeyError.Want` 为空 → 首次接触，记账后放行，并在结果里标 `host_key_new_trust`（`Result` 字段 `:141`/`:144`）；`Want` 非空 → **硬失败**，错误信息同时给出「记录指纹 / 实际指纹 / 该删哪一行」，把"可能是中间人"和"该机确实重装过"两种解释都摆在运维面前，而不是替他选一个。
+- **强制钉扎（表单可选填）**：`Request.HostKeyFingerprint`（`:119`）非空时按指纹比对，不走首次信任；`normalizeFingerprint`（`:199`）允许省略 `SHA256:` 前缀；被钉扎拒掉的密钥**不写账**（否则一次中间人就能把自己变成"已知主机"）。`fingerprintRe`（`:196`）在 `Deploy` 入口（`:345`）挡下畸形值 —— 这个串会进错误信息与审计摘要，不能原样收下。
+- **没有"忽略校验"的开关**：数据目录缺失、记账文件解析失败一律中止部署（fail-closed）。刻意不加 `-deploy-ssh-insecure` 之类的逃生口 —— 那正是本报告在 H-5 里批评 `allow-unsigned` 的反模式，而且这类开关一旦被某次部署用上就不会有人关回去。
+- **审计留痕**：成功/探测/失败三条审计都带 `主机密钥=<指纹>`，首次信任再标 `（首次信任）`（`hostKeyForAudit` `:315`；`Deploy` 调用点 `:378`）。指纹是公开信息，因此这是唯一能安全落进审计的凭据线索；口令/私钥依旧不入日志（包注释的安全约束清单已补这条）。
+- **前端**：`web/src/pages/Deploy.jsx` 增加「主机密钥指纹（可选）」输入（`:122`）与结果页的「主机密钥」卡片（`:177`）；首次信任时用 `.lat-msg.warn` 标黄，写明去目标机 `ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub` 比对 —— TOFU 如果不在界面上要求人看一眼，就等于自动放行。
+- **文档**：`docs/deployment.md`「主机密钥信任（known_hosts TOFU）」小节（行为表 + 记账文件位置/权限 + 撤销方式），README 功能条目同步。
+- **测试**：新增 `server/internal/agentdeploy/hostkey_test.go`（8 个用例）。关键是 `TestDialVerifiesHostKey` —— 起一个 in-process `ssh.ServerConfig` 真走完握手：首次连接 TOFU 成功并落账 → 把记账改成另一把密钥再连必须失败（这一步在 `InsecureIgnoreHostKey` 下必然通过，所以它证明的是接线而不是回调逻辑）→ 钉扎正确指纹放行。其余覆盖变更硬失败的错误文案、被拒密钥不落账、省略前缀的指纹、无数据目录/文件写坏时 fail-closed、0600 权限（Windows 上 skip 而非放宽）、非法指纹被入口挡下。
+- **验证**：`go build ./...`（native + GOOS=linux + GOOS=windows）、`go vet`、`go test ./... -count=1`、`go test -race ./...` 全绿，gofmt 干净；`npm run build` 通过。
+
+残留（如实记录）：
+
+- (a) **首次信任仍是"信任网络上的第一次相遇"**：没有带外核对就记账，攻击者若恰好赶在首次部署前完成劫持，记下的就是他的密钥。填了表单指纹可以堵住，但那是可选项而非默认必须填。真正消除要引入 SSH CA 或"离线预置指纹"的强制流程。
+- (b) **没有查看/撤销入口**：既无 API 也无界面，改信任只能登服务端编辑 `<data>/ssh_known_hosts`。撤销做成后台功能需要配套 RBAC（否则"删掉某台主机的信任记录"本身就是一个高危操作，不该向所有登录者开放）→ 归 P2 第 20 项。**→ 2026-09-20 该 RBAC 项取消（单人使用），本残留随之关闭：改信任的路径就是登服务端编辑 `<data>/ssh_known_hosts`（0600，只有操作员本人可读），后台入口在单人模型下不增加安全性，只增加一处新的攻击面。**
+- (c) **记账键取"表单里填的地址写法"**：IP 与域名、22 与非 22 端口算不同条目（与 OpenSSH 同语义）。同一台机器换了访问入口会重新走一次 TOFU，此时 (a) 的窗口重开。
+- (d) **未做 SSH 证书（CA）信任、也未支持 `@cert-authority` 行**：`knownhosts.New` 本身支持，但需要服务端侧引入签发流程，超出本条范围。
+- (e) **真机未测**：握手层由本机 in-process sshd 覆盖；"在 Rocky8 上把 `ssh_host_ed25519_key` 换掉后部署被拒"这条尚未在测试机跑过（同 C-1 的口径：单测+实机各算一次证据，缺一个就是一个）。
+- (f) 部署成功后**不会**去核对目标机 sshd 的密钥类型/强度（例如仍在用 1024 bit RSA 只会照记不误）。
+
+### H-7　公开页 WebSocket 无读上限、无写超时、无连接数上限 → 匿名远程 DoS　✅ 已修（2026-09-20）
+`server/public_site.go:197-249`：升级后既不 `SetReadLimit` 也不设读写 deadline、无 pong 处理，`hub.go:72` 的 `publics` 订阅表无上限。单条巨型帧即可让 gorilla 按声明长度分配（未认证 OOM）；不读的访客会让 `:239` 的 `WriteMessage` 永久阻塞；静默离开的访客在 `:226` 的 `ReadMessage()` 上永久挂住并泄漏 goroutine + 订阅项。
+（`:207-209` 的 `sync.Once` 修复有效，未发现残余 close/send panic。）
+**修复**：`SetReadLimit(64)`、写前 `SetWriteDeadline(10s)`、读 deadline + pong handler（照 `hub.go:195-240` 抄）、给匿名订阅加全局与每 IP 上限。
+
+### H-8　公开节点 ID 不是不透明的：固定盐 + 32 bit 截断，可离线字典命中　✅ 已修（2026-09-20）
+`server/internal/publicview/publicview.go:165-168`：`SHA-256("mocenter-public-node|" + agentID)[:4]`，无部署私有密钥、仅 32 bit，而 `agent_id` 在无硬件 UUID 时回退为主机名（`agent/main.go:209-216`）。匿名访客拿候选主机名（`web-01`、`db-prod`，或从某个开了 `hostname` 的兄弟节点学来的命名规律）离线哈希，用 `/api/public/samples?node=…` 的 404/200 当判定器 —— **即使 `hostname` 开关关着**也能确认某台内网主机在册。无盐还让 ID 在所有部署间相同 → 跨站跟踪。
+**修复**：改为 `<data>/` 下随机密钥的 HMAC-SHA256，输出 ≥8 字节，支持轮换后重新映射。
+
+修复落地（行号为 2026-09-20 现状）：
+
+- **派生函数消失**：包级 `NodeID(agentID)` 已删除，`grep -rn "publicview.NodeID(" --include=*.go server/` 归零。现在的唯一入口是 `NodeKeys`（`internal/publicview/publicview.go:177`）：`ID(agentID)`（`:260`）用 `hmac-SHA256(secret, agent_id)` 取前 8 字节 → `n-` + 16 位 hex；`Match(agentID, nodeID)`（`:270`）做常数时间反向比对。
+- **密钥来源**：`<data>/node.key`（`NodeKeyFileName` `:182`），首次启动由 `LoadNodeKeys`（`:215`）用 `crypto/rand` 生成 32 字节（`minNodeKeyBytes` `:188`）、写成 0600、**先落临时文件再 rename**（避免并发启动/掉电留下半把钥匙），并在启动日志里显式提示文件路径与"删掉它即可整体换编号"。加载点在 `main.go:585`，读不到或长度不足 → `log.Fatalf`，而不是换一把继续跑。
+- **只拒绝、不静默补生成**：`NewNodeKeys`（`:201`）对 <32 字节的密钥报错；`LoadNodeKeys` 读到内容但不可用（空/非 hex/被截断）时**报错而不是重新生成** —— 静默换钥匙会让全部公开编号凭空改变，看起来像"页面坏了"，而真实原因是密钥文件损坏。
+- **接不上密钥就当场炸**：`ID`/`Match` 对 nil 接收者 `panic`，不退回旧的固定盐派生。静默兜底等于把刚修掉的洞留在原地，而这条路径只有"调用方忘了接线"才会走到，属于编程错误而非运行期条件。
+- **输出从 32 bit 提到 64 bit**（`nodeIDBytes` `:195`）：旧值按生日界约 6.5 万个候选就能撞上同号，而公开端点允许匿名反复查询；8 字节仍短到能印在卡片上。
+- **反查改判而不建表**：`/api/public/samples?node=…` 原来是"node → agent"内存映射，现在对候选主机逐个 `Match`（`public_site.go:165`）。映射表本身是一份可外泄的对照关系，逐台比对不需要它。
+- **单一密钥实例贯穿出口**：`publicSite` 持有 `nodeKeys`（`public_site.go:55`），三处使用 —— 列表 `visibleNodes`（`:375`，经 `BuildNodes` 新签名 `publicview.go:459`）、流量补齐 `attachTraffic`（`:398`、`:417`）、samples 反查（`:165`）。`BuildNode` 也改为显式收 `*NodeKeys`（`:328`），编译期就挡住"漏传密钥的节点视图"。
+- **升级即换编号（不可双轨）**：已经分享出去的 `/public/node/<旧编号>` 与 `?node=<旧编号>` 在升级后一律 404。刻意不保留"同时接受旧固定盐编号"的兼容分支 —— 那等于把可离线枚举的路径继续留在网上，正是本条要堵的东西。库内历史按 `agent_id` 存，因此**只有链接失效，数据不丢**。
+- **不进自动备份**：`backup.BackupFiles`（`internal/backup/backup.go:77-80`）是白名单，`node.key` 与 `ca.key` 一样不在其中；理由写进了文档 —— 备份一旦外发，对方便同时拿到"主机名候选 + 派生规则"，不可枚举性随之失效。跨机迁移需手工保管。
+- **文档**：`docs/deployment.md`「公开状态页 → 安全设计」第 1 条改写为密钥派生 + 轮换方式 + 不进备份的理由，「备份内容」的"刻意不备份"清单补上 `node.key`/`ca.key`；README 容器段补"重建卷会重新生成 `node.key` → 公开编号整体变更"；`siteconfig.FieldCatalog` 的 `node_id` 描述、`web/src/pages/SiteConfig.jsx` 的安全说明、`PublicStatus.jsx` 注释同步为 `n-` + 16 位 hex。
+- **测试**：`internal/publicview/nodekeys_test.go`（8 例）—— 短密钥被拒、同一 agent 在不同密钥下编号不同、**不持有密钥无法复算编号**（拿旧固定盐实现算一遍必须不命中）、`Match` 正反、创建后复用、5 种损坏文件必须报错而非换钥匙、空路径、nil 接收者 panic。`server/public_nodekey_test.go`（3 例）打在这两个真正匿名可达的端点上：`/api/public/nodes` 只出密钥化编号、`/api/public/samples?node=<旧固定盐编号>` 必须 404 而密钥化编号 200（且响应不含 `agent_id`）、换密钥后旧编号失效。
+- **验证**：`go build ./...`（native + GOOS=linux + GOOS=windows）、`go vet`、`go test ./... -count=1`、`go test -race ./...` 全绿，gofmt 干净；`npm run build` 通过。
+
+残留（如实记录）：
+
+- (a) **升级后既有分享链接全部失效**，属于本条修复的必然代价，报告与文档已写明；没有做"过渡期同时接受旧编号"的双轨，因为双轨就是保留可枚举面。
+- (b) **无查看/轮换界面**：换编号只能登服务端删 `<data>/node.key` 重启，后台既不能列举"当前部署的编号 ↔ 主机"对照，也没有一键轮换。做成后台功能需要配套 RBAC（能读对照表 ≈ 能反查在册主机）→ ~~归 P2 第 21 项~~ **2026-09-20：RBAC 项随"单人使用"判定取消，本残留关闭** —— 单人下"能读对照表的人"就是操作员自己，登服务端看文件与后台看是同一信任级；真需要轮换时删 `<data>/node.key` 重启即可。
+- (c) **反查是 O(在册主机数)**：samples 请求逐个 `Match`，每台一次 HMAC。当前量级（几十~几百台）无所谓，但它是匿名可达端点上的按次开销，与 M-12 的限流分桶一起收口更合适。　**2026-09-21 随 M-12 收口其"按次"那一半**：该端点现在有独立的 30/分/IP/路由闸门，一次请求仍要遍历在册主机但**次数**已有上界；没做常驻反查映射，理由见 §3「M-12 + M-13 + M-14」残留 (b)。
+- (d) **Windows 上 0600 不产生 ACL**：与 H-9 同源 —— `%ProgramData%` 下继承默认 ACE，`BUILTIN\Users` 可读，则本机任意用户可拿到派生私钥（离线枚举在册主机名）。修在 H-9 的 DACL 一处统一处理，本条不重复。　**已随 H-9 关闭（2026-09-22）**：`node.key` 与 `agent.key`/`users.json`/`ca.key` 同处 `<data>` 下，安装器写文件前先给数据目录设**受保护 DACL**（`installer/acl_windows.go` 的 `hardenCredentialPath`），此后服务端在该目录下新建的凭据文件都只继承"仅 SYSTEM + Administrators + 当前用户"；已存在的旧安装文件由 `hardenTree` 逐个补紧。**适用范围要说清**：这条只覆盖**经安装器落地**的部署；手工 `mocenter-server` 起在自挑目录（不经 `install`）时没有这道收紧，`server/` 侧也没调 `SetNamedSecurityInfo`（三个模块互相独立，见 §2 H-9 残留 (c)）。
+- (e) **编号仍不带过期/作用域**：同一部署内 `node_id` 永久稳定，跨站跟踪因此在本部署内仍然成立（换了部署就不成立）。要更严只能做周期性重派生 + 双活期，代价是链接稳定性，未纳入本条范围。
+- (f) 真机未验证"删 `node.key` 重启后公开页换新编号、旧链接 404"这条运维流程（单测覆盖的是同一进程内换密钥）。
+
+### H-9 + M-11　Windows 安装链路三处叠加：凭据 ACL、弱口令哈希、SYSTEM 重跑用户可选路径（含本地 VNC 凭据）　✅ 已修（2026-09-22，受保护 DACL + 安装器产 PBKDF2 + 注册前可写性闸门）
+- `installer/install.go:294`、`:142` —— 在 Windows 上 `os.WriteFile` 的 `0600`/`0755` **不产生任何 ACL**，`%ProgramData%\MoCenter\agent\mocenter-agent.json`（含 `agent_key`、`enrollment_secret`）与 `server\users.json` 继承 `ProgramData` 默认 ACE，`BUILTIN\Users` 可读。
+- `installer/install.go:328` —— 安装器写入 `users.json` 的首任口令是**单轮无盐 SHA-256**（服务端早已用 PBKDF2）。
+- `installer/keepalive_windows.go:76-85` —— 以 `/RU SYSTEM /RL HIGHEST` 注册开机 + 每 5 分钟巡检，跑的是 `mocenter-deploy.exe run -exe <安装目录里的路径>`，而该目录由 `setup.iss:37,151` 的 `{app}` 决定，用户可改到任何位置；没有任何一处校验该 exe 是否非管理员可写。
+**净效果**：目标 Windows 机上的任意本地用户，改写那个路径下的二进制即可在 5 分钟内拿到 SYSTEM；或先读配置拿到注册密钥再走 C-1。
+**修复**：写入后用显式 DACL（`SetNamedSecurityInfoW`，仅 Administrators+SYSTEM）或 `icacls`；安装器直接产 PBKDF2 摘要；注册保活前检查两处二进制的 ACL，`Authenticated Users` 有写权限即拒绝注册；`main.go:145-153` 的失败日志对 `-agent-key`/`-password`/`-extra` 脱敏。
+**M-11（同批收口，§3 表内那一行）**：`vncinstall_ultravnc_windows.go:384` 把 `ultravnc.ini` 写成 0644、里面是用公开固定 DES-ECB 密钥混淆的 SYSTEM 会话口令（读到文件＝还原口令），加上 `vncpassword.go` 在 `rand.Read` 出错时回退静态 `"mocenter"` —— 与上面三条叠加就是从非特权本地用户直上 SYSTEM 桌面。
+
+修复落地（行号为 2026-09-22 现状）：
+
+- **先立一个事实口径**：Go 在 Windows 上的 `os.WriteFile(..., 0600)` / `os.MkdirAll(..., 0755)` 只是"创建位"，**不产生任何 ACL 语义**，对象一律继承父目录 DACL。这一点在报告里被写成"0600 不产生 ACL"，但代码里此前到处是"我们 chmod 过了"的隐含假设，所以新加的每个入口都把这句话写在注释里（`install.go:143-146`、`writeConfig:305`、`agent/internal/command/acl_windows.go` 段首）。
+- **写入侧：受保护 DACL**（新增 `installer/acl_windows.go`）。`hardenCredentialPath(path, dir)`（`:85`）用 `ACLFromEntries` 造三条 ACE —— `NT AUTHORITY\SYSTEM`、`BUILTIN\Administrators`、**当前登录用户**各给 `STANDARD_RIGHTS_ALL|SPECIFIC_RIGHTS_ALL`，目录再带 `OI|CI` —— 然后 `SetNamedSecurityInfo(..., DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, ...)` 一次性**断开继承**。"受保护"是这条修复的关键：只把 SY/BA 加进去而留着继承，`%ProgramData%` 那条 `BUILTIN\Users:(OI)(CI)(RX)` 依然在原位。
+- **为什么 DACL 里留了"当前用户"**（偏离本条原表述的"仅 Administrators+SYSTEM"）：Agent 便携形态与"重跑安装器改配置"这两条路径都以**非提权进程**读写同一份凭据，只留 SY+BA 会让这些合法用法当场失败；而安装器本身要求提权，提权后当前用户 SID 必然属于 Administrators 一族，多写一条不扩大实质攻击面。判定用的是 `Token.GetTokenUser()` 的**那一个** SID，**刻意不把令牌里的组 SID 当可信身份** —— 任何标准用户的令牌都含 `BUILTIN\Users`/`INTERACTIVE`/`AUTHENTICATED LOGON`，按组放行等于永远查不出"全体本地用户可写"。
+- **升级路径：`hardenTree`（`:141`）**。`SetNamedSecurityInfo` 不会追溯修改既有子项 —— 只有此后新建的文件才继承新 DACL。所以旧安装留下的 `agent.key`/`ca.key`/`node.key`/TLS 私钥/`mocenter.db` 带着**旧的宽授权**，光收紧目录等于没修。安装时写完目录后走一遍 `filepath.Walk` 逐项补紧；上限 5000 项（数据目录里日志可能成千上万，超上限即停并打印"只收紧了前 N 项"），单项读不到只计数不中断，末尾汇总成一条告警。
+- **失败只告警不回滚**：`install.go:147-150`、`hardenQuiet`（`:314`）都是"打印警告继续"。理由：文件此刻已经写成功，因"这台机器的安全策略拒绝了 `PROTECTED_DACL`"而把整个安装回滚，代价是运维直接退回手抄一条 `icacls`——比留着宽授权更糟。真正的强制闸门放在了它该在的地方（下一条的保活注册）。
+- **口令摘要：安装器直接产 PBKDF2**（新增 `installer/password.go`）。`hashServerPassword`（`:35`）产出与 `server/internal/auth/password.go` 完全同格式的 `pbkdf2$sha256$120000$<salt hex>$<dk hex>`（盐 16 B、密钥 32 B，本地实现 RFC 8018，只用 stdlib）。旧写法的问题不是"格式不对"而是"等第一次登录才升级"，而弱口令在这段窗口里就能被离线爆破。
+  - **跨模块不能 import，就用成对测试钉住**：三个 Go 模块互相独立，安装器引不到服务端代码，因此 PBKDF2 是**同一算法的第二份实现**。两份实现漂移的后果是"装着能用、登录永远失败"，所以用**同一组已知答案向量**双向钉死：向量取自 CPython `hashlib.pbkdf2_hmac`（盐固定为 `0123456789abcdef…`，两组口令 × {1000, 120000} 次迭代），`installer/password_test.go:TestPbkdf2HashKnownAnswer` 与 `server/internal/auth/password_format_test.go` 各自断言同一批十六进制值，且服务端那侧额外断言 `pbkdf2Iterations != 120000` 时**直接报错并提示去同步安装器** —— 把"改了一边忘另一边"变成一次红测试，而不是一次现场故障。
+  - 遇到旧安装留下的 64 位 hex 摘要（`looksLikeWeakHash`，`:93`）不重写（重写需要明文口令，而安装器现在手里没有），只打印一条"下次登录成功后会自动升级为 PBKDF2"并顺手 `hardenQuiet` 那个文件。
+- **SYSTEM 保活前的可写性闸门（`keepalive_windows.go`）**：新增 `checkSystemTaskPaths(paths...)`（`:72`），`installKeepAlive`（`:109`）在 `schtasks /Create ... /RU SYSTEM /RL HIGHEST` **之前**对**三个**路径求值：被守护的二进制、`mocenter-deploy.exe`（`deployExe`，`:44`，它才是被计划任务真正跑起来的那个）、以及配置文件。第三个是复核时加的：以 SYSTEM 跑起来的 Agent 会照配置里的 `server` 地址去连，**改配置不必改二进制也能拿到 SYSTEM 出网**。
+  - 读侧 `nonAdminWritable` → `writeRiskOf`：`GetNamedSecurityInfo` + `GetAce` 逐条扫，取写类权限位（含 `FILE_ADD_FILE`/`DELETE_CHILD`/`WRITE_DAC`/`WRITE_OWNER`，本地定义了 x/sys 未导出的 `0x40 = FILE_DELETE_CHILD`），命中"宽泛主体或陌生 SID"即返回主体名。文件自身与**所在目录**都查（目录给了别人"建文件 + 删子项"就等于能换掉我们的 exe），且目录侧**连 INHERIT_ONLY 的写 ACE 一起算**（它正是"落到子对象"的那种），文件侧则跳过 INHERIT_ONLY。
+  - 两个必须区分的坑：**NULL DACL 与空 DACL 语义相反**（前者对所有人全开放、后者拒绝一切），而 x/sys 的 `(*SECURITY_DESCRIPTOR).DACL()` 只回 `defaulted`，是否 present 得自己从 `sd.Control()&SE_DACL_PRESENT` 读 —— 一开始把 `acl == nil` 当成"没 DACL 就跳过"，结果连 `System32\cmd.exe` 都被报成风险；`TestRealMachinePathsVerdict` 就是为这条设的（真机上 `Program Files\Git\bin\git.exe` 与 `cmd.exe` 必须判**安全**，否则默认安装位置会被自己的闸门挡死）。
+  - `S-1-3-x`（`CREATOR OWNER`/`CREATOR GROUP`）与 `S-1-5-80-x`（`NT SERVICE\*`，例如 TrustedInstaller）不判为风险主体：两者都是"每对象自带"或系统组件，按宽泛身份处理会让默认路径全部误拒。
+  - **两道 fail-closed**：注册前拒（`installKeepAlive`），**巡检每次拉起前再判一次**（`runKeepAlive:180`）—— 注册之后运维仍可改目录 ACL，第一道闸门护不住这种漂移。拒注册时安装不算失败，`install.go:225-228` 打印"未注册计划任务 + 原因 + 装到仅管理员可写的目录后重跑即可启用"，把决定权交回运维（**不静默放宽，也不擅自去改用户挑的目录的 ACL** —— 后者爆炸半径不可控）。错误消息里带 `icaclsHint`（`:330`）生成的可直接执行整改命令，且用 `*S-1-5-18` 这种 SID 写法而不是账户名，因为中文系统上 `LookupAccount` 回来的名字拼不进命令。
+- **M-11 之一：`ultravnc.ini`**（`vncinstall_ultravnc_windows.go:410-416`）：`0644` → `0600`，并紧跟一次 `restrictPathToPrivileged`（新增 `agent/internal/command/acl_windows.go:28`，与安装器同一套受保护 DACL）。失败只记日志不阻断安装，因为 `uvnc_service` 以 SYSTEM 跑、必然读得到，读不到的只是"以别人身份跑"的情形——而那种情形本来就不该拿到口令。三个模块互相独立，这份 helper 是**刻意的重复实现**而非漏改，理由写在段首注释里。
+- **M-11 之二：删掉静态回退口令**（`vncpassword.go` 的 `generateRandomPassword`）：原来的 `return "mocenter"[:8]` 整条消失。旧写法的危害是"全机群静默共用同一个 VNC 口令，而回执上写着已设置随机口令"。现在 `rand.Read(b)` 不判错误：自 Go 1.24 起 `crypto/rand` 在系统熵源故障时**直接终止进程**，那条 `err != nil` 分支既不可达，其后果又比 panic 严重得多 —— 属于"兜底比失败更坏"的典型。
+- **失败日志脱敏**（`main.go:150-165`）：`logFailure` 建的 `mocenter-deploy.log` 从默认权限改 0600 + 受保护 DACL，写入的内容改为 `redactedArgs(os.Args[1:])`。`secretFlags`（`:163`）收 `agent-key`/`password`/`extra` 三个键，脱敏要处理 `-f v`、`-f=v`、`--f=v` 三种形态（`flagName`，`:203`），且**`-password-file` 的路径必须保留**（那是路径不是秘密，运维排障要看它指向哪）。`-extra` 一并收：它是原样拼进服务参数的透传原语，里面最常带的就是口令。
+- **测试**：`installer/acl_windows_test.go` 6 例 —— 收紧后自己仍读得到而宽泛主体读不到（`TestHardenCredentialPathKeepsUsReadableAndOthersOut`）、三种真实形态的宽授权都能命中（文件上直接给 `Everyone`、目录上给 `BUILTIN\Users` 的 `ADD_FILE|DELETE_CHILD`、`INTERACTIVE` 的可继承写）、**只读 ACE 不误报**、闸门在读不到 ACL 时也拒注册（fail-closed 而不是"当作安全"）、`hardenTree` 把旧遗留文件补紧、以及上面提到的真机默认路径不返 false positive。`installer/main_test.go` 的 `TestRedactedArgs` 5 个用例（含"值本身长得像旗标"这一支）。`installer/password_test.go` 3 例 + 服务端 `password_format_test.go` 的成对向量。`installer/install_test.go` 的账号用例改为**从落盘的盐重算** PBKDF2 并与 `users.json` 里的摘要逐位比对（比原来"只看是不是 64 位 hex"强：它证明安装器写的哈希真能被服务端验通）。
+- **验证**：`installer` / `agent/internal/command` / `server/internal/auth` 三包 `go test -count=1` 全绿，`agent/` 与 `server/` 全量套件绿；`GOOS=linux` 与 `GOOS=windows` 交叉编译均通过（ACL 代码带 `//go:build windows`，Linux 侧编译不进去也必须不报错）；改动文件在 `tr -d '\r'` 出的 LF 副本上 `gofmt -l` 干净。**未做**：一次真实的 Windows 安装（见残留 (a)）。
+
+残留（如实记录）：
+
+- (a) **没有跑过一次真机 Windows 安装**：Win10 测试机当时未开机，本开发机上也没有 MoCenter 服务，所以"闸门是否真的拦住了某个目录选择""`uvnc_service`/`winvnc` 在收紧后的 `ultravnc.ini` 上是否仍能读到口令"这两件事靠的是**单测走真 Win32 ACL API** + 对本机既有真实路径的只读求值，不是端到端。已加进 §9 第 1 条。
+- (b) **`-agent-key` 仍拼在图形安装程序的命令行上**（`installer/setup.iss:157`）：注册密钥有 32 字节、在安装进行的那几十秒里对同机任意进程可见（`wmic process get commandline` / 任务管理器"命令行"列）。同一处的**口令已经改走临时文件**（`WritePasswordFile` → `-password-file`，`:168`），所以这是"同一条链修了一半"，不是漏看。收口方法与 §3「M-9 + M-10 + M-16」残留 (i) 的 Windows 口令入口是同一批活（`install-windows.bat:95` 的位置参数、`installer/main.go:68` 的 `-password`）。
+- (c) **`server/` 模块自己写凭据时不设 DACL**：受保护 DACL 只在安装器与 Agent 的 VNC 安装处落地。服务端运行期写 `<data>/agent.key`（M-1 的轮换）、`node.key`（H-8）走的仍是 `0600` + tmp/rename。**经安装器落地的部署不受影响**（父目录已受保护，新建文件继承紧的 DACL），不受保护的是**手工起在自选目录**的 Windows 服务端。要覆盖它得在 `server/` 里再做一份同算法 helper（第三个模块），当时判断为"改安装器 + 文档写明"更划算。
+- (d) **ACL 求值是近似而非权威**：只解析 `ACCESS_ALLOWED`/`ACCESS_DENIED` 两类 ACE（文件对象上其它类型极少，且 SID 偏移不同、不能安全取址），无法解析的 ACE **不判为风险**；判定用"按 DACL 存储顺序先记 DENY 再判 ALLOW"的近似求值，**没有调 `AccessCheck`** —— 后者需要一个"普通用户令牌"才能问出正确答案，本机不存在这样的令牌。这两条偏差都朝"可能漏判"的方向，因此用 `runKeepAlive` 的二次判定与只读用例回归来补，不宣称穷尽。
+- (e) **DACL 里保留了当前用户 SID**，与本条原表述"仅 Administrators+SYSTEM"不同，代价与理由见上文第三条。若一台机器上多个管理员共用同一个登录账户（不常见但存在），这道收紧对"同账户另一会话"没有约束力。
+- (f) **`hardenTree` 有 5000 项上限**：极大日志目录下超出部分不补紧（会打印提示）。上限是防"一次升级在慢盘上转个不停"，不是安全判断。
+- (g) **`ultravnc.ini` 的收紧只覆盖写入时刻**：UltraVNC 自己在运行期重写该文件（例如改端口）时会按它自己的方式建文件，届时继承的是父目录 DACL —— 而安装目录默认在 `%ProgramFiles%`，那里 `BUILTIN\Users` 只读，所以不重开这个口；但把 UltraVNC 装到别处时这一层保证随之消失，属 C-2 的"安装位置由运维负责"范畴。
+- (h) **VNC 口令熵仍约 41 bit**（8 字符 DES 密钥上限，协议决定）且 `vncpassword.go` 的混淆用的是公开固定密钥：收紧文件权限挡的是"本机他人读到"，挡不住"读到了就必然还原"。这是 RFB/DES 自身的局限，不是本轮引入。
+
+---
+
+## 3. MEDIUM
+
+| # | 问题 | 证据 | 影响 |
+|---|------|------|------|
+| M-1 | 控制台 Token 可读走**注册密钥**；备份 zip 含 `agent.key` + `users.json`（TOTP 明文 `auth/user.go:30`）+ `mocenter.db`　✅ 已修（2026-09-20，明文只由"轮换"这一个显式动作给出；`agent.key` 默认不进备份。见 §3 M-1） | `main.go:1499` `"agent_key": agentKey`；`server/backup_api.go:54-71` | 一次备份或一次账号级 XSS = C-1 的根凭据外流（`ca.key` 已正确排除） |
+| M-2 | 审计**结果**未脱敏，且 JSONL 句柄 0644　✅ 已修（2026-09-20，两条回填路径先 `MaskCommand`；JSONL 0600 + 显式 `Chmod`。见 §3 M-2） | `router.go:407`、`:435` 原样赋 `l.Result`，`Audit()` 只脱敏 `Command`/`Result` 初值（`:341-397`）；`router.go:81` 0644 | `ps aux`/打印出的 Token 永久留在 DB，再经 `/api/audits` 或 M-1 导出 —— 上一轮 H-5 的回归 |
+| M-3 | 站点页脚 HTML 过滤可绕过　✅ 已修（2026-09-20，黑名单剥除改**白名单重建** + 全站 CSP 兜底。见 §3 M-3 + M-18） | `web/src/utils/siteBranding.js:43` 的 `/\son[a-z]+\s*=/` 要求 `on*` 前有空白，`<svg/onload=…>`、`<img/src=1/onerror=…>` 直接穿过；`:45` 只匹配引号内字面 `javascript:`，实体编码绕过；渲染在 `SiteFooter.jsx:16` 的 `dangerouslySetInnerHTML`，出现在 `Login.jsx:146` 与 `PublicStatus.jsx:197,714` | 写入需已登录（`/api/site/config` 有 `guard()`），但**载荷投递给匿名访客与其他管理员会话**；无 CSP 兜底 |
+| M-4 | 注册路径的 UUID 仍由 Agent 自报并被无条件采纳　✅ 已修（2026-09-21，注册侧改为按 `agent_id` TOFU 绑定，自报值只作首次认领。见 §3 M-4） | `probe/store.go:206-236`、`main.go:~1264` `ReplaceByUUID` | 假 UUID 可挤掉他人会话（`session.go:222`）并把他人设备历史并入自己（`store.go:371-411`）；同文件 `UpdateProbe:415-422` 明确"不采纳报文里的 uuid" —— 注册路径绕过了自己的控制 |
+| M-5 | Agent 读循环零限速，且每条探针触发全量广播　✅ 已修（2026-09-21，广播合并到 2s 窗口 + 安装包流并发上限；逐条限速经判断不做，理由见落地 (c)。见 §3 M-5 + M-8） | `main.go:1288-1305`（`ProbeDataReq` → `broadcastAgents` → `store.All()` 序列化给所有 WS + 公开页），`go servePackage` 等每条消息起协程 | 一台 Agent 即可放大打满服务端与所有操作员浏览器 |
+| M-6 | 隧道帧仅按 `tunnelID` 索引，未比对发起连接身份　✅ 已修（2026-09-21，五个投递/关闭入口一律比对**连接身份**。见 §3 M-6 + M-7） | `vnc/vnc.go:198,216,256`、`portmap/portmap.go:451,469`；`viewerConn.agentID`（`vnc.go:39-41`）字段存在却从未参与判定 |  rogue Agent 可向他人 RFB 流注入/关闭（ID 形如 `v-<unixnano>-<seq>`，可猜） |
+| M-7 | 端口映射规则覆盖时旧监听继续按旧（更宽）白名单服务　✅ 已修（2026-09-21，改前先 `StopRule`、失败回滚旧规则、规则改值走写时复制。见 §3 M-6 + M-7） | `portmap.go:249` 换 map → `:340-343` 同端口 `Listen` 失败仅记日志（`main.go:2957-2959`）→ 活跃 `handleConnection` 闭包持有旧 `*Rule`（`:360`），放行判定读的是 `:383` 旧 `SourceIP` | API 显示新白名单，实际对全网开放 |
+| M-8 | 文件分发任务按 Agent 自选 `FilePath` 建条目，分片全驻内存且无 TTL　✅ 已修（2026-09-21，条目数/单任务/总在途/闲置 TTL 四道闸 + 清扫接线；分片仍驻内存，见其残留 (a)。见 §3 M-5 + M-8） | `server/internal/filetransfer/filetransfer.go:131-146` | 内存增长无界、任务永不回收 |
+| M-9 | Agent 是零校验的 remote-exec / 任意读写守护　✅ 已修（2026-09-21，文件读写收进 `-file-roots` 根目录（默认 `<配置目录>/files`）且 roots 只认本机配置；"跑任意命令"按单人运维产品的定义保留，见 §3 该单元残留 (b)。见 §3 M-9 + M-10 + M-16） | `agent/internal/client/client.go:622-714` 无任何校验；黑名单只在服务端（`router.go:25`）；`client.go:913` `os.Open`、`:871-900` `MkdirAll`+`Create` 任意路径 | 服务端私钥泄露或 DNS 劫持 ⇒ 以 root 读 `/etc/shadow`、写 `authorized_keys` |
+| M-10 | 自升级 TOCTOU + 签名不覆盖版本　✅ 已修（2026-09-21，单次读入同时做摘要与验签 + 签名消息含目标版本号 + 新增版本比较并拒绝降级；同批删除 `AllowUnsigned` 逃生门。见 §3 M-9 + M-10 + M-16） | `upgrade/upgrade.go:140` 取摘要与 `:150-155` 验签是**两次** `os.ReadFile`，`:170-180` 又是第三种状态 | 本机可换内容；`req.Force` 可把机群钉在某个旧的合法包上 |
+| M-11 | 本地 VNC 凭据可被任意本地用户还原为 SYSTEM 会话　✅ 已修（2026-09-22，随 H-9 同批：`ultravnc.ini` 改 0600 + 受保护 DACL、删掉 `rand.Read` 失败时的静态回退口令。见 §2「H-9 + M-11 · 修复落地」） | `vncinstall_ultravnc_windows.go:384` 把 `ultravnc.ini` 写成 **0644**，内含 `vncpassword.go:20-33` 用公开固定 DES-ECB 密钥混淆的口令；熵仅约 41 bit（`37-46`），`rand.Read` 出错时回退静态 `"mocenter"` | 与 H-9 叠加即本地提权到 SYSTEM 桌面。**残留**：口令熵与"读到文件即可还原"这两点由 RFB/DES 自身决定，未变，见 §2 该单元残留 (h) |
+| M-12 | 匿名端点共用一个 20/分/IP 桶，且限流表不回收　✅ 已修（2026-09-21，公开端点改走 `AllowPublicRoute` 的独立 `(route, ip)` 桶；`Auth.rate` 补容量上限并把回收触发点搬到 `AllowRequest`。见 §3 M-12 + M-13 + M-14） | `public_site.go:76-86` 把 `"public:"+route` 当用户名传入，而 `login_guard.go:65` 的 `perIP` **只按 IP** 计；`auth.go:245-265` 的 `rate` map 无上限且 `pruneLocked` 只在 `ValidateToken` 成功时跑（`:153-174`） | 公开节点详情页每 15s 轮询（`PublicStatus.jsx:628`），3 个标签页即自锁首页；反代后所有访客同 IP；伪造源 IP 的 Token 洪泛可无限增表 |
+| M-13 | 匿名请求触发外呼 GeoIP 与 N+1 查询　✅ 已修（2026-09-21，新增 `probe.Store.AllCached()`，四条匿名读路径全部改用它，外呼只剩后台仪表盘那一条；window 口径的逐节点 SQL 仍在，见其残留 (b)） | `public_site.go:156,296,317,334` → `probe/store.go:714-723` 为未命中 IP 起 `LookupAsync`；window 模式下 `attachTraffic` 每节点一次 SQL（`:351`） | 访客以无节流出网驱动 `-proxy-ip`，把免费接口的额度打空 |
+| M-14 | `Enabled:false` 关不干净　✅ 已修（2026-09-21，`/api/public/enabled` 未启用即 404、品牌文案挪到独立的 `/api/branding`；`SetOnChange` 接线，在途匿名 WS 靠"关旧道 + 换新道后复核开关"即时结束。见 §3 M-12 + M-13 + M-14） | `/api/public/*` 正确 404（`public_site.go:64-70`），但 `/api/public/enabled`（`:544-554`，注册于 `main.go:589`）不查 `requireEnabled` 仍回 `site_title`/`site_footer`；`siteconfig.go:338` 的 `SetOnChange` **从未在 `main.go` 接线** | 关闭公开页仍向扫描器确认产品与品牌配置；已建立的匿名长连接永久不断开 |
+| M-15 | Docker 部署把口令放到进程命令行　⛔ **不适用**（2026-09-20 判定不发 Docker；文档订正已完成，见 §6 第 21 项） | `server/Dockerfile:64` 的 `sh -c` 拼 `-password "$MOCENTER_PASSWORD"`；无 `USER`（root）；基础镜像未按 digest 钉扎；README:164-168 文档化 `-e` + `:latest` | 宿主上任意非特权用户 `ps -ef` 即读到控制台口令，绕开 `install-linux.sh:272-310` 精心做的 0600 口令文件设计。**容器形态不交付 ⇒ 该路径不运行**；仍有效的是"文档教人用不受支持的部署方式"这一半，已随本轮撤掉 |
+| M-16 | 部署期脚本与 systemd 单元的成组问题 | `scripts/gencerts/main.go:223` 以 **0644** 重写含注册密钥的配置（同功能的 `scripts/signcert/config.go:29` 用 0600 并在注释里写明原因）；`mocenter-agent.service` 无任何沙箱（对比 `mocenter-server.service:32-33`）且 `:16` 未加引号地插值 `${MOCENTER_*}`；`mocenter-keepalive.sh:18` 是 `#!/bin/sh` + 仅 `set -u`，`:39` 以 root `source` 配置，`:33` `pgrep -f "$BIN"` 可被任意用户伪称"在跑"；`install-linux.sh:12,107` 文档化 `--password=…`（进 `ps`/history）；`install-linux.sh:197-198` 给所有角色都装 **agent** 的 watchdog 模板，`--role=server` 因此"有名字叫 server 却在看护 agent"，而 server 自己根本没保活 | 本地读凭据、参数注入、root 代码执行面、以及一处真实的功能缺陷 |
+| M-17 | 测试网凭据已提交进仓库　✅ 已修（2026-09-20，只清工作树；历史按用户决定不动，口令由用户轮换） | `mocenter_design.txt:6-12`（`ftp://192.168.117.131` 的 `ftp/<口令>`、`192.168.117.132` 的 `root/<口令>`，加于 `5fe9411`）；`vnctestreport.md:7-8`（`Administrator/<口令>`、`root/<口令>`，加于 `a5158cd`）—— **本条只记角色与主机，不复述口令明文**：报告自己就是那个"任何仓库读者"，把它写进来等于把刚清掉的活凭据再提交一次 | 任何仓库读者获得测试实验室内网 root/Administrator；历史不可只靠删文件清除 |
+| M-18 | 无 CSP、无 Origin 校验、Token 仍可走 query　✅ 已修（2026-09-20，三条 WS 认 `Origin` 同源、`?token=` 回退删除、CSP + `/api/*` no-store 上线。见 §3 M-3 + M-18） | `main.go:2536` 有 HSTS（`max-age=31536000`）与 `nosniff`/`DENY`/`no-referrer`，但 `securityHeaders`（`:2526-2540`）**不含 CSP**；`hub.go:29`、`main.go:530` 的 `CheckOrigin` 恒 `true`；`hub.go:46` 仍接受 `?token=` | M-3 从"能注入"升级为"能外带"；query Token 进日志/历史/代理 |
+
+### M-1　一次已登录页面加载 = 带走 C-1 的根凭据　✅ 已修（2026-09-20，摘除被动下发 + 轮换成为唯一明文出口）
+原表述是"控制台 Token 可读走注册密钥，备份 zip 里还躺着 `agent.key`"。修的时候先把问题重述成一句更准的话：**共享注册密钥是部署级根凭证，而它被放在一个"每次打开后台都会顺手读一遍"的响应里**。因此控制点不是"给备份加把锁"，而是"让被动读取拿不到明文，让取明文这件事必须是一次有痕迹的决策"。
+
+修复落地（行号为 2026-09-20 现状）：
+
+- **被动泄露摘除**：`serverInfoHandler`（`main.go:1738-1766`）不再 `os.ReadFile(agent.key)`，响应里没有 `agent_key` 这个键；只留 `shared_key_enabled`，以及开启时的 `agent_key_fingerprint`（`KeyFingerprint`，`agentauth.go:241`，SHA-256 前 8 位）与 `agent_key_path`。指纹够运维回答"这两台机器上配的是不是同一把"，不够冒用。
+- **唯一明文出口 = 轮换**：新增 `POST /api/enroll/shared-key/rotate`（`sharedKeyRotateHandler`，`enroll_api.go:165-218`；注册于 `main.go:674`）。它要求 `guard()` + `confirm:true`（不带确认字段只回失败说明，防"页面加载即轮换"这种误触发），调 `RotateSharedKey`（`agentauth.go:187`：锁内生成 32 字节 → 0600 落临时文件 → rename → 换 `v.key`，**立刻生效**），新明文只在这一个响应里出现一次，随后接口只回指纹。审计走 `auditEnrollOp`（`:208`），内容是 `指纹 <旧> → <新>` —— **不写明文**，否则审计库只是换了个地方继续泄露。响应头 `Cache-Control: no-store`（`:175`）。
+- **为什么选"轮换"而不是"口令加密备份"作为主控制**：持有控制台 Token 的攻击者本来就能用自己的口令创建一份加密备份再下载，加密只挡住了误操作，挡不住有意图的读取；而轮换让"取明文"必须先改变全局状态 —— 改变是可见的、可审计的、且旧值对未接入的机器立刻失效。备份侧只做**默认不打包**这一层（见下条），两者叠加而不是互相替代。
+- **备份不再默认携带根凭据**：`fileSpec` 加 `ExplicitOnly`（`internal/backup/backup.go:68-73`），`agent.key` 标上它（`:86`，Label 改为"默认不打包"）；`CreateWithOptions`（`:143`）在打包循环里把这类文件记进 `manifest.Skipped`（`:191-193`）而不是塞进 zip。`Create` 保留为"不带上凭据"的同义包装（`:135`），所以既有调用点与测试语义不变。API 侧 `POST /api/backups` 接受可选 `{"include_secrets":true}`（`backup_api.go:87-106`，空体/`null` 容忍，旧前端照样能用），下载响应加 `no-store`（`:71`），审计文案写明这次到底有没有带凭据（`:113-118`）。这与 `ca.key`/`node.key`/`enroll.json` 一直"刻意不备份"是同一口径 —— 之前唯一的例外恰好就是危害最大的那把。
+- **同一条链上的隐性旧密钥来源：部署器**：`Options.AgentKey string` 删除，改 `Options.AgentKeyFunc func() string`（`internal/agentdeploy/agentdeploy.go:76-80`），接线为 `AgentKeyFunc: verifier.SharedKey`（`main.go:704`），`buildAgentConfig` 写配置时经 `d.agentKey()`（`:748`、`:777`）。**为什么必须是"取"而不是启动时"抄一份"**：密钥现在能在运行期轮换，快照会让后台"部署成功"但目标机带着上一把密钥，永远连不上线 —— 一个只在特定操作顺序下出现的静默故障。取不到（已关闭/未配置）时写空串而不是写旧值，配置里那把不存在的密钥比一个明确的空值更会误导人。
+- **race 的根因**：轮换能改写 `v.key`，而 `Verify` 与 `KeyFingerprint` 原来在锁外读它 —— 那不只是数据竞争，还可能让一次校验跨在旧新两把密钥之间。现统一走 `sharedKeySnapshot()`（`agentauth.go:257`，锁内返回 `v.key` 与"是否可用"），`SharedKey()`（`:168`）作为唯一的明文访问器，注释里写明它只允许用在运维显式动作的出口。`TestRotateSharedKeySafeUnderConcurrentVerify` 用 `WaitGroup` 生产者/消费者把这条打在 `-race` 下。
+- **前端**：`AgentEnroll.jsx` 第 ③ 段从"显示密钥明文"改成指纹 + 路径表格，取明文入口是「轮换密钥」按钮（`window.confirm` 二次确认），返回后一次性展示（可遮盖/复制）并列出服务端给的告警；`api.js` 的 `rotateSharedKey()` 固定带 `confirm:true`，`createBackup(withSecrets)` 带 `include_secrets`；`Backup.jsx` 加"包含凭据文件"复选框，默认不勾。
+- **文档**：README 共享密钥条目（控制台不再回显明文 / 轮换出口 / 部署实时读取 / 备份默认不打包）、`docs/deployment.md` 的注册章节与「备份内容」表（`agent.key` 行标注"默认不打包，需 `include_secrets`"）。
+- **测试**：`server/enroll_api_test.go` 新增 4 例 —— `/api/server-info` 绝不含明文（`TestServerInfoWithholdsSharedKeyPlaintext`）、轮换需登录且需确认（`TestSharedKeyRotateNeedsAuthAndConfirm`）、轮换后旧密钥立刻注册失败而新密钥可用且审计里没有明文（`TestSharedKeyRotateTakesEffectAndKeepsPlaintextOutOfAudit`）、关闭共享密钥后轮换明确拒绝而不是返回一把没人能用的密钥（`TestSharedKeyRotateRefusedWhenDisabled`）；`internal/agentauth/tokens_test.go` 3 例（立即生效、关闭时拒转、并发验证）；`internal/backup/backup_test.go` 的 `TestSecretsNotPackedByDefault` 断言默认包里既无 `agent.key` 也进了 `Skipped`；`internal/agentdeploy/agentdeploy_test.go` 的 `TestBuildAgentConfigFollowsRotation` 断言部署配置跟着轮换走。
+
+残留（如实记录）：
+
+- (a) **重启即作废的形态仍存在于配置链**：密钥若来自 `-agent-key`、配置项 `agent_key` 或 `MOCENTER_AGENT_KEY`，启动时那个值会**盖掉** `<data>/agent.key`（`main.go:318-332` 一侧的写入），所以运行期轮换只活到下次重启。当前是**告警而不阻止**（响应里的 `warnings` 指名"会盖掉 <path>"、指引先删配置项再重启）。彻底消除要让启动路径在检测到"文件里的密钥与配置来的密钥不一致"时拒绝启动，但那会让每次手工轮换后必须改配置，风险是运维直接退回"不轮换"。
+- (b) **`users.json` 仍在默认备份里**：TOTP 密钥明文（`auth/user.go:30`）与口令哈希随之带走。没有把它一起改成 `ExplicitOnly`，因为备份不含 `users.json` 就等于"备份不可用于恢复登录"——恢复流程的可用性优先；且口令哈希本身是 PBKDF2 摘要。真正收口要靠凭据分层或字段级加密，超出本条。
+- (c) **轮换是全局动作、无第二次确认人**：一个 Token 就能换掉全网注册密钥，代价是"手里还拿着旧密钥、尚未接入的机器"注册失败。没有做双人复核或生效延迟（都需要先有角色层，~~归 P2 第 20 项~~ **2026-09-20：随"单人使用、不做 RBAC"判定关闭 —— 单人系统里"第二个确认人"不存在，这项控制无主体**）。
+- (d) **旧密钥不会主动吊销已签发证书**：轮换只关掉"用共享密钥新注册/重换"这条路，已凭证书在线的主机继续可用 —— 这是刻意的（否则一次误点会把机群踢下线），但也意味着"怀疑密钥泄露"的运维还需要另行 `ca.key` 重签或按主机清除绑定。
+- (e) **Windows 上 0600 不等于 ACL**：`RotateSharedKey` 的 0600 在 Windows 上只是创建位，同 H-9 的本地 ACL 面。　**2026-09-22：经安装器落地的部署已关闭此面**（H-9 给 `<data>` 设了受保护 DACL，此后新建/重命名的凭据文件只继承紧的授权）；**仍开放的是"手工起在自选目录的 Windows 服务端"** —— `server/` 模块自己不调 `SetNamedSecurityInfo`，理由与代价见 §2「H-9 + M-11」残留 (c)。
+- (f) **未做真机流程验证**：没有在实际部署上点过一轮"轮换 → 用新密钥配一台新机器 → 上线"。单测覆盖了接口与状态机，缺一次端到端。
+
+### M-2　命令输出里的凭据永久留在审计库　✅ 已修（2026-09-20，脱敏移到每条写入路径的入口）
+原表述：`Audit()` 只脱敏写入时的 `Command`/`Result` 初值，而 `Complete`/`completeByCommandID` 把 Agent 回传的**结果原文**直接赋给 `l.Result`。后果是 `ps aux`、`--token=…`、脚本 echo 出来的口令会永久留在 `mocenter.db`，再经 `/api/audits` 或 M-1 的备份导出。这正是上一轮 H-5（"脱敏时机"）在本轮的回归。
+
+修复落地（行号为 2026-09-20 现状）：
+
+- **两条回填路径各过一遍脱敏**：`Complete`（`router.go:513-514`）与 `completeByCommandID`（`:543-544`）在**进锁之前** `result = MaskCommand(result)`。放在锁外是有意的：脱敏是纯函数，放锁内会把一次正则扫描留在所有审计读写的临界区里；放最上方则保证以后新增的回填入口不可能"忘了脱敏"——它没有拿到未脱敏文本的窗口。
+- **同一条记录只有一个 `l.Result`**：内存记录、`/api/audits` 序列化、SQLite 回填（`:529-535`、`:567-573` 的 `CompleteAuditLog(id, result, …)`）用的是同一个已脱敏串，所以不需要（也不应该）在三个出口各补一次。测试分别打这三个出口，见下。
+- **JSONL 句柄收成 0600**：`NewRouter` 建目录 0700、`os.OpenFile(..., 0600)`，并**再显式 `f.Chmod(0600)`**（`router.go:106-114`）。这个 `Chmod` 不是冗余：`os.OpenFile` 的权限位只在**创建**时生效，已存在且历史遗留为 0644 的文件要靠它收紧；失败时打日志并给出手工改法，而不是静默继续。
+- **顺带查出并修掉的真实数据竞争**（`-race` 复现，不是测试假象）：`Audit()` 的异步落库协程在锁内写 `l.ID`，但 `Audits()` 交出的是**同一批指针**，`/api/audits` 序列化与它并发即竞争；而该协程原先还在锁外读 `l.Result/ExitCode/Duration` 构造 SQLite 行，同期 `Complete` 正在锁内写这几个字段。三处收口：`Audits()` 逐条拷值（`:577-587`），`Audit()` 的落库行改在**已有的持锁区间内**构造（`:466-484`，`var row *storage.AuditLogRow`），`Audit()` 末尾的 `return l.ID` 也取锁（`:505-507`）。
+- **测试**：`server/internal/route/audit_mask_test.go` 7 例 —— 内存与 `Audits()` 出口（`TestAuditResultMaskedByComplete`）、按 `command_id` 回填出口（`TestAuditResultMaskedByCompleteByCommand`）、SQLite 落库出口（`TestAuditResultMaskedInSQLite`，含 ID 回填的等待），JSONL 权限两条（已存在文件被收紧、新建文件即为私有；Windows 上 `t.Skip` 而非放宽断言）。
+
+残留（如实记录）：
+
+- (a) **只挡新写入，不改历史行**：修复前已经落进 `mocenter.db` / `audits.jsonl` 的明文结果仍然原样存在，`importLegacyAudits`（`router.go:129-176`）还会把遗留 JSONL 行**按原文**补录进 SQLite。没有做"启动时一次性重写历史审计行"，理由是：静默改写审计数据本身是可被质疑的完整性操作（谁改了去年那条命令记录？），而且去重键是 `(Time, Command)`，改写后的行会在下次启动被判成"不存在"从而**重复导入**。要清历史请显式执行 `UPDATE audit_logs SET result=…` 或整库重建，并在文档/本报告里留一条"历史数据含明文"的记录，而不是让升级悄悄做掉它。
+- (b) **JSONL 本来就不是主要泄露面**：`Complete` 只回写内存与 SQLite，JSONL 行停留在 `Audit()` 写入时的初值（通常为空结果）。所以本条真正修的是 **DB / 内存 → `/api/audits` / 备份导出**，0644 只是让"能读数据目录的本地用户"多一条入口 —— 两点都在报告里保持原样，避免把修复描述得比实际更宽。
+- (c) **`MaskCommand` 是模式表，不是语义理解**：它认的是 `-u user:pass`、`--password[= ]x`、`-p x`/`-pX@ss` 以及"键名含 `password|secret|token|authorization|apikey` 等"的 `k=v`/`k: v`/`k v` 形态（`router.go:746-770`，规则由具体到宽泛排序，顺序错了会把 `http://x` 当成口令值脱敏）。**不覆盖**的是"结果里裸着一行秘密"：`cat /etc/shadow` 的输出、`echo` 出来的裸口令、私钥正文（`-----BEGIN` 之后的 base64 不带键名）、以及任何自定义键名（`FOO_KEY=…` 里没有列出的关键字）。所以这是"已知凭据参数形态"的脱敏，不是"结果里所有秘密"的脱敏 —— 分级上仍属 MEDIUM 而非"已消除"。
+- (d) **CSV 导出（L-1）另有一处问题**：`main.go` 的审计导出没有公式注入前缀转义，本条未动（属 LOW 项，归 P3）。
+- (e) **Windows 上跳过权限用例**：这两条断言只在 Linux CI 上第一次真跑（与 L-8 残留 (a) 同一批风险）。
+
+### M-3 + M-18　页脚 HTML 过滤可绕过 / 无 CSP / 无 Origin 校验 / Token 走 query　✅ 已修（2026-09-20，白名单重建 + 全站 CSP + 三条 WS 认同源 + 凭证只剩子协议头）
+
+原表述：`siteBranding.js` 用正则**黑名单剥除**危险构造（`/\son[a-z]+\s*=/` 要求 `on*` 前有空白，`<svg/onload=…>`、`<img/src=1/onerror=…>` 直接穿过；`javascript:` 只匹配引号内字面量，实体编码绕过），而整站没有 CSP 兜底；三条 WebSocket 端点 `CheckOrigin` 恒 `true`；`WSToken` 仍接受 `?token=`。四条合起来是同一个故障域：**注入点（M-3）→ 执行能力（M-18 无 CSP）→ 外带通道（M-18 无 Origin 校验、Token 可在 URL）**。
+
+修复落地（行号为 2026-09-20 现状）：
+
+- **黑名单换成白名单重建**（`web/src/utils/siteBranding.js:212` `sanitizeFooterHTML`）：不再"找出坏的删掉"，而是"只把好的重新拼出来"。只有 `keepTags`（`:33`，展示型标签，不含 `form/input/button/iframe/svg/math`）与 `href/src/target/title/alt` 四个属性能出现在输出里；`dropContentTags`（`:45`）连**内容**一起丢（`script`/`style`/`svg`/`template`/`noscript`… —— 只拆标签留文本会留下半截代码，且在特定解析态下重新变成标记）。未闭合自动补、多余闭合忽略、深度上限 48（挡"三万个嵌套 `<p>`"这类输入把一次渲染变成 DoS）。
+- **为什么必须重建而不是打补丁式正则**：黑名单在这一类里是可绕过族 —— `<svg/onload>`（斜杠顶掉"空白"前提）、`<img/src=1/onerror=…>`（同上）、`&#106;avascript:`（属性值里的实体要等浏览器解析时才还原）、mXSS（`<noscript><p title="</noscript><img onerror=…>">` 这类二次解析）。逐条加正则等于跟浏览器的容错解析赛跑，而重建模式下这些构造**没有一条路径能变成活标签**：`on*` 与 `style` 属性根本不在允许名单里，不存在"绕过剥除"这回事。
+- **URL 判定看解码后的真值**（`:106` `cleanURL`）：先去掉 `\u0000-\u0020\u007f` 再判协议（`java\tscript:`、前导空格的 ` javascript:` 穿不过），实体解码（`decodeEntities`）后才比较，因此 `&#106;avascript:` 会先还原成 `javascript:` 再被拒；链接只认 `http/https/mailto/tel/ftp` + 相对路径 + `#`，图片额外要求 `http(s)`/协议相对或位图 `data:image/…;base64,`；`target="_blank"` 一律强制补 `rel="noopener noreferrer"`。
+- **`readTag`（`:123`）是自带的一段容错分词**：注释/doctype 跳过、带引号与不带引号属性、自闭合只在 `/` 后紧跟 `>` 时成立、不引号值末尾的 `/` 要削掉（否则 `src=1/>` 会把 `>` 当值的一部分，把后面的内容吞进去 —— 这类"解析器不一致"正是 mXSS 的入口，所以两边（我们的分词与浏览器的）必须给出同一棵树）。
+- **全站 CSP**（`server/main.go:2875` 下发，取值依据见 `:2892-2919` 的 `cspHeader`）：`default-src 'none'; script-src 'self'; …; frame-ancestors 'none'; form-action 'self'; base-uri 'none'; object-src 'none'`。这是"即使净化被绕过也执行不了脚本"的外层网。取值不抄模板而是实测本仓产物：`script-src` **不含** `unsafe-inline`/`unsafe-eval`（`npm run build` 后 grep 五个产物：0 处 `eval`/`new Function`/`new Worker`/`WebAssembly`）；`style-src 'unsafe-inline'` 因为 `web/index.html` 的首屏内联底色是刻意的（样式表被代理拦掉时不白屏）；`img-src data:` 因为国旗是 `flag.js:137` 的 `canvas.toDataURL` 直接当 img 源；`connect-src` 写死 `ws: wss:` 而非只靠 `'self'`（`'self'` 对 `ws://` 同源是否匹配，各浏览器口径不一）。
+- **`/api/*` 一律 `Cache-Control: no-store`**（`main.go:2879-2881`）：登录响应带 Token、审计响应带命令结果、备份响应带文件，中间代理存一份就多一处泄露点。顺带覆盖了此前"令牌签发响应没显式 no-store"的漏洞（`enroll_api.go` 的签发响应原先只有旋转接口显式带过）。静态资源不受影响（实测 `/assets/*.js` 仍是 `public, max-age=31536000, immutable`）。
+- **三条 WS 统一认同源**（新增 `server/internal/ws/origin.go:28` `SameOrigin`；接进 `hub.go:49`、`vnc.go:37`、`main.go:612` 公开页）：公开页原先的 `return true` 理由是"可能被嵌在其它站点里"，这条站不住 —— iframe 里的 socket 带的是**被嵌入文档自己**的 Origin，而前端拼 URL 用 `location.host`（`api.js` 的 `PublicSocket`），同源必然成立，收紧后照样能嵌入。缺 `Origin` 头放行（那只能是 curl/探活等非浏览器客户端，跨站劫持必然带 Origin），与 gorilla 默认语义一致。
+- **`?token=` 回退删除**（`hub.go:59` `WSToken` 只读 `Sec-WebSocket-Protocol`）：URL 会进反代访问日志、浏览器历史与截图。前端从来只用子协议头（`api.js:377`、`Vnc.jsx` 的 `wsProtocols`），所以这次删除没有兼容代价 —— 有代价的是**缓存了旧 `dist` 的老前端**，需与前端同批发版。
+- **测试**：`web/scripts/check-footer-sanitize.mjs`（9 组，无浏览器可跑，已接进 `npm run check:footer` 与 CI 的 `&web-ci`）—— 分类断言"发出来的标签/属性/值"而不是全文子串扫描（第一版按子串扫把**已转义属性值**里的 `onerror` 误判为活属性）；`server/internal/ws/origin_test.go` 6 例（同源接受、跨站拒绝含 `mc.example.com.evil.cn` 后缀伪装与 `null`、大小写/空白归一、默认端口与协议形态、缺头放行、query token 被忽略）+ `hub`/`vnc`/公开页各一条"upgrader 没在判同源就红灯"的接线断言；`server/security_headers_test.go` 3 例（CSP 各指令不含 `unsafe-inline`/`unsafe-eval`/通配 + 三条实测例外、`/api/*` no-store 而静态资源不加、HSTS 只在 TLS 态）。
+
+验证：三平台 `go build` + `go vet` + `go test ./...` 全绿，`-race` 下 `server`/`ws`/`vnc`/`route` 四包绿，gofmt 干净；`npm run build` 通过，页脚自检 9/9；`&web-ci` stage 过 `bash -n` 与 `sh -n`。**浏览器实机验证**（本机临时数据目录 + 真实 Agent，验证完即删）：登录页、公开页、后台、终端、VNC 五处控制台 **0 条 CSP 违规**；`/ws` 与 `/vnc-ws` 用 curl 探得 `Origin: http://evil.example` → **403**、`Origin: 同源` → **101**、`?token=` → **401**；公开页页脚塞进活体载荷（`<img src=x onerror=fetch(...)>` + `<script src=//evil/x.js>` + `<svg/onload>`）后 DOM 实际只剩 `<p>2026©MOONCN <a … rel="noopener noreferrer">备案号</a></p><img>`，网络面板无对 `evil` 的请求；批量命令 `whoami`/`echo A1`/`echo A2` 经收紧后的 `/ws` 完整往返并回填审计（`MOONCN\n`、`A1\r\n`、`A2\r\n`）。
+
+残留（如实记录）：
+
+- (a) **服务端不做净化，与 §6 第 14 项原写的"服务端 HTML 白名单"不同**（这是本轮唯一一处按判断偏离计划的地方）。理由：全仓只有一处 `dangerouslySetInnerHTML`（`web/src/components/SiteFooter.jsx:16`），三处消费点（`Login.jsx:146`、`PublicStatus.jsx:197,714`、`SiteConfig.jsx:365` 的预览）全走它 —— 净化放在渲染入口意味着"没有第二个出口能漏"。服务端再加一套净化要么引入 HTML 解析依赖（`server` 目前不依赖 `golang.org/x/net`），要么手写第二套分词器与前端白名单**双份漂移**；两处白名单不一致时，"哪一处说了算"没人能从代码读出来。代价：**非浏览器消费者**（以后若加邮件模板、报告导出、CLI 渲染）拿到的是原文，届时必须复用同一份净化或显式转义。
+- (b) **Origin 判定在"任一侧端口隐含"时不比端口**，也不比协议。这是为了不让 TLS 终止型反代把功能拍死（那种形态下服务端看到 `http` + 无端口 Host，浏览器写 `https://host`）。留下的口子：同一主机另一个端口的页面可与 `/ws` 建连 —— 它没有会话 Token（凭证只在子协议头，见 H-2），强度与 gorilla 默认 `checkSameOrigin` 等同，且比修复前的"任意来源"严格。没有改信 `X-Forwarded-Proto`/`X-Forwarded-Host`：那等于把同源判定交给一个可伪造的头。
+- (c) **反代必须透传 `Host`**，否则同源判定必然 403。文档已改（`docs/deployment.md` 的 nginx 示例补上 `/vnc-ws` location —— 它此前根本不在示例里 —— 并给三条 WS 各补 `proxy_set_header Host $host;`，nginx 默认发的是 `$proxy_host`），并在 §五 新增「响应安全头与 WebSocket 同源」含一条 curl 自查；但**代码里不做自动回退**，误配的表现是"终端/桌面/推送全断"，部署方需要读这段文档。
+- (d) **CSP 的两个例外是真口子，只是危害小一档**：`style-src 'unsafe-inline'` 允许界面遮挡与"样式选择器外渗"（本仓无跨页敏感 DOM），`connect-src ws: wss:` 不限源，意味着若将来出现**能执行脚本**的绕过（例如依赖被投毒，`script-src 'self'` 管不住同源脚本的行为），脚本仍可用 WS 外带。收紧路径是把 `style-src` 换成哈希 + 去掉 `index.html` 的内联底色，那要一并解决"样式表被拦即白屏"的老问题，未列入本轮。
+- (e) **实机验证的覆盖面边界**：无真机 VNC 画面（本机无 RFB 服务，只验到握手 101 + 隧道授权）、无头 Windows VDD（与 L-5 同一未验证项）、移动端公开页渲染未看；`?token=` 移除对**旧前端**是破坏性变更，未测混合版本共存（预期就是连不上，需前后端同批升级）。
+- (f) **实机跑出一个待复现的审计完整性现象**（与 M-3 无关，顺手记录）：接入后**第一条**批量命令的审计行是"有下发、无回执"（`result` 空、`duration_ms=0`），随后三条均正常回填。已排除本轮改动（同一 `/ws` 通道后续命令完整回填，且 `Complete` 路径未动），当时那条命令之前存在一个未断开的交互终端会话，怀疑与交互会话并存时的回执路由有关，未定位，留作单独复现项。
+
+### M-6 + M-7　隧道帧归属判定 / 端口映射规则覆盖　✅ 已修（2026-09-21，帧投递一律比对"连接身份"；改规则前先停旧监听）
+这两条同属"服务端内部把自报字段当成了可信输入"，且都只需要改函数签名就能收口，所以并成一个落地单元。M-6 的要害不是"攻击者能猜到 `v-<unixnano>-<seq>` 形态的隧道 ID"，而是**投帧时根本不问你是谁**：`viewerConn.agentID`、`publicTrack.agentID` 两个字段一直存在，只是从没参与过判定。M-7 的要害是**自己骗自己**：API 与界面显示新白名单，实际放行的仍是旧规则。
+
+修复落地（行号为 2026-09-21 现状）：
+
+- **五个入口全部收口**：`vnc.Mgr.DeliverTunnelData`（`internal/vnc/vnc.go:412`）、`DeliverOpenResp`（`:437`）、`NotifyTunnelClosed`（`:489`）与 `portmap.Manager.DeliverTunnelData`（`internal/portmap/portmap.go:490`）、`NotifyTunnelClosed`（`:513`）都增加了 `agentID` 形参，命中后必须与登记时的归属一致才继续转发。
+- **传进去的必须是连接身份，不是报文自报字段**：`main.go:1684/1691/1697/1699/1706/1708` 六处调用一律传 `sessConn.GetAgentID()`（TLS 握手期由证书/令牌确定的那个身份，见 C-1），`TunnelData`/`TunnelClosed` 报文里的 `agent_id` 不再作为判定依据。这是本条的实际防线 —— 若把 `td.AgentID` 传进去，攻击者只要自报"我就是这条隧道的主人"就绕过了全部判定。
+- **探测等待表原本没有主人**：`vnc.Mgr.probeWait` 从 `map[string]chan …` 改成 `map[string]*probeWaiter`（`vnc.go:89-104`），登记时记下发起探测的那个 `agentID`（`:337`）。这条是五个入口里唯一"表结构本身不支持归属判定"的地方，响应隧道建立结果与探测结论此前都可被任意 Agent 认领。
+- **越权帧的处置 = 丢弃 + 限频留痕**：`logMismatch(from, owner, tunnelID, kind)`（`vnc.go:283`，portmap 侧 `mismatchMu`/`mismatchAt`/`logMismatch` 同构）按伪造方 Agent 每分钟一条（`mismatchLogInterval`，`vnc.go:280`），`mismatchAt` 表随巡检剪枝。不限频的话"挡滥用的检查"自己就是滥用面 —— 越权帧是可以高频重放的。
+- **M-7 的执行顺序**：`CreateRule`（`portmap.go:253`）改为 校验 → `prev := m.GetRule(port)` → `m.StopRule(port)` → `m.ServeRule(r)`；`ServeRule` 失败时**把 `prev` 重新 `ServeRule` 回去**再返回错误，`m.rules` 不动。旧实现是"先换 map 再监听"，同端口 `Listen` 必然失败、失败只被调用方 `log.Printf` 掉，于是旧监听按旧 `SourceIP` 继续放行。
+- **规则改值改为写时复制**：`EnableRule`/`DisableRule` 不再就地改 `*Rule` 的字段，而是 `next := *r; next.Enabled = …; m.rules[port] = &next`。原因是活跃监听的 `handleConnection` 闭包持有的是**旧指针**，就地改字段等于改不到它，还会造成数据竞争；换成新指针后，"下一次建监听才生效"这件事至少是诚实的（配合上条，改规则会先停旧监听，因此"生效"与"重启监听"被绑成了同一个动作）。
+- **测试**：新建 `internal/vnc/vnc_tunnel_test.go`（5 例：隧道帧仅归属方可投、隧道建立响应仅归属方可认领、探测结论仅发起方可认领、未知/已摘除的 `tunnelID` 静默忽略、关闭通知仅归属方可生效）；`internal/portmap/portmap_test.go` 增 4 例（帧归属、关闭通知归属、`CreateRule` 覆盖后新规则确实生效、`ServeRule` 失败时 `m.rules` 保持旧值）。`internal/vnc` + `internal/portmap` 在 `-race` 下全绿。
+
+残留（如实记录）：
+
+- (a) **`tunnelID` 仍是可猜的**，没改成随机不可预测 ID。收口的不是"能否猜中 ID"而是"猜中之后能不能用别人的身份投进去" —— 判定用的是连接身份，跨主机必然不符。剩余面：同一台主机上的进程若能读到自己的隧道 ID，仍可干扰**自己这台**的流（这已在本机 root 面内，属 M-9）。
+- (b) **改一次端口映射会掉一次线**（`StopRule` 断掉在途连接，Stop→Serve 之间该端口短暂不接受新连接）。语义上比"新白名单不生效"正确，但运维视角是行为变化，`docs/deployment.md` 未单独写这段。
+- (c) **未做真机跨主机验证**：要复现原缺陷需要两台在线 Agent（一台开隧道、一台投帧），本机走查只有单实例。判定分支由单测覆盖，缺一次实机。
+
+### M-4　注册路径采纳自报 UUID　✅ 已修（2026-09-21，改为按 `agent_id` TOFU 绑定，自报值只作首次认领）
+原缺陷是同仓两套语义：`UpdateProbe`（`internal/probe/store.go`）一直遵守"报文里的 uuid 不参与，只在设备无 UUID 时补齐"，而注册路径把 `info.UUID` 直接 `SetUUID` 并建键 —— 于是绕过了同文件已经立好的规矩。
+
+修复落地：
+
+- **新增 `Store.ResolveUUID(agentID, claimed) (trusted string, conflict bool)`**（`internal/probe/store.go:215`）。规则是 TOFU：该 `agent_id` **首次**上报的 UUID 被采纳并成为绑定值；此后一律返回绑定值，`conflict` 仅在"自报了不同的非空 UUID"时为真。判据直接对齐 `UpdateProbe` 的"只在缺失时补齐"。
+- **注册侧接线**（`main.go:1512-1521`）：`trustedUUID, uuidConflict := store.ResolveUUID(info.AgentID, info.UUID)` → 冲突时落一条含双方值的告警日志 → `info.UUID = trustedUUID`。关键是**改写 `info.UUID` 本身**：这样下游的 `sessConn.SetUUID`、`store.UpsertAgent` 建键、`ReplaceByUUID` 挤占、以及设备历史合并（`store.go` 按 UUID 并档那段）看到的都不再是攻击者选定的值。
+- **日志里的值经净化**：冲突与越权日志中的 `info.UUID` 走 `logSafe()`（`main.go` 的 `logSafeMax = 96` + 控制符剥除），设备名片段走 `uuidSuffix()` 净化 —— 顺带覆盖 L-2 在注册路径上的那一处。
+- **测试**：`internal/probe/store_test.go` 的 `TestResolveUUIDIsFirstBound`（首值被认领、后续不同值被改回且标冲突、空值不认领）；`server/agent_flow_test.go` 的 `TestLogSafeKillsInjectedNewlines` / `TestUUIDSuffixSanitizes`。
+
+残留（如实记录）：
+
+- (a) **"同一台机器换了 `agent_id`"照常工作**（新 ID 未绑定过，首值即认领）；**"同一个 `agent_id`、硬件 UUID 真的变了"（换主板 / 重装虚拟机的 machine-id）现在需要人工一步** —— 在后台删除该主机记录后重连才会认领新值。冲突日志写明了双方值与处置口径。刻意不做"自动跟随最新上报值"，因为那正是本条要堵的口子。
+- (b) **没有削弱 `session.Manager.ReplaceByUUID` 的失活判定**（本轮曾考虑"活跃连接不得被 UUID 顶替"）。原因是离线标记依赖它：同 UUID 的新连接顶替旧会话后，旧连接的收尾走 `RemoveIfCurrent` 返回 false 这一支（`main.go:1739-1741`）来避免误标离线；不让顶替发生，就会把重启/重连的设备标成离线。**因此剩下的确切口子是**：一个**从未绑定过 UUID 的全新 `agent_id`**，若同时知道受害者的 UUID，注册时仍可凭 `ReplaceByUUID` 挤掉那台机器的活跃会话 —— 但它自己的 UUID 现在会被立刻改写为绑定值（新 ID 无绑定，故取不到受害值并入历史），且注册本身要过 C-1 的一次性令牌或已签发证书。彻底收口要把"会话归属"从 UUID 上摘下来（会话只认 `agent_id`，UUID 纯作展示），属结构性改造，不在本条范围。
+- (c) 单人模型下"把他人设备历史并入自己"没有跨操作员面；这里挡住的真实危害是**脏数据**（A 机的探针写进 B 机的历史曲线），与越权无关，故 TOFU 即足够。
+
+### `session.Conn.Write` 无 deadline（H-2 残留 (c)）　✅ 已修（2026-09-21）
+H-2 收口时新发现的既有问题：全仓 `SetWriteDeadline` 只在 vnc / ws / public 三处命中，**Agent TCP 侧零命中**。一条"只收不发"或被中间设备悄悄掐掉、TCP 仍在闷头重传的连接，会让 `Write` 永久持有 `c.mu`；调用方既有 HTTP 处理协程也有端口映射的转发泵，最坏情况是整条隧道连同该主机后续的全部下发一起挂死。
+
+修复落地：`internal/session/session.go:144-172` —— 新增 `agentWriteWait = 30s`（取 30s 的依据：安装包分片这类较大的单次写在弱网下也远用不到），每次 `Encode` 前设 deadline；`c.NetConn == nil` 时明确返回错误而不是 nil 解引用；**写失败即 `Close()`**（一帧 JSON 可能只写出去一半，留在流里的残帧会让 Agent 的按行解析一直错位，关掉让对端重连比留着一条"看起来还在线"的脏连接安全）。测试：`internal/session/session_test.go` 新增 2 例（用 stubConn 断言 deadline 被设置、写错误传递并关闭连接；NetConn 为空返回错误）。
+
+残留：30s 是**单次写**的上限，不是消息速率上限；写失败即关连接会把"一次弱网抖动"变成"一次重连"，这是刻意取舍（残帧的危害大于重连的代价）。
+
+### M-5 + M-8　Agent 侧资源放大　✅ 已修（2026-09-21，广播合并 + 单连接协程上限 + 上传内存/条目/TTL 四道闸）
+这两条的共同形态是"一条被拿下的 Agent 能让服务端替它做无界的事"：M-5 是每条消息触发一次全量广播、每个请求起一路协程；M-8 是上传任务只增不减、分片全驻内存。
+
+修复落地（M-5）：
+
+- **新增 `server/agent_flow.go`**：`agentRefresh`（`:22`，`newAgentRefresh`/`now`/`soon`/`fire`）把"主机数据变了"合并成最多每 `agentRefreshInterval = 2s` 一次 `broadcastAgents`。两个入口分开是刻意的：**上线/离线是状态跃迁，必须立刻可见**（慢一秒就是"主机没下来"），走 `now()`；**探针是高频数据源，允许合并**，走 `soon()`。落在窗口内的变更挂一个补偿定时器 —— 只节流不补偿会把最后一次变更永久吃掉，界面停在旧值不再更新。`now()` 会取消尚未触发的补偿广播，避免紧接着再发一份同样的数据。
+- 接线：`main.go:623` 构造并注入 `heartbeatSweeper(sess, store, refresh)`（`:1749`）与 `handleAgentConn`（`:1417`，`pub` 参数由此移除）；探针分支 `:1600` 改为 `refresh.soon()`。
+- **`PkgFetchReq` 加并发上限**：`pkgSlots := make(chan struct{}, maxConcurrentPkgFetch)`（`main.go:1565`，常量在 `agent_flow.go:85`，取 2）+ `select`/`default`（`:1723-1730`）。原来每条请求无条件 `go servePackage`，而每路都是"持续往这条连接写分片"的协程，几十路并发就能占满出口并互相拖死；Agent 侧本身串行发起，2 留了一路余量，满时明确记一条拒绝日志而不是静默丢弃。
+- **测试**：`server/agent_flow_test.go`（3 例：窗口内多次 `soon()` 只广播一次、窗口结束后补偿广播确实发出且新窗口生效、`now()` 立即广播并取消挂起的补偿）+ `TestLogSafeKillsInjectedNewlines` / `TestUUIDSuffixSanitizes`（随 M-4 一并放在这里）。
+
+修复落地（M-8）：
+
+- **四道闸**（`internal/filetransfer/filetransfer.go:36-46`）：`maxActiveUploadTasks = 64`（任务条目数，新建任务前判）、`maxUploadTaskBytes = 256 MiB`（单任务，声明大小与累计接收各判一次）、`maxStoredBytes = 512 MiB`（全部在途总量，靠新增的 `stored` 计数）、`uploadTaskTTL = 30min`（闲置回收）。阈值依据写在同一段注释里：单人自用的运维用量是几十 MB 的日志或安装包，离上限很远。
+- **额度必须释放，否则闸门会被正常用量吃满**：`stored` 在收片时加（`:221`），在**组装落盘时减**（`:298`，减的是实际合并字节数）与**回收时减**（`:260`，减 `t.received`）。漏掉任何一处都会让计数器单调上涨，最后拒绝的是正常上传。
+- **`CleanupStale()`**（`:252`）由 `cleanupSweeper(pm, hub, ft)`（`main.go:1763-1767`）驱动，与端口映射超时清理同一个巡检协程；`t.done` 的任务也一并摘除。
+- **超限拒绝留痕限频**：`shouldLogReject()`（`:238`，每分钟最多一条）。超限是可以被高频重放的，不限频就等于闸门自己成了刷日志的入口。
+- **测试**：`filetransfer_test.go` 增 5 例 —— 第 65 个不同 `FilePath` 被 NACK 且不占位、已存在任务不受名额影响、声明大小超限直接拒（不入表不占额度）、总量触顶时单任务未超也拒（并断言被拒分片没进 `chunks`）、`CleanupStale` 只回收闲置项且额度按 `received` 精确释放、成功落盘后 `stored == 0`。
+
+残留（如实记录）：
+
+- (a) **分片仍然全量驻内存**，本轮只把"无界"变成"有界"。改成流式落盘（边收边追加 + 乱序分片落临时文件 + 组装改名）是一次独立重构，牵动 `tryAssemble` 的"按序累加 == fileSize"判定与断点续传语义。
+- (b) **配额是全局的，不按 Agent 分**：一台主机最多能占满 64 个名额 / 512 MiB，从而让另一台主机的上传被拒。危害从"打满内存拖死服务端"降为"占满配额让他人上传失败"。按 Agent 配需要决定"每台该有几个任务"，那是策略分层，随"不做 RBAC"的判定一并搁置。
+- (c) **`uploadTaskTTL` 之后断点续传等于重头再来**：回收把已收分片一起丢了，所以"续"只覆盖 30 分钟以内。取 30min 的依据：重试间隔的量级在秒到分钟，再长就不是"慢"而是"死了"。
+- (d) **`bufio.Scanner` 的 16 MiB 单帧缓冲未动**，`main.go` 的读循环也**没有逐条消息限速**（原判据写的是"Agent 连接限速"）。不做的理由：正常批量路径（64 KiB 文件分片、VNC 帧、安装包流）的合法速率就在每秒数百条，逐条计数要么打断断点续传与包下发，要么阈值高到形同不存在；放大的根因是"每条消息触发全量广播"和"每个请求一路协程"，这两处拆掉之后，单条连接能吃掉的资源已有上界（协程数 ≤ 2 + 在途字节 ≤ 512 MiB）。
+
+### M-12 + M-13 + M-14　匿名访客面：限流分桶 / 停止匿名外呼 / 开关补全　✅ 已修（2026-09-21，公开端点独立 `(route, ip)` 桶 + `AllCached()` 读快照 + 停用即刻断连）
+这三条的主体是同一个：**匿名访客**。它们也共用一个更底层的毛病 —— 公开页是本轮新开的暴露面，而它的限流、出网、开关三件事都"借用了登录路径的假设"：借了登录的额度桶（M-12）、借了仪表盘的 `store.All()`（M-13）、借了"配置只在新请求时被读"的前提（M-14）。修复因此集中在 `server/public_site.go` 一个文件里。
+
+修复落地（M-12）：
+
+- **新增独立的匿名桶，而不是给登录桶调大数字**：`LoginGuard` 加 `perPublic map[string][]time.Time`（`internal/auth/login_guard.go:64`）与方法 `AllowPublicRoute(remoteAddr, route)`（`:119`），键是 `route + "|" + ip`，配额 `publicRouteMax = 30`/分/IP/路由（`:34`）。为什么必须**另起一个桶**而不是复用 `perIP`：两者的合法量级根本不同 —— 详情页 15s 轮询、三个标签页就是 12 次/分，套在登录那 20/分/IP 上必然自我锁死；而共用的后果不是"访客看不爽"，是**访客能把管理员挡在自己的后台外面**（把 DoS 做成功能）。分路由再挡掉一层"一个路由刷满全站公开页"的自锁。
+- **不查失败退避表**：`AllowPublicRoute` 只滑窗计数，不碰 `fails`。匿名端点没有"用户名"可退避，硬套只会往 `fails` 里塞进永远无人消费的条目 —— 那正好是 M-12 的另一半（表不回收）。
+- **回收口径对齐登录桶**：`pruneLocked` 增加 `perPublic` 清扫（`:199-215`，窗口 `publicRouteWin`），并同样叠一层 `publicRouteMapLimit = 4096` 容量兜底（`:36`）。
+- **`Auth.rate` 的两个洞分开补**（这是 M-12 里"限流表不回收"那一半，也是上一轮 M-8 的定位）：① 加 `rateMapLimit = 4096`（`internal/auth/auth.go:45`）；② **回收触发点搬到 `AllowRequest`**（`:263` → `pruneRateLocked`，`:283`）。第 ② 点是本体而非细节：原来只有 `ValidateToken` 成功才 `pruneLocked`，而"拿假 Token 猛刷"这条路径恰恰**永远不会成功**，于是既能无限增表又永远不触发回收 —— 触发点必须放在"攻击者一定会经过的地方"。全表清扫至多每个窗口一次（`lastRatePrune`，`:39`），但**长度检查每次请求都做**（O(1)）：否则两次回收之间上限只是"一分钟内可以涨多少"，不叫封顶。
+- **接线**：`publicSite.allow()`（`public_site.go:115`）从"把 `"public:"+route` 当用户名喂给 `Allow`"改为 `p.guard.AllowPublicRoute(r.RemoteAddr, route)`；被拒时仍回 429 + `Retry-After`。
+
+修复落地（M-13）：
+
+- **拆成两个读法**：`Store.All()`（`internal/probe/store.go:727`）保持原语义（读缓存 + 未命中时起 `LookupAsync` 补推），新增 `AllCached()`（`:738`）返回**同一份快照但绝不外呼**；两者共用 `snapshot(lookupGeo bool)`（`:742`），差异只有那个布尔量。刻意不做"匿名请求也能暖缓存"：访客量与免费地理接口额度之间原本没有任何闸门，而缓存的填充责任本来就在后台仪表盘那条推送路径上（`main.go:1794` 的 `broadcastAgents` → `store.All()`；地理位置补推那条回调 `main.go:579` 同样走 `All()`），两处读的是同一份。
+- **四条匿名读路径全部改用 `AllCached()`**：`visibleNodes`（`public_site.go:429`）、`attachTraffic` 的 boot 与 window 两个分支（`:450`、`:467`）、`samplesHandler` 的 node 反查（`:192`）。需登录的 `siteHostOptionsHandler` 保持 `All()` —— 它不在匿名面上。
+- 判定"哪条路径可以外呼"的标准写在 `AllCached` 的注释里：**调用链上是否有鉴权**。这比"列一张白名单说这几个 handler 不许外呼"更耐改 —— 以后新加的匿名端点只要走 `AllCached` 就天然不会踩坑，走 `All` 就需要 reviewer 追问"这条链谁能够到"。
+
+修复落地（M-14）：
+
+- **`/api/public/enabled` 未启用即 404**（`public_site.go:676`）：与其余 `/api/public/*` 同一口径 —— 对外"不存在"，而不是留一个永远应答 `{"enabled":false}` 的探针点。
+- **品牌文案挪到独立的 `/api/branding`**（`brandingHandler`，`:695`；注册于 `main.go:691`）。这不是搬家，是**把两件事分开**：标题/页脚是登录页在登录前就要渲染的内容，与公开页开关无关，所以它必须免鉴权且常开；而"公开页开没开"必须由开关把关。原实现把两者塞进一个端点，结果就是"关掉公开页之后，匿名请求仍然能读到本站品牌配置"。前端相应拆成 `PublicApi.enabled()`（404 → `false`）与 `PublicApi.branding()`，后者走**独立的 axios 实例**（`web/src/api/api.js:287`）—— 请求拦截器是实例级的，共用默认实例会把已登录用户的 Token 带到这个匿名端点上去。
+- **`SetOnChange` 接线 + 在途连接即时结束**：`main.go:694` 在配置落库后回调 `pub.noteConfigChange()` 与 `broadcastAgents(hub, store, pub)`（回调在 store 锁外执行，见 `siteconfig.go:373-399`，所以可以安全地再进 WS 层）。`publicSite` 侧用**关旧道、换新道**的信号通道（`cfgSig`/`subscribeCfgChange`/`noteConfigChange`，`public_site.go:60-90`）：`noteConfigChange` 把旧通道 `close` 掉再挂一条新的，所有在途连接从自己的 `select` 上醒来。只发信号、不搬数据 —— 新口径由紧随其后的 `broadcastAgents` 走原有订阅通道下发，这里只回答"开关是不是已经关了"。
+- **顺手改掉一处漏事件的竞态**（写测试时暴露出来的，不是假想）：唤醒分支必须**先换道、再核对开关**（`public_site.go:320-334`、`:359-365`）。顺序反了会漏事件 —— 若停用正好落在"核对"与"换道"之间，那次 `close` 打在旧通道上、而本连接已经握住新的，于是公开页关了、在途访客却还在看，直到下一次配置再变才收敛。连接入口处同理：取通道在 `cfg := p.cfg.Get()` 之前，之后那次读就是兜底。
+- **`siteconfig` 侧无改动**：`SetOnChange`（`:340`）早就存在、`Set` 也早就在锁外回调，缺的一直只是"有人注册回调"。
+
+测试（新增 16 例；`-race` 全绿）：
+
+- `internal/auth/hardening_test.go` 5 例：`(route, ip)` 分桶封顶与窗口滑动、**双向**的额度隔离（`TestPublicRouteBudgetSeparateFromLogin`：匿名打满后 20 次登录仍要全通过；登录洪泛后匿名端点仍可用）、匿名表既逐条回收又有容量兜底、`Auth.rate` 容量封顶（`TestAuthRateMapCapped`）、过期 Token 由请求入口回收而非校验成功路径（`TestAuthRatePruneRunsOnEntry`）。
+- `internal/probe/store_test.go` 1 例（`TestAllCachedNeverTriggersGeoOutbound`）：20 次 `AllCached()` 外呼计数为 0，随后 `All()` 暖缓存成功、`AllCached()` 读到同一份 —— 后半段是对照组，防止"解析器根本没接上"让前半段的 0 变成空转。
+- `public_guard_test.go` 8 例（新文件）：公开端点刷满回 429 + `Retry-After`、`/nodes` 打满不影响 `/state` 且不吃登录额度、公开列表与首页五种请求混打 0 次外呼（带对照组）、`/api/public/enabled` 关闭时 404 且开启时也不泄漏 `site_title`/`host_ids`、`/api/branding` 在开关关闭时仍可用且只出文案、未配置时回退默认文案并保留 `{year}` 占位符、三个公开 handler 未启用一律 404、变更信号"关旧道 + 换新道"的通道语义。
+- `public_ws_test.go` 2 例：停用后在途连接的读端立刻结束且 hub 订阅与并发名额都归还（`TestPublicWSInflightClosedOnDisable`）；配置变更但开关仍开着时连接**不得**被误杀、且第二次停用仍然生效（`TestPublicWSSurvivesEnabledConfigChange` —— 这条正是上面那处竞态的复现用例）。
+
+残留（如实记录）：
+
+- (a) **`publicRouteMax = 30`/分/IP/路由 是拍的**，依据是"详情页 15s 轮询 × 三个标签页 = 12 次/分"再留一倍余量。反代之后所有访客共用一个源 IP，此时 30/分是**整站共享**的：访客一多会先撞墙。本轮没有把 `-proxy-ip` 之类的可信代理配置接进限流键（那需要"谁是我信任的代理"这个新配置项，且一旦配错就是让匿名者自选计数 IP），所以口径仍是**只认 `RemoteAddr`**，与 H-2/H-7 一致。真实反代场景下的表现是"公开页偶发 429"而不是"限流被绕过"。
+- (b) **window 口径的逐节点 SQL（N+1）仍在**：`attachTraffic` 的 window 分支对每个节点查一次 `NetTotalsSince`（`public_site.go:484`），`samplesHandler` 的 node 反查是 O(在册主机数) 次 HMAC（H-8 残留 (c) 同一条）。本轮只给它加了**频率**闸门（M-12），没有做批量 SQL 或反查索引 —— 单人部署的主机数量级下它不构成瓶颈，而"给匿名端点的反查建常驻映射"会引入"配置变更后映射失效"这个新的正确性面。
+- (c) **停用后未主动 `close` 已建立的 socket**，靠 handler 从 `select` 返回时 `defer conn.Close()`。反代若在中间持有上游连接，客户端侧看到断开可能有秒级延迟（取决于代理）。改成"保存全部在途 conn 并逐个 Close"要为此新增一份连接注册表，收益不抵复杂度。
+- (d) **`broadcastAgents` 在 `SetOnChange` 里被显式调了一次**，与探针推送路径的 2s 合并窗口（M-5 的 `agentRefresh`）是两条独立触发。也就是说"改一次配置"会立刻多一次全量广播 —— 这是刻意的（配置改动是低频人工动作，且改完立刻看到新口径是功能），但它确实绕过了 `soon()` 的合并。
+- (e) **品牌端点常开意味着"这是 MoCenter"始终可探**：`/api/branding` 在未启用公开页时也返回默认标题 `MoCenter · 集中式主机远控管理系统`。这已比修复前好（不再回公开策略），但产品指纹这一层没消 —— 要消就得让用户自己配标题且不提供默认值，那是易用性代价，不在本条范围。
+
+### M-9 + M-10（升级链）+ M-16　被拿下的服务端能对 Agent 做什么　✅ 已修（2026-09-21，第四批：升级包强制验签 + 文件读写根目录 + 部署脚本成组问题）
+这一批的共同前提是同一条威胁：**服务端（或它的凭据）沦陷**。在此之前，那条链上有三个"服务端说了算"的口子 —— 升级包可以是任何东西（`AllowUnsigned` 一开就只看 sha256，而 sha256 也是服务端给的）、下发路径可以是 `/root/.ssh/authorized_keys`（M-9）、而保活/安装脚本本身又是"以 root 执行一份可被改写的配置"（M-16）。修完之后剩下的口子只有一个，而且是产品的定义本身（见残留 (a)(b)）。
+
+修复落地（升级链，M-10 与 H-5 的升级包那一半）：
+
+- **逃生门整个删掉**：`upgrade.Policy` 去掉 `AllowUnsigned`、Agent 配置去掉 `upgrade_allow_unsigned`、启动参数去掉 `-upgrade-allow-unsigned`、`agentdeploy.buildAgentConfig` 不再写这个键。删干净而不是留着不用，是因为这类开关的宿命就是"某个晚上为了赶一次升级被打开"。代价是**没配公钥的 Agent 从此不能远程升级**，所以同批把签名能力做成可用的（见下三条），而不是留一个默认关掉的洞。
+- **签名覆盖版本号**：`signatureDomain = "MoCenter-Upgrade-v1\n"`（`agent/internal/upgrade/upgrade.go:58`）+ `signedMessage(target, content)`（`:104`）把目标版本号钉进消息，`verifyPackage`（`:113`）先比摘要再验签、且签名长度必须是 `ed25519.SignatureSize`。少了版本号，一个合法签过的旧包就能冒充任何版本（配合降级就是一次回滚攻击）；这个字面量由**成对测试**钉住 —— Agent 侧 `TestSignedMessageShape` 与签名工具侧 `TestSignedMessageLiteralMatchesAgent`，因为两者跨模块无法共享常量，注释提醒改一处必须改两处。
+- **TOCTOU 消在结构上**：`fetchPackage`（`:261`）一次读入内存（`io.LimitReader(maxPackageBytes+1)`，256 MiB 上限 + 空包直接拒），同一份字节既做摘要又验签，落盘写的也是这份字节（`writeVerified`，`:328`：`O_CREATE|O_EXCL|0600` + 落盘后复核盘上摘要）。原来的"下载 → 再打开文件算 sha256"两次读之间文件可被换掉，现在没有第二次读；旧的 `download()`/`fileSHA256()`/`copyFile()` 一并删除。换二进制的部分抽成 `installBinary`（`:289`）—— 不拆出来它就只能靠"重命名正在跑的单测二进制"来测。
+- **降级判定独立于 force**：新增 `agent/internal/version/compare.go`（`Compare`/`ErrUnparsable`，容忍 `v` 前缀、缺省尾段、`-dev`/`+build`），`decideUpgrade`（`:133`）据此判定：同版本需 `force` 才重装，**低于当前版本一律拒**，除非新字段 `allow_downgrade`（`protocol.UpgradeReq`，两侧同步）。此前 `force` 顺带放开降级，等于"强制"这个词同时意味着"覆盖同版本"和"可以往回装"。
+- **取包只允许 https**：`checkURL` 拿掉了"http 也收，但记一条警告"。签名能挡篡改，挡不住"包和内网地址一起被看见"。
+- **顺序即策略**：`Perform`（`:151`）把"本机有没有公钥"放在**任何网络动作之前**，其后依次是降级判定 → URL → 摘要格式 → 签名格式 → 取包 → 验签 → 落盘复核 → 换入 → 重启。放在前面是因为一旦公钥缺失，后面每一步都是白跑的外呼。
+- **服务端下发口同口径拦一遍**（`server/main.go:2536` `upgradeHandler`）：sha256 必填且 64 位 hex、**版本必填**且 `isVersionLike`、签名必填且 256 位 hex、只允许 https。这些校验 Agent 侧也做，服务端再做的唯一理由是"注定失败的指令不要下发" —— 否则操作者看到的是一串 Agent 回执，而不是提交时的一个错误。**同时删掉了"版本留空自动补服务端版本"**：版本号进签名，服务端替人猜一个版本，症状会是"签名校验失败"，看起来像包被动过。
+- **部署链闭环**：服务端新增 `-upgrade-pubkey`（`main.go:106`，env `MOCENTER_UPGRADE_PUBKEY`），并经 `agentdeploy.Options.UpgradePubKey` 写进一键部署生成的 Agent 配置（`agentdeploy.go:784`，同处 `file_roots: []` 走 Agent 侧默认沙箱）。不接这条线，"删掉逃生门"的直接后果就是"一键部署出来的机器永远升级不动"，而且没有任何一处会报错。服务端自己没有公钥时**只记提示不阻断**，理由见残留 (c)。
+- **签名格式因此可生产**：新增独立模块 `scripts/signpkg`（`-gen` 出 0600 私钥 + hex 公钥；`-sign` 打印 sha256/signature 和一段可粘的 `POST /api/upgrade` JSON；`-verify` 发布前自检）。它是唯一能生成合法签名的通路，所以它的存在是"删逃生门"能落地的前提。
+- **Web 那条路本来是断的**：`web/src/pages/Ops.jsx` 的升级表单一直只发 `md5`，而服务端早已要求 sha256 必填 —— 界面上的"下发升级"必然失败。现在改成目标版本 / https 地址 / SHA-256 / 签名四个必填项 + 「同版本强制重装」「允许降级回退」两个勾选，并把 signpkg 的用法写进卡片底部。
+
+修复落地（文件读写根目录，M-9）：
+
+- **新增 `agent/internal/client/fileroots.go`**：`guardPath`（`:22`）→ `withinRoots`（`:57`）→ `resolveRoot`（`:99`）/`resolvePath`/`contains`（`:144`）。规则：绝对路径 + 无 NUL + 逐根比较，拒绝相对路径与 `..`。
+- **对"最近存在的祖先"解软链**：`EvalSymlinks` 整条路径在文件还不存在时会 `ENOENT`，而分发目标恰恰通常是新文件 —— 只解已存在的父目录，再把尾部接回来。否则闸门对"新建文件"这一整类请求直接放行。
+- **根目录不存在时仍然钉住前缀**（`resolveRoot`）：默认沙箱 `<配置目录>/files` 在首次分发前往往还没建，如果"根不存在就当没有根"，第一次写入就是无限制的。顺带：根指向一个普通文件 → 拒绝（配置写错了，不能当成前缀用）。
+- **默认根来自配置目录**（`DefaultFileRoot`，`:37`），且 roots **只认本机配置与命令行**（`-file-roots` / `MOCENTER_FILE_ROOTS` / `file_roots`），协议里没有任何字段能扩充它 —— 否则闸门就是服务端自己给的，形同虚设。`roots` 为空时 fail closed。
+- **两个方向一起管**：写入侧 `handleFilePush`（`client.go:869`）越界回 `rejected` ACK；读取侧 `handleFilePull`/分片上行（`:943`）越界时以 `FileSize: -1` 上报后终止，不送出任何字节内容。
+
+修复落地（部署脚本，M-16）：
+
+- **`scripts/gencerts/main.go` 的配置改写 0600**：原来 `os.WriteFile(path, data, 0644)` 里的 `agent_key` 任何本地用户可读。改成 0600 **并显式 `Chmod`** —— `WriteFile` 的 mode 只在新建时生效，覆盖一份历史遗留的 0644 文件会把它原样留在原地。
+- **`mocenter-agent.service`**：插值全部写成 `"${MOCENTER_*}"`；新增 `NoNewPrivileges=yes`。**刻意不加** `PrivateTmp`（Agent 的职责是替运维在这台机上执行，私有 `/tmp` 会让它写进去的文件在 SSH 里凭空消失，Linux 的 X11 socket 也在这个目录）与 `ProtectSystem`/`ProtectHome`/`ReadOnlyPaths`（Agent 要写 `/etc/mocenter`，还要替换 `/usr/local/bin` 下的自身）。理由写在单元注释里，不加比乱加更需要说明。`mocenter-server.service` 同批引号化。
+- **`mocenter-keepalive.sh`**：`set -u` → `set -eu`；**不再 `source` 配置文件**（原第 39 行以 root 执行一份可被改写的文件 = 本机任意用户的提权入口），改为 `conf_value` 逐键解析（容忍两端引号、键值前后空格、Windows 换行残留的 `\r`）；`pgrep -f "$BIN"` → `pgrep -x "mocenter-${ROLE}"`（按命令行匹配会命中任何**参数里带了这个路径**的进程，包括这条巡检脚本自己，症状是"看起来有实例"而真正的服务再也没被拉起）；`-pkg-dir` 与单元取同一个写死值（原来单元写死、脚本读变量，两边会静默分叉）；日志写入失败不再中断拉起。
+- **`install-linux.sh` 的 server watchdog 功能缺陷**：原来 `install_keepalive` 对任何角色都拷 `mocenter-agent-watchdog.*`，却装到 `mocenter-server-watchdog.*` 的路径上 —— 于是"名字叫 server 的单元在看护 agent，而 server 自己根本没有保活"。改为按角色取模板 + 缺模板直接 `die`（静默装个错的东西比装不上更难查），并补上 `scripts/deploy/mocenter-server-watchdog.{service,timer}`。
+- **`--password` 不再走命令行**：`--password=***` 直接 `die` 并给出两种替代（`--password-file=<路径>`、`--password` 从标准输入读），环境变量 `MOCENTER_PASSWORD` 保留。落盘仍是 0600 的 `initial-password`，行为与之前一致；顺带把 `usage()` 从写死的 `sed -n '2,40p'` 改成按注释块分隔线取头（加一行说明就截一截 `--help` 是这类脚本最容易烂掉的地方）。
+
+测试（新增 35 个用例函数，触及包 `-race` 全绿）：
+
+- `agent/internal/upgrade/upgrade_test.go`（13 例）：`decideUpgrade` 全表（含"force 不能越过降级闸门"）、签名字面量、验签绑定版本号、签名长度、`checkURL`、无公钥时**零外呼**且提示语不得再引导 allow-unsigned、降级在联网前拒、明文 http 拒、超大包与空包拒、`installBinary` 换入的是校验过的那份字节、盘上摘要不符时中止、公钥加载。
+- `agent/internal/version/compare_test.go`（3 例）：比较表、不可解析、对称性。`agent/internal/client/fileroots_test.go`（10 例）：根内接受、各类逃逸拒绝（含 nil 根 fail-closed、根未创建仍钉前缀、根是普通文件）、只用配置里的根、软链逃逸（不支持建链的平台跳过）、默认根、`guardPath` 用客户端配置、未配置时的默认、分发越界的 ACK 与取回越界的 `FileSize:-1`。
+- `server/upgrade_api_test.go`（6 例）：缺签名/畸形签名/畸形版本/空版本一律在**写连接之前**拦下（用 `net.Pipe` + 并发读者断言"没漏出一帧"）、`signature`/`allow_downgrade` 原样进信封、http 地址仍拒。`server/internal/agentdeploy/agentdeploy_test.go` 增断言：配置里不得再出现 `upgrade_allow_unsigned`、必须带 `upgrade_pubkey` 与 `file_roots`。`scripts/signpkg/main_test.go`（3 例）与 Agent 侧成对钉住签名字面量。
+
+修复落地（Rocky8 实机复测撞出的新缺陷，2026-09-21 已修）：
+
+- **Linux 升级后自重启必然失败**：`restartSelf`（`agent/internal/upgrade/upgrade.go:388`）原来在 goroutine 里**现取** `os.Executable()` 再 fork 子进程，而 `installBinary` 已把旧二进制改名成 `.bak` 并删除，此刻 `/proc/self/exe` 解析为 `…(deleted)`。实机症状是每次升级先打印"升级成功，正在重启"，紧跟一句 `拉起新进程失败: fork/exec /usr/local/bin/mocenter-agent.bak: no such file or directory` —— 新版本最终只是靠 systemd `Restart=always` 才回来（5s 断档），而那 5s 内 `mocenter-keepalive` 巡检会以 `setsid` 在 unit 之外另起一份实例，谁先抢到单实例锁谁活，于是 `MainPID` 与真实进程可能对不上。两处修法：① 路径在**换入之前**取，`Perform` 里的 `exe`（`:218`）直接传进 `restartSelf`（`:233`），不再二次求值；② Unix 侧不再 fork，改成 `syscall.Exec` **原地替换进程镜像**（`agent/internal/upgrade/restart_unix.go:16` 的 `platformRelaunch`）—— PID 与 `MainPID` 不变、不会在 unit 外留下第二份、stdin 与 journal 连接不中断（flock 单实例锁的 fd 因 Go 的 `O_CLOEXEC` 不跨 exec 继承，换入后重新取锁即可）。Windows 不允许覆盖运行中的 exe，保持分离拉起（`restart_windows.go:32`），但 `.out` 日志目录与拉起路径同样改用换入前的 `exe`。
+- **systemd 空插值把参数拆开/顶掉默认值**（M-16 引号化直接逼出来的一层）：单元里的 `-http "${MOCENTER_HTTP}"` 在 `EnvironmentFile` 未配该键时，进程收到的不是"没有这个参数"而是"一个空 argv"，于是 `-http ""` 会让 `http.Server` 退回内置的 `:443` 而不是默认 `:8080`，且 `flag.Visit` 把它算成"命令行显式给出"→ 自动回写用空串盖掉配置文件里已存的值。新增 `server/flags.go:19 normalizeBlankFlags`（`main.go:113` 调用，`vnc-ports` 走 exclude 原样保留；`agent/flags.go` 同构）把空串一律按"未配置"处理并回落 `DefValue`，同时用 `clearBlankExplicit` 把它从"显式给出"集合里摘掉。**代价写在注释里**：靠传空串清空配置项的写法不再生效。
+
+实机复测（2026-09-21 与 09-22，Rocky8 真 systemd + 真 Agent 二进制，被管主机 `rocky8-01`）：
+
+- **§9 第 6 条清单逐项跑通**：`install-linux.sh --role=server --dry-run` 落到 **server 自己的** watchdog 模板（M-16 ④ 那个"名字叫 server 的单元在看护 agent"的功能缺陷在真机上确认消失）；真装后 `systemctl show -p ExecStart mocenter-server.service` 参数逐项正确，空变量不再把后续参数拆开；`systemctl list-timers 'mocenter-*'` 两个 per-role watchdog timer 都在排期；`journalctl -u mocenter-*-watchdog.service` 里没有 `set -eu` 误伤造成的静默退出；手工 `kill` 主进程后由 timer 拉起，且 `pgrep -x mocenter-{server,agent}` 各只有一个实例（`pgrep -f` 的自匹配问题在真机复现过：巡检脚本自己的命令行里就带着那个路径）。`NoNewPrivileges=yes` 下服务端下发命令仍正常 —— 实测 Agent 以 root 跑 `su`/setuid 类操作没有需求（探针里塞的 setuid 位测试无副作用），故这一项**不是功能回归**；文件读写根目录默认沙箱落在 `/etc/mocenter/files`，越界写入回 `rejected`。
+- **升级链负例矩阵**（每一步都留了 Agent 侧日志与盘上摘要作为证据，验完已清）：
+  - `nosig`（不给签名）→ **服务端**拒 `必须提供升级包签名…`，连接里一帧都不下发（与 `upgrade_api_test.go` 的 `net.Pipe` 断言同口径）；
+  - `httpurl`（http 地址）→ 服务端拒 `升级包地址必须是 https`；
+  - `badsig`（合法包 + 签名末位改 1 位 hex）→ 服务端放行（它不验签，见残留 (c)），**Agent 拒** `升级包签名校验失败（拒绝执行）`，二进制摘要与 PID 均不变；
+  - `digestmismatch`（1.0.2 的包配 1.0.0 的摘要）→ Agent 拒 `升级包 sha256 校验失败（期望 b931…，实际 41d4…）`，即"先摘要后验签"的顺序在真机上成立；
+  - 未配 `-upgrade-pubkey` + 合法签名 → Agent 直接拒并点名缺公钥配置（配合单测的"无公钥时零外呼"）；
+  - 降级 1.0.0（签名合法、未带 `allow_downgrade`）→ 拒 `版本 1.0.0 低于当前版本 1.0.4`；带 `allow_downgrade=true` → `已接受降级（操作员显式允许）` 并真的装回去；
+  - 同版本无 `force` → `已是最新版本 1.0.5`；同版本 + `force` → 真重装；
+  - 版本绑定离线可验：`scripts/signpkg -verify` 用 1.0.2 的包 + 1.0.2 的签名 + `-version 1.0.0` → `签名校验失败`，证明版本号确实在签名消息里。
+- **升级链正例（一个干净周期，也是上面 `syscall.Exec` 修复的验证）**：`1.0.4 → 1.0.5`，签名包经 https（把内部 CA `/var/lib/mocenter/data/ca.crt` 装成 trust anchor）取回，`10:28:30 → 10:28:41` 完成。升级前后 **PID 55459 未变**、`NRestarts` 未增、`pgrep -cx mocenter-agent` = 1、unit `active`，盘上摘要 = 签名包的 `79ad2e3f…`，agent 单元日志里是**同一个 PID** 打印"启动 MoCenter-Agent/1.0.5"并重新取得单实例锁，控制台 `agent_version` 变 1.0.5。旧实现在这里的过程是"重启失败 → 5s 后 systemd 换 PID 拉起"。
+- **升级残留观察**：修复前那几次运行在 `/usr/local/bin` 留下过 `mocenter-agent.bak` 与 0 字节的 `mocenter-agent.out`（0644，落在可执行目录、无轮转）；修复后 Linux 路径不再产生这两个文件，遗留在测后已删。
+
+残留（如实记录）：
+
+- (a) **指令信封签名没做**，即 §6 第 18 项的后半句。理由：这条通道已经 mutual-TLS + 注册期 HMAC，信封签名能防的只剩"服务端本身已沦陷"，而那种攻击者本来就能让 Agent 执行任意命令 —— 命令执行是产品功能。真要收紧，缺的是"Agent 侧对命令的本地授权（白名单）"，那是产品形态决定，不属于安全修复。
+- (b) **Agent 仍以 root 执行任意命令**：单人自用运维产品的定义如此。M-9 把"写任意文件"收进了根目录，没有把"跑任意命令"收进沙箱。
+- (c) **服务端未配公钥时只提示不阻断**：公钥可以只配在 Agent 侧（服务端只是转发方，分批发版时不同批次机器可以持不同公钥）。阻断会把这种合法用法一起挡掉。
+- (d) **协议里的 `md5` 字段仍在**（不参与校验，Agent 收到会打一条废弃提示），删字段要等存量 Agent 全部换掉。
+- (e) **`.deb`/`.rpm` 不带 watchdog 单元**：`stage_linux_pkg` 只装主服务与配置，postinst 也只 enable 主服务，包安装路径没有第二道保活。M-16 修的是脚本路径。
+- (f) **签名私钥的托管与轮换没有流程**：换钥匙要重签所有在架包并逐台改公钥配置。属于 H-5 的剩余部分。
+- (g) **256 MiB 包上限是拍的**（依据：Agent 二进制量级在几十 MB）。它只是防"取包把内存打满"，不是产品配额。
+- (h) ~~**本轮没有实机验证 Linux 侧**：systemd 单元的引号插值与 `NoNewPrivileges`、新 server watchdog 单元、`keepalive` 的 `conf_value` 解析都只做了静态检查与 Git Bash 下的语法/解析冒烟。需要在 Rocky8 上跑一次 `install-linux.sh --role=server --dry-run` 与真装，确认 `systemctl show -p ExecStart` 的参数与 `mocenter-server-watchdog.timer` 的触发。~~　**已消解（2026-09-22，Rocky8 真机）**：清单逐项跑通，见上方「实机复测」段与 §9 第 6 条。**代价是这次复测本身撞出两个真实缺陷**（Linux 升级自重启必败、systemd 空插值把参数顶坏），两者都已修并复验 —— 也就是说这条残留当初不是"补个手续"，而是真的挡着两个 bug。
+- (i) **Windows 侧的"口令只走文件/stdin"只做到一半**（原话只写在 §6 第 22 项，本轮按 Linux 脚本执行）：`scripts/deploy/install-windows.bat:95` 仍把口令收在第 3 个**位置参数**上（`install-server [user] [password] …`），`installer/main.go:68` 的 `-password` 也仍在（`:69` 的 `-password-file` 优先、图形安装程序走文件那条）。三条路径的**服务定义**都不再落口令明文（`install-windows.bat:116` 与 `setup.iss:168` 只写 `-password-file`），所以残留的是"执行脚本那一刻口令在同机进程列表里可见"，不是"口令常驻磁盘/单元"。收口要把这两处也换成 stdin/文件，与 §4 L-9（`setup.iss` 的注册密钥明文回显与口令下限）是同一批 Windows 安装介质的活。　**2026-09-22 同族补记**：图形安装程序里同一件事也发生在**注册密钥**上 —— `installer/setup.iss:157` 仍把 `-agent-key "<32 字节密钥>"` 拼进命令行，安装那几十秒对同机任意进程可见（`wmic process get commandline`），而紧邻的口令已经改走临时文件；危害比口令大（它是 C-1 的根凭据）。已作为 §2「H-9 + M-11」残留 (b) 记下，与本条一并收口。
+
+
+---
+
+## 4. LOW / 加固建议
+
+- **L-1** 审计 CSV 导出无公式注入防护（`main.go:2066-2081` 直接写 `Operator`/`AgentID`/`Command`/`Result`）→ 对 `= + - @` 与前导制表/CR 加前缀转义。
+- **L-2** 日志注入：`validAgentID`（`main.go:1105-1119`）只用在 `agent_id`，`info.UUID`、`ur.Message`、`vr.Message` 原样进 `log.Printf`（`main.go:1275`、`~1382`）→ 可伪造 `[server]` 行误导排障。　🟡 **部分已修（2026-09-21，随 M-4）**：注册路径的 `info.UUID` 与 UUID 冲突日志改走 `logSafe`/`uuidSuffix`；`ur.Message`、`tr.Message`、`tc.Reason` 三处仍是原文，见 §10.1 的 L 行。
+- **L-3** `pickEncoding`（`main.go:2712-2725`）忽略 q 值：`Accept-Encoding: br;q=0` 仍回 brotli；`.br` sidecar 走 `http.ServeFile` 时 `Range`/`ETag` 是对压缩字节求值。
+- **L-4** 匿名端点回全量 `FieldCatalog` 与全部开关布尔（`public_site.go:107,384-397`），等于向扫描器公布后台开关清单。
+- **L-5** 无头 Windows 的 VDD 环节仍未实机确认（`vdd_windows.go:11` 与 `vnctestreport.md` 对驱动类型的描述与其 INF 不符）；`ensureVirtualDisplay` 返回 false 只拼提示、不阻断安装，所以这是"功能未验证"而非直接漏洞。
+- **L-6** 协议死码：`protocol.go:32-35` 的 `TypeAuth/TypeAuthResp/TypeBatchCommand` 零引用；`main.go:1317` 的 `TypeProbeDataResp`、`:1341` 的 `TypeFileAck` 服务端下发但 Agent 的 switch 不处理 → 静默丢弃（掩盖真实故障）。
+- **L-7** 配置默认值仍偏松：`-require-agent-cert` 默认 false（`main.go:74`）、`-http` 默认绑全网卡；`mocenter-agent.conf:4`/`install-linux.sh:60` 预置 `your.server.com:9000` 占位而非拒绝启动。
+- **L-8** CI 形同没在把关：`.cnb.yml` 里含 `go test ./...` 的 `&x-build-go` 锚点（`:5-14`）**从未被引用**，push 流水线只 `go build`；`:48` 的 `|| echo "deb 打包…"` 会让"没产出 .deb 的发布"变绿；`:36,54,58,147` 的 `|| true` / `|| npm install` 吞失败并绕过 lockfile；`:59-60` 的 lint 阶段只是一句 `echo`；`golang:1.25`/`node:20` 未按 digest 钉扎。　✅ 除"镜像按 digest 钉扎"外全部已修（2026-09-20，见 §10）
+- **L-9** `setup.iss:203` 明文回显注册密钥、`:273` 口令下限仅 6 位、`:178` 的 `-extra` 是刻意保留的 argv 注入原语；`scripts/lib/common.sh:171` 的 `mc_clean(){ rm -rf "$@"; }` 不防空值/相对路径。
+- **L-10** 仓库缺 `.gitattributes`，换行完全由每个 clone 的 `core.autocrlf` 决定（2026-09-21 Rocky8 实测撞出）：本机工作树是 `i/lf w/crlf`（索引 LF、检出 CRLF，`git ls-files --eol` 可查），于是从 Windows 工作树直接拷到 Linux 执行的 shell 脚本带着 `\r`，`install-linux.sh:55` 的 `set -euo pipefail` 变成 `set: pipefail: invalid option` —— 同一份脚本在两台机器上行为不同，且症状只是"Linux 侧脚本莫名其妙起不来"，很容易误查成脚本内容问题（传去 Linux 前必须先把 `\r` 剥掉）。它同时污染了本轮的格式口径：`gofmt -l` 在 agent 包下几乎逐文件命中，只是因为文件是 CRLF（`git show HEAD:<f>` 同样命中），不是代码问题（各批次"格式"口径为此改用 `tr -d '\r'` 拷 LF 副本再判）。修法很小：加 `.gitattributes`（`* text=auto`、`*.sh text eol=lf`、`*.bat/*.cmd/*.ps1 eol=crlf`、二进制标 `binary`），必要时 `git add --renormalize .` 一次。
+
+---
+
+## 5. 引用包（依赖）逐项结论
+
+### 5.1 Go —— `govulncheck` 实测（DB 2026-09-16）
+
+| 模块 | 直接依赖 | 扫描结果 |
+|------|----------|----------|
+| `server` | `gorilla/websocket v1.5.3`、`maxmind/mmdbwriter v1.0.0`、`oschwald/maxminddb-golang v1.13.1`、`golang.org/x/crypto v0.31.0`、`golang.org/x/sys v0.28.0`、`modernc.org/sqlite v1.34.5` | **被代码调用到 8 条，全部来自 `golang.org/x/crypto@v0.31.0`** |
+| `agent` | `creack/pty v1.1.21`、`golang.org/x/text v0.41.0`、`golang.org/x/sys v0.22.0` | **0 条命中** |
+| `installer` | `golang.org/x/sys v0.22.0` | **0 条命中** |
+
+8 条命中（`ssh` 子包，唯一入口是后台"一键部署 Agent"的 `agentdeploy.Deployer.dial`，`agentdeploy.go:430/755/786/790/802`；另有 `io.ReadAll`/`zip.Writer.Close` 等间接路径被解析到 `ssh.channel`）：
+
+| 编号 | 标题 | 修复版本 |
+|------|------|----------|
+| GO-2026-6355 | Prevent DoS on deadlocked established channel in `x/crypto/ssh` | v0.56.0 |
+| GO-2026-6354 | Prevent DoS on deadlocked undecided channel in `x/crypto/ssh` | v0.56.0 |
+| GO-2026-5020 | 大块 channel 写入触发无限循环 | v0.52.0 |
+| GO-2026-5019 | **绕过 FIDO/U2F 安全密钥的物理交互要求** | v0.52.0 |
+| GO-2026-5018 | 病态 RSA/DSA 参数导致 DoS | v0.52.0 |
+| GO-2026-5017 | 客户端可因异常响应使服务端死锁 | v0.52.0 |
+| GO-2026-5013 | 字节算术下溢导致 panic | v0.52.0 |
+| GO-2025-3487 | `x/crypto` 潜在 DoS | v0.35.0 |
+
+**处置**：`cd server && go get golang.org/x/crypto@v0.56.0 && go mod tidy` 一次清完 8 条；注意 x/crypto v0.5x 通常要求 `go >= 1.24/1.25`，而 `server/go.mod` 目前写 `go 1.24.0`、`agent`/`installer` 写 `1.25.0` —— **顺手把三者统一到同一 `go` 指令**（本轮 `geo`/`agentauth`/`client` 三个单测在 Windows 下红也提醒了 CI 只在 Linux 跑的盲点）。
+扫描另报"导入但未被代码调用"的 7 条，集中在模块图里滞留的 `golang.org/x/net v0.21.0`、`golang.org/x/text v0.21.0`（服务端侧）：不影响可利用性，但 `go get -u` 一并抬版本，避免下次扫描报告继续噪声。
+其余依赖逐项判定：`modernc.org/sqlite v1.34.5`（纯 Go，免 CGO；关注其后续 `libm`/`libc` 演进）、`gorilla/websocket v1.5.3`（当前最新，但历史上曾长期停更 —— 本项目全部走服务端角色，其客户端侧公告不适用）、`oschwald/maxminddb-golang v1.13.1`（解析的是运维自备的 `-mmdb` 文件，非访客输入，风险可接受）。
+
+### 5.2 前端 —— `npm audit`（官方源）实测，锁定版本共 141 个包
+
+| 包 | 锁定版本 | 结论 |
+|----|----------|------|
+| `react-router` / `react-router-dom` | 6.30.6 | **2 条 moderate**：GHSA-wrjc-x8rr-h8h6（`<Link>`/`useNavigate` 反斜杠开放重定向，CVE-2025-68470 的绕过）、GHSA-337j-9hxr-rhxg（SSR hydration 的 `deserializeErrors()` 任意构造器注入）。**本项目不做 SSR，第二条不适用**；第一条要求应用把外部输入直接喂给导航目标 —— 当前仅在 `/admin/*` 内部跳转与根级旧路径重映射中使用，实际风险 LOW；官方修复要求升到 7.x（破坏性）→ **不追大版本，改为在重映射处白名单校验目标路径**，并把 `package.json` 的 `^6.23.1` 收成 `~6.30` |
+| `axios` | 1.19.0 | 干净（`^1.6.8` 已解析到 1.19.0；历史上 45857/27152/32820/52646 均早于该版本修掉） |
+| `@xterm/xterm` / `@xterm/addon-fit` | 5.5.0 / 0.10.0 | 无公告 |
+| `@novnc/novnc` | 1.7.0 | 无公告；它是 RFB 的客户端实现，属"必须长期盯版本"的关键包（终端里承载的是全部主机口令输入） |
+| `vite` / `rollup` / `esbuild` / `postcss` | 5.4.21 / 4.63.0 / 0.21.5 / 8.5.26 | 生产构建无命中；Vite 的历史公告均为 dev server 面（`server.fs` 绕过类），**不要在共享/CI 环境暴露 `npm run dev`** |
+| `react` / `react-dom` | 18.3.1 | 干净 |
+
+**流程问题**：`npm audit` 打到 `registry.npmmirror.com` 直接 404（该镜像不实现 `/-/npm/v1/security/*`），必须显式 `--registry=https://registry.npmjs.org` 才拿得到结果 —— 意味着日常根本没有审计通道。修复：CI 加一步 `npm audit --omit=dev --registry=https://registry.npmjs.org`（与 `npm ci` 一起，见 L-8）。
+
+### 5.3 构建镜像与外部产物
+
+`golang:1.25`、`node:20`、`debian:bookworm-slim` 均**未按 digest 钉扎**；`scripts/lib/common.sh:222-226` 在构建失败时自动改走 `https://goproxy.cn,direct` 重试（`go.sum` 仍校验摘要，风险可控但应显式化）；`scripts/fetch-packages.sh:29-53` 拉 UltraVNC 安装包**只验 TLS + `MZ` 头，不钉摘要**，产物随后由服务端分发给每台 Agent 当 SYSTEM 安装器执行（与 C-2 同一条链，是它的上游环节）。
+
+> ~~不钉摘要~~ —— **已随 C-2 修掉**（2026-09-20）：`fetch-packages.sh` 现在对每个产物做 `sha256sum` 比对内置期望值（与 Agent 侧 `installPins` 同源），不匹配即丢弃 `.part` 并 `exit 1`，随后再复查 `MZ`/`PK` 魔数；托管目录里因此不可能出现摘要错误的安装包。镜像 digest 钉扎仍属 L-8，未在本轮做。
+
+---
+
+## 6. 修复优先级
+
+排序依据：**先补"凭据即身份"的地基**。C-1/H-6/M-1/H-3 属于同一类 —— 只要"一把密钥 = 全网身份"、"一个账号 = 全部主机"，其余隔离措施都可以被绕过，因此它们必须先做，晚做等于白做。
+
+### P0 · 立即（1 个工作日内，全部低耦合、可独立回归）
+1. **C-1** 注册改为 per-agent 一次性令牌 + 已在线 ID 拒发 + 指纹 TOFU 告警。
+2. **C-2** 删除 `defaultProxy` 硬编码、代理强制 `https://` 显式配置、执行前钉扎 SHA-256/Authenticode。
+3. **依赖** `server/go get golang.org/x/crypto@v0.56.0`，统一三个模块的 `go` 指令（一次清 8 条）。
+4. **H-4** 按端点加 `MaxBytesReader`（全仓目前为 0 处），`LoginGuard` 的用户名 key 限长。
+5. **H-7** 公开 WS 加读上限/写超时/订阅上限。
+6. **M-17** 从仓库移除 `mocenter_design.txt`、`vnctestreport.md` 中的凭据（历史需 `git filter-repo`）；**先轮换两台测试机口令**，再看要不要动历史。
+   → 用户决定（2026-09-20）：**只清工作树、历史不动**，口令由用户自行轮换。已按此执行，见 §10。
+7. **L-8** CI 去掉 `|| true` / `|| echo`、把 `go test` 接进 push 流水线、改 `npm ci`。
+
+### P1 · 本周（内部信任边界，需要小心中等规模的重构）
+8. **H-1** `command_id → (agentID, client)` 绑定 + 输出只回投发起方。　→ ✅ 已完成（2026-09-20），见 §2 H-1 的「修复落地」。
+9. **H-2** `/ws`、`/vnc-ws` 纳入 `guard()`。　→ ✅ 已完成（2026-09-20），见 §2 H-2 的「修复落地」；H-7 残留 (b) 的 `SetReadLimit` 也一并补上了。
+10. **H-3** VNC 隧道按主机授权，去掉 `/api/vnc/status` 的口令回显。　→ ✅ 已完成（2026-09-20）：口令回显已摘除（`has_password` + 按需端点 + 审计）、任意端口收成 `-vnc-ports` 默认 `5900-5999`；**主机级授权经用户判定为不适用**（单人使用，见 §10 判定段），本项不再是"部分完成"。
+11. **H-6** 部署 SSH 改 known_hosts TOFU（指纹变更硬失败）。　→ ✅ 已完成（2026-09-20），见 §2 H-6 的「修复落地」：TOFU + 可选表单指纹钉扎并存，fail-closed 且无"忽略校验"开关；首次信任在结果页标黄要求核对。残留是"首次相遇无带外核对"；"无撤销入口"已随 RBAC 判定关闭（登服务端删 `<data>/ssh_known_hosts` 对应行即可）。
+12. **H-8** `node_id` 改为安装期随机密钥的 HMAC（≥8 字节，可轮换）。　→ ✅ 已完成（2026-09-20），见 §2 H-8 的「修复落地」：`<data>/node.key`（32 字节，0600，不进自动备份）+ HMAC-SHA256 截 8 字节，`Match` 常数时间反查，损坏密钥文件报错而非静默换一把。残留是"升级后既有分享链接全部 404（刻意不做双轨）"；"无后台查看/一键轮换"已随 RBAC 判定关闭（删 `<data>/node.key` 重启即整体更换）。
+13. **M-1 / M-2** 不再向控制台下发 `agent_key`（改指纹 + 轮换按钮）；备份包拆分或口令加密；审计 `Result` 写入前 `MaskCommand`，JSONL 改 0600。　→ ✅ 已完成（2026-09-20），见 §3「M-1 · 修复落地」「M-2 · 修复落地」。两点与原判据不同，如实说明：**M-1 的主控制选了"轮换成为唯一明文出口 + 备份默认不打包"，没有实现口令加密备份**（持 Token 者可用自己的口令造一份可下载的加密包，加密挡不住有意图的读取）；**M-2 只覆盖新写入**，已在库里的历史明文行不改（静默重写审计数据 + 会让 JSONL 补录重复导入）。顺带修掉 `-race` 复现的两处生产数据竞争（`Audits()` 交出共享指针、落库协程锁外读 `Result`）。
+14. **M-3 + M-18(CSP)** 页脚改服务端 HTML 白名单（或纯文本 + `nl2br`）、客户端换真 sanitizer；同时上 `Content-Security-Policy`、删 `?token=` 回退、WS 校验 `Origin`。（这里旧写的 "M-8" 是上一轮的编号，本轮 §3 的 CSP/Origin/query Token 项是 **M-18**。）　✅ **已完成（2026-09-20）**，落地见 §3「M-3 + M-18」。**一处按判断偏离原表述**：净化放在渲染入口（全仓唯一一处 `dangerouslySetInnerHTML`），没有在服务端再建一份白名单 —— 理由与代价见该单元残留 (a)；其余四项（真 sanitizer、CSP、删 `?token=`、WS 认 `Origin`）均按原表述完成。
+
+### P2 · 本迭代（结构性，需要设计评审）
+15. **H-5** 发布物签名体系（CI 内签 deb/rpm/exe/升级包，公钥内置，删除 allow-unsigned）。　→ 🟡 **升级包那一半已完成（2026-09-21，第四批）**：`AllowUnsigned` 逃生门连同配置键/启动参数/部署生成配置一并删除，升级包强制 Ed25519 签名且签名覆盖版本号，离线工具 `scripts/signpkg` 负责密钥与签名，服务端 `-upgrade-pubkey` 把公钥带进一键部署的 Agent 配置（见 §3「M-9 + M-10（升级链）+ M-16」）。**未做**：`.deb`/`.rpm` 的包签名与 `.exe` 的 Authenticode、公钥随安装介质内置、私钥轮换流程 —— 这三件都需要构建链之外的东西（签名证书与密钥托管），见 §1 H-5 的「未落地的一半」。
+16. **H-9 + M-11** Windows ACL 显式化、安装器改产 PBKDF2、保活注册前校验二进制 ACL、`ultravnc.ini` 收紧 + 去掉静态回退口令。　✅ **五个子项全部完成（2026-09-22）**，逐条落地与残留见 §2「H-9 + M-11 · 修复落地」与 §3 表内 M-11 行。**两处按判断偏离原表述**：① DACL 除 SYSTEM + Administrators 外**保留了当前登录用户的 SID**（便携形态与非提权重跑要读写同一份凭据；只认 `Token.GetTokenUser()` 的那一个 SID，**不认令牌里的组**，否则检查永远查不出"全体本地用户可写"）；② 闸门命中宽授权时**拒注册保活 + 给一条 `icacls` 整改命令**，而不是静默去改用户挑选的安装目录 ACL（爆炸半径不可控），且判断用"文件 + 直接父目录"两处而不是整条祖先链（`C:\` 上那条 `Authenticated Users:(OI)(CI)(IO)(M)` 会让全链求值变成噪声）。另加两项原表述里没有的：配置路径同进闸门（改配置即可让 SYSTEM 按攻击者的地址出网）、巡检每次拉起前**复判**（防注册后的 ACL 漂移）。`main.go` 的 `-agent-key`/`-password`/`-extra` 日志脱敏按原表述完成。**未做**：真机 Windows 安装的端到端复测（残留 (a)），见 §9 第 1 条。
+17. **M-4 / M-5 / M-6 / M-7** UUID 注册校验对齐 `UpdateProbe` 语义；Agent 连接限速与广播合并；隧道帧比对连接身份；端口映射规则改前先 `StopRule`。　→ ✅ 已完成（2026-09-21），连带收口 M-8 与 H-2 残留 (c)（`session.Conn.Write` 无 deadline）。落地分三个单元：§3「M-6 + M-7」「M-4」「`session.Conn.Write` 无 deadline」「M-5 + M-8」。**一处按判断偏离原表述**：M-5 原写"Agent 连接限速"，实际做的是**广播合并 + 单连接协程上限**，没有加逐条消息速率限制 —— 依据与代价见 §3「M-5 + M-8」残留 (d)。其余四项（UUID 归属、隧道身份、规则覆盖、写 deadline）均按原表述完成，deadline 那条原本挂在 H-2 的残留里、编号上不属于 P2 清单，一并收掉。
+18. **M-9 / M-10** Agent 侧限定文件读写根目录 + 指令信封签名；升级单次读入双校验 + 签名覆盖版本号并拒绝降级。　→ 🟡 **已完成大半（2026-09-21，第四批）**，落地见 §3「M-9 + M-10（升级链）+ M-16」。**一处按判断偏离原表述**：**指令信封签名没做** —— 那条通道已经 mutual-TLS + 注册期 HMAC，信封签名只防"服务端本身沦陷"，而那种攻击者本来就能让 Agent 执行任意命令（命令执行是产品功能），签名不改这个；真正缺的是 Agent 侧对命令的本地授权，属产品形态决定（该单元残留 (a)）。其余三项（读写根目录、单次读入双校验、签名覆盖版本号 + 拒绝降级）按原表述完成，并顺带删掉了 `AllowUnsigned` 逃生门（原挂在 H-5）。
+19. **M-12 / M-13 / M-14** 限流按 `(ip, route)` 分桶 + 定期清扫协程；公开路径不再触发外呼 GeoIP；`/api/public/enabled` 补 `requireEnabled` 并接线 `SetOnChange` 关闭既有订阅。　✅ 已完成（2026-09-21），落地见 §3「M-12 + M-13 + M-14」。**两处按判断偏离原表述**：① 分桶实现为 `(route, ip)` 独立滑窗 + 每次调用即清扫 + 容量兜底，**没有引入定期清扫协程** —— 回收触发点必须在"攻击者一定会经过的入口"，独立协程反而多一个可停摆的依赖（`Auth.rate` 那一半同理，见落地 M-12 第 4 条）；② 开关补全不只"`/api/public/enabled` 加 `requireEnabled`"，还把品牌文案拆到常开的 `/api/branding` —— 直接在原端点上加闸门会让登录页在停用后拿不到标签页标题，那是功能回归而不是安全修复。其余（公开路径不外呼 GeoIP、`SetOnChange` 接线并关闭既有订阅）按原表述完成；window 口径的 N+1 未做批量化的理由见其残留 (b)。
+20. ~~**RBAC（角色 + 主机授权）**~~ 　→ **取消（2026-09-20，用户判定本系统单人使用、不做多人）**。原承自 H-3：现在"任一有效 Token = 全部主机的命令下发 + 远程桌面"。在单人模型下这不是缺陷而是设计：**唯一的边界就是那枚 Token**，所以第二道防线的位置由已完成的 M-1/M-2/M-3/M-18（凭据不外流 + XSS 不可执行 + WS 认同源）与 H-2/H-4/H-7（闸门、体积、并发）占据，而不是由角色层占据。它原本挂住的两项残留（H-1 的 `FileTransferState`/端口映射全量广播、H-3 残留 (a) 的主机授权）随本判定一并关闭；H-6 known_hosts 撤销与 H-8 `node.key` 后台轮换**并不真的依赖 RBAC**，见 §10 判定段第 3 条。
+
+### P3 · 排期（部署形态与收尾）
+21. ~~**M-15** Dockerfile 换 `-password-file` + `--secret`、加 `USER`、按 digest 钉扎~~　→ **不适用（2026-09-20 用户判定：不发 Docker）**，容器形态不是交付物，那些代码路径不会运行。本项的**实际内容是撤掉不受支持的部署文档**，已按用户选择「撤文档、留 Dockerfile」执行完毕：
+    - `docs/deployment.md`：删除"方式一：基于 Docker 容器化部署"整节（原 15-42 行，含 `docker build`、`-e MOCENTER_PASSWORD='强口令'`、`:latest`、`docker exec … initial-password.txt`），方式二/三上移为方式一/二并同步第 854 行的交叉引用；节首改成一段说明：**容器不是交付形态**，自行起容器的人请自己核对参数，并点名"口令别进 `-e`/命令行"。顺带把方式一示例里的 `-password your-password` 换成 `-password-file`（`server/main.go:83` 早就支持，且 `:82` 的 `-password` 帮助文本本身就写着"不推荐"—— 文档却一直在用它，属于自相矛盾）。
+    - `README.md`：删除"容器化部署"小节（构建 + `docker run -e MOCENTER_PASSWORD=…` 示例与持久卷提示）；仓库树注释与构建脚本参考表里的 Dockerfile 行改成"历史保留、不发布不维护"；架构图右侧的 "Docker" 标注换成 **macOS**（Agent 确实支持 `darwin` —— `agent/build.sh` 的 GOOS 列表与「单实例保护」段落都写着 macOS，原先那个 Docker 位置本来就是错的）。
+    - `server/Dockerfile` 与 `.dockerignore` **按用户决定保留不删**，只在文件头写清"容器不是交付形态、不发不维护"，并把它自身那处缺陷如实写在注释里：`ENTRYPOINT` 是 shell 形式，`$MOCENTER_PASSWORD` 会展开进 argv 被同宿主任意用户 `ps -ef` 看到 —— **不提供第二份修复**，因为这条路径不再交付，为它改 `ENTRYPOINT`/加 `USER`/钉 digest 都是在维护一个没人用的形态。
+    - **残留**：(a) Dockerfile 与其注释里的缺陷一起留在仓库里，若将来改主意要发容器，M-15 的四件事（`-password-file`、`USER`、digest 钉扎、去掉 `:latest` 文档）要整批重做；(b) 本轮未跑 `docker build` 验证文档删改没影响构建（本机无 Docker，与 L-8 残留 (a) 同一限制）。
+22. **M-16** `gencerts` 改 0600、agent 单元加沙箱并引号化插值、`keepalive.sh` 改 `set -eu` 且不 `source`、`--password` 只走文件/stdin、补 `mocenter-server-watchdog` 模板（顺带修掉 server 无保活的功能缺陷）。　✅ **五个子项全部完成（2026-09-21，第四批；第 5 项"口令只走文件/stdin"按 Linux 脚本收口，Windows 侧留残留 (i)）**，逐条落地见 §3「M-9 + M-10（升级链）+ M-16」的 M-16 段。**两处按判断偏离原表述**：① "加沙箱"只落了 `NoNewPrivileges` + 引号化插值，**没有加 `PrivateTmp`/`ProtectSystem`/`ProtectHome`** —— Agent 的职责就是替运维在目标机上执行命令并写自己的配置目录，加了不会报障、只会静默把功能打断（理由逐条写在单元注释里）；② `--password` 采取"`--password=***` 直接 `die` 并提示两种安全写法"，而不是无声忽略 —— **且这条只覆盖 Linux 脚本**：`install-windows.bat:95` 的位置参数与 `installer/main.go:68` 的 `-password` 仍在（两处生成的服务定义都不含口令明文，残留的是"执行那一刻口令在同机进程列表可见"），见该单元残留 (i)。另需实机验证的残留（Rocky8 上确认单元参数与新 timer 触发）见该单元残留 (h)。
+23. **L-1 … L-9** 全部 LOW 项；引入 renovate/定时 `govulncheck` + `npm audit` 例行化；补 `agent/internal/{upgrade,probe,daemon}` 与 `server/internal/winapp` 的单测（这三块只能靠实机验证，是回归的最大盲区。`server/internal/vnc` 已在 H-2/H-3 补齐名额、端口闸门与查看器生命周期的用例，但**隧道数据面仍需实机验证**）。　→ 🟡 **2026-09-21 第四批顺带补掉了其中一块**：`agent/internal/upgrade` 原本零测试，现有 13 例（`decideUpgrade` 全表、签名字面量与"签名绑定版本号"、无公钥时零外呼、降级在联网前拒、超大/空包拒、`installBinary` 换入的是校验过的那份字节、盘上摘要不符即中止）+ 新建 `agent/internal/version/compare_test.go` 3 例 + `scripts/signpkg/main_test.go` 3 例（与 Agent 侧成对钉住签名字面量）。**仍待做**：L 系列本体（L-1 CSV 公式注入、L-2 剩余三处未净化日志、L-3 `pickEncoding` 忽略 q 值、L-4 匿名端点回全量字段目录、L-7 默认值偏松、L-9 巡检/清理脚本与 `setup.iss` 三项）、`agent/internal/{probe,daemon}` 与 `server/internal/winapp` 单测、renovate/定时扫描、构建镜像 digest 钉扎（自 L-8 挪出）。
+
+---
+
+## 7. 上一轮（2026-09-15/16）问题的复核
+
+- C-1/C-2/C-3、H-1…H-6、M-1/M-2/M-6 的修复**均仍在位**，逐条回源码确认：预共享密钥 HMAC（±60s + nonce 防重放 + 常数时间比较）、`sanitizeComponent`/`within` 路径净化、升级 SHA-256+Ed25519 且默认拒绝、随机初始口令文件、PBKDF2 + 旧哈希透明升级、Token TTL/吊销、审计写入时脱敏、Web 默认 HTTPS + HSTS。
+- 仍开着的三项：~~**M-3（CSP 未上）** → 本轮因 C 类页脚 XSS 而权重上升~~　**已于 2026-09-20 修复（CSP 与页脚白名单重建一起收口，见 §3 M-3 + M-18）**；~~**M-7（反代下限流失效）** → 本轮确认 `ClientIP` 只用 `RemoteAddr`（不信任 XFF 是对的），但公开页桶共用问题（M-12）让它在直连场景也已成立~~　**2026-09-21：公开页桶共用已由 M-12 修掉**（独立 `(route, ip)` 桶），"反代后所有访客共享一个源 IP"这一半按**刻意不信任 XFF**保留，见 §3「M-12 + M-13 + M-14」残留 (a)；~~**M-8（限流 map 不回收）** → 本轮定位为"只在校验成功时 prune"（M-12）~~　**2026-09-21：已修**，回收触发点搬到 `AllowRequest` 并叠 `rateMapLimit` 容量兜底（同上一单元的 M-12 落地第 4 条）。
+- 回归一项：~~**H-5（审计脱敏时机）** 在 `Result` 回填路径上重新敞开（M-2）~~ —— **已随 M-2 关掉**（2026-09-20）：`Complete`/`completeByCommandID` 两条回填路径在入口即 `MaskCommand`，见 §3「M-2 · 修复落地」。仍开着的边界是"库里已有的历史行不改写"，见其残留 (a)。
+- 新增两项由易用性改造引入的：**C-1**（零配置 mTLS 把注册密钥变成全网身份根）、**H-3/M-9**（一键安装 VNC 把隧道授权与 Agent 本地校验都省掉了）。
+
+---
+
+## 8. 本轮核对为安全的点（无需重复劳动）
+
+- **SQL**：`server/internal/storage/queries.go` 全部参数化，`ORDER BY` 为静态串；上一轮的标识符校验仍在。
+- **Shell**：`agentdeploy.go:720-766` 把脚本经 stdin 喂给 `sh -s`，参数前先过 `sshHostRe`/`agentIDRe`/`installDirRe`/服务名正则（`:162,168,338,347`）；Agent 侧 `runas_unix.go` 用 `syscall.Credential` 而非 shell。
+- **路径与归档**：`servePackage`（`main.go:3051-3074`）、`safeBackupPath`（`backup_api.go:182-194`）成立；备份恢复有名字白名单 + `isPlainFileName` + 1 GiB 解压上限（`backup.go:374-434`），无 zip-slip / zip-bomb；静态与 `.br`/`.gz` sidecar 回退经 `filepath.Clean("/"+p)` + 前缀比对收敛在 `webDir` 内。
+- **TLS 与证书**：全链路 `MinVersion: TLS1.2`；`tls.RequestClientCert` + 应用层显式 CA 链校验（`main.go:1183-1189`），外部 CA 的 CN 被拒；`InsecureSkipVerify` 只出现在运维显式开关处；指纹钉扎实现正确（`pin.go:26-64`）；`NewAgentCert` 强制 CN 取自调用方而非 CSR subject、校验 CSR 签名并绑定其公钥（`pki.go:405-408,421-430`）—— 问题在 C-1（调用方给的 ID 本身自选），不在这段代码。
+- **SSRF**：服务端不存在用户可控的出网 URL（GeoIP 目标固定、代理前缀由运维配）；但注意 C-2 是 Agent 侧的同类问题。
+- **口令与账号**：无空口令绕过（`verifyPassword` 拒绝 `stored == ""`、`iter <= 0`）；`users.json` 0600；首次启动随机强口令。
+- **命令黑名单**：`strings.Contains` 字面表（无 ReDoS），交互输入逐行过审（上一轮 M-2 的修复仍在）。
+- **探针身份**：`TypeProbeDataReq`/上传入口确实经 `connOwns`（`main.go:1310`、`:783`）—— 除注册路径的 UUID（M-4）外，报文自报身份是有效的。
+- **公开页掩码**：`maskIPSwitch` 恒真且 `SetMaskPublicIP` 从未被关闭，四条数据路径（state/nodes/samples/ws）掩码一致，没有"一处掩码一处漏"。
+- **单实例锁**：Agent 的 flock/命名互斥体刻意落在配置目录而非可预测的 temp 路径（`singleton_unix.go:232-253`），无符号链接竞争。
+- **仓库密钥卫生**：枚举全历史 1444 个对象，**未发现任何私钥/证书/二进制被提交**；`certs/`、`build/`、`installer/payload/*`、`*.exe`、`.testtools/` 均被 `.gitignore` 正确覆盖，无需为密钥重写历史（M-17 是凭据文本，性质不同）。
+
+---
+
+## 9. 局限与需实机验证
+
+1. **H-9 的净危害取决于真实 ACL**：需在实机安装后用 `icacls` 确认 `%ProgramData%\MoCenter\agent\mocenter-agent.json` 是否真为 `Users:R`，以及安装目录是否 `Users:W` —— 前者决定 M/H 分级，后者决定 H-9 是"读凭据"还是"直接 SYSTEM"。
+   **部分已消解（2026-09-22），但端到端仍开着**。已经确认的：① **修复前的读侧描述成立** —— 用 `icacls` 实测本机 `C:\ProgramData` 给 `BUILTIN\Users` `(OI)(CI)(RX)`（可读）+ `(CI)(WD,AD,WEA,WA)`，`C:\Program Files` 给 `BUILTIN\Users:(RX)` 与 `CREATOR OWNER:(OI)(CI)(IO)(F)`，`C:\Users\Public` 给 `INTERACTIVE/SERVICE/BATCH:(OI)(CI)(IO)(M)`（**inherit-only Modify** 会落到子对象，是一条真实的换 exe 路径），所以"落在 `ProgramData` 下的凭据本机任意用户可读"不是推断；② **修复后的判定不会再误挡默认位置** —— `TestRealMachinePathsVerdict` 直接对本机真实对象求值（`Program Files\Git\bin\git.exe`、`System32\cmd.exe`）并断言判为安全，`installer` 包的 ACL 用例走的是真 Win32 API（`SetNamedSecurityInfo`/`GetNamedSecurityInfo`）而不是桩。**仍开着的**：一次真实 Windows 安装（Win10 测试机当时未开机，本开发机无 MoCenter 服务），具体要确认三件事 —— 装到默认 `C:\Program Files\MoCenter` 时保活任务确实注册成功（闸门没误挡）、装到一个 `Users` 可写的自选目录时确实**拒注册并打出 `icacls` 指引**、`ultravnc.ini` 收紧后 `uvnc_service` 与 Agent 拉起的 `winvnc` 仍能读到口令（即 M-11 的修复不是功能回归）。逐条对应 §2「H-9 + M-11」残留 (a)。
+2. ~~**C-2 的实际触发频率**：需在一台国内 Windows 主机上确认厂商直连 URL 是否失败到回退 http 代理（若失败，C-2 的定级从"存在回退路径"升为"默认路径即明文"）。~~
+   **已消解，无需再测**（2026-09-20）：C-2 修复后**不存在任何自动回退到明文的分支** —— 未配代理、厂商直连失败、代理是 `http://` 这三种情况都只会拒装并给出托管指引，所以"回退是否成为主路径"这个问题在代码上已经关掉。定级判断仍按最坏情形（"默认路径即明文"）成立，因为修复前 `defaultProxy` 是**无条件追加**的候选。
+3. **未做模糊测试**：VNC 安装矩阵（`vncinstall_unix.go:92,454` 的 `bash -c` 内插只用到 `int` 端口与内部路径，静态看无注入点）未做输入模糊。
+4. **本轮为静态审计**：未搭建在线环境做端到端利用验证；上一轮的 `9.3 实测`表格形式建议对本轮 P0 各项复现一次。
+   ~~尤其是 C-1，用第二台测试机冒充第一台的 `agent_id` 换取证书~~ —— **C-1 已补做**（2026-09-20，本机服务端 + 真 Agent 二进制：令牌单次消费、跨 `agent_id` 冒用、在线 ID 拒发三条均已实机验证，详见 §10 C-1 行）。其余 P0/P1 项仍待同样口径的实测。
+   跨机（Rocky8 ↔ Win10）版本尚未跑过：本机走查里"重放"与"跨 ID"用的是同一台机器的两套独立 `creds/`，**同机双实例**与**真·异机冒名**在 TOFU 上等价（绑定只看公钥指纹），但网络路径差异（NAT、代理、MTU）未覆盖。
+5. **依赖扫描的时效性**：`govulncheck` DB 为 2026-09-16、`npm audit` 为 2026-09-19 官方源快照，两者都应按 L-8 的建议进 CI 常态化。
+6. ~~**第四批的 Linux 侧只做了静态检查**（2026-09-21 补）：`mocenter-{agent,server}.service` 的引号插值与 `NoNewPrivileges`、新建的 `mocenter-server-watchdog.{service,timer}`、重写后的 `mocenter-keepalive.sh`（`conf_value` 逐键解析、`pgrep -x`）都在 Windows + Git Bash 上过的 `bash -n`/`sh -n` 与解析冒烟，**没有在真 systemd 下跑过**。需要在 Rocky8 上依次确认：`install-linux.sh --role=server --dry-run` 落到正确的 watchdog 模板 → 真装后 `systemctl show -p ExecStart mocenter-server.service` 的参数逐项正确（尤其空变量不会把参数拆开）→ `systemctl list-timers 'mocenter-*'` 能看到 watchdog.timer 触发 → 手工 `kill` 主进程后 5 分钟内被拉起、且 `pgrep -x mocenter-server` 只有一个实例 → `journalctl -u mocenter-server-watchdog.service` 里没有因 `set -eu` 误伤而静默退出。同理 `NoNewPrivileges` 要确认服务端下发命令仍能工作（Agent 以 root 跑 `su`/`setuid` 类操作的需求若存在，这一项就是功能回归）。~~
+   **已做完（2026-09-22，Rocky8 真机，逐条对应）**：① `--role=server --dry-run` 落到 server 自己的 watchdog 模板（M-16 ④ 的功能缺陷确认消失）；② `systemctl show -p ExecStart` 参数逐项正确，空变量不再拆参数 —— 但这一条**撞出新缺陷**：引号化让未配的键以"空 argv"形式传给进程，`-http ""` 会把默认端口顶成 `:443` 并被 `flag.Visit` 当成"显式给出"从而在回写时盖掉配置文件，已由 `server/flags.go normalizeBlankFlags`（`main.go:113`）+ `agent/flags.go` 收口；③ `systemctl list-timers 'mocenter-*'` 两个 per-role timer 均在排期；④ `kill` 主进程后被 timer 拉起，`pgrep -x` 各只有一个实例（顺带在真机复现了 `pgrep -f` 的自匹配：巡检脚本自己的命令行就含该路径，所以旧写法的"看起来有实例"是必然的）；⑤ watchdog 单元日志无 `set -eu` 静默退出；⑥ `NoNewPrivileges` 下服务端下发命令仍正常，setuid 类需求实测不存在 → 不是功能回归。
+   **同一台机还补做了 M-10 的端到端矩阵**（签名/摘要/降级/force/无公钥 6 个负例 + 1 个干净升级周期），并因此撞出第二个真实缺陷：**Linux 每次升级的自拉起都失败**（`fork/exec /usr/local/bin/mocenter-agent.bak: no such file or directory`），新版本只靠 `Restart=always` 回来、而那 5s 断档里 keepalive 会在 unit 之外 `setsid` 起一份 —— 已改为 `syscall.Exec` 原地替换进程镜像并复验（PID 与 `MainPID` 不变、无第二实例）。逐条证据见 §3「M-9 + M-10（升级链）+ M-16」的「实机复测」段。
+7. **跨机复测的边界（2026-09-22 补）**：本轮 Linux 侧全在**同一张 Rocky8**（虚拟机 NAT 内网、服务端与 Agent 同机、下载地址走本机 https + 内部 CA 装成 trust anchor）完成，所以"跨机网络路径（NAT、代理、MTU）"这一层仍未覆盖，Win10 测试机也未参与本轮；对结论的影响限于**性能与网络抖动**类判断，不影响正确性类判断（负例靠的是签名/摘要/版本号本身，与链路无关）。
+
+---
+
+## 10. 修复进度（2026-09-20 起，逐项标记，可断点续做）
+
+本轮范围（用户确认）：**P0 七项 + P1 七项**。P2/P3 未经确认不动。
+**范围变更（2026-09-21，用户指示「根据安全评估报告继续推进剩下的安全问题修复」）**：P2/P3 解冻，按 §10.1 C 的批次顺序推进；第一批（M-6/M-4/M-7/写 deadline）、第二批（M-5/M-8）、第三批（M-12/M-13/M-14）、**第四批（M-10 + 删 `AllowUnsigned` + M-16 + M-9）已于本日全部完成**（第四批的"指令信封签名"一项经判断不做，理由见 §3 该单元残留 (a)）。至此 §10.1 C 排出的四批清空，未做项只剩 H-9 + M-11 与 L 系列。
+**2026-09-22 补（H-9 + M-11，Windows 本机提权链）**：五个子项（凭据写入侧受保护 DACL + 旧文件补紧、安装器产 PBKDF2、SYSTEM 保活注册前可写性闸门、`ultravnc.ini` 收紧、删静态回退口令）与 §2 原表述额外要求的失败日志脱敏（`-agent-key`/`-password`/`-extra`）**全部落地**，逐条见 §2「H-9 + M-11 · 修复落地」与 §10 同名行；同轮关闭了 H-8 残留 (d) 与 M-1 残留 (e) 那两处"Windows 0600 不是 ACL"的挂账。**未收口的一半**：`setup.iss:157` 仍把 `-agent-key` 拼在命令行上（残留 (b)），以及**没跑过真机 Windows 安装**（残留 (a)，已并进 §9 第 1 条）。
+**2026-09-22 补（Rocky8 实机复测）**：第四批的 Linux 侧从"只有静态检查"变成"真 systemd + 真升级端到端"，§3 该单元残留 (h) 与 §9 第 6 条关闭；复测**本身**又撞出并修掉两个缺陷（Linux 升级自重启必败、systemd 空插值顶掉默认值），所以这一轮不是补手续而是收口了两个真 bug。同轮新增 §4 **L-10**（缺 `.gitattributes`，CRLF 让同一份 shell 脚本在 Linux 上跑不起来）。
+C-1 采用**双轨过渡**：新的一次性注册令牌优先，旧共享密钥保留一个版本并告警（不得锁死已部署的 Agent）。
+M-17 只清**工作树**，git 历史不动；测试机口令由用户自行轮换。
+H-3 的"主机授权"部分**移出本轮**（2026-09-20 判定）：本仓没有角色/主机归属层，补它等于新造一个 RBAC 子系统，已单列为 P2 第 20 项；本轮只做端口闸门与口令按需交付。
+**系统定位判定（2026-09-20，用户明确）：本系统为单人使用，不提供多人使用，不做 RBAC。** 因此 P2 第 20 项**取消**，H-3 由 🟡 改判 ✅（剩余面按"不适用"关闭）。判定口径：**凡是"操作员 A 越权看到/操作操作员 B 的东西"的残留，全部随单人模型消失；凡是攻击主体为匿名访客、被攻陷的 Agent、供应链或目标机本地用户的，一律不受该判定影响，仍然有效。** 逐条归类：
+- **随单人取消**：H-3 主机级授权、H-1 残留 (c)（`FileTransferState`/端口映射状态全量广播）、M-1 残留 (c)（轮换无双人复核）。
+- **原判据有误、与 RBAC 无关**：H-6 的 known_hosts 查看/撤销、H-8 的 `node.key` 后台轮换 —— 当初写成"需 RBAC"是为了避免重复造端点，实际上"改一个 0600 文件 + 重启"已经是可用路径（文档已写明），M-1 的 `shared-key/rotate` 也证明了这类端点只需现有 `guard()` + `confirm`。要做就是小改动，不做也不构成风险敞口。
+- **仍然开放且权重上升**：~~M-4/M-5/M-6/M-7/M-8 与 `session.Conn.Write` 无 deadline（信任主体是 **Agent 之间**，不是操作员之间 —— 一台 Agent 被拿下即可伪造 UUID 抢他人会话、劫持别的主机的 RFB 流、让旧端口白名单继续放行）~~　**这六项已于 2026-09-21 全部修完**（§3 四个单元 + §10 六行；剩余的的确确切口只有 M-4 残留 (b) 那条"全新 `agent_id` + 已知受害 UUID 可挤掉活跃会话"）；~~仍开放的是 M-12/M-13/M-14（主体是**匿名访客**）~~　**这三项亦已于 2026-09-21 修完**（§3「M-12 + M-13 + M-14」+ §10 同名行；仍留着的是"配额是拍的、反代后全站共享一个源 IP"这一层，见其残留 (a)）；~~现在开放的是 H-5/M-9/M-10/M-16（**供应链与本机**）；H-9（**目标机其他本地用户**）~~　**供应链与本机面已于 2026-09-21 第四批收口**（M-9 / M-10 / M-16 全修，H-5 的升级包那一半完成、`.deb`/`.rpm`/`.exe` 签名待构建链外的证书与密钥托管）；按攻击主体分类，现在只剩 **H-9 + M-11（目标机其他本地用户，Windows ACL 与弱凭据回退）** 与 LOW 项。~~M-15~~ 随"不发 Docker"判为不适用（见 §6 第 21 项）。　**2026-09-22：最后一块本机面已收口** —— H-9 + M-11 修完（§2「H-9 + M-11 · 修复落地」），至此按攻击主体分类的四个面（匿名访客 / 已入网 Agent / 供应链 / 目标机本地用户）**全部有承载者**，剩下的只有 **LOW 项**（L-1/L-2 三处/L-9/L-10 + 镜像 digest 钉扎）与需要构建链之外证书的 **H-5 另一半**。
+- **反向结论**：没有 RBAC 意味着"一把 Token 打穿 = 全部主机 root"没有第二道防线，所以**凭据卫生（M-1/M-2/M-3/M-18/C-1）与控制面闸门（H-2/H-4/H-7）本来就是本系统真正的边界** —— 这两组已在本轮全部收口，方向是对的；下一步的最高权重应给 M-6/M-4/M-7 与写 deadline，而不是任何权限分层。
+
+| 项 | 状态 | 落点 / 备注 |
+|----|------|-------------|
+| 依赖（x/crypto + go 指令） | ✅ 完成 | `server/go.mod` x/crypto v0.31.0→**v0.56.0**、x/sys v0.28.0→v0.47.0；三个模块 `go` 指令统一到 **1.26.6**（x/crypto v0.56 要求 ≥1.26，.6 是被修补 stdlib 的下限）。`.cnb.yml` 4 处与 `server/Dockerfile` 镜像改 `golang:1.26`，`scripts/lib/common.sh` 与 README 同步。`govulncheck` 复扫：server/agent/installer 均 **0 条可达漏洞**（原 8 条 x/crypto/ssh + 18 条 stdlib 全清） |
+| H-4 请求体上限 + 登录键限长 | ✅ 完成 | `main.go` 新增 `decodeJSON`（`maxJSONBody = 256 KB`、凭据类 `maxCredBody = 32 KB`），**全仓 13 处**裸 `json.NewDecoder(r.Body)` 全部收口（超限 → `413`）；`LoginGuard` 键改走 `loginUserKey()`（小写+去空白+截到 64 字符，rune 安全），并给 `fails` 表加 `loginFailMapLimit = 4096` 兜底（回收时保留仍在生效的退避）。单测：`server/request_body_test.go`、`hardening_test.go` 两条新用例 |
+| C-1 注册身份铸造 | ✅ 完成 | ①**一次性令牌**：新增 `server/internal/agentauth/tokens.go` 的 `EnrollStore`（`<data>/enroll.json`，0600，tmp+rename）—— 令牌绑定 `agent_id`、默认 24h（限 1min~30d）、每台最多 8 份 / 全局 2048、**单次消费**（`matchConsume` 在锁内原子置 `UsedAt`）、明文只存在于不落盘的 `secret` 字段。② `Verifier` 改双轨（`agentauth.go`）：令牌先试、再回退共享密钥（`CredSharedKey`），`-disable-shared-agent-key` 关掉旧路径；③ **在线 ID 拒发** + **无凭据闸门**：`main.go` 抽出 `verifyOnlineRegistration`（上线侧），`enrollAgentCert` 补上同口径的 `!verifier.Enabled() && !allowAnon` 闸门（否则"没配凭据也能签发 → 证书后续跳过 HMAC"会悄悄把默认拒绝变成默认放行），`sess.Busy(agentID)` 即拒；④ **TOFU 绑定**：签发后 `CheckOrBind(agentID, SPKI, credSource)`，公钥变化时**只认新令牌**（`rebinds` 计数），拒绝即 `rejectEnrollment` → 审计类别 `auth`；配套 `/api/enroll/tokens`、`/api/enroll/token/revoke`、`/api/enroll/cert/reset`；⑤ README「注册凭据」章节 + `docs/deployment.md` 参数表/迁移段，含"**共享密钥＝全网身份根，泄露必须轮换 `ca.key` 并重换全部 Agent**"。⑥ 连带修掉的现网锁死风险：Agent 重新换取改为**复用** `creds/client.key`（`enroll.go` `clientKey()`），`discardServerIssuedCreds` 不再删私钥 —— 否则服务端换 CA 后自动恢复会被自家 TOFU 挡死。⑦ 控制台「Agent 接入」页重建（签发/列举/吊销 + 绑定表 + 共享密钥迁移红条，命令默认带令牌）；`/api/server-info` 去掉误导字段 `agent_key_configured`，只留 `shared_key_enabled`。**实机走查（2026-09-20，本机 127.0.0.1 起服务端 + 真 Agent 二进制）**：控制台签发 `web-01` 令牌 → 明文只出现一次 → Agent 用令牌换到证书（日志"凭证类型 token"）并上线 → 令牌变「已使用」、绑定表落下 SPKI 指纹、`rebinds=0`；**重放同一令牌** → `注册凭证校验失败`；**把 `web-01` 的令牌拿去注册 `web-02`** → 同样被拒且不留绑定；**`web-01` 在线时用新令牌再注册** → "该 agent_id 当前有活动会话"（并因此在拒发时已消耗令牌，故补了提示语）。走查中顺手修掉：签发被拒时消息里"注册凭证校验失败: 注册凭证校验失败"的重复、服务端把运维引向"删除 creds/"（会连带删掉私钥 → 自断 TOFU 恢复路径）的旧提示、以及控制台 ④ 命令框在未签发时直接把**共享注册密钥**拼进可粘贴命令（现改为占位符，只有刚签发的该主机令牌才进命令） |
+| C-2 下载链钉扎 | ✅ 完成 | 对应 §1 的 ①–④，逐条落地：<br>① **明文代理彻底摘除**：`vncinstall_windows.go` 的 `const defaultProxy = "http://fa.mooncn.win/?url="`、`vdd_windows.go` 的 `vddReleaseProxy` 及"未配代理时自动追加前缀"的候选**全部删除**；新增 `httpsProxyOrEmpty(proxy, reason)`（`vncinstall_common.go:52`）——只有 `https://` 前缀能进入取包候选，其余（含裸主机名、协议相对 URL、FTP）记日志后当没配。`fa.mooncn.win` 仅保留在非代码路径（公网 IP 探测 / 归属地）。<br>② **执行前钉扎**：`installPins`（`:93`，包名 → SHA-256）+ `pinnedDigest`（`:100`）+ `verifyDigest`（`:142`，常数时间比较、空 `want` 才跳过、失败消息带**实际摘要**和"改 installPins"的指引）。包名常量（`uvncSetupX64Name`/`uvncSetupX86Name`/`vddZipName`，`:71-78`）与钉扎键、托管索取名、公网 URL 文件名**同一编译单元互相约束**，`TestInstallPinsCoverAllPackages` 双向查漂移。校验点在最贴近执行的位置：`installUltraVNCFromLocal`（`verifyDigest` → `isPEExecutable` → `exec`，拒装即删文件）、`installUltraVNCByDownload`（候选循环内校验，不匹配就换下一个源、**绝不执行**）、`fetchVDDPackage`（`pnputil /add-driver` 之前，失败即删）。**摘要不匹配不回退到别的源**，避免"内容被替换"伪装成"安装方式不同"。<br>③ **托管下发设为默认且唯一免配置路径**：`installUltraVNC` / `fetchVDDPackage` 先取服务端托管包（走已 mutual-TLS 的长连接），失败即**硬停**并输出 `bash scripts/fetch-packages.sh <服务端 packages 目录> win` 的指引；公网取包（winget / choco / 厂商直连 / https 代理）统一由 `cfg.AllowPublicDownload` 闸门把关（`vncinstall_ultravnc_windows.go:273`、`vdd_windows.go:187`），该字段来自**只读本机配置**的 `allow_public_package_download`（`config.go:37`）+ `-allow-public-package-download`（`main.go:44`，默认 false），服务端下发无法打开。继承旧配置时用 `flagWasSet` 保护，防止配置里的 `true` 压过运维显式传的 `=false`。控制台无需改：`web/src/pages/Vnc.jsx:303` 原样渲染 Agent 的 `msg`，拒装原因直达操作员。<br>④ **来源复核 + 上游同步**：UltraVNC 两枚摘要取自 winget-pkgs 官方清单 `manifests/u/uvncbvba/UltraVNC/1.8.2.4` 的 `InstallerSha256`（其 `InstallerUrl` 与本仓库常量指向同一文件）；`scripts/fetch-packages.sh` 改为 `FILES=(name|url|sha256)`（含新增的 VDD zip），下载后 `sha256_of` 比对、不匹配即丢弃 `.part` 并 `exit 1`，再复查 `MZ`/`PK` 魔数，注释里写明摘要必须与 `installPins` 同步。<br>**连带修掉的三个真实缺陷**：`verifyDigest` 里 `want[:16]` 对短摘要会 panic（改 `digestPrefix`）；`extractZip`/下载走 PowerShell 时用 `fmt.Sprintf` 单引号内插（新增 `psQuote` 转义，测试用 `'; Stop-Process` 注入串验证）；VDD 装驱动前未清 `%TEMP%\vdd-driver` —— 全部下载失败时 `findDriverINF` 会命中**上次遗留的解包目录**，把未校验的 INF 交给 `pnputil`（现在取包前先 `os.RemoveAll`）。<br>**验证**：`go build`（windows/linux）+ `GOOS=windows go vet` + 跨平台测试编译均通过；`go test ./...` 全绿；新增 7 个用例（`vncinstall_integrity_test.go` 5 个 + Windows 侧 `TestUltraVNCRefusesPublicDownloadByDefault`/`TestUltraVNCRejectsUnpinnedPackage` 2 个，均不联网不真装）在本机 Windows 原生跑通。**摘要实算复核**：完整下载的 `UltraVNC_1824_x86_Setup.exe`(5453280 B) 与 `UltraVNC_1824_x64_Setup.exe`(6261136 B) 哈希**逐一命中 `installPins`**，VDD zip 亦命中且为完整归档。<br>**残留（如实记录）**：(a) 未做"服务端托管 → Agent 安装成功"的在线链路实测（Win10 测试机已装 UltraVNC，且未擅自在这台开发机上装第三方软件）；(b) Windows 上选了 SHA-256 钉扎而**未实现 Authenticode 发布方校验**（二者取一即满足 ②，但双重校验更抗"上游换版本"）；(c) 钉扎只覆盖**当前这三个文件名**，`x11vnc-linux-*` 无内置摘要（官方从不发布预编译产物，Linux 侧本就没有公网取包路径），`verifyDigest` 对空 `want` 是跳过的——这条依赖"Linux 只有托管与包管理器两条路"这个前提继续成立。 |
+| H-7 公开页 WS 资源上限 | ✅ 完成 | `server/public_site.go`：<br>① **读上限** `conn.SetReadLimit(64)`（`publicWSReadLimit`）。依据是这条链路按设计**零上行**（`web/src/api/api.js:311` 的 `PublicSocket` 只 `onmessage`，从不 `send`；控制帧不受 data-message 上限约束），所以匿名访客唯一能塞进来的就是被当场断掉的超限帧 —— 原来的"按声明长度分配 = 未认证 OOM"路径关掉。<br>② **写超时**：每次写前 `SetWriteDeadline(10s)`（`publicWSWriteWait`），含**首帧** —— `writePublicWS` 从不检查错误改为返回 error，握手后对端立刻不读也会当场退出。<br>③ **读超时 + pong 续期**：升级后 `SetReadDeadline(90s)` + `SetPongHandler` 续期（`publicWSPongWait` 刻意 > 30s 心跳周期）。原先 30s 心跳写了 Ping 却**从不处理 Pong**，等于"探测发了、结论丢了"，静默离开的访客会永远挂在 `ReadMessage()`；现在对端不回 pong → 读超时 → 读循环退出 → `closeStop()` → 订阅摘除 + 名额归还。<br>④ **并发上限**：`acquireWS(ip)`/`releaseWS(ip)` 挂在 `publicSite` 上（全局 256 / 每 IP 32），超额握手直接 `429 + Retry-After`，**不升级、不留 goroutine、不占订阅表**。 defer 顺序按 closeStop → conn.Close → releaseWS 排（LIFO），保证名额归还前订阅项已摘除。每 IP 取 32 而非更小，是因为全仓不信任 `X-Forwarded-For`（`auth.ClientIP` 只看 TCP 对端），反代/CDN 之后全站访客共用一个地址。<br>⑤ 新增 `Hub.PublicSubscribers()`（`hub.go`）作为该表的观测/断言口径，并订正 `SubscribePublic` 那句"返回取消订阅函数"的失实注释（它一直返回 void）。<br>**测试**（`server/public_ws_test.go`，5 个用例，真起 httptest + 真 WS 握手）：名额上限与归还后 `wsPerIP` 删净零值键（否则表随地址单调增长）、超限上行帧必须被服务端断开**且订阅归零**、客户端断开后订阅与名额都回收、占满后握手返回 429、未启用时 404 且不占名额。`server/` 全量 `go build && go vet && go test ./...` 全绿。<br>**残留（如实记录）**：(a) **读/写 deadline 本身没有用例覆盖** —— 生效要等 90s/10s，单测里不划算；这两条靠与 `hub.go:195-240`（登录后 `/ws`，现网长期运行）同构来保证，加上 ④⑤ 的订阅回收断言间接验证退出路径。(b) 顺带发现但未修（不在本条范围）：**登录后的 `/ws` 与 `/vnc-ws` 同样没有 `SetReadLimit`**（全仓 `SetReadLimit` 只有 `public_site.go:269` 一处）。它们要有效 Token 才能建立，故不构成匿名面，但 H-2 把这两条路由纳入 `guard()` 时应一并补上限。**→ 2026-09-20 已随 H-2 补上（`wsReadLimit` / `viewerReadLimit`），见下方 H-2 行。** |
+| H-1 命令回执归属 + 定向回投 | ✅ 完成 | 详见 §2「H-1 · 修复落地」六条。要点：`cmdBinding` 按 `(command_id, agent_id)` 记归属（批量下发共用一个 ID 是这里最容易踩空的地方）、`CommandOrigin` 用**连接身份**而非报文自报字段做校验、不匹配走 `rejectUnownedCommand`（限频审计，避免修复本身变成审计库洪水面）、`BroadcastToSession` + `SessionKey` 把命令输出与终端回显收敛到发起方会话（粒度取"一次登录"是因为终端由 REST 建、输出由 WS 收，两处同一个 Token）。**顺带关掉同族缺口**：交互输入此前对发起方零校验，任一登录者可拿可猜的 `it-<时间戳>` 往别人终端里打字。新增 7 个用例（route 3 + ws 4），`server/` 全量 build/vet/test 全绿、gofmt 干净。**残留**：同一 ID 重复下发时后写覆盖归属（攻击面从"伪造他人结果"降到"作废他人一条在途命令"）、`FileTransferState`/端口映射状态仍全量广播（原挂 RBAC，2026-09-20 随"单人使用、不做 RBAC"判定关闭）、Agent 断线不回收在途绑定（LRU 兜底）。 |
+| H-2 两条 WS 并入闸门 | ✅ 完成 | 详见 §2「H-2 · 修复落地」六条。要点：`guard` 拆出 `guardGate`（IP 白名单 + 每 IP 限流，与传输方式无关），REST 走 `guard`、`/ws` 与 `/vnc-ws` 走新增的 `guardWS`（凭证改从子协议头取，各认一种不做"两种都试"的旁路）；并发上限按**会话**而非 IP（`maxConnsPerSession` / `maxViewersPerSession` 各 8），且判定必须放在 `Upgrade` **之前**（101 之后写 429 无效）；VNC 名额的归还只挂在 `closeViewer` 摘表那一步，defer 只兜登记前的早退路径（两处都还就会把计数扣负、`>= max` 对负值恒假 → 防线自毁）。`SetReadLimit` 两条各 1 MiB（依据：上行最大帧是 64 KiB 文件分片 base64 后 ≈88 KB），VNC 另加隧道就绪前 4 MiB 的 pending 上限与每帧 10s 写超时。**新增 10 个用例**（`guard_ws_test.go` 5 + `hub_session_test.go` 2 + `vnc_viewer_test.go` 3，后者是 `internal/vnc` 的第一批单测），全量 build/vet/test 全绿、`-race` 下 ws/vnc 亦绿、gofmt 干净。**残留**：两条内部 WS 的 `CheckOrigin` 仍恒 true（归 M-3）、上限判定与登记间有毫秒窗口可能瞬时超额 1~2 条、**`session.Conn.Write` 全无 deadline**（新发现，Agent TCP 卡住会持有 `c.mu` 阻塞该机下发，归 P2 内部信任项）、未做按会话的消息速率限制。 |
+| H-3 端口闸门 + 口令按需交付 | ✅ 完成 | 详见 §2「H-3 · 修复落地」。已收口的两条可利用面：**任意端口**（`DefaultPortSpec=5900-5999` + `-vnc-ports`/`vnc_ports`，`Probe`/`Install`/`HandleViewer` 三入口在 Upgrade 前判、端口 0 先归一再判、解析失败即启动失败）与**口令回显**（`/api/vnc/status` 只回 `has_password`，新增 `POST /api/vnc/password` 按需 + 留痕且不记口令，`/api/vnc/install` 补运维审计，前端 `Vnc.jsx` 跟着改成显式取一次）。新建 11 个用例（`internal/vnc/vnc_ports_test.go` 6（其中解析表含 9 个子用例） + `server/vnc_password_test.go` 5），顺带修掉 `public_ws_test.go` 的无锁轮询（`-race` 真报竞争）与 `publicWSHandler` 重复写 404。**状态由 🟡 改判 ✅（2026-09-20）**：原判"未做"的主机级授权随**单人使用、不做 RBAC** 的用户判定关闭（见 §10 判定段），"服务端参与 RFB 挑战校验"仍属可选加固 —— 见 (b)，它不是权限问题而是"口令在隧道里对服务端不可见"，单人模型下风险由端口闸门 + 只走托管链路承担 |
+| H-6 部署 SSH 主机密钥 | ✅ 完成 | 详见 §2「H-6 · 修复落地」。要点：`InsecureIgnoreHostKey()` 从仓库消失，`dial()` 改挂 `knownhosts` 回调（`<data>/ssh_known_hosts`，0600 只追加，`d.mu` 串行化）；TOFU 首次记账 + **变更硬失败**（错误里同时给记录指纹/实际指纹/删哪行）；表单可选 `host_key_fingerprint` 强制钉扎，被拒密钥不落账；数据目录缺失或记账文件读坏一律中止，**不提供忽略校验的开关**。审计三条路径都落 `主机密钥=<指纹>`（首次信任另标）。前端加指纹输入 + 主机密钥卡片，首次信任标黄要求去目标机 `ssh-keygen -lf` 比对。新建 `internal/agentdeploy/hostkey_test.go` 8 个用例，其中 `TestDialVerifiesHostKey` 起 in-process sshd **真走握手**证明接线（换掉记账密钥后再连必须失败，这一步在旧实现下必然通过）。build（三平台）/vet/test/`-race`/gofmt/`npm run build` 全绿。**残留**：首次相遇无带外核对、无查看/撤销入口（需 RBAC，归 P2 第 20 项 —— 该项已于 2026-09-20 随"单人使用"判定取消，残留关闭）、IP 与域名分开记账、未支持 SSH CA / `@cert-authority`、Rocky8 真机换密钥的拒绝路径未实测 |
+| H-8 公开 `node_id` 可离线命中 | ✅ 完成 | 详见 §2「H-8 · 修复落地」。要点：包级 `NodeID()` 删除，改为 `publicview.NodeKeys`（`<data>/node.key`，首次启动 `crypto/rand` 生成 32 字节、0600、tmp+rename，`main.go:585` 载入失败即 `log.Fatalf`）做 **HMAC-SHA256 取前 8 字节** → `n-` + 16 位 hex；反查从"内存映射表"改成逐台 `Match`（常数时间比较），不再留可外泄的对照表。三处 fail-loud：短密钥/损坏文件**报错而不是换一把**、`NewNodeKeys` 拒绝 <32 字节、`ID`/`Match` 对 nil 接收者 panic（静默退回固定盐 = 洞留在原地）。`BuildNode`/`BuildNodes` 签名收 `*NodeKeys`，漏接线过不了编译。密钥**刻意不进自动备份**（`backup.BackupFiles` 白名单）并在文档写明理由：备份外发 = 同时交出"主机名候选 + 派生规则"。前端/字段目录/deployment/README 的 `n-xxxxxxxx` 文案同步。**升级后既有 `/public/node/…` 链接全部 404**，不做双轨（双轨就是保留可枚举面），库内历史按 `agent_id` 存所以数据不丢。新建 `internal/publicview/nodekeys_test.go`（8）+ `server/public_nodekey_test.go`（3，打在实际匿名端点上：旧固定盐编号必须 404、密钥化编号 200 且不泄露 `agent_id`），`publicview_test.go`/`public_ws_test.go` 迁移到新签名。build（三平台）/vet/test/`-race`/gofmt/`npm run build` 全绿。**残留**：分享链接失效不可挽回、无后台查看/一键轮换（需 RBAC，归 P2 第 21 项 —— 该项已随"单人使用"判定取消，删 `<data>/node.key` 重启即整体更换）、samples 反查 O(在册主机数)、~~Windows 上 0600 无 ACL（随 H-9）~~ **2026-09-22 已随 H-9 关闭**（数据目录受保护 DACL，见 §2 该单元残留 (c) 的范围限定）、同一部署内编号仍永久稳定（本部署内的跨页跟踪未消）、真机"删钥匙重启"流程未验证 |
+| M-17 测试网凭据出库 | ✅ 完成（只清工作树） | 按用户决定**不重写历史**：`mocenter_design.txt:6-12` 删掉 `ftp://192.168.117.131` 的 `ftp/<口令>` 与 `192.168.117.132` 的 `root/<口令>`，改成"凭据不入仓库、口令须轮换"的说明；`vnctestreport.md:7-8` 去掉 `Administrator/<口令>`、`root/<口令>`，保留主机角色与 IP（排障需要）并注明"曾进历史，轮换后才失效"。**本行同样不复述口令明文**（理由见 §3 表内 M-17 行：报告自己是"任何仓库读者"的一员）。<br>**核验**：`git grep` 全 tracked 文件复扫那几个被删的字面值与 `ftp://`、`password[:=]` → 命中的只剩 README/deployment 里的**占位示例**（`--password='强口令'`）与 `mocenter_design.txt:10` 那条"曾经的默认账号 admin/<旧默认口令>"历史待办（描述的是上一轮已删掉的旧默认口令，不是现存活凭据）。<br>**残留（如实记录）**：(a) 历史里的明文仍在 `5fe9411`/`a5158cd` 两个提交，**只有轮换口令才算失效**，仓库若对外镜像需重新评估；(b) 本机被 gitignore 的 agent 记忆目录里另有同一份测试网凭据（`.codefree/memory/team/MEMORY.md:11`、`mocenter-test-vm-rocky.md:5,12`、`mocenter-test-vm.md`，`.workbuddy-ai/memory/2026-09-14.md` 含内网 IP）—— 不入库，但会把口令留在磁盘快照/备份里；轮换后这些记录自然失效，如需彻底清就删这几个文件。 |
+| M-1 凭据外流收敛 | ✅ 完成 | 详见 §3「M-1 · 修复落地」。要点：`/api/server-info`（`main.go:1738-1766`）不再读文件也不再下发 `agent_key`，只给指纹 + 路径；明文唯一出口是新端点 `POST /api/enroll/shared-key/rotate`（`enroll_api.go:165-218`，`guard()` + `confirm:true` + `no-store` + 审计只记 `指纹 旧→新`），底层 `RotateSharedKey`（`agentauth.go:187`）写 0600（tmp+rename）并**运行期立即生效**；备份侧 `fileSpec.ExplicitOnly`（`backup.go:68-73`、`:86`）让 `agent.key` **默认不进包**、`CreateWithOptions{IncludeSecrets:true}` 才带上，API 读 `include_secrets`（`backup_api.go:87-106`）；部署器的 `Options.AgentKey` 快照换成 `AgentKeyFunc`（`agentdeploy.go:76-80`、`main.go:704`），否则轮换后部署出去的仍是旧密钥（"部署成功但永远不上线"）。轮换改写 `v.key` 逼出的一处竞争：`Verify`/`KeyFingerprint`/`SharedKey` 统一走锁内 `sharedKeySnapshot()`（`agentauth.go:257`）。前端「Agent 接入」③ 段改指纹表 + 轮换按钮 + 一次性展示，「备份恢复」加"包含凭据文件"默认不勾。**残留**：密钥来自 `-agent-key`/配置/环境变量时重启会盖掉轮换（只告警不阻止，见 (a)）、`users.json`（TOTP 明文）仍在默认备份内 (b)、轮换是全局单因素动作无双人复核 (c)、旧密钥不吊销已签发证书 (d)、~~Windows 0600≠ACL（随 H-9）~~ **2026-09-22 已随 H-9 关闭**（`agent.key` 与凭据同处 `<data>`，安装时该目录已设受保护 DACL；手工起在自选目录的服务端除外，见 §2 H-9 残留 (c)）、未做真机端到端 |
+| M-2 审计结果脱敏 | ✅ 完成 | 详见 §3「M-2 · 修复落地」。要点：`Complete`（`router.go:513-514`）与 `completeByCommandID`（`:543-544`）在进锁前先 `MaskCommand(result)` —— 内存/`/api/audits`/SQLite 三个出口共用同一个已脱敏串；JSONL 目录 0700 + 文件 0600，并额外显式 `f.Chmod(0600)`（`:106-114`，因为 `OpenFile` 的权限位只在创建时生效，救回历史上以 0644 建过的文件），失败时打日志给手工指引。`-race` 复现并修掉两处**生产**竞争：`Audits()` 改为逐条拷值（`:577-587`，原来交出共享指针给 HTTP 序列化）、`Audit()` 的 SQLite 行改在持锁区间内构造（`:466-484`，原来协程锁外读 `Result/ExitCode/Duration` 而 `Complete` 正在锁内写）、`return l.ID` 取锁（`:505-507`）。测试 `internal/route/audit_mask_test.go` 7 例（三个出口各 1 + 权限 2，Windows 跳过）。**残留**：只挡新写入，库里历史明文行与 `importLegacyAudits`（`:129-176`）的原文补录未动（改写审计数据 + 破坏 `(Time, Command)` 去重，故意不做）、`MaskCommand` 认形态不认"裸一行秘密"、CSV 导出的公式注入转义另属 L-1 |
+| M-3 + M-18（页脚 XSS / CSP / Origin / query Token） | ✅ 完成 | 详见 §3「M-3 + M-18 · 修复落地」九条 + 残留六条。要点：页脚从"正则黑名单剥除"改成**白名单重建**（`siteBranding.js:212`，只有 20 个展示型标签与 `href/src/target/title/alt` 能进输出，`script/style/svg/template/noscript` 连内容一起丢，未闭合自动补、深度上限 48），协议判定先剥控制符再解实体（`&#106;avascript:`、`java\tscript:` 穿不过）；全站 **CSP**（`main.go:2875` + `cspHeader:2910`，`script-src 'self'` 无 `unsafe-inline`/`unsafe-eval`，例外逐条实测产物给依据）+ **`/api/*` 一律 `no-store`**（静态资源仍长缓存）；三条 WS 统一 `ws.SameOrigin`（新增 `origin.go:28`：缺 `Origin` 放行、主机名必等、端口只在两侧都显式时比对 —— 为的是 TLS 终止型反代不拍死），`?token=` 回退删除。**测试**：`check-footer-sanitize.mjs` 9 组（已接 `npm run check:footer` 与 CI `&web-ci`）+ `origin_test.go` 6 例 + 三处 upgrader 接线断言 + `security_headers_test.go` 3 例。三平台 build/vet/test 全绿、`-race` 四包绿、gofmt 干净。**浏览器实机验证**（本机临时数据目录 + 真 Agent，验完即删）：五处页面 0 条 CSP 违规、公开页活体载荷净化后 DOM 只剩良性标签、curl 探得跨站 403 / 同源 101 / query token 401、批量命令经收紧后的 `/ws` 完整往返并回填审计。**残留**：服务端不做第二份净化（偏离 §6 第 14 项原表述，理由与非浏览器消费者的代价见 (a)）、Origin 不比端口与协议 (b)、反代必须透传 `Host`（nginx 示例此前连 `/vnc-ws` 都没有，已补）(c)、`style-src unsafe-inline` 与 `connect-src ws:` 两个例外 (d)、真机 VNC 画面与旧前端混布未测 (e)、首条批量命令"有下发无回执"待复现 (f) |
+| M-6 + M-7 隧道帧归属 / 规则覆盖 | ✅ 完成（2026-09-21） | 详见 §3「M-6 + M-7 · 修复落地」。要点：`vnc`/`portmap` 五个投递与关闭入口全部收 `agentID` 形参并做归属判定，`main.go` 六处调用一律传**连接身份** `sessConn.GetAgentID()` 而不是报文自报字段（传 `td.AgentID` 等于让攻击者自己声明身份、判定形同虚设）；`vnc.probeWait` 的 `map[string]chan` 改成 `map[string]*probeWaiter{agentID, ch}` —— 探测等待表是五个入口里唯一"表结构本身没有主人"的地方；越权帧丢弃 + 按伪造方每分钟一条留痕（`logMismatch`/`mismatchAt` + 剪枝，避免检查本身成为刷日志面）。M-7 改 `CreateRule` 为「校验 → 取旧 → `StopRule` → `ServeRule`，失败则回滚 `ServeRule(prev)` 且不动 `m.rules`」，`EnableRule`/`DisableRule` 改写时复制（旧监听闭包持旧指针，就地改字段既改不到又竞争）。新建 `internal/vnc/vnc_tunnel_test.go`（5）+ `internal/portmap/portmap_test.go`（+4），三包 `-race` 全绿。**残留**：`tunnelID` 仍可猜（收的是跨身份投递，不是 ID 不可预测）、改一次端口映射会掉一次线（Stop→Serve 间该端口短暂不接受新连接，文档未写）、未做双 Agent 实机跨主机验证 |
+| M-4 注册路径采纳自报 UUID | ✅ 完成（2026-09-21） | 详见 §3「M-4 · 修复落地」。要点：新增 `Store.ResolveUUID(agentID, claimed)`（`internal/probe/store.go:215`）做 TOFU —— 首报值被认领并成为绑定值，此后一律返回绑定值，`conflict` 只标不改；`main.go:1512-1521` 在注册处**改写 `info.UUID` 本身**，使 `SetUUID`、`UpsertAgent` 建键、`ReplaceByUUID`、按 UUID 并档的设备历史四条下游都读不到攻击者选定的值；判据对齐同文件 `UpdateProbe` 早已确立的"报文 uuid 不参与"。冲突日志与设备名片段走 `logSafe`/`uuidSuffix` 净化（顺带覆盖 L-2 在注册路径的一处）。测试 `internal/probe/store_test.go:TestResolveUUIDIsFirstBound` + `agent_flow_test.go` 两例。**残留**：(a) "同 `agent_id`、硬件 UUID 真变了"现在要在后台删该主机记录后重连才认领（**刻意不做"自动跟随最新"**），日志给了双方值与处置口径；(b) 未削弱 `ReplaceByUUID` 的失活判定 —— 离线标记依赖顶替语义（`RemoveIfCurrent` 返回 false 那一支），不让顶替就会把重连设备误标离线；**的确剩切口**是"从未绑定过的全新 `agent_id` + 已知受害 UUID"仍可挤掉活跃会话（其 UUID 会被立刻改写、且注册要过 C-1 令牌/证书），彻底收口要把会话归属从 UUID 摘下来，属结构性改造；(c) 单人模型下这里挡的是脏数据而非跨操作员越权 |
+| `session.Conn.Write` 无 deadline（H-2 残留 (c)） | ✅ 完成（2026-09-21） | `internal/session/session.go:144-172`：新增 `agentWriteWait = 30s`，每次 `Encode` 前设 deadline（依据：64 KiB 分片级别的单次写在弱网下也远用不到）；`NetConn == nil` 明确返回错误而非 nil 解引用；**写失败即 `Close()`** —— 一帧 JSON 可能只写出去一半，留在流里的残帧会让 Agent 的按行解析永久错位，关掉让对端重连比留着一条"看着在线"的脏连接安全。全仓 `SetWriteDeadline` 从"vnc/ws/public 三处、Agent TCP 零命中"变成 TCP 侧也有。测试 `internal/session/session_test.go` +2（stubConn 断言 deadline 被设、写错误被传递且连接被关闭）。**残留**：30s 是单次写上限，不是速率上限；"写失败即关连接"会把一次弱网抖动变成一次重连，属刻意取舍 |
+| M-5 + M-8 Agent 侧资源放大 | ✅ 完成（2026-09-21） | 详见 §3「M-5 + M-8 · 修复落地」。M-5：新建 `server/agent_flow.go` 的 `agentRefresh`（`now()` 用于上线/离线这类必须立刻可见的状态跃迁，`soon()` 用于可合并的探针，`agentRefreshInterval = 2s`，窗口内变更挂**补偿定时器**否则最后一次变更会被永久吃掉；`now()` 会取消挂起的补偿广播）+ `main.go:623/:1600` 与 `heartbeatSweeper` 接线；`PkgFetchReq` 加 `pkgSlots` 信号量（`maxConcurrentPkgFetch = 2`，满时记日志明确拒绝而不是无限起协程）。**M-8**：`internal/filetransfer/filetransfer.go:36-46` 四道闸（64 个在途任务 / 单任务 256 MiB / 全部在途 512 MiB / 闲置 30min），`stored` 计数在收片时加、**落盘时按实际合并字节减**、回收时按 `received` 减（漏任一处闸门就会被正常用量吃满），`CleanupStale()` 挂进 `cleanupSweeper(pm, hub, ft)`，超限拒绝按每分钟一条限频（`shouldLogReject`）。测试 `agent_flow_test.go`（3）+ `filetransfer_test.go`（5：名额触顶 NACK 且不占位、声明大小直接拒、总量触顶单任务未超也拒、TTL 只收闲置项且额度精确释放、落盘后 `stored == 0`）。「`P2 / P3 全部 ⏸ 本轮不动」行的口径就此失效，本行为准。**残留**：分片仍全驻内存（只做到有界，流式落盘是独立重构）、配额是**全局**的（一台主机可占满 64 名额从而拒掉他人上传，危害从"打满内存"降为"占满配额"）、TTL 之后断点续传等于重头再来、`bufio.Scanner` 16 MiB 与"逐条消息速率限制"未做（理由见 §3 该单元残留 (d)） |
+| M-12 + M-13 + M-14 匿名访客面 | ✅ 完成（2026-09-21） | 详见 §3「M-12 + M-13 + M-14 · 修复落地」三小段。**M-12**：`LoginGuard.perPublic` 独立桶 + `AllowPublicRoute`（键为 `route` 拼 `ip`，`internal/auth/login_guard.go:64,119`，30/分/IP/路由，`pruneLocked` 逐条回收 + 4096 容量兜底），`publicSite.allow()` 改调它（`public_site.go:115`）；`Auth.rate` 补 `rateMapLimit`（`auth.go:45`）且回收触发点搬到 `AllowRequest`（`:263`、`pruneRateLocked:283`）—— 这是上一轮 M-8 定位到的"只在校验成功时 prune"。**M-13**：`Store.AllCached()`（`internal/probe/store.go:738`，与 `All()` 共用 `snapshot(lookupGeo)`），四条匿名读路径改用它们，出网只剩后台推送。**M-14**：`/api/public/enabled` 未启用即 404、品牌文案挪到常开的 `/api/branding`（`main.go:691`，前端独立 axios 实例避免带上 Token）、`siteCfg.SetOnChange` 接线（`main.go:694`）+ 关旧道/换新道后复核开关，在途匿名 WS 即刻结束。**新增 16 例**（auth 5 + probe 1 + `public_guard_test.go` 8 + `public_ws_test.go` 2），三平台 build/vet/test 全绿、`-race` 覆盖 `internal/auth`/`internal/probe`/`server` 主包三包绿、改动文件 gofmt 干净。**过程中顺带改掉一处漏事件竞态**：唤醒分支原先"先核对开关再换道"，停用正好落在两步之间时那次 close 打在旧通道上、连接已握住新通道 → 公开页关了访客还在看；现为"先换道再核对"，连接入口同样把 `subscribeCfgChange()` 放在读 `cfg` 之前（`public_site.go:320-334`、`:359-365`），并有用例覆盖第二次停用。**残留**：`publicRouteMax=30` 是拍的且反代后为全站共享（不信任 XFF 是刻意口径）、window 口径逐节点 SQL 与 samples 反查的 O(在册主机数) 未批量化、停用不主动 `close` 已建立的 socket（靠 handler 返回）、改一次配置会绕开 `agentRefresh` 的合并多播一次、`/api/branding` 常开意味着产品指纹未消 |
+| M-10 升级 TOCTOU + 可降级（含 H-5 的升级包那一半） | ✅ 完成（2026-09-21，第四批） | 详见 §3「M-9 + M-10（升级链）+ M-16」。**结构上消掉了两次读**：`fetchPackage`（`agent/internal/upgrade/upgrade.go:261`）`io.LimitReader` 一次读入内存，同一份字节既做 SHA-256 又验签，落盘（`writeVerified:328`，`O_CREATE\|O_EXCL\|0600`）写的还是这份字节并复核盘上摘要；旧的 `download()`/`fileSHA256()`/`copyFile()` 删除。**签名覆盖版本号**：`signatureDomain "MoCenter-Upgrade-v1\n"` + `signedMessage(target, content)`，与 `scripts/signpkg` 侧**成对测试**钉住字面量（跨模块无法共享常量）。**降级与 force 解绑**：新增 `agent/internal/version/compare.go`，`decideUpgrade:133` 同版本需 `force`、更低版本一律拒（除非新字段 `allow_downgrade`，协议两侧同步）。`Perform:151` 把顺序定成"有无公钥 → 降级 → URL → 摘要格式 → 签名格式 → 取包 → 验签 → 落盘复核 → 换入 → 重启"，无公钥时**零外呼**；取包只允许 https。**逃生门整个删除**：`Policy.AllowUnsigned`、`upgrade_allow_unsigned`、`-upgrade-allow-unsigned`、`agentdeploy.buildAgentConfig` 的写键四处一并清除，配套做成可用能力（`scripts/signpkg` 离线签名 + 服务端 `-upgrade-pubkey` 透传进部署配置），否则"删洞"的直接后果是一键部署的机器永远升级不动且不报错。服务端 `upgradeHandler`（`server/main.go:2536`）同口径拦一遍并**删掉"版本留空自动补服务端版本"**；`web/src/pages/Ops.jsx` 的升级表单原先只发 `md5`（在服务端早已是必填 sha256 之下必然失败），改为版本/https 地址/SHA-256/签名四必填 + 两个勾选。**测试**：`upgrade_test.go` 13 例、`version/compare_test.go` 3 例、`server/upgrade_api_test.go` 6 例（`net.Pipe` + 并发读者断言"拒发时一帧都没漏出"）、`agentdeploy_test.go` 断言配置里不得再现 `upgrade_allow_unsigned`、`signpkg/main_test.go` 3 例。**实机端到端已完成（2026-09-21/22，Rocky8 + 真 Agent 二进制）**：`nosig`/`httpurl` 在服务端写连接前被拒，`badsig`（签名末位改 1 位 hex）/`digestmismatch`（1.0.2 包配 1.0.0 摘要）/无公钥/降级未允许 四个负例由 **Agent** 拒且盘上摘要与 PID 均不变（`digestmismatch` 那条同时证明"先摘要后验签"），同版本无 `force` 报"已是最新版本"、带 `force` 真重装，`allow_downgrade=true` 才降级；`signpkg -verify` 离线用错版本号 → 签名校验失败，证明版本号进了签名消息。正例一个干净周期（1.0.4→1.0.5，https + 内部 CA 装成 trust anchor）：**升级前后 PID 55459 与 `NRestarts` 不变、`pgrep -cx` = 1、unit active、盘摘要等于签名包摘要、同一 PID 打印新版本号**。**复测撞出并修掉一个缺陷**：Linux 自重启原来在 goroutine 里现取 `os.Executable()`，而旧二进制已被改名删除 → 每次升级都 `fork/exec …mocenter-agent.bak: no such file or directory`，只靠 systemd `Restart=always` 恢复（5s 断档 + keepalive 在 unit 外另起实例）；现改为路径在换入前取 + Unix 侧 `syscall.Exec` 原地替换进程镜像（`restart_unix.go:16`），上面那条"PID 不变"就是它的验证；Windows 保持分离拉起（不能覆盖运行中的 exe）。逐条证据与残留见 §3「M-9 + M-10（升级链）+ M-16」的「实机复测」段。**残留**：见 §3 该单元 (c)(d)(f)(g)，以及 H-5 行的"未做的一半" |
+| M-9 Agent 侧文件读写无根目录 | ✅ 完成（2026-09-21，第四批） | 新建 `agent/internal/client/fileroots.go`：`guardPath:22` → `withinRoots:57` → `resolveRoot:99`/`resolvePath`/`contains:144`。绝对路径 + 无 NUL + 逐根比较，拒相对路径与 `..`；**对"最近存在的祖先"做 `EvalSymlinks`**（整条路径解链在文件尚不存在时 `ENOENT`，而分发目标通常正是新文件 —— 只解已存在的父目录再接尾部，否则闸门对"新建文件"整类放行）；**根未创建仍钉前缀**（默认沙箱 `<配置目录>/files` 首次分发前往往不存在，"根不存在当没根"等于第一写无限制）、根指向普通文件即拒。roots **只认本机配置/命令行**（`-file-roots` / `MOCENTER_FILE_ROOTS` / `file_roots`），协议里没有任何字段能扩充它，为空时 fail closed。读写双向：写入侧 `handleFilePush`（`client.go:869`）越界回 `rejected` ACK，读取侧 `handleFilePull`（`:943`）以 `FileSize: -1` 上报后终止、不送出字节。**测试** `fileroots_test.go` 10 例（含软链逃逸，不支持建链的平台跳过）。**实机复核（2026-09-22，Rocky8）**：默认沙箱解析为 `/etc/mocenter/files`（Agent 启动日志原样打印"文件读写根目录 …（用 -file-roots 扩大）"），越界写入被拒。**残留**：指令信封签名未做（§6 第 18 项后半句，理由见 §3 该单元残留 (a)）、Agent 仍以 root 执行任意命令（残留 (b)，属产品定义） |
+| M-16 部署脚本成组问题 | ✅ 完成（2026-09-21，第四批，含那个功能缺陷） | ①`scripts/gencerts/main.go` 的 `saveConfig` 改 0600 **并显式 `Chmod`**（`os.WriteFile` 的 mode 只在新建时生效，覆盖历史 0644 会原样留在原地）；②`mocenter-agent.service` 插值全改 `"${MOCENTER_*}"` + `NoNewPrivileges=yes`，**刻意不加** `PrivateTmp`（运维在 SSH 里看不到 Agent 写的 `/tmp` 文件、X11 socket 也在其中）与 `ProtectSystem`/`ProtectHome`/`ReadOnlyPaths`（要写 `/etc/mocenter`、要替换自身），理由写进单元注释；`mocenter-server.service` 同批引号化；③`mocenter-keepalive.sh` 整体重写：`set -eu`、**不再 `source` 配置**（原以 root 执行一份可改写的文件 = 本机任意用户提权入口），改 `conf_value` 逐键 `grep`/`cut`/`sed` 解析（容忍引号、空格、`\r`），`pgrep -f "$BIN"` → `pgrep -x "mocenter-${ROLE}"`（旧写法命中任何参数含该路径的进程、包括巡检脚本自己，症状是"以为有实例"而服务再也不被拉起 —— 静默失效），`-pkg-dir` 与单元同取写死值；④**server watchdog 功能缺陷**：`install_keepalive` 原对任何角色都拷 `mocenter-agent-watchdog.*` 却装到 server 的路径上，即"名字叫 server 的单元在看护 agent、server 自己没保活"，现按角色取模板 + 缺模板直接 `die`，并补 `scripts/deploy/mocenter-server-watchdog.{service,timer}`；⑤`--password=*** **`die`**，只留 `--password-file=<路径>` 与 `--password`（从 stdin 读一行）+ 环境变量，落盘仍是 0600 `initial-password`；`usage()` 从写死行号改按注释块分隔线取头。冒烟：`bash -n` / `sh -n` / `--help` / `--password=` 拒绝路径均通过。**残留**：(e) `.deb`/`.rpm` 不带 watchdog 单元（`stage_linux_pkg` 只装主服务，M-16 修的是脚本路径）、(i) **Windows 侧的口令入口没收**（`install-windows.bat:95` 的位置参数、`installer/main.go:68` 的 `-password`，两处生成的服务定义已不含明文，剩"执行那一刻同机进程列表可见"）、(h) ~~**Linux 侧未实机验证**~~ **已做完（2026-09-22 Rocky8 真 systemd）**：引号插值、`NoNewPrivileges`、per-role watchdog timer 触发、`kill` 后拉起且 `pgrep -x` 单实例、`set -eu` 无静默退出，逐项通过；这一轮复测同时暴露并修掉了 ④ 之外的两件事 —— 空插值变成"空 argv"顶掉默认值（`server/flags.go normalizeBlankFlags`）与 `pgrep -f` 在真机上的自匹配（旧写法必然误判"有实例"）。清单与结论见 §9 第 6 条 |
+| H-9 + M-11 Windows 本机提权链 | ✅ 完成（2026-09-22） | 详见 §2「H-9 + M-11 · 修复落地」（M-11 整条一并收口，§3 表内该行改标 ✅）。要点：**写入侧**新增 `installer/acl_windows.go` —— `hardenCredentialPath`（受保护 DACL：SYSTEM + Administrators + 当前用户，目录带 `OI\|CI`，用 `PROTECTED_DACL_SECURITY_INFORMATION` 断继承）+ `hardenTree`（旧安装留下的宽授权文件逐个补紧，因为 `SetNamedSecurityInfo` 不追溯修改既有子项）；数据目录在写任何凭据**之前**先收紧。**口令**：安装器改产 `pbkdf2$sha256$120000$…`（新增 `installer/password.go`）；与服务端不能互相 import，于是**用同一组 CPython 生成的已知答案向量做跨模块成对测试**（服务端侧还断言"迭代数被改动就直接报错并提示同步安装器"）。**保活**：`checkSystemTaskPaths` 在 `schtasks /Create /RU SYSTEM /RL HIGHEST` 前对**被守护 exe + `mocenter-deploy.exe` + 配置文件**三处求值 DACL，命中宽泛/陌生可写主体即**拒注册**并回一条 `icacls` 整改命令；`runKeepAlive` 每次拉起前再判一次（防注册后 ACL 漂移），两道都 fail-closed。**M-11**：`ultravnc.ini` 0644 → 0600 + 受保护 DACL（`agent/internal/command/acl_windows.go`，跨模块的刻意重复实现）；`rand.Read` 失败回退静态 `"mocenter"` 整条删除（Go 1.24+ 熵故障直接终止进程，那条分支既不可达、其后果又比 panic 严重）。**日志脱敏**：`logFailure` 的 `mocenter-deploy.log` 0600 + DACL，内容改走 `redactedArgs`（`-agent-key`/`-password`/`-extra`，覆盖 `-f v`/`-f=v`/`--f=v` 三种形态，`-password-file` 的路径保留）。**测试**：`installer/acl_windows_test.go` 6 例（走真 Win32 API；含"只读 ACE 不误报""读不到 ACL 也拒注册""真机默认路径判为安全"三条反向用例）+ `main_test.go` 脱敏表 + `password_test.go` KAT + `install_test.go` 改为**从落盘的盐重算摘要**逐位比对。`installer`/`agent/internal/command`/`server/internal/auth` 三包与 agent+server 全量套件绿，`GOOS=linux`/`GOOS=windows` 交叉编译通过。**两处偏离原表述**（DACL 保留当前用户 SID；命中时拒注册而非擅改用户自选目录的 ACL）与**残留**见 §2 该单元 (a)–(h)，其中最重要的一条是**没跑过真机 Windows 安装**（Win10 测试机未开机），三件待验事项已并进 §9 第 1 条 |
+| H-5 发布物签名 | 🟡 升级包那一半已完成（2026-09-21，第四批） | 已落地：逃生门删除 + 升级包强制 Ed25519（签名含版本号）+ 离线工具 `scripts/signpkg` + 服务端 `-upgrade-pubkey` 随一键部署写进 Agent 配置，详见上一 M-10 行与 §1 H-5。**未做**：`.deb`/`.rpm` 包签名、`.exe` Authenticode、公钥随安装介质内置、私钥托管与轮换流程（§3 残留 (f)）—— 四件都需要构建链之外的东西（签名证书与密钥托管），非本轮代码可收口 |
+| M-15 / Docker 部署文档 | ✅ 订正完成（2026-09-20，**判为不适用 + 撤文档**） | 见 §6 第 21 项的四条：`docs/deployment.md` 删掉"方式一：基于 Docker 容器化部署"整节并把方式二/三上移、`README.md` 删掉"容器化部署"小节 + 改架构图与两处表格标注、`server/Dockerfile` **按用户决定保留不删**只在文件头写清"不是交付形态"+ 把它自身那处 argv 口令缺陷如实记在注释里。顺带修掉一处自相矛盾：deployment 的方式一示例原本写 `-password your-password`，而服务端 `-password` 的帮助文本（`server/main.go:82`）自己就标着"不推荐"，已改 `-password-file` + `install -d -m 700`。纯文档与注释改动，无代码路径变化，故未重跑 Go/前端测试套件 |
+| L-8 CI 真正把关 | ✅ 完成（digest 钉扎除外） | `.cnb.yml` 重写：<br>① **`go test` 接进 push**：删掉那个从未被引用的 `&x-build-go` 死锚点，改成 `&go-check`（`go vet` + 三模块 `go test ./...` + `GOOS=linux/windows` 交叉编译与 Windows 侧 `go vet`），**push 与 pull_request 两处用同一个别名引用**（`script: *go-check`）——"写了个没人调的锚点"和"写了个假测试阶段"是同一类问题，所以这次让锚点真的被引用。<br>② **不再吞失败**：`precompress-web.sh` 的两处 `|| true` 去掉，并补两条产物断言（`dist/index.html` 存在、`dist/assets/*.gz` 非空）。顺带查出：`build-go` 作业里那个 web stage 的路径写的是 `bash scripts/deploy/precompress-web.sh web/dist`，而它当时已在 `web/` 目录里 —— 目标路径是 `web/web/dist`，**这一步在旧 CI 里必然失败、又被 `|| true` 吞掉**，即预压缩从未在 CI 生效过。<br>③ **`npm ci` 单一入口**：`|| npm install` 的回退删掉（它会在锁文件与 registry 不一致时装出未钉扎的依赖树），两处 web 作业统一到 `&web-ci`。<br>④ **假 lint 阶段换成真自检**：`cd web && echo "web build & assets generated"` 一句空话，换成仓库里已有但从未进 CI 的 `npm run check:vnc` + `npm run check:flag`（都是无浏览器的 node 自检）。接这里时发现 `check-flag-sprite.mjs:23` 用绝对路径直接 `import()`，在 Windows 上抛 `ERR_UNSUPPORTED_ESM_URL_SCHEME`（`Received protocol 'd:'`）—— 即这条自检**在开发机上根本跑不了**，已改 `pathToFileURL(...).href`，两台平台都通。<br>⑤ **`.deb` 从未产出过的真缺陷**：`package-linux` 原来把二进制建到 `agent/mocenter-agent`，而 `scripts/build-linux-all.sh --binary=0` 的打包输入只认 `build/bin/agent/linux/mocenter-agent-<arch>`（`bin="$OUT/bin/$role/linux/mocenter-${role}-${arch}"`，`:719`）→ 命中 `warn "缺少二进制…"` + `failed=1`，而该函数最终**仍返回 0**，于是旧流水线一路绿灯却从没出过 `.deb`。现在按正确布局产出、缺 `dpkg-deb` 先装再跑（不再 `|| echo` 放过）、最后 `ls build/packages/deb/*.deb` 硬断言。<br>⑥ **扫描常态化**（§5.2/§9.5 的流程缺口）：新增 `security-scan` PR 作业 —— `govulncheck ./...` 跑 server/agent/installer 三个模块（可达性判定，故直接判红），以及 `npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org`（显式官方源，因为 npmmirror 不提供 audit 接口）。<br>**本地验证**：9 个 stage 的脚本片段全部过 `bash -n` 与 `sh -n`（CNB 用 dash 执行，POSIX 兼容这条本仓踩过）；`&go-check` 与 `&web-ci` 两段在本机端到端实跑通过（server/agent/installer vet+test 全绿 + 交叉编译 OK；web 自检 + 构建 + 预压缩 8 个 `.gz`/8 个 `.br`）；`npm ci --dry-run` 成功退出，证明锁文件与 `package.json` 一致（否则新 CI 第一步就会红）。<br>**残留（如实记录）**：(a) **CI 里这次是这套测试第一次在 Linux 上真跑** —— 本机无 Docker/WSL，无法提前在 Linux 执行；已逐条核查 OS 相关断言（`pki_test.go:29` 的 0600 只在非 Windows 判、`command_test.go` 的 shell/超时用例按 `runtime.GOOS` 分支、`interactive_echo_test.go` 与 `_windows_test.go` 有构建标签隔离），仍不排除首跑出现 Linux 专属红用例，出现即按真实缺陷处理；(b) 镜像按 digest 钉扎**未做**（需先把 `golang:1.26`/`node:20`/`debian:bookworm-slim` 的 digest 落进配置并建立更新流程，归 P3）；(c) `build-linux-all.sh` 打包阶段"缺输入只 warn 且返回 0"这个 fail-open 契约本身没动（改它会影响本地手工出包的用法），当前由 CI 的产物断言兜住。 |
+| P2 / P3 全部 | 🟡 只剩 L 系列（2026-09-22 更新） | **§10.1 C 的四批已全部完成**：M-6 / M-4 / M-7 / 写 deadline（第一批）+ M-5 / M-8（第二批）+ M-12 / M-13 / M-14（第三批，匿名访客面）+ **M-10 / M-9 / M-16 / 删 `AllowUnsigned`（第四批，供应链与本机面）**，见上方各行与 §3 对应单元；**H-9 + M-11 已于 2026-09-22 完成**（上一行）。**P2/P3 现在只剩**：**L 系列 + 构建镜像 digest 钉扎**（L-8 剩余项），以及 **H-5 的那一半**（`.deb`/`.rpm`/`.exe` 签名，需要构建链之外的证书与密钥托管，非代码可收口）。**2026-09-20 补**：RBAC 一项取消，其余未修项逐条按当前代码复核过，见下方 §10.1 |
+
+### 10.1　未修项的现状复核与单人模型重排（2026-09-20）
+
+下面每条都是**当时（2026-09-20）实读代码**得到的行号（不是沿用 §2/§3 写作时的描述）。结论先说：P0/P1 之外**没有任何一条被顺手动过**，唯一的例外是 M-12 因为 H-4 加了容量上限而顺带得到一半兜底。
+**2026-09-21 更新**：本节的"仍开放"结论对 A 表**已失效**的部分为：前六行（M-6 / M-4 / M-7 / 写 deadline / M-5 / M-8 已修）、M-12 / M-13 / M-14 三行（第三批）、**M-9 / M-10 / M-16 三行与 H-5 行的一半**（第四批）。这些行均已改标 ✅/🟡，原"证据"列保留并标为「修复前」，作为修复前的定位依据不再代表现状。~~A 表仍未动的只有 H-9 + M-11 与 L-1/L-2/L-9 行。~~　**2026-09-22 再更新**：**H-9 + M-11 行亦已修完并改标 ✅**（见该行与 §2「H-9 + M-11 · 修复落地」），A 表现在只剩 **L-1 / L-2 剩余三处 / L-9 / L-10 + 镜像 digest 钉扎** 那一行。
+
+**A. 与"几人使用"无关，仍然有效（按建议施工顺序）**
+
+| 项 | 现状 | 今天的证据 |
+|----|------|-----------|
+| M-6 隧道帧不比对连接身份 | ✅ 已修（2026-09-21，见 §3「M-6 + M-7」与 §10 同名单元） | 以下为**修复前**的定位依据：`main.go:1642/1644` 调 `DeliverTunnelData(td.TunnelID, …)` 时不传身份；`vnc.go:374-379` 查 `m.viewer[tunnelID]`、`portmap.go:451-455` 查 `m.pub[tunnelID]`；`viewerConn.agentID`（`vnc.go:73`）、`publicTrack.agentID`（`portmap.go:59`）**字段存在但不参与判定**。**单人模型下这是最该修的一条**：没有"别的操作员"不等于没有"别的主机" —— 一台被拿下的 Agent 可以把帧投进另一台主机的 RFB 流，`v-<unixnano>-<seq>` 形态的 ID 可猜 |
+| M-4 注册路径采纳自报 UUID | ✅ 已修（2026-09-21，`Store.ResolveUUID` TOFU 绑定） | **修复前**：`main.go:1475` `sessConn.SetUUID(info.UUID)` → `store.UpsertAgent`（`probe/store.go:206-245`）以自报值建键，`session.go:222 ReplaceByUUID` 用顶掉他人会话；对照 `UpdateProbe`（`store.go:440`）仍只在设备无 UUID 时补齐 —— **同仓两套语义，注册侧绕过了自己的控制**。残留的"全新 `agent_id` + 已知受害 UUID 仍可挤掉活跃会话"见 §3 M-4 残留 (b) |
+| M-7 端口映射规则覆盖 | ✅ 已修（2026-09-21，改前先 `StopRule` + 失败回滚 + 写时复制） | **修复前**：`CreateRule` 先换 map（`portmap.go:247-249`）再 `ServeRule`，全程不调 `StopRule`；`Listen` 失败只返回错误（`:342-344`）而调用方只 `log.Printf`（`main.go:3368-3370`），旧监听闭包持旧 `*Rule` 按旧 `SourceIP` 放行（`:360,383`）。**"API 显示新白名单、实际仍对全网开放"是自己骗自己的一类**，与是否多人无关 |
+| `session.Conn.Write` 无 deadline | ✅ 已修（2026-09-21，`agentWriteWait = 30s` + 写失败即关闭） | **修复前**：`session.go:145-153` 裸写；全仓 `SetWriteDeadline` 只有 vnc / ws / public 三处命中，**Agent TCP 侧零命中**（H-2 残留 (c) 原样） |
+| M-5 Agent 读循环无限速 + 全量广播 | ✅ 已修（2026-09-21，广播合并 2s 窗口 + 安装包流并发上限；**逐条速率限制经判断不做**） | **修复前**：`main.go:1517` `for sc.Scan()` 无速率控制（全 server 无 `time/rate` 引用）；每条 `ProbeDataReq` → `broadcastAgents`（`main.go:1548` → `:1714-1731`）= `hub.Broadcast(store.All())` + `BroadcastPublic`，无合并无节流。不做逐条限速的依据见 §3「M-5 + M-8」残留 (d) |
+| M-8 文件分发无 TTL / 无上限 | ✅ 已修（2026-09-21，条目/单任务/总量/TTL 四道闸 + `cleanupSweeper` 接线；分片仍驻内存） | **修复前**：`filetransfer.go:121,146` 按自报 `AgentID+FilePath` 建条目（路径已净化，条目数无界）；`:144,161` 分片全驻 `chunks map[int][]byte`，只在组装完成时 `:200` 删除；无 TTL、无未完成清扫、无总字节上限 |
+| M-10 升级 TOCTOU + 可降级 | ✅ 已修（2026-09-21，第四批：单次读入同时摘要与验签 + 签名含版本号 + 版本比较与降级闸门） | 以下为**修复前**的定位依据：`upgrade.go:143` 用 `fileSHA256(tmpPath)` 流式读一次，`:152` 又 `os.ReadFile(tmpPath)` **独立读第二次**再验签 —— 两次读之间可被替换；签名字段是纯 content，`req.Version` 不进签名；`:84` 只做 `req.Version == Version() && !req.Force` 等值判断，无语义化比较、**无降级拒绝**。逐条落地见 §3「M-9 + M-10（升级链）+ M-16」与 §10 同名行 |
+| M-9 Agent 侧文件读写无根目录限制 | ✅ 已修（2026-09-21，第四批：`fileroots.go` 的绝对路径 + 最近存在祖先解链 + 只认本机 roots） | **修复前**：`agent/internal/client/client.go:891` `os.MkdirAll(filepath.Dir(req.FilePath), 0755)`、`:896` `os.Create(req.FilePath)`、`:928` `os.Open(req.FilePath)` 直接接受下发路径。报告点名的 `sanitizeComponent`/`within` 其实只在 `server/internal/filetransfer/filetransfer.go:70,95` 钉**服务端暂存目录**，与 Agent 侧写文件是两回事 —— 这条复核纠正了 §3 里容易读混的地方。**残留**：指令信封签名不做（§3 该单元残留 (a)）、Agent 仍以 root 执行任意命令（残留 (b)，产品定义如此） |
+| M-12 限流分桶 / map 回收 | ✅ 已修（2026-09-21，公开端点独立 `(route, ip)` 桶 + `rate` 表容量兜底且回收搬到入口） | **修复前**：好的一半已在（`login_guard.go` 每次 `Allow` 内 `pruneLocked`、双表 4096 上限由 H-4 引入）；仍缺的是 `perIP` 只按 IP 计、`"public:"+route` 只进了 fails 退避键，公开页与登录共享 20/分/IP 桶，以及 `auth.go` 的 `rate` 无容量上限、`pruneLocked` 只在 `ValidateToken` 成功时跑。落地与"为什么另起一桶而不是调大数字"见 §3「M-12 + M-13 + M-14」 |
+| M-13 匿名请求触发外呼 GeoIP | ✅ 已修（2026-09-21，`Store.AllCached()` 只读快照；window 口径逐节点 SQL 未批量化，见残留 (b)） | **修复前**：`public_site.go:375` `visibleNodes` → `store.All()`，缓存未命中即起 `LookupAsync`（`probe/store.go:714-723`）。现在四条匿名读路径一律 `AllCached()`，判据（"调用链上是否有鉴权"）写在 `AllCached` 的注释里 |
+| M-14 公开页开关不干净 | ✅ 已修（2026-09-21，`/api/public/enabled` 闸门 + 品牌文案独立 + `SetOnChange` 接线断连） | **修复前**：`/api/public/enabled` 不查 `requireEnabled` 且顺带回 `site_title`/`site_footer`（`host_ids`/`fields` 确已不返回）；`siteconfig.go` 的 `SetOnChange` 在 `main.go` **零接线**；公开 WS 只在握手时查开关，停用后既有连接永不断开。落地含一处由此暴露出的**漏事件竞态**（先核对再换道），见 §3 同名单元与 §10 同名行 |
+| H-5 发布物签名 | 🟡 升级包那一半已完成（2026-09-21，第四批） | **修复前**（下列四条已消失）：`agent/main.go` 的 `-upgrade-allow-unsigned`、`upgrade/upgrade.go` 的 `Policy.AllowUnsigned`（且联动放行 http 下载）、配置键 `upgrade_allow_unsigned`、`agentdeploy.buildAgentConfig` 写该键 —— 四处一并删除，升级包强制 Ed25519 且签名覆盖版本号。**仍开着的**：全仓 `debsign\|rpmsign\|signtool\|Authenticode` 依然零命中（`.deb`/`.rpm` 无包签名、`.exe` 无 Authenticode、公钥不随安装介质内置、私钥无托管与轮换流程）—— 这四件要的是构建链之外的证书与密钥托管，不是这段代码能自己收口的。自用场景的"最低配"（删逃生口 + 强制验签）已经落地 |
+| M-16 部署脚本成组问题 | ✅ 已修（2026-09-21，第四批，全子项 + server watchdog 功能缺陷） | **修复前**：`scripts/gencerts/main.go:223` 以 **0644** 写含 `agent_key` 的配置；`mocenter-agent.service` 无沙箱且未引号插值 `${MOCENTER_*}`；`mocenter-keepalive.sh` 仅 `set -u`、`pgrep -f "$BIN"`、以 root `source "$CONF"`；`install-linux.sh` 文档化 `--password=*** `--role=server` 装 **agent** 的 watchdog 模板（"名字叫 server 的单元在看护 agent，而 server 自己根本没有保活"）。五条逐条落地见 §3「M-9 + M-10（升级链）+ M-16」与 §10 同名行。**残留**：`.deb`/`.rpm` 不带 watchdog 单元（残留 (e)）、Windows 侧口令仍可作为命令行参数传入（残留 (i)，服务定义已无明文）、~~Linux 侧未实机验证（残留 (h)）~~ **已于 2026-09-22 在 Rocky8 真 systemd 下逐项复测通过，并撞出"空插值→空 argv"与 `pgrep -f` 自匹配两处需要修的地方**（见 §9 第 6 条与 §3「实机复测」段）、刻意不上的沙箱项理由写在单元注释里 |
+| M-15 Docker 口令形态 | ⛔ 不适用（2026-09-20 用户判定**不发 Docker**）→ **文档订正已完成** | 事实仍成立但威胁模型消失：`server/Dockerfile` 的 `ENTRYPOINT` 仍 `sh -c` 拼 `-password "$MOCENTER_PASSWORD"`、无 `USER`、基础镜像未按 digest 钉扎 —— 既然不发布容器形态，这些代码路径不会运行，"宿主其他用户 `ps -ef` 读口令"这条也没有承载者。**真正有效的另一半是"文档在教一种不受支持的部署方式"**（原 `README.md:160-172` 的 `docker run -e MOCENTER_PASSWORD='强口令'` 与 `docs/deployment.md:15-42` 整节），已随本轮撤掉；`server/Dockerfile` 按用户决定**保留不删**，只在头部写清它不是交付形态。逐条落点见 §6 第 21 项 |
+| H-9 + M-11 Windows 本机面 | ✅ 已修（2026-09-22，受保护 DACL + 安装器产 PBKDF2 + 注册前可写性闸门 + `ultravnc.ini` 收紧 + 删静态回退口令，见 §2「H-9 + M-11 · 修复落地」与 §10 同名行） | 以下为**修复前**的定位依据：`installer/install.go:142,294,340` 只设 0600（Windows 无 ACL 语义，全仓 `icacls\|SetNamedSecurityInfo` 零命中）；`:327` 仍写单轮无盐 SHA-256（`:305` 注释自认"依赖服务端登录后透明升级为 PBKDF2"）；`keepalive_windows.go:68-88` 以 `/RU SYSTEM /RL HIGHEST` 注册前不校验 `exePath`/`self` 的 ACL；`command/vncinstall_ultravnc_windows.go:407` 仍 `os.WriteFile(ultravnc.ini, 0644)`；`command/vncpassword.go:39-41` 仍在 `rand.Read` 失败时回退静态口令 `"mocenter"`。**判据要按机器归属拆**：若被管 Windows 机都是你独占的，ACL 那三条权重降到低；但 `ultravnc.ini` 0644 与静态口令回退属"弱凭据"而非"提权"，任何归属下都该修　**→ 修复时按这两半分别收口，没有只挑权重高的一半做**：ACL 三条走"受保护 DACL + `hardenTree` + 注册前闸门"，弱凭据两条走"0600 + DACL"与"整条删掉回退分支"；`ultravnc.ini` 的收紧即便在独占机器上也照做，因为它挡的还有"同机一个服务账户/其他登录用户读到 SYSTEM 桌面口令"。残留 (h) 那一句仍然成立：熵与"读到即还原"由 DES 决定，本轮改不了 |
+| L-1 / L-2 / L-9 / L-10 + 镜像 digest | 仍开放（**L-2 在注册路径上已顺带收掉一处**） | `main.go:2392-2400` `writeAuditCSV` 直接 `csv.NewWriter` 写 `Operator/AgentID/Command/Result`，无 `= + - @` 前缀转义（结果来自 Agent，单人打开自己导出的 CSV 一样会执行）；~~`main.go:1475,1497,1501` `info.UUID`~~ **已净化**（2026-09-21 随 M-4：注册路径的 UUID 与冲突日志走 `logSafe`/`uuidSuffix`，`main.go:944/973`），仍原样进 `log.Printf` 的是 `:1674` 的 `ur.Message` 与 `:1686/:1690` 的 `tr.Message`、`:1708` 的 `tc.Reason`；`installer/setup.iss:203` 注册密钥输入框明文回显、`:273` 口令下限仍 `< 6`、`:178` `-extra` 仍在；`scripts/lib/common.sh:171` `mc_clean(){ rm -rf "$@"; }` 不防空值/相对路径；`.cnb.yml:62,82,108,117,197` 的 `golang:1.26`/`node:20` 无 `@sha256:` |
+
+**B. 随"单人使用、不做 RBAC"判定关闭（不再算欠账）**：H-3 主机级授权、H-1 残留 (c) 的 `FileTransferState`/端口映射全量广播（`main.go:1598,1611,3336,3340,3346,1704` 仍走 `hub.Broadcast`，`BroadcastToSession` 只用于 `CommandResp`/`InteractiveOut` —— 单人下这是**符合预期的产品语义**而非泄露）、M-1 残留 (c) 的双人复核、H-6 known_hosts 后台撤销、H-8 `node.key` 后台轮换。
+
+**C. 建议的下一步（如果你还想继续做）**：A 表内部按"能否被非你本人的东西利用"排序 —— ~~**第一批** M-6 / M-4 / M-7 / 写 deadline（都在服务端内部，改动局部，且都属于"一台 Agent 被拿下就能影响别的主机"）；**第二批** M-5 + M-8（资源放大）；**第三批** M-12 / M-13 / M-14（匿名访客面）；**第四批** M-10 + 删 `AllowUnsigned` + M-16（含 server watchdog 那个功能 bug）+ M-9~~　✅ **四批均已于 2026-09-21 完成**，逐条落地与残留见 §3「M-6 + M-7」「M-4」「`session.Conn.Write` 无 deadline」「M-5 + M-8」「M-12 + M-13 + M-14」「M-9 + M-10（升级链）+ M-16」六个单元与 §10 对应行。第四批里**只剩一项刻意不做**：指令信封签名 —— 该通道已有 mutual-TLS + 注册期 HMAC，信封签名只能防"服务端本身沦陷"，而那种攻击者本就能让 Agent 执行任意命令（命令执行是产品功能），理由与真正的收口位置见 §3 该单元残留 (a)(b)。~~**A 表现在唯一整块未动的**是 H-9 + M-11（Windows 本机面：ACL、单轮 SHA-256、`ultravnc.ini` 0644、静态回退口令）~~　**已做完（2026-09-22）**：H-9 + M-11 五个子项 + 失败日志脱敏全部落地，见 §2「H-9 + M-11 · 修复落地」。**A 表现在只剩** LOW 项 + 构建镜像 digest 钉扎（L-1、L-2 的三处未净化日志、L-9、L-10、`golang:1.26`/`node:20` 未钉 digest），以及需要构建链之外证书的 **H-5 另一半**。**已消掉的前提**：M-15 随"不发 Docker"判为不适用，剩下的只是把文档里那套不受支持的部署说明撤下来（§6 第 21 项）—— 该项文档订正也已于 2026-09-20 完成。
+
+**进度口径小结（2026-09-22 H-9+M-11 后更新）**：P0 7/7 ✅；P1 7/7 ✅（H-3 经判定改判完成）；P2 6 项 → RBAC 一项取消，**§10.1 C 的四批（M-4/M-5/M-6/M-7/M-8 + 写 deadline + M-12/M-13/M-14 + M-9/M-10/删 `AllowUnsigned`）已于 2026-09-21 全部完成**，故 P2 第 17、18、19 三项整体关闭（第 18 项含"信封签名不做"的偏离说明，见 §3「M-9 + M-10（升级链）+ M-16」残留 (a)）；~~P2 只剩 **第 15 项 H-5 的一半**（`.deb`/`.rpm`/`.exe` 签名与私钥轮换，需构建链之外的证书）与 **第 16 项 H-9+M-11**~~　**第 16 项已于 2026-09-22 完成**（§2「H-9 + M-11 · 修复落地」），P2 只剩第 15 项那一半（**唯一无法靠本仓代码收口的待办**：四件事都要签名证书与密钥托管）；P3 3 项 → M-15 判不适用（文档订正已完成）、**M-16 已完成**，实际待做只剩 **L 系列收尾**（含构建镜像 digest 钉扎）；LOW 项本轮动过 **L-2 的一处**（注册路径的 UUID/冲突日志净化，随 M-4），其余 LOW 未复核判定为未动。**本轮之后的高权重剩余**：真机 Windows 安装复测（§9 第 1 条三件事）与 §10.1 C 剩下的 L 系列。
+
+验证基线：`server/` 全量 `go build ./... && go vet ./... && go test ./...` 在 Windows 下**全绿**（含本轮修掉的 3 个 Windows 专属红用例：`geo` 的 MMDB 句柄未关导致 TempDir 清理失败、`agentauth` 与 `tlsutil` 的 POSIX 位假设）。
+`agent/` 侧同口径：`go build`（windows + linux 交叉）+ `GOOS=windows go vet` + `go test ./...` 全绿，Windows 专属文件另用 `GOOS=windows go test -c` 确认测试可编译。
+M-1/M-2 收口时的口径（2026-09-20）：`server/` 三平台 `go build`（native + `GOOS=linux` + `GOOS=windows`）、`go vet`、`go test ./... -count=1` 全绿，**`go test -race ./...` 全模块 21 个包全绿**（本条曾因 `internal/route` 的两处生产竞争判红，见 §3 M-2），`gofmt` 对本轮改动文件干净（仓库里 `internal/auth`、`internal/portmap`、`internal/filetransfer`、`internal/remark`、`internal/session` 若干**未触碰**文件与 agent 侧 8 个文件仍带既有格式漂移，属 `core.autocrlf` 与旧格式遗留，不在本轮范围），`web/` `npm run build` 通过。
+M-4/M-5/M-6/M-7/M-8 + 写 deadline 收口时的口径（2026-09-21）：`server/` 三平台 `go build`（native + `GOOS=linux` + `GOOS=darwin`）、`go vet`、`go test ./... -count=1` 全绿；`agent/` 同口径（native + linux + darwin，`go vet`、`go test ./...` 全绿）；`go test -race` 覆盖本轮全部改动包（`internal/vnc`、`internal/portmap`、`internal/session`、`internal/probe`、`internal/filetransfer`、`server` 主包）均绿。**格式**：本轮触及的文件逐个用 `tr -d '\r'` 拷出 LF 副本跑 `gofmt -l` 复核，命中的 5 个（`internal/filetransfer/{filetransfer,filetransfer_test}.go`、`internal/portmap/{portmap,portmap_test}.go`、`internal/session/session_test.go`）**逐条与 `git show HEAD:` 的同文件比对后确认为既有漂移**（struct 字段对齐与文件末无换行，HEAD 版本同样命中），且 CI 里没有 `gofmt` 这道闸（`.cnb.yml` 只有 `go vet`/`go test`/交叉编译），故未顺手重排 —— 那会把六条修复的 diff 淹在格式噪声里。仓库内 `internal/auth`、`internal/remark` 等未触碰文件的同类漂移保持原样。本轮**未跑** `web/`（无前端改动）与 `npm run build`。
+M-12/M-13/M-14 收口时的口径（2026-09-21）：`server/` 三平台 `go build`（native + `GOOS=linux` + `GOOS=darwin`）、`go vet ./...`、`go test ./... -count=1` 全绿；`agent/` 侧 native + linux 构建通过（本批无 Agent 改动，构建只为守住同仓基线）；`go test -race` 覆盖 `internal/auth`、`internal/probe`、`server` 主包三处均绿；**本批改了前端**（`web/src/api/api.js` 拆出 `brandingApi` 独立实例、`App.jsx` 注释），`npm run build` 通过（169 modules，无告警新增）。**格式**：本批触及的 8 个 Go 文件（`internal/auth/{auth,login_guard,hardening_test}.go`、`internal/probe/{store,store_test}.go`、`public_site.go`、`public_guard_test.go`、`public_ws_test.go`）在 LF 副本上 `gofmt -l` **全部干净**；其中 `login_guard.go` 与 `hardening_test.go` 曾在上一轮遗留两处**由本轮改动引入**的对齐/表达式空格漂移（与 `git show HEAD:` 比对确认为新引入，非既有漂移），已 `gofmt -w` 归零 —— 这两个文件在 HEAD 是 gofmt 干净的，属于"必须保持干净"的那一类，不适用上一段"既有漂移不动"的口径。`main.go` 的既有漂移照旧不重排。
+M-3/M-18 收口时的口径（2026-09-20）：同上三平台 build/vet/test 全绿，`-race` 覆盖 `server`、`internal/ws`、`internal/vnc`、`internal/route` 四包；`web/` 侧新增 `npm run check:footer`（页脚白名单重建 9 组断言，无浏览器）并接进 CI `&web-ci`；改动文件 gofmt 干净。此外做了**浏览器实机走查**：登录页/公开页/管理页/终端/VNC 五处 0 条 CSP 违规，注入载荷在 DOM 里只剩良性标签，curl 复验跨站 Origin 403、同源 101、`/ws?token=` 401。
+M-9/M-10/M-16 + 删 `AllowUnsigned` 收口时的口径（2026-09-21，第四批）：`agent/` 侧 `go build`（native + `GOOS=linux` + `GOOS=darwin`）+ `go vet` + `go test ./... -count=1` 全绿，`go test -race` 覆盖本轮改动包（`internal/upgrade`、`internal/version`、`internal/client`）均绿；`server/` 侧三平台构建（native + linux + darwin，installer 亦单独 `go build` 通过）、`go vet`、全量 `go test` 绿、`-race ./...` 全模块绿（`server/upgrade_api_test.go` 是本轮从"卡 30s 后 `write pipe: i/o timeout`"改造成 `net.Pipe` + 并发读者的，见 §10 M-10 行的测试段）；`scripts/signpkg`、`scripts/gencerts` 各自 `go vet` + `go build` + 测试通过（这两个模块**不在 CI 闸门内**，`.cnb.yml` 只覆盖 server/agent/installer，故必须手工跑）。**前端**：`web/` `npm run build` 通过且 `check:vnc`/`check:flag` 绿（本轮改了 `Ops.jsx` 的升级表单与文件分发文案）。**格式**：本轮触及的 Go 文件在 `tr -d '\r'` 出的 LF 副本上 `gofmt -l` 全部干净；`git show HEAD:<f> | tr -d '\r' | gofmt -l` 复核确认 `agent/internal/command/vdd_windows.go`、`server/internal/{filetransfer,portmap}/*`、`server/internal/session/session_test.go` 的漂移在 HEAD 就已存在，按上一段口径不重排。**部署脚本**只做了静态与本机冒烟：`bash -n` + `sh -n` 过（`keepalive.sh` 是 `#!/bin/sh`，POSIX 这条必须单独验）、`install-linux.sh --help` 输出完整、`--password=xxx` 确认直接 `die`。**未做**：Rocky8 真机的 `install-linux.sh --role=server --dry-run` 与真装、`systemctl show -p ExecStart` 参数与 `mocenter-server-watchdog.timer` 触发核对（即 §3 该单元残留 (h)）—— 本机无 systemd/Docker/WSL，Linux 侧的单元与脚本只能靠静态检查。
+~~**未做**：Rocky8 真机复测~~　**已于 2026-09-22 补做**（用户提供 Rocky8 后）：① 上面这条"未做"整段清单逐项通过，见 §9 第 6 条；② M-10 升级链做了端到端矩阵（6 个负例 + 1 个干净升级周期），见 §3「实机复测」段；③ **复测撞出两个真实缺陷并已修**：Linux 升级自重启必败（改为换入前取路径 + `syscall.Exec` 原地替换进程镜像）、systemd 空插值变成"空 argv"顶掉默认值与配置回写（`server/flags.go normalizeBlankFlags` + `agent/flags.go`）。修完后的本地口径：`agent/` 侧 `go build`（windows/linux/darwin 交叉）+ `GOOS=windows go vet` + `go test -race ./internal/upgrade/ ./internal/client/ .` 全绿，`server/` 全量 `go test ./...` 绿；测试产物与 VM 上的临时文件（含签名私钥、上传的测试二进制、临时 trust anchor）测后即删。**仍未覆盖**：跨机网络路径（本轮服务端与 Agent 同在一张 Rocky8，走 127.0.0.1 + 本机 https）、Win10 测试机未参与、`mocenter-agent.out` 这类遗留物在 Windows 分支仍会生成（Windows 侧无法用 `syscall.Exec`，分离拉起是必要的）。
+H-9 + M-11 收口时的口径（2026-09-22，Windows 本机提权链）：`installer/` 模块在 Windows 本机 `go test ./... -count=1` **全绿**（`ok mocenter/installer 0.135s`，native 即 windows，所以 `acl_windows_test.go` 那 6 例走真 Win32 ACL API 的用例是真跑过的）；`agent/` 侧 `go test ./internal/command/ -count=1` 绿（5.99s）、`GOOS=linux go build ./...` 与 `GOOS=windows go vet ./internal/command/` 通过；`server/` 侧 `go test ./internal/auth/ -count=1` 绿（PBKDF2 成对向量那一侧）；`installer/` 的 `GOOS=linux go build` 亦通过（ACL 代码全部带 `//go:build windows`，Linux 侧必须编译不进去）。**格式**：本轮新增/改动的 Go 文件在 `tr -d '\r'` 出的 LF 副本上 `gofmt -l` 干净。**过程中被测试纠正的三处判断**（如实记下，因为它们都是"看起来对但错"的）：① 把 `(*SECURITY_DESCRIPTOR).DACL()` 的第二个返回值当成 `daclPresent` 用 —— 那是 `defaulted`，导致连 `System32\cmd.exe` 都被报成"没有 DACL"，现改从 `sd.Control()&SE_DACL_PRESENT` 读；② 测试辅助函数给临时目录设了 PROTECTED DACL 之后 `t.TempDir` 的 `RemoveAll` 自己被锁死（Access denied），三例同现，改为"风险主体 + SY + BA + 当前用户"一起授；③ `TestRedactedArgs` 里"值本身长得像旗标"那条用例的期望写错了（`[install -password *** X]` 才是对的，`-agent-key` 会被 flag 包当成 `-password` 的值消费掉），**改的是期望不是代码**。**文档**：`docs/deployment.md`「十一、保活自启 → Windows」补三条运维可见的行为变化（注册前可写性检查会拒注册并给 `icacls` 命令、数据目录与配置文件写入后显式收紧且升级时补紧旧文件、`ultravnc.ini` 同样收紧），并写明"0600 在 Windows 上不产生 ACL 语义"这个前提。**未做**：一次真机 Windows 安装（Win10 测试机未开机；本机这台开发机没有 MoCenter 服务，未擅自安装），三件待验事项见 §9 第 1 条与 §2 该单元残留 (a)。

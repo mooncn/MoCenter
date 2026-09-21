@@ -3,17 +3,19 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
-// TestEnsureServerAccountCreatesHashedAccount 验证安装器写出的 users.json
-// 与被 server/internal/auth/user.go 期望的格式完全一致 —— 尤其是密码只以
-// SHA-256 摘要落盘（绝不能出现明文）。
+// TestEnsureServerAccountCreatesHashedAccount 覆盖安装器写出 users.json 的两条契约：
+// 结构与 server/internal/auth/user.go 期望一致，且口令只以加盐迭代的 PBKDF2 摘要落盘
+// （绝不能出现明文，也不能退回旧版的单轮无盐 SHA-256）。
+// 其中的口令是合成测试向量，不对应任何真实凭据。
 func TestEnsureServerAccountCreatesHashedAccount(t *testing.T) {
 	dir := t.TempDir()
 	created, err := ensureServerAccount(dir, "admin", "s3cret-pw")
@@ -55,9 +57,17 @@ func TestEnsureServerAccountCreatesHashedAccount(t *testing.T) {
 	if u.Username != "admin" {
 		t.Errorf("username = %q，期望 admin", u.Username)
 	}
-	sum := sha256.Sum256([]byte("s3cret-pw"))
-	if want := hex.EncodeToString(sum[:]); u.PasswordHash != want {
-		t.Errorf("password_hash = %q，期望 %q", u.PasswordHash, want)
+	// 摘要必须是 PBKDF2（H-9）：单轮无盐 SHA-256 零成本可爆破、且同口令同摘要。
+	if !strings.HasPrefix(u.PasswordHash, pbkdf2Prefix+strconv.Itoa(pbkdf2Iterations)+"$") {
+		t.Fatalf("password_hash 不是 PBKDF2 格式: %q", u.PasswordHash)
+	}
+	parts := strings.Split(u.PasswordHash, "$")
+	salt, derr := hex.DecodeString(parts[3])
+	if derr != nil {
+		t.Fatalf("盐段不是 hex: %v", derr)
+	}
+	if got := pbkdf2Hash("s3cret-pw", salt, pbkdf2Iterations); got != u.PasswordHash {
+		t.Errorf("摘要与口令对不上：用同一盐重算得 %q，落盘 %q", got, u.PasswordHash)
 	}
 }
 

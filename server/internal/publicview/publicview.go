@@ -7,17 +7,26 @@
 //     而不是靠前端"不渲染"。前端隐藏属于 UI，接口层面必须没有数据。
 //   - agent_id / uuid / remote_addr(内网地址) / 网卡累计流量 一律不出现在
 //     任何输出结构中（没有对应字段 = 无法因配置误开而泄露）。
-//   - 每台主机额外派生一个稳定的**节点编号** node_id（n-xxxxxxxx），
-//     供公开页路由与前端 key 使用。它与 agent_id 之间是单向哈希关系，
-//     反向无法推导，因此公开页既不需要暴露 agent_id，也不会因主机重名而串号。
+//   - 每台主机额外派生一个**部署内稳定**的节点编号 node_id（n-xxxxxxxxxxxxxxxx），
+//     供公开页路由与前端 key 使用。它由**部署私钥**（`<data>/node.key`，安装期随机生成）
+//     做 HMAC-SHA256 后截 8 字节得到：反向无法推导 agent_id，同一 agent_id 在不同部署
+//     里也得到不同编号 —— 因此公开页既不需要暴露 agent_id，外人也无法拿主机名候选
+//     离线字典反查"哪些主机在册"（详见 NodeKeys）。
 //
 // 本包不做配置判断（是否可见由调用方 siteconfig 决定），只负责"按开关裁剪"，
 // 这样脱敏逻辑可被单元测试单独覆盖。
 package publicview
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -40,7 +49,7 @@ const (
 
 // Node 公开页的单台主机视图。
 type Node struct {
-	// NodeID 公开节点编号（n-xxxxxxxx），非 agent_id，不可反推
+	// NodeID 公开节点编号（n- + 16 位 hex），由部署私钥派生，非 agent_id、外部不可反推
 	NodeID string `json:"node_id"`
 	// Remark 备注名（运维填写，通常是最适合对外展示的友好名称）
 	Remark string `json:"remark,omitempty"`
@@ -157,14 +166,112 @@ type Summary struct {
 	ServerTime  int64 `json:"server_time"`
 }
 
-// NodeID 由 agent_id 派生稳定的公开节点编号。
+// NodeKeys 派生公开节点编号（node_id）的**部署私有密钥**。
 //
-// 用途：公开页的详情路由（/public/node/n-xxxx）需要一个对外标识，
-// 但 agent_id 必须保密 —— 于是取 SHA-256 前 4 字节（32 bit）作为编号。
-// 前缀 "n-" 让它与 agent_id 在日志/路由中一眼可分。
-func NodeID(agentID string) string {
-	sum := sha256.Sum256([]byte("mocenter-public-node|" + agentID))
-	return "n-" + hex.EncodeToString(sum[:4])
+// 为什么必须是密钥而不是固定盐（H-8）：node_id 是公开页上唯一对外可见的主机标识，
+// 一旦它是"人人可算"的函数（例如固定盐 + SHA-256），匿名访客就能拿一批候选主机名
+// （`web-01`、`db-prod`，或从某台开了 hostname 的兄弟节点学来的命名规律）离线算出
+// 各自的 node_id，再用 `/api/public/samples?node=…` 的 404/200 当判定器逐条命中 ——
+// 即使 `hostname` 开关关着，也等于把"哪些内网主机在册"整本念给外人听。
+// 换成部署私钥后，同一个 agent_id 在不同部署里得到完全不同的编号，离线字典失去前提。
+type NodeKeys struct {
+	secret []byte
+}
+
+// NodeKeyFileName 部署私钥在数据目录下的文件名（与 <data>/agent.key 同一套习惯）。
+const NodeKeyFileName = "node.key"
+
+// minNodeKeyBytes 密钥长度下限（256 bit）。
+//
+// 取 32 字节是因为 HMAC 的强度不会超过密钥本身；短于这个值的密钥既可穷举，
+// 也会让"部署私钥"退化回"公开常量"。
+const minNodeKeyBytes = 32
+
+// nodeIDBytes 编号携带的摘要字节数（64 bit）。
+//
+// 旧实现只取 4 字节（32 bit）：按生日界约 6.5 万个候选就能撞上同一个编号，
+// 而公开页允许匿名反复查询。8 字节把碰撞与暴力成本推到实际不可达，
+// 同时编号仍短到可以印在卡片上。
+const nodeIDBytes = 8
+
+// NewNodeKeys 校验并持有部署私钥。
+//
+// 这里**只拒绝、不补生成**：密钥必须由启动方（读数据目录）提供，
+// 否则每次进程重启就会换一把，公开页的节点编号跟着全变，而没人会预期这件事。
+func NewNodeKeys(secret []byte) (*NodeKeys, error) {
+	if len(secret) < minNodeKeyBytes {
+		return nil, fmt.Errorf("节点编号密钥不足 %d 字节（当前 %d），拒绝以可预测方式派生公开编号", minNodeKeyBytes, len(secret))
+	}
+	cp := make([]byte, len(secret))
+	copy(cp, secret)
+	return &NodeKeys{secret: cp}, nil
+}
+
+// LoadNodeKeys 从文件读取部署私钥；不存在则生成一把随机密钥并写入（0600）。
+//
+// 文件格式与 <data>/agent.key 一致（十六进制文本 + 换行），便于运维用同一套习惯轮换。
+// 读到内容但长度不够时**报错而不是重新生成**：那通常意味着文件被截断（磁盘满/
+// 半途复制），静默换钥匙会让全部公开编号凭空改变，看起来像"页面坏了"。
+func LoadNodeKeys(path string) (keys *NodeKeys, created bool, err error) {
+	if path == "" {
+		return nil, false, errors.New("节点编号密钥路径为空")
+	}
+	if data, rerr := os.ReadFile(path); rerr == nil {
+		hexStr := strings.TrimSpace(string(data))
+		if hexStr == "" {
+			return nil, false, fmt.Errorf("节点编号密钥文件 %s 为空", path)
+		}
+		secret, derr := hex.DecodeString(hexStr)
+		if derr != nil {
+			return nil, false, fmt.Errorf("解析节点编号密钥 %s 失败: %w", path, derr)
+		}
+		k, kerr := NewNodeKeys(secret)
+		if kerr != nil {
+			return nil, false, fmt.Errorf("%v（如需重新生成，请先删除 %s）", kerr, path)
+		}
+		return k, false, nil
+	} else if !os.IsNotExist(rerr) {
+		return nil, false, rerr
+	}
+	secret := make([]byte, minNodeKeyBytes)
+	if _, rerr := rand.Read(secret); rerr != nil {
+		return nil, false, fmt.Errorf("生成节点编号密钥失败: %w", rerr)
+	}
+	if mkErr := os.MkdirAll(filepath.Dir(path), 0700); mkErr != nil {
+		return nil, false, mkErr
+	}
+	// 先写临时文件再 rename：避免并发启动或掉电时留下半把密钥
+	tmp := path + ".tmp"
+	if werr := os.WriteFile(tmp, []byte(hex.EncodeToString(secret)+"\n"), 0600); werr != nil {
+		return nil, false, werr
+	}
+	if rerr := os.Rename(tmp, path); rerr != nil {
+		os.Remove(tmp)
+		return nil, false, rerr
+	}
+	k, kerr := NewNodeKeys(secret)
+	return k, true, kerr
+}
+
+// ID 派生某台主机的公开节点编号。
+//
+// nil 接收者是一次接线错误（说明调用方忘了把密钥传下来），这里 panic 而不是
+// 退回旧的"固定盐派生"—— 静默退回等于把刚修掉的洞留在原地。
+func (k *NodeKeys) ID(agentID string) string {
+	if k == nil || len(k.secret) < minNodeKeyBytes {
+		panic("publicview: 未初始化节点编号密钥（应在服务端启动时从数据目录载入）")
+	}
+	mac := hmac.New(sha256.New, k.secret)
+	mac.Write([]byte(agentID))
+	return "n-" + hex.EncodeToString(mac.Sum(nil)[:nodeIDBytes])
+}
+
+// Match 判断某个编号是否属于该 agent（反查，常数时间比较）。
+func (k *NodeKeys) Match(agentID, nodeID string) bool {
+	if k == nil {
+		panic("publicview: 未初始化节点编号密钥（应在服务端启动时从数据目录载入）")
+	}
+	return subtle.ConstantTimeCompare([]byte(k.ID(agentID)), []byte(nodeID)) == 1
 }
 
 // MaskPublicIP 对公网 IP 做部分掩码（保留前两段），即使误开启也不至于精确到主机。
@@ -217,11 +324,12 @@ func SetMaskPublicIP(on bool) { maskIPSwitch = on }
 // BuildNode 按配置裁剪出单台主机的公开视图。
 //
 // cfg 决定字段可见性；调用方须已用 cfg.HostAllowed 判定该主机是否可公开。
-func BuildNode(a *protocol.AgentInfo, cfg *siteconfig.Config) *Node {
+// keys 用于派生 node_id（部署私钥，见 NodeKeys）。
+func BuildNode(a *protocol.AgentInfo, cfg *siteconfig.Config, keys *NodeKeys) *Node {
 	if a == nil {
 		return nil
 	}
-	n := &Node{NodeID: NodeID(a.AgentID)}
+	n := &Node{NodeID: keys.ID(a.AgentID)}
 	on := func(key string) bool { return cfg.FieldVisible(key) }
 
 	if on("remark") {
@@ -348,13 +456,13 @@ func AttachTraffic(n *Node, a *protocol.AgentInfo, cfg *siteconfig.Config) {
 
 // BuildNodes 批量裁剪并按「在线优先、备注/主机名」排序，保证公开页顺序稳定
 // （服务端 map 遍历顺序随机，不排序会导致每次推送卡片乱跳）。
-func BuildNodes(agents []*protocol.AgentInfo, cfg *siteconfig.Config) []*Node {
+func BuildNodes(agents []*protocol.AgentInfo, cfg *siteconfig.Config, keys *NodeKeys) []*Node {
 	out := make([]*Node, 0, len(agents))
 	for _, a := range agents {
 		if a == nil || !cfg.HostAllowed(a.AgentID) {
 			continue
 		}
-		if n := BuildNode(a, cfg); n != nil {
+		if n := BuildNode(a, cfg, keys); n != nil {
 			out = append(out, n)
 		}
 	}

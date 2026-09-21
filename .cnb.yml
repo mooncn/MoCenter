@@ -1,74 +1,123 @@
 # MoCenter CI 流水线：构建 web / server / agent 三大部分
 # 参考 CNB 流水线语法（docs.cnb.cool/zh/build）
+#
+# 本文件的三条硬约束（每条都对应一次真实代价，改之前先读）：
+#
+#  1. **不许用 `|| true` / `|| echo` 吞失败**。被吞掉的失败表现为"流水线绿了、产物却没有"，
+#     只有到发布或用户报障时才暴露 —— 旧版里 `deb 打包`与 `precompress-web.sh` 两处就是这个形态。
+#     允许"缺工具就先装再试"，不允许"缺工具就当没事发生"。
+#  2. **前端只走 `npm ci`**。`|| npm install` 的回退会在锁文件与 registry 对不上时
+#     装出未钉扎的依赖树：构建照样成功，但没人对产物的来源负责。
+#  3. **push 必须跑 `go test ./...`**。旧版含 `go test` 的 `&x-build-go` 锚点从未被任何作业
+#     引用过（写了个没人调的锚点 = 写了个假测试阶段），push 只 `go build`，
+#     于是全部单测从来没在 CI 上跑过一次。现在检查逻辑收在 `&go-check` 里，
+#     push 与 pull_request 两处共用同一份。
+#
+# 仍未做（记在 docs/security-review-2026-09-19.md §10 的 P3 行）：构建镜像按 digest 钉扎。
 
-# 公共构建步骤（YAML 锚点复用）
-.x-build-go: &x-build-go
-  image: golang:1.25
-  script: |
-    echo "=== [server] 构建 mocenter-server ==="
-    cd server && go mod download && go build -ldflags "-s -w" -o mocenter-server . && cd ..
-    echo "=== [agent] 构建 mocenter-agent (linux) ==="
-    cd agent && CGO_ENABLED=0 go build -ldflags "-s -w -X mocenter/agent/internal/version.Version=${MOCENTER_AGENT_VERSION:-1.0.1}" -o mocenter-agent . && cd ..
-    echo "=== Go 单元测试 ==="
-    cd server && go test ./...
-    cd ../agent && go test ./...
+# Go 侧统一检查：vet + 全量单测 + 交叉编译锚定。
+# 交叉编译只 build/vet 不 test：Windows 侧的 Agent 测试要真跑得有 Windows runner。
+.go-check: &go-check
+  |
+    set -e
+    echo "=== [server] go vet + go test ==="
+    (cd server && go vet ./... && go test ./...)
+    echo "=== [agent] go vet + go test ==="
+    (cd agent && go vet ./... && go test ./...)
+    echo "=== [installer] go vet + go test ==="
+    (cd installer && go vet ./... && go test ./...)
+    echo "=== 交叉编译锚定（agent 必须同时能在 linux/windows 上编译）==="
+    (cd agent && GOOS=linux GOARCH=amd64 go build ./... \
+      && GOOS=windows GOARCH=amd64 go build ./... \
+      && GOOS=windows go vet ./...)
+    (cd server && GOOS=linux GOARCH=amd64 go build ./...)
+    echo "OK  go vet / go test / 交叉编译"
+
+# 前端统一检查 + 构建。npm ci 严格照 package-lock.json，失败即红。
+.web-ci: &web-ci
+  |
+    set -e
+    cd web
+    npm ci --no-audit --no-fund
+    echo "=== 前端回归自检（这个位置以前只有一句 echo，等于没在把关）==="
+    npm run check:vnc
+    npm run check:flag
+    # 页脚是全站唯一一处把服务端字符串交给 dangerouslySetInnerHTML 的地方，
+    # 它的净化器没有浏览器也能跑，所以同样进 CI。
+    npm run check:footer
+    echo "=== 构建 + 预压缩 ==="
+    npm run build
+    # 预压缩失败不再被 `|| true` 吃掉：产物缺失时服务端会退化成每次请求现压，
+    # 移动端首屏体积回到 3 倍 —— 那是功能退化，不是"可忽略的警告"。
+    bash ../scripts/deploy/precompress-web.sh dist
+    test -f dist/index.html || { echo "!! 构建成功退出却没产出 dist/index.html"; exit 1; }
+    ls dist/assets/*.gz >/dev/null 2>&1 \
+      || { echo "!! 预压缩没产出任何 .gz（检查 precompress-web.sh 与 dist 布局）"; exit 1; }
+    echo "OK  web 自检 + 构建 + 预压缩"
 
 main:
   push:
     - name: build-go
       docker:
-        image: golang:1.25
+        image: golang:1.26
       stages:
+        # 检查放在构建之前：编译错误便宜、断言失败才是 CI 该抓的东西；
+        # 顺序反了会让"build 先红"掩盖测试。
+        - name: go-check
+          script: *go-check
         - name: build-go
           script: |
+            set -e
             echo "=== [server] go build ==="
-            cd server && go build -ldflags "-s -w" -o /tmp/mocenter-server . && echo OK
+            (cd server && go build -ldflags "-s -w" -o /tmp/mocenter-server .)
             echo "=== [agent] go build ==="
-            cd ../agent && CGO_ENABLED=0 go build -ldflags "-s -w -X mocenter/agent/internal/version.Version=${MOCENTER_AGENT_VERSION:-1.0.1}" -o /tmp/mocenter-agent . && echo OK
-            echo "=== go test ==="
-            cd /tmp
-        - name: build-web
-          image: node:20
-          script: |
-            echo "=== [web] npm install & build ==="
-            cd web && npm install --no-audit --no-fund && npm run build
-            # 预压缩：服务端优先回传 .gz/.br，弱网/移动端首屏体积降到约 1/3
-            bash scripts/deploy/precompress-web.sh web/dist || true
-            echo "web build done -> dist/"
+            (cd agent && CGO_ENABLED=0 go build \
+              -ldflags "-s -w -X mocenter/agent/internal/version.Version=${MOCENTER_AGENT_VERSION:-1.0.1}" \
+              -o /tmp/mocenter-agent .)
+            # 成功退出却没产物 = 上一步被谁改错了输出路径；这里补最后一道确认
+            test -s /tmp/mocenter-server && test -s /tmp/mocenter-agent
+            echo "OK  /tmp/mocenter-server、/tmp/mocenter-agent"
     - name: package-linux
       docker:
-        image: golang:1.25
+        image: golang:1.26
       stages:
         - name: package-agent
           script: |
+            set -e
             echo "=== [package] 构建 Linux amd64 二进制 ==="
-            cd agent && CGO_ENABLED=0 go build -ldflags "-s -w -X mocenter/agent/internal/version.Version=${MOCENTER_AGENT_VERSION:-1.0.1}" -o mocenter-agent .
+            # 输出到 build/bin/agent/linux/mocenter-agent-amd64，而不是随手丢在 agent/ 下：
+            # 打包脚本在 --binary=0 下只认这个布局（scripts/build-linux-all.sh 里
+            # bin="$OUT/bin/$role/linux/mocenter-${role}-${arch}"）。旧版把二进制建到
+            # agent/mocenter-agent，打包时"缺少二进制"只 warn 不 fail，再被 || echo 吞掉，
+            # 于是 .deb 从来没真正产出过、流水线却一直绿。
+            mkdir -p build/bin/agent/linux
+            (cd agent && CGO_ENABLED=0 go build \
+              -ldflags "-s -w -X mocenter/agent/internal/version.Version=${MOCENTER_AGENT_VERSION:-1.0.1}" \
+              -o ../build/bin/agent/linux/mocenter-agent-amd64 .)
             echo "=== [package] 生成 .deb 安装包（含 systemd 服务） ==="
-            bash scripts/build-linux-all.sh --type=agent --package=deb --arch=amd64 --binary=0 \
-              || echo "deb 打包需在构建机安装 dpkg-deb"
+            # dpkg-deb 由 dpkg 包提供，Debian 基础镜像本就自带；真缺就先装上再跑。
+            command -v dpkg-deb >/dev/null 2>&1 \
+              || { echo "-- 缺 dpkg-deb，安装 dpkg"; apt-get update -qq && apt-get install -y -qq dpkg; }
+            bash scripts/build-linux-all.sh --type=agent --package=deb --arch=amd64 --binary=0
+            # 打包脚本对"缺输入"只 warn 并返回 0，所以产物必须由 CI 自己确认
+            ls build/packages/deb/*.deb >/dev/null 2>&1 \
+              || { echo "!! 打包脚本成功退出却没产出 .deb（看上方是否 warn「缺少二进制」）"; exit 1; }
+            echo "OK  $(ls build/packages/deb/*.deb)"
     - name: build-web
       docker:
         image: node:20
       stages:
-        - name: install
-          script: cd web && npm ci --no-audit --no-fund || npm install --no-audit --no-fund
-        - name: build
-          script: |
-            cd web && npm run build
-            bash ../scripts/deploy/precompress-web.sh dist || true
-        - name: lint
-          script: cd web && echo "web build & assets generated"
+        - name: web-ci
+          script: *web-ci
 
 $:
   pull_request:
     - name: pr-build
       docker:
-        image: golang:1.25
+        image: golang:1.26
       stages:
-        - name: go-build
-          script: |
-            cd server && go build ./... && echo "server build OK"
-            cd ../agent && go build ./... && echo "agent build OK"
+        - name: go-check
+          script: *go-check
         - name: script-guard
           # 构建/打包脚本的静态检查。
           # 这些脚本一旦写错目标平台（典型：windows/arm 并非 Go 支持的目标，
@@ -142,7 +191,33 @@ $:
             (cd scripts/signcert && go build ./... && go vet ./... && go test ./... && echo "OK  scripts/signcert")
         - name: web-build
           image: node:20
+          script: *web-ci
+    - name: security-scan
+      docker:
+        image: golang:1.26
+      # 依赖漏洞扫描常态化（上一轮的 8 条 x/crypto + 18 条 stdlib 就是靠人工才发现的）。
+      # govulncheck 做的是**可达性判定**（只有真正被调用到的符号才报），
+      # 所以不会像版本匹配类扫描那样淹没人；因此这里可以直接判红，不必降级成警告。
+      stages:
+        - name: go-vuln
           script: |
-            cd web && npm install --no-audit --no-fund && npm run build
-            bash ../scripts/deploy/precompress-web.sh dist || true
-            echo "web build OK"
+            set -e
+            if ! command -v govulncheck >/dev/null 2>&1; then
+              go install golang.org/x/vuln/cmd/govulncheck@latest
+            fi
+            GVC="$(command -v govulncheck || echo "$(go env GOPATH)/bin/govulncheck")"
+            for m in server agent installer; do
+              echo "=== govulncheck $m ==="
+              (cd $m && "$GVC" ./...)
+            done
+            echo "OK  三个 Go 模块均无可达漏洞"
+        - name: npm-audit
+          image: node:20
+          script: |
+            set -e
+            cd web
+            npm ci --no-audit --no-fund
+            # 必须显式指向官方源：registry.npmmirror.com 不实现 /-/npm/v1/security/*，
+            # 用镜像跑 audit 会 404 —— 那正是"日常根本没有审计通道"的原因。
+            echo "=== npm audit（生产依赖，high 及以上判红）==="
+            npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org

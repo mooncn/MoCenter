@@ -43,11 +43,14 @@ func makeDataDir(t *testing.T) string {
 }
 
 // TestCreateAndRestore 备份 -> 恢复到空目录，内容应逐字节一致。
+//
+// 这里显式带上凭据：它同时验证"agent.key 在打包时能被完整往返恢复"，
+// 而"默认不打进去"由 TestSecretsNotPackedByDefault 单独守。
 func TestCreateAndRestore(t *testing.T) {
 	src := makeDataDir(t)
 	out := filepath.Join(t.TempDir(), "backup.zip")
 
-	res, err := Create(src, out, "1.0.1")
+	res, err := CreateWithOptions(src, out, "1.0.1", CreateOptions{IncludeSecrets: true})
 	if err != nil {
 		t.Fatalf("备份失败: %v", err)
 	}
@@ -155,6 +158,37 @@ func TestBackupExcludesNonData(t *testing.T) {
 			strings.HasSuffix(f.Name, ".tmp"):
 			t.Fatalf("备份包不应包含 %s", f.Name)
 		}
+	}
+}
+
+// TestSecretsNotPackedByDefault 默认备份包不得含 agent.key。
+//
+// 备份接口对任何已登录会话可达、包还会被到处拷贝，所以"顺手把全网身份根带走"
+// 必须是显式选择而不是默认行为（M-1）。同时要求它在 Skipped 里被说出来 ——
+// 一个悄悄少了一个文件的备份包，比一个不含密钥的备份包危险得多。
+func TestSecretsNotPackedByDefault(t *testing.T) {
+	src := makeDataDir(t)
+	out := filepath.Join(t.TempDir(), "backup.zip")
+	res, err := Create(src, out, "1.0.1")
+	if err != nil {
+		t.Fatalf("备份失败: %v", err)
+	}
+	for _, e := range res.Entries {
+		if e.Name == "agent.key" {
+			t.Fatal("默认备份不应包含 agent.key")
+		}
+	}
+	announced := false
+	for _, s := range res.Skipped {
+		if strings.HasPrefix(s, "agent.key") {
+			announced = true
+		}
+	}
+	if !announced {
+		t.Fatalf("应在 Skipped 里说明 agent.key 未打包，实际 %v", res.Skipped)
+	}
+	if _, err := os.Stat(filepath.Join(src, "agent.key")); err != nil {
+		t.Fatalf("源文件不应被动过: %v", err)
 	}
 }
 
