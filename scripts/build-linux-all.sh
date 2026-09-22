@@ -193,6 +193,9 @@ setup_outdir() {
     ./*|../*) OUT="$(mc_root)/${OPT_OUTDIR#./}" ;;
     *) OUT="$(mc_root)/$OPT_OUTDIR" ;;
   esac
+  # OUT 也是 mc_clean 的允许范围根（见 scripts/lib/common.sh 的 mc_clean）：
+  # 只允许删除本次输出目录之下的路径，防止"变量没初始化 → rm -rf 打到别处"。
+  OUT_ROOT="$OUT"
   mkdir -p "$OUT"
 
   if [ "$OPT_CLEAN" = 1 ]; then
