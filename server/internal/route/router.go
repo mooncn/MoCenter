@@ -272,16 +272,80 @@ func (r *Router) GetBlacklist() []string {
 }
 
 // IsBlocked 判断命令是否命中黑名单。
+//
+// ## 它是什么，不是什么
+//
+// 这是**纵深防御**中的一层界面护栏，**不是安全边界**。任意 shell 语法都能把
+// 一个被拦的字面串改写成等价但不同的字符串（`rm  -rf  /` 只是多了个空格、引号拼接到 `rm`、
+// `$(echo cm0gLXJmIC8=|base64 -d|sh)`），所以"绕不过"从来不是它的目标。
+// 目标是把"手滑"和"照着教程贴一条破坏性命令"挡住，并且不给界面/文档
+// 留下"已经拦住了"的错觉（那条错觉比没有护栏更危险）。
+//
+// ## 相比旧版多做了什么
+//
+// 旧版只做 `strings.Contains(原文)` 这一条匹配，于是**连不涉及任何混淆技巧的
+// 常见写法都漏**：`rm  -rf  /`（多打一个空格）、`rm -rf / #`（后面跟注释）、
+// 制表符分隔。这里在原文之外再对"归一化后的形式"匹配一次：
+//   - 去掉引号字符（' " ` \）—— shell 会吃掉它们；
+//   - 把连续空白（空格 / 制表 / CR / LF）压成一个空格；
+//   - 去掉行内注释起始的 ` #` 之后的内容。
+//
+// 真正的边界是"命令执行本身是产品功能"：被管主机上的 Agent 以高权限执行任意
+// 命令是设计意图，所以护栏失守不等于越权。收口位置在审计与授权，不在字符串匹配。
 func (r *Router) IsBlocked(cmd string) (bool, string) {
-	low := strings.ToLower(cmd)
+	variants := []string{strings.ToLower(cmd)}
+	if norm := normalizeForBlacklist(cmd); norm != "" {
+		variants = append(variants, norm)
+	}
 	r.blackMu.RLock()
 	defer r.blackMu.RUnlock()
 	for _, b := range r.blacklist {
-		if strings.Contains(low, strings.ToLower(b)) {
-			return true, b
+		pat := strings.ToLower(strings.TrimSpace(b))
+		if pat == "" {
+			continue
+		}
+		for _, v := range variants {
+			if strings.Contains(v, pat) {
+				return true, b
+			}
 		}
 	}
 	return false, ""
+}
+
+// normalizeForBlacklist 把一条命令压成"shell 展开前"的近似形态，用于黑名单匹配。
+//
+// 刻意保守：只做**去掉引号 + 压缩空白 + 截掉行内注释**这三件不会改变语义方向的
+// 归一化。不做变量展开、不做命令替换求值、不猜 base64 —— 那些要么需要真 shell、
+// 要么把护栏变成"看起来能拦"的假象（见 IsBlocked 的说明）。
+func normalizeForBlacklist(cmd string) string {
+	var b strings.Builder
+	b.Grow(len(cmd))
+	prevSpace := false
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch c {
+		case '\'', '"', '`', '\\':
+			// shell 会吃掉这些引号/转义符，匹配前先去掉
+			continue
+		case ' ', '\t', '\r', '\n', '\v', '\f':
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		case '#':
+			// 行内注释：# 只在"词首"（前一字符是空白或行首）时开始注释
+			if i == 0 || cmd[i-1] == ' ' || cmd[i-1] == '\t' || b.Len() == 0 ||
+				(b.Len() > 0 && b.String()[b.Len()-1] == ' ') {
+				out := strings.TrimSpace(b.String())
+				return strings.ToLower(out)
+			}
+		}
+		b.WriteByte(c)
+		prevSpace = false
+	}
+	return strings.ToLower(strings.TrimSpace(b.String()))
 }
 
 // Dispatch 将命令下发到指定 Agent。

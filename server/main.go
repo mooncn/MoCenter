@@ -1347,16 +1347,63 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 		resp.Message = "agent_id 非法"
 		return resp
 	}
-	if !verifier.Enabled() && !allowAnon {
-		resp.Message = "服务端未配置注册凭据（一次性注册令牌或共享注册密钥），拒绝签发"
-		rejectEnrollment(router, conn, er.AgentID, resp.Message)
-		return resp
+	// ── 凭据裁决（H-N1 的修复点）──────────────────────────────────────────
+	//
+	// 旧实现是两道**互相抵消**的判断：这里写 `if !verifier.Enabled() && !allowAnon {拒}`，
+	// 而 Verifier.Verify 对"未启用"返回 ("", nil)（把"没配凭据"当成"校验通过"）。
+	// 于是「服务端一个凭据都没配 + 开了 -allow-unauthenticated-agents」时，
+	// 一张自选 agent_id 的 CSR + **完全空的凭据**就能换到本套 CA 签发的合法客户端证书
+	// （已在本轮用 POC 实测复现，见 docs/security-review-2026-09-22.md）。
+	//
+	// 现在的口径只有一句：**匿名与否只看"这张报文有没有出示凭据"，放行与否只看运维开关。**
+	//
+	//   · 出示了凭据（proof 非空）→ 必须验过，与 allowAnon 无关。绝不降级成匿名，
+	//     否则"令牌配错了"会被伪装成"正常接入了"，排障时查不出来。
+	//   · 没出示凭据（proof 为空）→ 这是唯一的匿名入口，只有 allowAnon 为真才放行，
+	//     且必须带 TS。此时**是否配置了凭据已不影响判定**：没配 = 运维配置缺失，
+	//     没出示 = 匿名意图，两者不是一回事，不能相乘。
+	credentialFree := er.Proof == ""
+	credSource := agentauth.CredAnon
+
+	if !credentialFree {
+		// 出示了凭据 → 必须验过，与 allowAnon 无关
+		src, err := verifier.Verify(er.AgentID, er.Nonce, er.Proof, er.TS)
+		if err != nil {
+			// 凭据校验失败同样要留 auth 审计：这类事件的信号价值与"被绑定拦住"同级 ——
+			// 可能是令牌抄错，也可能是有人在试别人的令牌 / 重放旧报文。
+			// 只进日志的话没人会看（而 rejectEnrollment 会把理由一并写进审计）。
+			rejectEnrollment(router, conn, er.AgentID, err.Error())
+			resp.Message = err.Error()
+			return resp
+		}
+		credSource = src
+	} else {
+		// 完全没带凭据：这是唯一的匿名入口，需**运维显式开启**才放行。
+		// 注意此处不再看 verifier.Enabled()：无论服务端配没配凭据，没带凭据就是匿名，
+		// 匿名只由开关决定 —— 旧版把这两件事混在一起判断，才出现"未配凭据 + 开开关
+		// = 谁都能换证书"（H-N1）。
+		if !allowAnon {
+			resp.Message = "未携带注册凭据（需要一次性注册令牌 / 共享注册密钥），" +
+				"或由运维开启 -allow-unauthenticated-agents 后重试"
+			if !verifier.Enabled() {
+				resp.Message = "服务端未配置注册凭据（一次性注册令牌或共享注册密钥），拒绝签发"
+			}
+			rejectEnrollment(router, conn, er.AgentID, resp.Message)
+			return resp
+		}
+		// 开了开关也不接受"空壳"报文：nonce 与 TS 是防重放/防时序乱用的最低要求。
+		// 它们与 agent_id 一起被记进审计，事后能判定"这次签发是匿名来的"。
+		if er.TS <= 0 || er.Nonce == "" {
+			resp.Message = "匿名接入仍需携带 nonce 与时间戳（防重放）"
+			rejectEnrollment(router, conn, er.AgentID, resp.Message)
+			return resp
+		}
 	}
-	credSource, err := verifier.Verify(er.AgentID, er.Nonce, er.Proof, er.TS)
-	if err != nil {
-		log.Printf("[server] 拒绝 Agent %q 换取证书: %v（来自 %s）", er.AgentID, err, tlsInfo(conn))
-		resp.Message = err.Error()
-		return resp
+	if credSource == agentauth.CredAnon {
+		// 显式匿名接入必须留痕：事后排查看得出"这台主机的身份是没有凭据支撑的"。
+		log.Printf("[server] 警告: 以**无凭据**方式为 Agent %q 签发证书（服务端开启了 "+
+			"-allow-unauthenticated-agents，来自 %s）；该身份不可作为信任依据，"+
+			"请为该主机签发一次性注册令牌后重新接入", er.AgentID, tlsInfo(conn))
 	}
 	if sess != nil && sess.Busy(er.AgentID) {
 		resp.Message = "该 agent_id 当前有活动会话，拒绝换发证书；本次注册凭据已消耗，" +
@@ -1373,6 +1420,9 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 		resp.Message = "签发证书失败: " + cerr.Error()
 		return resp
 	}
+	// TOFU 绑定只在存在令牌存储时执行：匿名路径通常没有存储（否则它就不是匿名路径了），
+	// 此时"谁来绑定"没有承载者。这个空档是 -allow-unauthenticated-agents 的固有代价，
+	// 已在启动日志里告警，并被上面的 CredAnon 留痕。
 	if store := verifier.Tokens(); store != nil {
 		if spki := agentauth.SpkiHashOfPEM(certPEM); spki != "" {
 			if berr := store.CheckOrBind(er.AgentID, spki, credSource); berr != nil {
@@ -1662,6 +1712,17 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 				// 交互终端不回 CommandResp，会话结束就在这里收口归属登记，
 				// 否则这条映射要等到容量驱逐（2 万条上限）才清掉。
 				router.ReleaseCommand(io.CommandID, sessConn.GetAgentID())
+				// 交互输入的**逐行黑名单缓冲**必须一并回收（M-N2）。
+				//
+				// 它与 ReleaseCommand 是同一次收口的两半，之前只接了前一半，
+				// DropInteractive 是死代码（全仓零调用点）：
+				//   · 每个会话在 iguard.bufs 里留一个永不删除的键，持到进程退出；
+				//   · 更糟的是触顶时的处置是**整表 wipe**（interactive.go:46），
+				//     不是淘汰最旧 —— 一次 wipe 会连带清掉当时活跃终端的半行输入，
+				//     表现为"打着字突然黑名单过滤失灵/半行错乱"；
+				//   · 缓冲里含运维在终端里敲的**半行命令**（可能含口令），
+				//     会一直驻留到下一次整表 wipe。
+				router.DropInteractive(route.InteractiveKey(sessConn.GetAgentID(), io.CommandID))
 			}
 		case protocol.TypeFileUploadReq:
 			var fu protocol.FileUploadReq
@@ -1699,7 +1760,8 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			var ur protocol.UpgradeResp
 			_ = json.Unmarshal(env.Data, &ur)
 			hub.Broadcast(protocol.TypeUpgradeResp, ur)
-			log.Printf("[server] Agent %s 升级结果: %v %s", sessConn.GetAgentID(), ur.OK, ur.Message)
+			// L-2：ur.Message 是 Agent 自报字段，原样进日志能被用来伪造 "[server] ..." 行
+			log.Printf("[server] Agent %s 升级结果: %v %s", sessConn.GetAgentID(), ur.OK, logSafe(ur.Message))
 		case protocol.TypeTunnelOpenResp:
 			var tr protocol.TunnelOpenResp
 			if json.Unmarshal(env.Data, &tr) != nil {
@@ -1711,11 +1773,11 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			if isVNCTunnel(tr.TunnelID) {
 				vncMgr.DeliverOpenResp(tr.TunnelID, sessConn.GetAgentID(), tr.OK, tr.Message)
 				if !tr.OK {
-					log.Printf("[server] VNC 隧道建立失败 %s: %s", tr.TunnelID, tr.Message)
+					log.Printf("[server] VNC 隧道建立失败 %s: %s", logSafe(tr.TunnelID), logSafe(tr.Message))
 				}
 			} else if !tr.OK {
 				// 端口映射隧道建立失败：关闭对应的公网侧连接
-				log.Printf("[server] 隧道建立失败 %s: %s", tr.TunnelID, tr.Message)
+				log.Printf("[server] 隧道建立失败 %s: %s", logSafe(tr.TunnelID), logSafe(tr.Message))
 				pm.NotifyTunnelClosed(tr.TunnelID, sessConn.GetAgentID(), tr.Message)
 			}
 		case protocol.TypeTunnelData:
@@ -1733,6 +1795,9 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 				if isVNCTunnel(tc.TunnelID) {
 					vncMgr.NotifyTunnelClosed(tc.TunnelID, sessConn.GetAgentID())
 				} else {
+					// tc.Reason 是 Agent 自报的自由文本，portmap 侧已按"_ string"忽略它
+					// （隧道关闭不需要原因），因此这里不构成日志注入面；L-2 的三处
+					// 只剩升级回执与两条隧道建立失败的 Message，均已过 logSafe。
 					pm.NotifyTunnelClosed(tc.TunnelID, sessConn.GetAgentID(), tc.Reason)
 				}
 			}
@@ -2496,13 +2561,60 @@ func writeAuditCSV(w http.ResponseWriter, logs []*route.AuditLog) {
 	for _, l := range logs {
 		_ = cw.Write([]string{
 			strconv.FormatInt(l.Time, 10),
-			l.Operator, l.AgentID, l.CommandID, l.Command, l.Result,
+			csvCell(l.Operator), csvCell(l.AgentID), csvCell(l.CommandID),
+			csvCell(l.Command), csvCell(l.Result),
 			strconv.Itoa(l.ExitCode),
-			strconv.FormatBool(l.Blocked), l.BlockReason,
+			strconv.FormatBool(l.Blocked), csvCell(l.BlockReason),
 			strconv.FormatInt(l.Duration, 10),
 		})
 	}
 	cw.Flush()
+}
+
+// csvCell 中和 CSV 的**公式注入**（L-1）。
+//
+// 为什么必须做：csv.Writer 只负责"正确地引用"，它不管打开方（Excel/WPS/LibreOffice）
+// 会不会把单元格内容当公式执行。以 = + - @ 开头的值，或被前导制表符/回车"顶"到
+// 首位的值，会被表格软件解释成公式，DDE / 外链 / HYPERLINK 都能从那里打到本机。
+//
+// 危险面为什么真实存在：Command 与 Result 的值来自 **Agent 回传** —— 也就是说
+// "某台被拿下的被管主机"能直接决定运维导出的 CSV 里写什么。单人使用也一样中招：
+// 他导出的正是自己机器上那些被管主机的回传结果。
+//
+// 做法：首字符命中危险集合时前置一个单引号。这是表格软件的"按文本处理"约定，
+// 视觉上只多一个前导 '，而内容本身一位不改 —— 比剥离危险字符更安全，因为
+// 导出件仍能完整还原被管主机到底回了什么。
+func csvCell(s string) string {
+	if s == "" {
+		return s
+	}
+	// 前导空白（含制表/回车/换行）会被表格软件忽略后再看首字符，所以先跳过它们
+	// 找到"真正会被当成公式首位"的那个字符。
+	i := 0
+	for i < len(s) {
+		switch s[i] {
+		case ' ', '\t', '\r', '\n', '\v', '\f':
+			i++
+			continue
+		}
+		break
+	}
+	if i >= len(s) {
+		// 全是空白，不可能构成公式；原样返回，交给 csv.Writer 引用
+		return s
+	}
+	switch s[i] {
+	case '=', '+', '-', '@':
+		return "'" + s
+	}
+	// 前导空白之后是危险字符时也要拦：Excel 会先吃掉空白再看首字符
+	if i > 0 {
+		switch s[0] {
+		case '\t', '\r', '\n':
+			return "'" + s
+		}
+	}
+	return s
 }
 
 func portmapRulesHandler(pm *portmap.Manager, authz *auth.Auth) http.HandlerFunc {
@@ -3370,7 +3482,7 @@ func handleWebMessage(sessionKey, operator string, data []byte, sess *session.Ma
 			return
 		}
 		// 交互输入同样过黑名单（逐行检查）：远程终端此前是黑名单的最大旁路
-		safe, blocked := router.FilterInteractive(inp.AgentID+"|"+inp.CommandID, inp.InputData)
+		safe, blocked := router.FilterInteractive(route.InteractiveKey(inp.AgentID, inp.CommandID), inp.InputData)
 		if blocked != "" {
 			hub.BroadcastToSession(sessionKey, protocol.TypeInteractiveOut, protocol.InteractiveOutput{
 				CommandID: inp.CommandID,

@@ -1,0 +1,50 @@
+# 换行策略显式化（对应 docs/security-review-2026-09-19.md 的 L-10）。
+#
+# 为什么必须由仓库决定，而不是由每个 clone 的 core.autocrlf 决定：
+# 2026-09-21 在 Rocky8 实测撞到过 —— Windows 工作树是 `i/lf w/crlf`（索引 LF、
+# 检出 CRLF），从那里直接拷到 Linux 执行的 shell 脚本带着 \r，
+# `install-linux.sh` 的 `set -euo pipefail` 变成 `set: pipefail: invalid option`。
+# 同一份脚本在两台机器上行为不同，症状只是"Linux 侧脚本莫名其妙起不来"。
+# 它同时污染了格式口径：`gofmt -l` 在 agent 包下几乎逐文件命中，
+# 只因为文件是 CRLF，不是代码问题（各轮修复的"格式"校验为此改用 tr -d '\r'）。
+
+# 默认：按内容自动识别文本，检出时用 LF（跨平台一致）
+* text=auto eol=lf
+
+# 必须在 Linux/POSIX shell 下执行的脚本一律 LF：
+# 带 \r 时 dash 会在解析期就报 `Syntax error: "(" unexpected`，
+# 而 `bash -n` 一律放过（CI 的 script-guard 因此特意补了 sh -n）。
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Windows 批处理必须是 CRLF：某些工具链对 .bat 的 LF 处理不一致
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制，禁止任何转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.pdf   binary
+*.docx  binary
+*.xlsx  binary
+*.zip   binary
+*.gz    binary
+*.br    binary
+*.7z    binary
+*.exe   binary
+*.dll   binary
+*.deb   binary
+*.rpm   binary
+*.mmdb  binary
+*.woff  binary
+*.woff2  binary
+*.ttf   binary
+
+# 二进制文件与生成物在 diff / 语言统计里不糊弄
+*.min.js  linguist-generated
+*.min.css linguist-generated

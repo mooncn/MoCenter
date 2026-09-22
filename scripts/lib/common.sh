@@ -168,8 +168,31 @@ mc_pkg_tool_rpm() {
 # ---------- 目录清理 ----------
 # 只清理「本次确实会产出内容」的子目录：这样 --type=agent 不会误删上一次的
 # server 产物，重复执行不同参数组合也不会互相覆盖。
-mc_clean() { rm -rf "$@"; }
-mc_reset_dir() { rm -rf "$1"; mkdir -p "$1"; }
+#
+# L-9：这里必须**逐个拒绝**空值、相对路径与危险根路径。
+# 旧实现是一句 `rm -rf "$@"`：`mc_clean "$VAR"` 在 VAR 为空时会退化成
+# `rm -rf ""`（多数 rm 会报错，但补了 -f 就静默通过），
+# `mc_clean "."` 或 `mc_clean "/"` 则直接删工作目录/根 ——
+# 构建脚本里这种调用点一旦传入未初始化的变量，代价是不可逆的。
+# 判据：只允许以仓库根（脚本自己定位出来的那个 OUT_ROOT/仓库目录）为前缀的绝对路径。
+mc_clean() {
+  for _mc_p in "$@"; do
+    case "$_mc_p" in
+      "") die "mc_clean 收到空路径，拒绝执行（调用方变量未初始化？）" ;;
+      "/"|"."|".."|"/*/.."|*"//"*) die "mc_clean 拒绝危险路径：$_mc_p" ;;
+    esac
+    case "$_mc_p" in
+      /*) : ;;  # 绝对路径，再经过下面的前缀检查
+      *) die "mc_clean 只接受绝对路径（收到相对路径：$_mc_p）" ;;
+    esac
+    case "$_mc_p" in
+      "${OUT_ROOT:-/nonexistent}"/*) : ;;
+      *) die "mc_clean 拒绝删除仓库产物根之外的路径（OUT_ROOT=${OUT_ROOT:-未设置}）：$_mc_p" ;;
+    esac
+    rm -rf "$_mc_p" || die "mc_clean 删除失败：$_mc_p"
+  done
+}
+mc_reset_dir() { mc_clean "$1"; mkdir -p "$1"; }
 
 # ---------- 平台支持预检 ----------
 # 某些 GOOS/GOARCH 组合不被 Go 支持（典型：windows/arm，broken port，
