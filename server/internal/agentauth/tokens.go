@@ -58,6 +58,9 @@ const (
 	CredToken = "token"
 	// CredSharedKey 部署级共享注册密钥（旧方式，双轨过渡期保留）
 	CredSharedKey = "shared-key"
+	// CredAnon 服务端显式开启 -allow-unauthenticated-agents 时的无凭据接入。
+	// 它由**运维开关**决定，不由"忘配密钥"产生 —— 见 Verifier.Verify 的注释（H-N1）。
+	CredAnon = "anonymous"
 )
 
 // EnrollToken 一条注册令牌记录。

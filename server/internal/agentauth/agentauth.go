@@ -265,8 +265,15 @@ func (v *Verifier) sharedKeySnapshot() (string, bool) {
 // 未通过时返回错误；错误串刻意保持模糊（不区分"令牌不存在"与"证明不对"），
 // 免得把这条通道变成探测某个 agent_id 是否配过令牌的 oracle。
 func (v *Verifier) Verify(agentID, nonce, proof string, ts int64) (string, error) {
+	// 未启用任何凭据路径时**必须报错**，不能返回 ("", nil)。
+	//
+	// 这里曾经是 `return "", nil` —— 把"没配凭据"当成"校验通过"，调用方
+	// enrollAgentCert 在 -allow-unauthenticated-agents 下又不再自己判 Enabled，
+	// 两处语义一叠加就成了"无凭据者可自选 agent_id 换到合法 CA 证书"（H-N1）。
+	// 静默通过这种语义没有任何调用方需要：要放行匿名注册的地方应当**显式**放行
+	// （见 main.go 的 CredAnon），而不是靠"忘了配密钥"这条路径顺出来。
 	if !v.Enabled() {
-		return "", nil
+		return "", fmt.Errorf("服务端未配置注册凭据（一次性注册令牌或共享注册密钥）")
 	}
 	if agentID == "" {
 		return "", fmt.Errorf("缺少 agent_id")

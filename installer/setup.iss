@@ -199,8 +199,12 @@ begin
     '只需填当前角色需要的项，另一项留空不影响安装。');
   PageBasic.Add('服务端地址（host:port，安装 Agent 时必填）：', False);
   PageBasic.Add('Server 后台登录用户名（安装 Server 时必填）：', False);
-  PageBasic.Add('Server 后台登录密码（安装 Server 时必填，至少 6 位）：', True);
-  PageBasic.Add('Agent 注册密钥（安装 Agent 时必填，取总控机数据目录下 agent.key 的内容）：', False);
+  PageBasic.Add('Server 后台登录密码（安装 Server 时必填，至少 12 位）：', True);
+  // L-9：注册密钥是**等价于主机身份**的凭据（拿到它就能为任意 agent_id 换证书），
+  // 输入框最后一位参数 True 表示掩码回显 —— 旧版为 False，等于在安装向导界面上
+  // 明文显示它，任何能瞄到屏幕的人/录屏/截图都能抄走。
+  // 注意 LastChar 仍会被读进 Process2，属 Inno 的固有限制；掩码至少挡住旁人旁观。
+  PageBasic.Add('Agent 注册密钥（安装 Agent 时必填，取总控机数据目录下 agent.key 的内容）：', True);
 
   // 第 3 页：高级
   PageAdv := CreateInputQueryPage(PageBasic.ID,
@@ -270,9 +274,12 @@ begin
       Result := False;
       Exit;
     end;
-    if (Pos('server', role) > 0) and (Length(SafeVal(PageBasic.Values[2])) < 6) then
+    // L-9：下限由 6 提到 12。服务端的 PBKDF2 会把离线爆破成本抬得很高，但
+    // 6 位口令在**在线**尝试下也只需几小时（且这是后台唯一的口令闸门），
+    // 顺带与 README/docs 里"强口令"的口径对齐。
+    if (Pos('server', role) > 0) and (Length(SafeVal(PageBasic.Values[2])) < 12) then
     begin
-      MsgBox('安装 Server 必须设置至少 6 位的后台登录密码。', mbError, MB_OK);
+      MsgBox('安装 Server 必须设置至少 12 位的后台登录密码。', mbError, MB_OK);
       Result := False;
       Exit;
     end;
