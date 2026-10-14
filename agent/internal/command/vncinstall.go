@@ -22,6 +22,17 @@ type VncInstallResult struct {
 	Mode     string // 实际生效的模式：interactive / service
 }
 
+// VncPasswordResult 读取当前 VNC 口令的结果。
+//
+// 与 VncInstallResult 分开：读取是**只读**操作，不改配置、不重启服务、
+// 不打断正在进行的远程会话，因此也没有 Port 这种"本次生效值"的语义。
+type VncPasswordResult struct {
+	OK       bool
+	Message  string
+	Password string
+	Mode     string // 口令所属的模式：interactive / service
+}
+
 // VNC 安装模式（与服务端 protocol 常量保持一致）。
 const (
 	// VncModeInteractive 交互会话模式：VNC 运行在登录用户的交互会话中，

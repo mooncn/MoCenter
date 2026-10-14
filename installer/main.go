@@ -246,7 +246,7 @@ func usage() {
 
 示例:
   REM 在被控机上安装 Agent（-agent-key 取总控机 <data>\agent.key 的内容）
-  mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key <注册密钥>
+  mocenter-deploy.exe install -role agent -server mc.example.com:9000 -agent-key <注册密钥>
 
   REM 在总控机上安装 Server
   mocenter-deploy.exe install -role server -user admin -password-file <0600 口令文件>   # 推荐

@@ -543,6 +543,10 @@ func (r *Router) Audit(l *AuditLog) int64 {
 			Blocked:     l.Blocked,
 			BlockReason: l.BlockReason,
 			Duration:    l.Duration,
+			// Category 必须一并抄过去：漏了它，InsertAuditLog 会把空值补成 'command'，
+			// 于是"注册面拒绝(Category=auth)"与"运维操作(op)"两类审计在库里永远显示成
+			// 命令执行，`/api/audits?category=auth` 一条也查不到（真机 H-N1 端到端复测撞出）。
+			Category: l.Category,
 		}
 	}
 	r.auditMu.Unlock()

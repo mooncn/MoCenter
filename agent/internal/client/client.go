@@ -724,6 +724,12 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 			return
 		}
 		go c.handleVncInstall(req)
+	case protocol.TypeVncPasswordReq:
+		var req protocol.VncPasswordReq
+		if json.Unmarshal(env.Data, &req) != nil {
+			return
+		}
+		go c.handleVncPassword(req)
 	case protocol.TypePkgFetchResp:
 		var resp protocol.PackageFetchResp
 		if json.Unmarshal(env.Data, &resp) != nil {
@@ -853,6 +859,19 @@ func (c *Client) handleVncInstall(req protocol.VncInstallReq) {
 	})
 }
 
+// handleVncPassword 读取本机当前 VNC 口令并回传。
+//
+// 只读：不改配置、不重启服务，因此不会打断正在进行的远程会话 ——
+// 这是它与"一键安装（会重置口令并重启）"的关键区别。
+func (c *Client) handleVncPassword(req protocol.VncPasswordReq) {
+	r := command.VncReadPassword()
+	// 日志只记"读到没有"，绝不把口令本身写进日志（那等于又存了一份明文凭据）
+	log.Printf("[agent] VNC 口令读取结果: ok=%v mode=%s msg=%s", r.OK, r.Mode, r.Message)
+	_ = c.write(protocol.TypeVncPasswordResp, protocol.VncPasswordResp{
+		OK: r.OK, Message: r.Message, Password: r.Password, Mode: r.Mode,
+	})
+}
+
 // handleFilePush 接收服务端下发的文件分片，写入本地目标文件并回传 ACK/NACK。
 func (c *Client) handleFilePush(req protocol.FilePushReq) {
 	log.Printf("[agent] 收到文件分发分片 seq=%d %s", req.ChunkSeq, req.FilePath)
@@ -969,10 +988,15 @@ func (c *Client) sendFileChunks(req protocol.FileDownloadReq) {
 		n, rerr := f.Read(buf)
 		if n > 0 {
 			md5 := md5Chunk(buf[:n])
-			_ = c.write(protocol.TypeFileUploadReq, protocol.FileUploadReq{
+			// 写失败必须留下痕迹并停止（L-6）：原先是 `_ = c.write(...)`，
+			// 连接断在半路时服务端只会收到一个永远缺片的任务，Agent 侧一行日志都没有。
+			if werr := c.write(protocol.TypeFileUploadReq, protocol.FileUploadReq{
 				AgentID: c.cfg.AgentID, FilePath: req.FilePath, FileSize: size,
 				ChunkSeq: seq, ChunkData: append([]byte(nil), buf[:n]...), ChunkMD5: md5,
-			})
+			}); werr != nil {
+				log.Printf("[agent] 文件回传中断于第 %d 片（%s，共 %d 字节）: %v", seq, req.FilePath, size, werr)
+				return
+			}
 			seq++
 		}
 		if rerr != nil {

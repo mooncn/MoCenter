@@ -665,7 +665,7 @@ func main() {
 	mux.HandleFunc("/api/vnc/probe", vncProbeHandler(vncMgr, authz))
 	mux.HandleFunc("/api/vnc/install", vncInstallHandler(vncMgr, authz, router))
 	mux.HandleFunc("/api/vnc/status", vncStatusHandler(vncMgr, authz))
-	mux.HandleFunc("/api/vnc/password", vncPasswordHandler(vncMgr, authz, router))
+	mux.HandleFunc("/api/vnc/password", vncPasswordHandler(vncMgr.ReadPassword, authz, router))
 	mux.HandleFunc("/api/agents", agentsHandler(store, authz))
 	mux.HandleFunc("/api/agents/history", historyHandler(store, authz))
 	// 延迟监测（ICMP/TCP/HTTP）：查询历史曲线 + 下发/查看探测目标
@@ -820,6 +820,7 @@ func main() {
 		agentCertHosts := adminCertHosts(*addr, *serverName)
 		if publicIP := detectPublicIP(); publicIP != "" {
 			agentCertHosts = append(agentCertHosts, publicIP)
+			setPublicIP(publicIP) // 供「Agent 接入」页面拼部署命令用
 			log.Printf("[server] 探针到本机公网 IP %s，已加入服务端证书 SAN", publicIP)
 		}
 		agentCert, usingAutoCert, certErr := identity.ServerCertificate(*tlsCert, *tlsKey, agentCertHosts...)
@@ -1121,6 +1122,64 @@ func logCertSANWarning(cert tls.Certificate, listenAddr string, hosts []string) 
 // 而证书里若没有它就必然校验失败（这正是"服务端换了 IP 就连不上"的成因）。
 // 探测失败（内网机器 / 出口被拦 / 启动太早）不是错误：返回空串，调用方照常签发，
 // 由本机网卡地址与 -server-name 兜底。
+// 本机公网 IP 的缓存。
+//
+// 为什么需要缓存：探测要联网、单个源 4 秒超时（三个源最坏 12 秒），
+// 而「Agent 接入」页面要读它来拼部署命令 —— 每次请求都同步探测会让页面卡住。
+// 所以：启动时探测一次（本来就要为证书 SAN 做），之后只在拿到空值时后台补探。
+var (
+	publicIPMu        sync.Mutex
+	publicIPCached    string
+	publicIPLastTry   time.Time
+	publicIPDetecting bool
+)
+
+// publicIPRetryInterval 探测失败后的最小重试间隔。
+// 启动时网络未就绪是常见情况，一次失败就永久放弃会让页面永远拿不到地址。
+const publicIPRetryInterval = 60 * time.Second
+
+// setPublicIP 记录启动阶段探测到的公网 IP。
+func setPublicIP(ip string) {
+	if ip == "" {
+		return
+	}
+	publicIPMu.Lock()
+	publicIPCached = ip
+	publicIPMu.Unlock()
+}
+
+// cachedPublicIP 返回已缓存的公网 IP；未探测到返回空串（不阻塞）。
+func cachedPublicIP() string {
+	publicIPMu.Lock()
+	defer publicIPMu.Unlock()
+	return publicIPCached
+}
+
+// refreshPublicIP 在后台补探公网 IP（已有值或正在探测则直接返回）。
+func refreshPublicIP() {
+	publicIPMu.Lock()
+	if publicIPCached != "" || publicIPDetecting {
+		publicIPMu.Unlock()
+		return
+	}
+	if !publicIPLastTry.IsZero() && time.Since(publicIPLastTry) < publicIPRetryInterval {
+		publicIPMu.Unlock()
+		return
+	}
+	publicIPLastTry = time.Now()
+	publicIPDetecting = true
+	publicIPMu.Unlock()
+
+	ip := detectPublicIP() // 在锁外做，避免拖住其它读取方
+
+	publicIPMu.Lock()
+	publicIPDetecting = false
+	if ip != "" {
+		publicIPCached = ip
+	}
+	publicIPMu.Unlock()
+}
+
 func detectPublicIP() string {
 	client := &http.Client{Timeout: 4 * time.Second}
 	urls := []string{
@@ -1676,9 +1735,8 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			// 探针是高频数据源：整份主机列表的广播按窗口合并，
 			// 否则一条连接把上报间隔改小就能放大成"每条报文 × 所有订阅者"的全量推送。
 			refresh.soon()
-			_ = sessConn.Write(protocol.TypeProbeDataResp, protocol.ProbeDataResp{
-				ProbeID: fmt.Sprintf("probe-%d", time.Now().UnixNano()), Timestamp: time.Now().Unix(),
-			})
+			// 探针不回执（L-6）：Agent 的 handleMessage 里没有 ProbeDataResp 分支，
+			// 回执发出即被丢弃，等于每台主机每 10 秒多一帧纯开销。
 		case protocol.TypeCommandResp:
 			var cr protocol.CommandResp
 			if json.Unmarshal(env.Data, &cr) != nil {
@@ -1732,9 +1790,16 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 				log.Printf("[server] 丢弃 %s 的上传分片（自报身份 %q 与连接身份不符）", sessConn.GetAgentID(), fu.AgentID)
 				continue
 			}
-			// 分片接收：MD5 校验 + 断点续传 + ACK/NACK
-			ack := ft.HandleUploadChunk(&fu)
-			_ = sessConn.Write(protocol.TypeFileAck, ack)
+			// 分片接收：MD5 校验 + 断点续传 + 容量闸门
+			_ = ft.HandleUploadChunk(&fu)
+			// 不回写 FileAck（L-6）：Agent 在吐分片期间**不接收任何消息**
+			// （sendFileChunks 由读循环内联调用，client.go:677），每片一条 ACK
+			// 只会堆在 socket 里；跨网段链路上未读缓冲一旦顶满，服务端这一侧的
+			// 写要等到 agentWriteWait(30s) 才返回，期间它连分片都没法继续收。
+			// 2026-10-01 真机口径：同机环回上复现不出这个停顿（512 条回执被内核
+			// 队列整段吸收，旧服务端 32MiB 回传 1s 完成、无超时），故此处按
+			// "无用的反向流量"而非"已知故障"处理。缺片由服务端
+			// "分片齐且总长相符才落盘"+ CleanupStale 兜底，不需要 Agent 实时确认。
 			// 推送状态给 Web
 			hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
 				AgentID: fu.AgentID, FilePath: fu.FilePath, Action: "upload",
@@ -1805,6 +1870,11 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			var vr protocol.VncInstallResp
 			if json.Unmarshal(env.Data, &vr) == nil {
 				vncMgr.NotifyInstall(sessConn.GetAgentID(), &vr)
+			}
+		case protocol.TypeVncPasswordResp:
+			var pr protocol.VncPasswordResp
+			if json.Unmarshal(env.Data, &pr) == nil {
+				vncMgr.NotifyPassword(sessConn.GetAgentID(), &pr)
 			}
 		case protocol.TypePkgFetchReq:
 			var pr protocol.PackageFetchReq
@@ -1914,6 +1984,15 @@ func serverInfoHandler(authz *auth.Auth, identity *agentauth.Identity, verifier 
 			// shared_key_enabled：部署级共享注册密钥当前还能不能用来注册
 			// （false = 只认一次性令牌，此时指纹与密钥路径一律不下发）。
 			"shared_key_enabled": sharedKeyOn,
+		}
+		// public_ip：本机探测到的公网 IP，供「Agent 接入」页面把部署命令里的总控地址
+		// 补全 —— -listen 是 ":9000" / "0.0.0.0:9000" 这类写法时，命令里根本没有可用主机名。
+		// 取不到就**不下发该字段**（前端据此退回占位符），而不是给一个空串让前端拼出坏地址。
+		if ip := cachedPublicIP(); ip != "" {
+			resp["public_ip"] = ip
+		} else {
+			// 启动时没探到（例如开机早于网络就绪）：后台补探，下次请求即可用。
+			go refreshPublicIP()
 		}
 		if sharedKeyOn {
 			// 明文改由 /api/enroll/shared-key/rotate 这个显式动作一次性给出，
@@ -2462,11 +2541,18 @@ func vncStatusHandler(mgr *vnc.Mgr, authz *auth.Auth) http.HandlerFunc {
 	}
 }
 
-// vncPasswordHandler 按需交付某主机最近一次安装/启动生成的 VNC 口令，并留痕。
+// vncPasswordHandler 按需交付某主机**当前生效**的 VNC 口令，并留痕。
+//
+// 实现是实时向 Agent 读取（Agent 从 ultravnc.ini / x11vnc 口令文件还原），
+// 不是回放服务端缓存的上次安装结果 —— 服务端重启、换人操作、或 VNC 是手工装的，
+// 缓存都答不上来。读取是只读操作，不会重启服务、不会打断正在使用的远程会话。
 //
 // 为什么要单开一个 POST 端点并记审计：口令本身是"能打开这台机器桌面"的凭据，
 // 谁在什么时候取过是事后追查远程桌面事件的第一手线索。
-func vncPasswordHandler(mgr *vnc.Mgr, authz *auth.Auth, router *route.Router) http.HandlerFunc {
+// readPassword 由调用方注入（生产环境传 vncMgr.ReadPassword）。
+// 注入而不是直接依赖 *vnc.Mgr，是为了让 HTTP 层能单独测"交付与留痕"这条契约 ——
+// 否则要造一个假的 Agent 连接才能覆盖到。
+func vncPasswordHandler(readPassword func(string) *protocol.VncPasswordResp, authz *auth.Auth, router *route.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
@@ -2481,9 +2567,12 @@ func vncPasswordHandler(mgr *vnc.Mgr, authz *auth.Auth, router *route.Router) ht
 		if !decodeJSON(w, r, maxJSONBody, &body) {
 			return
 		}
-		var pw string
-		if resp := mgr.LastResult(body.AgentID); resp != nil {
-			pw = resp.Password
+		// 实时向 Agent 读取机器上**当前生效**的口令，而不是回放本进程缓存的上次安装结果：
+		// 服务端重启、换人操作、或 VNC 是手工装的，缓存都答不上来，而重装又会打断在用会话。
+		resp := readPassword(body.AgentID)
+		pw, msg := "", ""
+		if resp != nil {
+			pw, msg = resp.Password, resp.Message
 		}
 		// 审计只记"取到了没有"，绝不把口令本身写进审计（那是又存了一份明文凭据）。
 		result := "无可用口令"
@@ -2497,10 +2586,13 @@ func vncPasswordHandler(mgr *vnc.Mgr, authz *auth.Auth, router *route.Router) ht
 			})
 		}
 		if pw == "" {
-			writeJSON(w, map[string]interface{}{"ok": false, "msg": "该主机没有可交付的 VNC 口令，请先执行一键安装/启动"})
+			if msg == "" {
+				msg = "该主机没有可交付的 VNC 口令，请先执行一键安装/启动"
+			}
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": msg})
 			return
 		}
-		writeJSON(w, map[string]interface{}{"ok": true, "password": pw})
+		writeJSON(w, map[string]interface{}{"ok": true, "password": pw, "mode": resp.Mode})
 	}
 }
 
@@ -3354,11 +3446,19 @@ func serveStaticFile(w http.ResponseWriter, r *http.Request, path string, fi os.
 	if ct := mimeByExt(filepath.Ext(path)); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
-	// 预压缩产物优先：省去每次请求的压缩开销，也避免弱网下反复传输大包
-	if enc := pickEncoding(r.Header.Get("Accept-Encoding")); enc.name != "" {
+	// 预压缩产物优先：省去每次请求的压缩开销，也避免弱网下反复传输大包。
+	//
+	// 带 Range 的请求必须走原文件（L-3）：http.ServeFile 是拿 **.br/.gz 的字节数**
+	// 去解释客户端那份"未压缩字节"的偏移量的，Range 命中时会回一个长度与内容都
+	// 对不上的 206 —— 客户端解完压只拿到错位的一截。分段请求不常见，但一旦发生
+	// 就是静默的数据错误，所以直接放弃这条路径的压缩收益。
+	//
+	// Vary 无条件声明：这条响应的内容确实随 Accept-Encoding 变化，只在命中 sidecar
+	// 时才写会让中间缓存把"未压缩的那份"当成唯一表示存下来。
+	w.Header().Set("Vary", "Accept-Encoding")
+	if enc := pickEncoding(r.Header.Get("Accept-Encoding")); enc.name != "" && r.Header.Get("Range") == "" {
 		if cand := path + "." + enc.ext; fileExists(cand) {
 			w.Header().Set("Content-Encoding", enc.name)
-			w.Header().Set("Vary", "Accept-Encoding")
 			http.ServeFile(w, r, cand)
 			return
 		}
@@ -3371,19 +3471,58 @@ type encoding struct {
 	ext  string // 预压缩产物后缀
 }
 
-// pickEncoding 解析 Accept-Encoding，支持 br / gzip（br 优先，体积更小）。
+// pickEncoding 解析 Accept-Encoding，支持 br / gzip（同为可接受时 br 优先，体积更小）。
+//
+// 必须按 q 值判定（L-3）：原先用 strings.Contains 匹配子串，于是
+//   - `br;q=0` —— 客户端**明确拒绝** brotli —— 照样判成命中，回一份 .br；
+//   - `gzip;q=1.0, br;q=0.2` —— 客户端更想要 gzip —— 仍然按"谁先出现"回 br。
+//
+// 两种情况都只是"给了一份客户端不想要的编码"，浏览器会照单全收，
+// 症状是内容能显示但某些中间层/老设备解压失败，很难查到这里。
+//
+// 不识别的编码一律按"不可接受"处理：客户端列了 br/gzip 之外的清单而没有提到
+// 这两个，就说明它不支持，不能靠 Contains 的巧合把它算成支持。
 func pickEncoding(header string) encoding {
-	h := strings.ToLower(header)
-	if h == "" {
-		return encoding{}
+	brQ, gzQ := 0.0, 0.0
+	for _, tok := range strings.Split(strings.ToLower(header), ",") {
+		name, q := splitEncodingToken(tok)
+		switch name {
+		case "br":
+			brQ = q
+		case "gzip":
+			gzQ = q
+		}
 	}
-	if strings.Contains(h, "br") {
-		return encoding{name: "br", ext: "br"}
-	}
-	if strings.Contains(h, "gzip") {
+	// 权重高者胜；相等（含两者都未标 q，即都为 1）时按服务端偏好回 br。
+	if gzQ > brQ {
 		return encoding{name: "gzip", ext: "gz"}
 	}
+	if brQ > 0 {
+		return encoding{name: "br", ext: "br"}
+	}
 	return encoding{}
+}
+
+// splitEncodingToken 拆出一个编码名与它的 q 值（缺省 1）。
+// q 值畸形时按 0 处理：宁可回退未压缩，也不要把解析不了的参数当成"客户端同意了"。
+func splitEncodingToken(tok string) (string, float64) {
+	name := strings.TrimSpace(tok)
+	q := 1.0
+	if i := strings.IndexByte(name, ';'); i >= 0 {
+		param := strings.TrimSpace(name[i+1:])
+		name = strings.TrimSpace(name[:i])
+		if strings.HasPrefix(param, "q=") {
+			v, err := strconv.ParseFloat(strings.TrimSpace(param[2:]), 64)
+			if err != nil || v < 0 {
+				q = 0
+			} else if v > 1 {
+				q = 1
+			} else {
+				q = v
+			}
+		}
+	}
+	return name, q
 }
 
 func fileExists(p string) bool {

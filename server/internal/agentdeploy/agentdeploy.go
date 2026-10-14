@@ -847,17 +847,32 @@ func buildInstallScript(a installScriptArgs) string {
 	fmt.Fprintf(&sb, "CONF=%s\n", conf)
 	fmt.Fprintf(&sb, "DIR=%s\n", dir)
 	fmt.Fprintf(&sb, "SVC=%s\n", svc)
-	// 目标目录与配置文件：配置与二进制分离，升级不覆盖配置
+	// 二进制始终替换（部署/升级都要换），配置**只在首次部署时写入**。
+	//
+	// 为什么不再覆盖配置：覆盖会丢掉本机定制（file_roots / proxy_ip / latency_targets
+	// 等）以及 Agent 启动后写回的设备身份，与 install-linux.sh 的既定升级语义
+	//（"已安装则只换二进制与服务，配置原样保留"）也不一致。
+	// 注意：这也意味着**无法**再用重新部署的方式给存量 Agent 补 upgrade_pubkey ——
+	// 那种情况需要手工改配置，或先删除配置再部署一次。
 	sb.WriteString(`$SUDO mkdir -p "$DIR" /etc/mocenter
 if command -v install >/dev/null 2>&1; then
   $SUDO install -m 0755 "$BIN" "$DIR/mocenter-agent"
-  $SUDO install -m 0600 "$CONF" "/etc/mocenter/mocenter-agent.json"
 else
   # 部分最小化系统没有 install 命令，退回 cp + chmod
   $SUDO cp -f "$BIN" "$DIR/mocenter-agent"
   $SUDO chmod 0755 "$DIR/mocenter-agent"
-  $SUDO cp -f "$CONF" "/etc/mocenter/mocenter-agent.json"
-  $SUDO chmod 0600 "/etc/mocenter/mocenter-agent.json"
+fi
+CONF_DST=/etc/mocenter/mocenter-agent.json
+if [ -f "$CONF_DST" ]; then
+  echo "[config] 已保留既有配置（升级模式，未覆盖 $CONF_DST）"
+else
+  if command -v install >/dev/null 2>&1; then
+    $SUDO install -m 0600 "$CONF" "$CONF_DST"
+  else
+    $SUDO cp -f "$CONF" "$CONF_DST"
+    $SUDO chmod 0600 "$CONF_DST"
+  fi
+  echo "[config] 首次部署，已写入 $CONF_DST"
 fi
 `)
 	if a.HasSystemd {

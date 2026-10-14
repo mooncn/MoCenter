@@ -95,6 +95,24 @@ sudo bash scripts/deploy/install-linux.sh upgrade --role=server \
 # 升级时无需重复提供 --user/--password-file；要清理重装（删除既有配置）加 --force
 ```
 
+**升级顺序与前置条件**（一次说清，避免踩坑）：
+
+1. **服务端**：替换二进制 + 重启即可（上面那条命令），配置/账号/数据保留。
+   注意**证书只在启动时加载** —— 换过证书必须重启进程才生效。
+2. **Agent** 两条路：
+   - **远程升级**（推荐，不用登录被控机）：`POST /api/upgrade` 或 Web「运维操作 → 远程升级」。
+     要求包为 https 且同时通过 SHA-256 与 Ed25519 签名。
+     **前提是 Agent 已配 `-upgrade-pubkey`** —— 没配则一律拒绝，这是默认安全态而非故障。
+   - **重新部署**：Web「部署 Agent」（SSH 一键）或
+     `install-linux.sh upgrade --role=agent --bin=...`。
+     目标机已有 `/etc/mocenter/mocenter-agent.json` 时**只替换二进制并重启服务，配置原样保留**，
+     因此可以直接当升级用（本机定制与设备身份不会被冲掉）。
+3. **建议先升 Agent 再升服务端**：新服务端若下发了旧 Agent 不认识的消息，旧 Agent 会
+   **静默忽略**（不会崩），只是对应功能会超时；反过来（新 Agent + 旧服务端）没有这个问题。
+4. **给存量 Agent 补 `-upgrade-pubkey`**：重新部署**不会**覆盖已有配置，所以补不进去 ——
+   需手工编辑目标机的配置，或先删除该文件再部署一次（后者会按总控侧的值重写配置，本机定制会丢）。
+   也不能靠「文件分发」补：`-file-roots` 默认只允许写 `<配置目录>/files`，改不到配置文件本身。
+
 **保活自启**（脚本按环境自动选择）：
 
 | 环境 | 注册内容 |
@@ -416,7 +434,7 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
 
    # Agent（只给注册凭据；首次连接自动换取客户端证书，之后走 mTLS）
    # 推荐用 Web「Agent 接入」页签发的**一次性注册令牌**（一台一份、用后即废），见下节
-   ./mocenter-agent -server your.server.com:9000 -agentid host-01 -agent-key <一次性注册令牌>
+   ./mocenter-agent -server mc.example.com:9000 -agentid host-01 -agent-key <一次性注册令牌>
    ```
 
    浏览器访问 `https://<总控>:8080` 会提示自签名证书，**接受即可**；若要受信任证书，
@@ -457,7 +475,7 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
    | `-server-fingerprint`（Agent） | 公钥指纹固定，免 CA 文件、不受服务端换 IP/证书影响 |
    | `-enroll-secret`（Agent） | 换取证书用的注册凭据（默认取 `agent_key`，换取成功后自动清空） |
    | `-creds-dir`（Agent） | 客户端证书落盘目录（默认 `<配置目录>/creds`） |
-   | `-upgrade-pubkey`（服务端 / Agent） | 升级包验签公钥（Ed25519 hex）。服务端配了就随「一键部署」写进 Agent 配置；**Agent 没配它就不接受任何升级指令**，没有跳过验签的开关 |
+   | `-upgrade-pubkey`（服务端 / Agent） | 升级包验签公钥（Ed25519 hex）。服务端配了就会写进**新部署**的 Agent 配置（已有配置不会被覆盖，见「一键部署」的升级语义）；**Agent 没配它就不接受任何升级指令**，没有跳过验签的开关 |
    | `-file-roots`（Agent） | 文件分发/取回允许的根目录（逗号分隔），默认 `<配置目录>/files`；只认本机配置与命令行，服务端指令改不了 |
 
    **注册凭据：优先用一次性令牌**
@@ -1081,6 +1099,7 @@ Agent 与 Server **同一份配置只允许一个实例**。跨平台实现不�
 | 日志出现「已有一个使用同一配置的 Agent 在运行，本次启动终止」 | **这是保护生效，不是故障**：已有实例持有单实例锁。用 `systemctl status mocenter-agent` / `ps -ef \| grep mocenter-agent` 确认。若确实是上次断电遗留（日志会提示锁文件多久没被刷新、PID 是否来自上一次开机），删掉锁文件后重启即可，**不要**去杀那个 PID（可能已被复用）。详见「单实例保护」 |
 | 日志出现「无法打开锁文件 … 本次启动**未启用**单实例保护」 | 锁文件所在目录对运行用户不可写。锁文件与 `-config` 指定的配置文件同目录，请确保该目录可写（systemd 单元里是 `/etc/mocenter`，见「单实例保护」） |
 | Agent 报 `x509: certificate is valid for 127.0.0.1, ::1, not <IP>` | 服务端证书 SAN 不含 Agent 连接用的地址。见下方「TLS 证书 SAN 不匹配」 |
+| Agent 报 `服务端地址仍是安装占位符 "your.server.com:9000"` 后退出 | 地址来自历次安装介质预置的占位值（旧 `.deb`/`.rpm` 里的 `mocenter-agent.conf`、旧 `install-windows.bat` 示例）。它连不上任何主机但形似合法配置，过去的表现是"服务在跑、这台永远不在线"，现在 Agent 启动即拒绝并把问题写在一行日志里。改法：把 `MOCENTER_SERVER`（或 `-server`、配置文件里的 `server`）改成实际地址。当前版本的 conf 模板已改为留空、`install-linux.sh` 装 Agent 时缺 `--server` 直接报错退出 |
 | Agent 报 `remote error: tls: certificate required` | 服务端启用了 mTLS（`-ca-cert`）但 Agent 未带客户端证书；用 `-agent-key` 走自动换取，或补 `-client-cert`/`-client-key` |
 | 换了新证书仍报旧 SAN | 证书只在服务端**启动时**加载，替换文件后必须重启服务端进程 |
 

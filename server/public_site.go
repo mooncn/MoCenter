@@ -126,8 +126,12 @@ func (p *publicSite) allow(w http.ResponseWriter, r *http.Request, route string)
 
 // stateHandler GET /api/public/state
 //
-// 返回：总开关状态、字段可见性元数据（供前端决定渲染哪些项）、节点列表与汇总。
-// 未登录访客靠这一个接口即可渲染整个公开首页。
+// 返回：总开关状态、节点列表与汇总。未登录访客靠这一个接口即可渲染整个公开首页。
+//
+// 不下发 publicFieldCatalog()（L-4）：那份目录含每个字段的 sensitive 标记与说明，
+// 等于向任何扫到这条匿名端点的人公布"后台展示开关清单长什么样"。前端渲染只需要
+// config.fields 这个"哪些项可见"的键值表（PublicStatus.jsx 里的 visible()），
+// 目录本身只有登录后的配置页 /api/site/config 才用得上。
 func (p *publicSite) stateHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !p.requireEnabled(w) {
@@ -142,7 +146,6 @@ func (p *publicSite) stateHandler() http.HandlerFunc {
 			"ok":      true,
 			"enabled": true,
 			"config":  publicConfigPayload(cfg),
-			"fields":  publicFieldCatalog(),
 			"nodes":   nodes,
 			"summary": publicview.BuildSummary(nodes, time.Now().Unix()),
 		})

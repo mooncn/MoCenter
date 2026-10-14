@@ -12,7 +12,7 @@ import SiteFooter, { useSiteTitle } from '../components/SiteFooter.jsx'
 //   - 节点标识是服务端用部署私钥派生的 node_id（n- + 16 位 hex），前端拿不到 agent_id。
 //   - 总开关关闭时接口返回 404，本页显示"未开放"，不做任何兜底猜测。
 export default function PublicStatus() {
-  // snapshot 是一次完整的展示快照：config + fields + nodes + summary。
+  // snapshot 是一次完整的展示快照：config + nodes + summary。
   // 关键：节点列表与汇总必须**同源同帧**更新 —— 否则 WS 推送先到、汇总后到，
   // 会出现"卡片已有数据、汇总还显示 0"的自相矛盾画面。
   const [snapshot, setSnapshot] = useState(null)
@@ -33,7 +33,6 @@ export default function PublicStatus() {
         }
         setSnapshot({
           config: d.config || {},
-          fields: d.fields || [],
           nodes: Array.isArray(d.nodes) ? d.nodes : [],
           summary: d.summary || {},
         })
@@ -51,7 +50,6 @@ export default function PublicStatus() {
         setSnapshot((prev) => ({
           ...prev,
           config: d.config || prev?.config || {},
-          fields: prev?.fields || [],
           nodes: d.nodes,
           summary: d.summary || {},
         }))

@@ -8,8 +8,8 @@ REM   install-windows.bat install-server [user] [password] [listen] [http]
 REM   install-windows.bat status | uninstall
 REM
 REM 示例:
-REM   install-windows.bat install your.server.com:9000
-REM   install-windows.bat install your.server.com:9000 host-01
+REM   install-windows.bat install mc.example.com:9000
+REM   install-windows.bat install mc.example.com:9000 host-01
 REM   install-windows.bat install-server admin MyPass :9000 :8080
 REM
 REM 说明:
@@ -50,7 +50,7 @@ goto usage
 REM ---------------------------------------------------------------- Agent
 :install_agent
 if "%SERVER%"=="" (
-  echo 请指定服务端地址，如: install-windows.bat install your.server.com:9000
+  echo 请指定服务端地址，如: install-windows.bat install mc.example.com:9000
   exit /b 1
 )
 call :require_admin || exit /b 1

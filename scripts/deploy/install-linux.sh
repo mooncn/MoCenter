@@ -21,7 +21,7 @@
 #   --dry-run                   只打印将要执行的动作，不修改系统
 #   --bin=<路径>                单个组件时可直接指定二进制路径
 #   --bin-dir=<目录>            在该目录下按 mocenter-<role>[-<arch>] 自动查找
-#   --server=host:port          Agent 要连接的服务端地址（默认 your.server.com:9000）
+#   --server=host:port          Agent 要连接的服务端地址（安装 Agent 时必填）
 #   --agentid=名称              Agent 标识（留空回退为设备 UUID/主机名）
 #   --proxy-ip=前缀             国内加速代理前缀（可选）
 #   --user=名称               Server 后台登录账号（默认 admin）
@@ -61,7 +61,7 @@ ACTION="install"
 ROLE="agent"
 BIN=""
 BIN_DIR=""
-SERVER="${MOCENTER_SERVER:-your.server.com:9000}"
+SERVER="${MOCENTER_SERVER:-}"
 AGENT_ID="${MOCENTER_AGENT_ID:-}"
 PROXY_IP="${MOCENTER_PROXY_IP:-}"
 S_USER="${MOCENTER_USER:-admin}"
@@ -145,6 +145,15 @@ case "$ACTION" in install|upgrade|uninstall|status) ;; *) die "未知动作：$A
 # upgrade 与 install 走同一条路径：具体是"升级"还是"全新安装"由配置文件是否存在决定
 INSTALL_ACTION=0
 [ "$ACTION" = "install" ] || [ "$ACTION" = "upgrade" ] && INSTALL_ACTION=1
+
+# Agent 必须有明确的服务端地址（L-7）。
+# 之前这里默认填 your.server.com:9000：占位符长得像一份合法配置，Agent 会安静地
+# 去解析一个不存在的域名并无限重连，运维看到的是"服务在跑但主机一直不在线"。
+# 安装阶段就该问清楚的参数，不该推到运行期去猜。
+if [ "$INSTALL_ACTION" = 1 ] && [ "$ROLE" != "server" ]; then
+  [ -n "$SERVER" ] || die "缺少服务端地址：Agent 需要 --server=host:port（或环境变量 MOCENTER_SERVER）。
+     例：sudo bash $0 --role=agent --bin=./mocenter-agent --server=10.0.0.5:9000"
+fi
 
 need_root() {
   [ "$DRY_RUN" = 1 ] && return 0

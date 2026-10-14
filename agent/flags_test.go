@@ -5,6 +5,30 @@ import (
 	"testing"
 )
 
+// TestIsPlaceholderServer 钉住 L-7 的判定范围：只认历次安装介质预置过的那个占位主机名。
+//
+// 误判的代价是"真实部署起不来"，漏判的代价是"老部署无限重连一个不存在的域名"，
+// 所以两个方向都要钉：带端口/大小写要认，前缀写法与同名子域之外的地址不能误伤。
+func TestIsPlaceholderServer(t *testing.T) {
+	cases := map[string]bool{
+		"your.server.com":           true,
+		"your.server.com:9000":      true,
+		"YOUR.SERVER.COM:9000":      true,
+		" your.server.com:9000 ":    true,
+		"10.0.0.5:9000":             false,
+		"mocenter.internal:9000":    false,
+		"your.server.com.evil.test": false, // 同名前缀的其它域名不是占位符
+		"sub.your.server.com:9000":  false, // 子域不算占位符
+		"https://your.server.com":   false, // 带协议前缀属于写错的地址，由连接环节报错，不在本判定范围
+		"":                          false,
+	}
+	for addr, want := range cases {
+		if got := isPlaceholderServer(addr); got != want {
+			t.Errorf("isPlaceholderServer(%q)=%v，期望 %v", addr, got, want)
+		}
+	}
+}
+
 // TestNormalizeBlankFlagsAgent 钉住 Agent 侧「空串参数按未配置处理」。
 //
 // 背景：mocenter-agent.service 写成 `-server "${MOCENTER_SERVER}" -agentid "${MOCENTER_AGENT_ID}"`，

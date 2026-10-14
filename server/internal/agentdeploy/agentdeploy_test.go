@@ -3,6 +3,7 @@ package agentdeploy
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -71,6 +72,57 @@ func TestInstallScriptQuotesInputs(t *testing.T) {
 		if !strings.Contains(line, quoted) {
 			t.Fatalf("存在未加引号的用户输入: %q", line)
 		}
+	}
+}
+
+// 生成的安装脚本必须是合法 POSIX sh。
+//
+// 它是拼出来的：写错一个引号或 if/fi 配对，整段脚本会在目标机上以"语法错误"整体失败，
+// 而本机不跑一次是看不出来的（这类问题在批处理上已经栽过一次）。
+func TestBuildInstallScriptSyntax(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("环境无 sh，跳过语法校验")
+	}
+	cases := []struct {
+		desc string
+		args installScriptArgs
+	}{
+		{"root + systemd", installScriptArgs{RemoteBin: "/tmp/x", RemoteConf: "/tmp/c",
+			InstallDir: "/usr/local/bin", Service: "mocenter-agent", HasSystemd: true, AgentID: "h1", IsRoot: true}},
+		{"非 root + 无 systemd", installScriptArgs{RemoteBin: "/tmp/x", RemoteConf: "/tmp/c",
+			InstallDir: "/opt/bin", Service: "mc-agent", HasSystemd: false, AgentID: "h1", IsRoot: false}},
+		{"路径含空格与单引号", installScriptArgs{RemoteBin: "/tmp/a b'c", RemoteConf: "/tmp/c",
+			InstallDir: "/usr/local/bin", Service: "mocenter-agent", HasSystemd: true, AgentID: "h1", IsRoot: true}},
+	}
+	for _, c := range cases {
+		script := buildInstallScript(c.args)
+		cmd := exec.Command(sh, "-n")
+		cmd.Stdin = strings.NewReader(script)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("%s：脚本语法校验失败: %v\n%s\n--- 脚本 ---\n%s", c.desc, err, out, script)
+		}
+	}
+}
+
+// 回归：既有配置必须**保留**（升级语义）。
+//
+// 覆盖会丢掉本机定制（file_roots / proxy_ip / latency_targets）与 Agent 写回的设备身份，
+// 也与 install-linux.sh 的既定升级语义（"只换二进制与服务，配置原样保留"）不一致。
+// 二进制则必须无条件替换 —— 升级就是要换二进制。
+func TestBuildInstallScriptPreservesExistingConfig(t *testing.T) {
+	script := buildInstallScript(installScriptArgs{
+		RemoteBin: "/tmp/x", RemoteConf: "/tmp/c",
+		InstallDir: "/usr/local/bin", Service: "mocenter-agent", HasSystemd: true, AgentID: "h1", IsRoot: true,
+	})
+	if !strings.Contains(script, `if [ -f "$CONF_DST" ]`) {
+		t.Fatalf("脚本缺少「已存在则保留」的判断:\n%s", script)
+	}
+	if !strings.Contains(script, "已保留既有配置") {
+		t.Fatalf("脚本应明确告知配置被保留（否则运维不知道发生了什么）:\n%s", script)
+	}
+	if !strings.Contains(script, `install -m 0755 "$BIN" "$DIR/mocenter-agent"`) {
+		t.Fatalf("二进制应无条件替换:\n%s", script)
 	}
 }
 

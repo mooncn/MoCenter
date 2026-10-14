@@ -114,3 +114,107 @@ func TestUltraVNCIniPasswordFormat(t *testing.T) {
 	}
 	t.Fatalf("ultravnc.ini 中未找到 passwd 行:\n%s", ini)
 }
+
+// 回归：ini 里不是本次下发的口令时，校验必须失败。
+//
+// 这直接对应「旧实例退出时用旧口令回写 ini」这个间歇性故障：修复前没有任何读回校验，
+// 于是一路报成功，而前端拿着新口令去连必然认证失败，且看不出原因。
+func TestVerifyUltraVNCIniDetectsClobber(t *testing.T) {
+	dir := t.TempDir()
+	ini := filepath.Join(dir, "ultravnc.ini")
+
+	// 模拟被旧实例回写覆盖：文件里是上一次的旧口令
+	const oldPw = "OLDOLDOL"
+	if err := os.WriteFile(ini, []byte(ultraVNCIniContent(5900, oldPw)), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 本次下发的口令与文件不一致 → 必须报错
+	if err := verifyUltraVNCIni(dir, "NEWNEWNE"); err == nil {
+		t.Fatal("ini 中是旧口令，verifyUltraVNCIni 却通过了（回写覆盖会被漏掉）")
+	}
+	// 与文件一致 → 必须通过（否则会把正常情况也判成失败）
+	if err := verifyUltraVNCIni(dir, oldPw); err != nil {
+		t.Fatalf("ini 与口令一致时校验应通过，实际: %v", err)
+	}
+}
+
+// 回归：ini 缺失或不可读时必须报错，不能静默通过。
+func TestVerifyUltraVNCIniMissingFile(t *testing.T) {
+	if err := verifyUltraVNCIni(t.TempDir(), "ABCDEFGH"); err == nil {
+		t.Fatal("ini 不存在时校验应失败")
+	}
+}
+
+// passwd2 不能被当成 passwd 解析：两者同值时最容易掩盖问题。
+func TestIniPasswordValueSkipsPasswd2(t *testing.T) {
+	dir := t.TempDir()
+	ini := filepath.Join(dir, "ultravnc.ini")
+	content := "[admin]\r\nAuthRequired=1\r\n\r\n[UltraVNC]\r\n" +
+		"passwd=AAAABBBBCCCCDDDD01\r\npasswd2=111122223333444455\r\n"
+	if err := os.WriteFile(ini, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := iniPasswordValue(ini); got != "AAAABBBBCCCCDDDD01" {
+		t.Fatalf("应取 passwd 的值，实际取到 %q", got)
+	}
+}
+
+// tasklist CSV 解析：既要取到 PID，又不能在「无匹配」的本地化提示行上误判。
+// 环境清理是否彻底全靠这个判断，误判会让"旧实例仍在跑"被当成"已清空"。
+func TestParseTasklistCSV(t *testing.T) {
+	// 单条匹配（真实格式：进程名,PID,会话名,会话#,内存）
+	if got := parseTasklistCSV("\"winvnc.exe\",\"4321\",\"Console\",\"1\",\"12,345 K\"\r\n"); len(got) != 1 || got[0] != "4321" {
+		t.Fatalf("应解析出 PID 4321，实际 %v", got)
+	}
+	// 多条
+	got := parseTasklistCSV("\"winvnc.exe\",\"1\",\"Console\",\"1\",\"1 K\"\r\n" +
+		"\"winvnc.exe\",\"2\",\"Console\",\"1\",\"1 K\"\r\n")
+	if len(got) != 2 {
+		t.Fatalf("应解析出 2 个 PID，实际 %v", got)
+	}
+	// 无匹配：tasklist 打印一行本地化提示，中英文各验一次
+	for _, msg := range []string{
+		"信息: 没有运行的任务匹配指定标准。\r\n",
+		"INFO: No tasks are running which match the specified criteria.\r\n",
+	} {
+		if got := parseTasklistCSV(msg); len(got) != 0 {
+			t.Fatalf("无匹配提示不应被解析成 PID，实际 %v", got)
+		}
+	}
+	// 空输出
+	if got := parseTasklistCSV(""); len(got) != 0 {
+		t.Fatalf("空输出应为空，实际 %v", got)
+	}
+}
+
+// 校验和不符时必须报错，绝不能把 HEX 段解出来当口令返回。
+//
+// UltraVNC 用 GetPrivateProfileStruct 读取 passwd，校验和对不上就判数据损坏并**丢弃**，
+// 此时若照常返回解出的口令，等于给出一个必然连不上的错误口令 —— 比报错更难排查。
+func TestDecodeUltraVNCPasswordChecksum(t *testing.T) {
+	good := privateProfileStructValue(vncObfuscatePassword("abcdefgh"))
+	pw, err := decodeUltraVNCPassword(good)
+	if err != nil {
+		t.Fatalf("正确编码应能解出: %v", err)
+	}
+	if pw != "abcdefgh" {
+		t.Fatalf("解出 %q, want %q", pw, "abcdefgh")
+	}
+
+	// 篡改末位校验和（避开恰好相同的情况）
+	bad := good[:len(good)-1] + "0"
+	if bad == good {
+		bad = good[:len(good)-1] + "1"
+	}
+	if _, err := decodeUltraVNCPassword(bad); err == nil {
+		t.Fatal("校验和不符时必须报错（否则会返回一个连不上的错误口令）")
+	}
+
+	// 非 HEX 与长度异常
+	for _, s := range []string{"ZZZZ", "ABC", "", "GGGGGGGGGGGGGGGGGG"} {
+		if _, err := decodeUltraVNCPassword(s); err == nil {
+			t.Errorf("%q 应被拒绝", s)
+		}
+	}
+}

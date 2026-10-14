@@ -141,6 +141,25 @@ if !credentialFree {
 ### 验证
 `server/enroll_hn1_test.go`（新增 8 例，其中 1 例为 3 个子场景）：没配凭据时拒发、`Verify` 不再沉默通过、匿名路径仍须 nonce/TS、错凭据不降级、令牌路径不受影响、拒发必留审计。
 
+### 真机端到端复测（2026-10-01，Rocky 8 测试机）—— 24/25 通过，唯一失败项撞出一个真缺陷
+`.testtools/hn1-e2e.sh`：起**真实服务端**（三个开关逐一置为 false/true 组合）+ `openssl` 现出现场私钥与 CSR，走 `TypeEnrollReq` 真 TLS 握手，A–G 七组：
+
+| 组 | 场景 | 结果 |
+|---|---|---|
+| A | 空凭据 + 自选 `agent_id`（就是原 POC 的输入） | 换不到证书；给出明确拒绝原因；绑定表里不存在该主机 |
+| B | 错令牌 | 换不到证书；Agent 侧看得到服务端原因；拒签在服务端/回执链路留痕 |
+| C | 正确一次性令牌 | **正向路径可用**：拿到证书 + CA + 服务端指纹；证书公钥与本机私钥配对（私钥不出机器）；绑定表按 SPKI 记账（TOFU 落库，`spki=20e581…bae4da` 与证书算出的完全一致）；换取后以 mTLS 正常上线；配置里的 `enrollment_secret` 被清空（一次使用） |
+| D | 已消耗令牌二次使用 | 换不到第二张证书；**在册绑定指纹未被改动**；留下拒绝原因；令牌列表接口不回显明文 |
+| E | 拿别的主机的令牌换自己的 `agent_id` | 拒；绑定表里没有该主机 |
+| F | 对**已有活动会话**的 `agent_id`（在册主机 `rocky8-01`）抢注 | 拒，理由写明"当前有活动会话"；`rocky8-01` 的绑定指纹未被改动；**未打断在册主机的既有会话** |
+| G | 注册面审计 | 见下 |
+
+G 组断言"签发与拒绝都要进审计且带 `auth` 分类"失败：22 条拒签记录全部挂着 `category='command'`。这不是判据写错，而是一个**真缺陷**：`Router.Audit` 在把内存审计抄成 SQLite 行时漏了 `Category` 字段（内存回退路径抄了，所以单测全绿），`storage.InsertAuditLog` 又把空值补成 `'command'` —— 后果是注册面拒签、运维操作在库里永久显示成"命令执行"，`/api/audits?category=auth` 一条也查不到，即"拒发必留审计"这条防线在**检索面**上是失效的。已修（`server/internal/route/router.go:549`）并加回归 `TestAuditCategorySurvivesSQLite`（删掉那一行即判红，验过红/绿双向）；真机复核脚本 `.testtools/audit-category-check.sh` 装上修复后的构建重跑一次拒签 + 一次签发，`RESULT pass=3 fail=0`：`?category=auth` 命中且含本轮 `ac-check` 的 4 条拒签、`?category=op` 命中签发与吊销、`?category=command` 里本轮记录 0 条。**修复前那 22 条历史行不回改**（无回填脚本，且它们的时间戳与内容都在，只是类别标签旧）。
+
+**两条过程教训（都写进了判据，避免下次自我欺骗）**：
+1. 第一轮 `RESULT pass=12 fail=12`，Agent 退出码 **126** —— `vm.py put` 上去的 Agent 二进制是 644，**没一个用例真的跑起来**，而"没拿到证书"类断言全部白给 PASS。修法是 `chmod +x` 之外给脚本加 `CASE_ALIVE` 闸门：本轮 Agent 没启动则任何 PASS 一律记 FAIL。
+2. G 组的反向断言第一版按"command 桶里有几条拒签字样"计数，把修复前的历史行当成缺陷，误报一次 FAIL；改为只按本轮 `agent_id` 挑记录。
+
 ---
 
 ## 3. 🟡 中危 M-N2（既有报告提到但被低估，本轮已修复）
@@ -168,6 +187,8 @@ if !credentialFree {
 ---
 
 ## 4. 🟢 低危（本轮已全部收口）
+
+> **2026-10-01 续**：本节"全部收口"的范围是**本轮新发现或改写过的 5 项**（L-1/L-2/L-9/L-10 + 黑名单加固）。上一份报告 §4 里仍未动的 **L-3（`pickEncoding` 忽略 q 值）、L-4（匿名 `/api/public/state` 回全量字段目录）、L-6（协议死码与"发了没人收"的回执）、L-7（占位服务端地址）已于 2026-10-01 全部收口**，落地、残留与"两个默认值刻意不动"的理由见 `security-review-2026-09-19.md` §4 对应行与其末尾的 2026-10-01 验证基线段。**其中 L-6 修掉的是一条真实缺陷而非死码清理**：服务端每个上传分片回写一条 Agent 永远不会读的 `FileAck`，而 Agent 是在自己的读循环里同步吐分片的 —— 大文件会把服务端这一侧写到 deadline 超时并掐断控制连接。至此 LOW 系列只剩 **L-5（无头 Windows VDD，需真机）** 与 **CI 镜像 digest 钉扎（需注册表摘要）**。
 
 ### L-1　审计 CSV 公式注入 —— ✅ 已修
 
@@ -302,7 +323,7 @@ OK  已拦住: [relative/path]
 | `server/internal/agentauth/tokens.go` | 新增 `CredAnon` 凭证类型 |
 | `server/main.go` | `enrollAgentCert` 凭据裁决解耦 + 匿名留痕 + 拒发必审计（H-N1）；`csvCell` 公式注入中和（L-1）；三处 `logSafe`（L-2）；`DropInteractive` 接线（M-N2） |
 | `server/internal/route/interactive.go` | `InteractiveKey` 统一键 + 触顶淘汰最旧（M-N2） |
-| `server/internal/route/router.go` | `normalizeForBlacklist` + `IsBlocked` 双变体匹配（黑名单加固） |
+| `server/internal/route/router.go` | `normalizeForBlacklist` + `IsBlocked` 双变体匹配（黑名单加固）；**2026-10-01 真机复测追加**：`Audit` 抄 SQLite 行时补上漏掉的 `Category`（`:549`），否则注册面拒签与运维操作在库里全是 `command`，`?category=auth` 查不到 |
 | `installer/setup.iss` | 注册密钥掩码 + 口令下限 12（L-9） |
 | `scripts/lib/common.sh` | `mc_clean` 逐项防呆（L-9） |
 | `scripts/build-linux-all.sh` | 设置 `OUT_ROOT` 供 `mc_clean` 判定 |
@@ -311,19 +332,21 @@ OK  已拦住: [relative/path]
 | `server/hardening_export_test.go` | 新增 3 例（L-1 / L-2） |
 | `server/internal/route/hardening_blacklist_test.go` | 新增 3 例（黑名单加固） |
 | `server/internal/route/interactive_lifecycle_test.go` | 新增 4 例（M-N2） |
+| `server/internal/route/audit_category_test.go` | **新增（2026-10-01）**：`TestAuditCategorySurvivesSQLite` —— 三类审计各写一条，从 SQLite 路径按 `?category=` 查回并断言类别未丢、auth 行不得出现在 command 桶（真机复测撞出的缺陷的回归闸门；删掉 `router.go` 那行 `Category:` 即判红） |
+| `.testtools/hn1-e2e.sh` / `.testtools/audit-category-check.sh` | **新增（2026-10-01）**：H-N1 真机端到端 A–G 组 + 审计类别真机复核，均带"用例未真跑即不作数"的 `CASE_ALIVE` 闸门 |
 
-**测试增量**：18 个新测试函数（含 3 个子场景用例），全部围绕「漏掉就等于没改」的性质，而非实现细节。
+**测试增量**：18 个新测试函数（含 3 个子场景用例），全部围绕「漏掉就等于没改」的性质，而非实现细节。**2026-10-01 追加 1 例**（`TestAuditCategorySurvivesSQLite`）。
 
 ---
 
 ## 8. 残留与未做（如实记录）
 
 1. **H-5 的另一半 —— `.deb`/`.rpm`/`.exe` 签名与私钥轮换**：仍开放。四件事都要签名证书与密钥托管，**不是本仓代码能自己收口的**。升级包那一半已闭环且本轮复核无回退。
-2. **CI 镜像未按 digest 钉扎**（`golang:1.26` / `node:20`）：仍开放。需先把 digest 落进配置并建立更新流程，属排期项。
+2. **CI 镜像未按 digest 钉扎**（`golang:1.26` / `node:20`）：仍开放。**2026-10-01 复核过它为什么做不了**：开发机无 `docker` 命令，`auth.docker.io` 与 CNB 注册表根路径 `curl -m 25` 双双超时（exit 28），取不到当前真实摘要；把凭空写出的摘要钉进 CI 比不钉更糟（拉不到镜像，且"钉扎"看起来已生效）。需要一台能出网的构建机先取摘要、再建立更新流程，属排期项而非代码项。
 3. **`-allow-unauthenticated-agents` 的固有代价**：该开关打开时，匿名路径通常没有令牌存储（否则就不叫匿名了），因此 **TOFU 绑定没有承载者**。已如实写进代码注释与启动告警 —— 这个开关的语义就是「接受不可作为信任依据的身份」，运维应仅用于过渡期，且必须为每台主机补发一次性令牌。
 4. **黑名单是纵深防御，不是安全边界**：见 §4 的边界声明。它拦不住 shell 任意构造，也不打算拦。
 5. **未做依赖扫描复跑**：本环境网络可用但本轮未跑 `govulncheck` / `npm audit`（`.cnb.yml` 的 `security-scan` 作业已在 PR 阶段常态化执行，合入时即为真跑）。
-6. **未做实机端到端复现**：H-N1 的 POC 走的是 `enrollAgentCert` 的完整调用链 + `net.Pipe` 连接，**不是**「起服务端 + 真 TLS 握手 + 真 CSR」的端到端。修复后的断言在 `enrollAgentCert` 边界内是充分的（该函数就是签发决定点），但若需要彻底确认，建议在测试机起服务端带 `-allow-unauthenticated-agents` 且不配密钥，用 `openssl` 造 CSR 走 `TypeEnrollReq`，确认收到的是拒绝而不是证书。
+6. ~~**未做实机端到端复现**~~　✅ **已于 2026-10-01 在 Rocky 8 测试机补做，24/25 通过**：真实服务端 + 真 TLS 握手 + `openssl` 现出现场 CSR，A–G 七组覆盖"空凭据 / 错令牌 / 正确令牌正向签发（含 SPKI 绑定与私钥配对的密码学核对）/ 令牌二次使用 / 拿别人的令牌 / 抢注有活动会话的 `agent_id` / 审计留痕"，逐组结果与两条过程教训见 §2「真机端到端复测」。**它顺带撞出一个原判据覆盖不到的真缺陷**（审计 `Category` 在 SQLite 落库时被丢弃，导致注册面审计在检索面上失效），已修 + 加回归 + 真机复核 `pass=3 fail=0`。**剩余残留**：修复前那 22 条历史审计行的类别标签仍是 `command`（不做回填）；测试机系统时钟比实际日期慢约 9 天（`date` 显示 9 月 21 日），本轮所有"时间窗"判据都按机器时钟自洽校验，不影响签发/过期逻辑本身。
 7. **`installer/setup.iss` 的 `-extra` 保留**：理由见 §4 L-9 表格，这是本轮唯一「刻意不修」的低危项。
 
 ---
@@ -331,5 +354,5 @@ OK  已拦住: [relative/path]
 ## 9. 优先级建议
 
 1. **H-N1 已完成修复**（本轮）。若生产环境此前带 `-allow-unauthenticated-agents` 且未配凭据运行过，**应视为注册通道曾开放**：建议轮换内置 CA、为每台主机补发一次性令牌。同时检查配置文件里是否残留 `allow_anon_agents`（`main.go:228` 会回读它，去掉命令行参数不会关掉）。
-2. **M-N2 / L 系列已完成修复**（本轮）。
-3. **H-5 另一半 + 镜像 digest 钉扎**：按既有排期推进，两者都不阻塞当前使用。
+2. **M-N2 / L 系列已完成修复**（本轮 L-1/L-2/L-9/L-10；**余下的 L-3/L-4/L-6/L-7 已于 2026-10-01 收口**，见 §4 顶部续记）。
+3. **H-5 另一半 + 镜像 digest 钉扎**：按既有排期推进，两者都不阻塞当前使用。**2026-10-01 补一句口径**：这两项如今是报告里唯一还开着的"待办"，且**都不是代码问题** —— 前者要签名证书与密钥托管，后者要能取到注册表摘要（本机 `docker` 不存在、注册表 `curl` 超时）。第三类剩余是**真机复测**（H-N1 端到端、H-9 的 Windows 安装、Win10↔Rocky8 的 VNC 链路、L-5 的无头 VDD），需要用户侧开机与提供测试机口令。**2026-10-01 更新**：用户已提供两台测试机口令，**Rocky 8 侧已全部做完**（H-N1 端到端 24/25 + 由其撞出的审计类别缺陷已修并真机复核；L-3/L-4/L-6/L-7 的真机复测见 `security-review-2026-09-19.md` §4 各行的 🖥 段）；**只剩 Win10 侧三项**（H-9 真机安装、Win10↔Rocky8 VNC 链路、L-5 无头 VDD）—— 2026-10-01 复测时该 VM 的 445/3389 可达但**用户给的 FTP(21) 连接被拒**（服务未监听），文件通道待用户确认。

@@ -5,10 +5,12 @@
 package command
 
 import (
+	"bytes"
 	"crypto/des"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +32,32 @@ func vncObfuscatePassword(pw string) []byte {
 	out := make([]byte, 8)
 	block.Encrypt(out, in)
 	return out
+}
+
+// vncDeobfuscatePassword 还原 VNC 存储口令，即 vncObfuscatePassword 的逆运算。
+//
+// 为什么可以、也应该这么做：VNC 的存储口令用的是**公开固定密钥**的 DES-ECB，
+// 任何拿到该文件的人都能还原 —— 所以这不是"破解别人的秘密"，也没有引入新的暴露面
+// （文件本身就已经是等价凭据，且其读取权限已被收紧到特权账户）。
+//
+// 有了它才能回答"这台机器现在的 VNC 口令到底是什么"：否则一旦服务端重启、
+// 换人操作、或 VNC 是手工装的，就只剩"重装一次把口令重置掉"这一条路 ——
+// 那会打断正在使用中的远程会话。
+func vncDeobfuscatePassword(stored []byte) (string, error) {
+	if len(stored) != 8 {
+		return "", fmt.Errorf("存储口令应为 8 字节，实际 %d 字节", len(stored))
+	}
+	block, err := des.NewCipher(vncStoreKey)
+	if err != nil {
+		return "", err
+	}
+	out := make([]byte, 8)
+	block.Decrypt(out, stored)
+	// 生成侧是"不足 8 字节以 0 补齐"，故截到第一个 NUL 即原口令
+	if i := bytes.IndexByte(out, 0); i >= 0 {
+		out = out[:i]
+	}
+	return string(out), nil
 }
 
 // generateRandomPassword 生成用于 VNC 的随机口令（去易混淆字符，长度 8=VNC 上限）。

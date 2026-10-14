@@ -141,6 +141,58 @@ func TestSPAMethodGuard(t *testing.T) {
 	}
 }
 
+// TestPickEncodingQValues 回归 L-3：q 值必须参与判定。
+// 上一版用 strings.Contains，`br;q=0`（明确拒绝）也判成命中，
+// `gzip;q=1.0, br;q=0.2`（更想要 gzip）也按出现顺序回 br。
+func TestPickEncodingQValues(t *testing.T) {
+	cases := map[string]string{
+		"br":                   "br",
+		"gzip, deflate, br":    "br",
+		"br;q=0.5, gzip;q=1.0": "gzip", // gzip 权重更高
+		"gzip;q=1.0, br;q=0.5": "gzip",
+		"br;q=0":               "",     // 明确拒绝 brotli
+		"br;q=0, gzip":         "gzip", // 拒绝 br 但接受 gzip
+		"gzip;q=0, br;q=0":     "",     // 两个都拒绝 → 未压缩
+		"identity":             "",     // 只接受 identity
+		"br;q=abc":             "",     // q 值畸形 → 按不可接受
+		"br;  q=0":             "",     // 参数带空格
+		"GZIP":                 "gzip", // 大小写不敏感
+		"zstd, br":             "br",
+		"br, br;q=0":           "", // 后者覆盖前者
+	}
+	for header, want := range cases {
+		if got := pickEncoding(header).name; got != want {
+			t.Errorf("pickEncoding(%q)=%q，期望 %q", header, got, want)
+		}
+	}
+}
+
+// TestSPARangeSkipsSidecar 回归 L-3：带 Range 的请求不能走预压缩产物。
+// ServeFile 会用 .br 的字节数解释"未压缩字节"的偏移，命中时回一个
+// 长度与内容都错位的 206 —— 静默的数据错误。
+func TestSPARangeSkipsSidecar(t *testing.T) {
+	mux, _ := newSPA(t)
+	req := httptest.NewRequest(http.MethodGet, "/assets/index-abc123def.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	req.Header.Set("Range", "bytes=0-6")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("Range 请求应回 206，实得 %d", w.Code)
+	}
+	if got := w.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Range 响应不得带 Content-Encoding（偏移量是针对原始字节的），实得 %q", got)
+	}
+	if body := w.Body.String(); body != "console" {
+		t.Fatalf("应回原始字节的 0-6，实得 %q", body)
+	}
+	// Vary 无条件声明：这条响应的内容确实随 Accept-Encoding 变化
+	if got := w.Header().Get("Vary"); !strings.Contains(got, "Accept-Encoding") {
+		t.Fatalf("必须声明 Vary: Accept-Encoding，实得 %q", got)
+	}
+}
+
 // TestHasContentHash 内容哈希识别：用于决定是否长缓存，误判会把可变文件永久缓存。
 func TestHasContentHash(t *testing.T) {
 	cases := map[string]bool{

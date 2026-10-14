@@ -70,3 +70,45 @@ func TestPrivateProfileStructPasswordEncoding(t *testing.T) {
 		t.Fatalf("校验和 = %s, want %s", v[16:], want)
 	}
 }
+
+// 反混淆必须与混淆严格互逆，并与权威测试向量一致：
+// obfuscate("Secure!") == D7A514D8C556AADE，故反混淆必须还原出 "Secure!"。
+//
+// 这个逆运算支撑"读取当前 VNC 口令"功能：没有它，口令一旦与服务端缓存脱钩
+// （服务端重启、换人操作、手工装的 VNC）就只能靠重装去重置，
+// 而那会打断正在使用的远程会话。
+func TestVncDeobfuscateKnownVector(t *testing.T) {
+	raw, err := hex.DecodeString("D7A514D8C556AADE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := vncDeobfuscatePassword(raw)
+	if err != nil {
+		t.Fatalf("反混淆失败: %v", err)
+	}
+	if got != "Secure!" {
+		t.Fatalf("deobfuscate = %q, want %q", got, "Secure!")
+	}
+}
+
+// 往返：任意 8 字符口令混淆后再反混淆必须回到原值。
+func TestVncPasswordRoundTrip(t *testing.T) {
+	for _, pw := range []string{"abcdefgh", "ABCDEFGH", "aB3kM9zQ", "12345678", "zzzzzzzz"} {
+		got, err := vncDeobfuscatePassword(vncObfuscatePassword(pw))
+		if err != nil {
+			t.Fatalf("%q 往返失败: %v", pw, err)
+		}
+		if got != pw {
+			t.Errorf("往返后 = %q, want %q", got, pw)
+		}
+	}
+}
+
+// 长度不对必须报错，而不是返回一个看似可用的短口令。
+func TestVncDeobfuscateRejectsWrongLength(t *testing.T) {
+	for _, n := range []int{0, 4, 7, 9, 16} {
+		if _, err := vncDeobfuscatePassword(make([]byte, n)); err == nil {
+			t.Errorf("%d 字节的输入应被拒绝", n)
+		}
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,6 +161,20 @@ func main() {
 		}
 	}
 
+	// 服务端地址的两道校验必须放在参数回写**之前**：回写会把命令行值持久化，
+	// 若配置里原本存着有效地址，一次 `-server your.server.com:9000`（老安装脚本就会这么传）
+	// 会先把有效配置覆盖成占位符再退出，下次无参启动也读不回来了。
+	if *server == "" {
+		log.Fatal("请通过 -server、环境变量 MOCENTER_SERVER 或配置文件指定服务端地址")
+	}
+	// 安装介质里预置过的占位地址不能当配置用（L-7）。
+	// 现在模板已改留空，这条是给**老部署**兜底的：从旧包/旧脚本装上的机器配置里
+	// 仍然是 your.server.com:9000，不拦的话它会一直解析一个不存在的域名无限重连，
+	// 界面表现为"服务在跑但主机永远不在线"，运维无从下手。
+	if isPlaceholderServer(*server) {
+		log.Fatalf("服务端地址仍是安装占位符 %q：请改成实际地址（-server host:port、环境变量 MOCENTER_SERVER，或配置文件里的 MOCENTER_SERVER）后重启", *server)
+	}
+
 	// 命令行显式传入的参数（flag.Visit）优先级最高，并自动保存回配置文件，
 	// 这样下次可直接按最新参数启动，无需重复传参。
 	{
@@ -205,9 +220,6 @@ func main() {
 		}
 	}
 
-	if *server == "" {
-		log.Fatal("请通过 -server、环境变量 MOCENTER_SERVER 或配置文件指定服务端地址")
-	}
 	// 设备身份（UUID）：优先用配置里已持久化的值，其次实时探测；探测不到就留空
 	//（服务端会退化为按 agent_id 识别）。拿到后写回配置，保证重启/改配置都不漂移。
 	if *agentUUID == "" {
@@ -402,4 +414,21 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// placeholderServerHost 是历次安装介质（conf 模板、install-linux.sh、旧打包产物）
+// 里预置过的占位主机名。
+const placeholderServerHost = "your.server.com"
+
+// isPlaceholderServer 判断服务端地址的主机段是否仍是安装占位符（L-7）。
+// 只看主机段、大小写不敏感、允许带端口；`https://your.server.com` 这类带前缀的
+// 写法主机段不是它，因此不误判。
+func isPlaceholderServer(addr string) bool {
+	host := strings.TrimSpace(strings.ToLower(addr))
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else {
+		host = strings.TrimSuffix(host, "/")
+	}
+	return host == placeholderServerHost
 }

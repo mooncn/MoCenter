@@ -99,13 +99,14 @@ type probeWaiter struct {
 type Mgr struct {
 	mu          sync.Mutex
 	sess        *session.Manager
-	viewer      map[string]*viewerConn                   // tunnelID -> 查看器连接
-	viewersBySs map[string]int                           // 操作员会话键 -> 并发查看器数
-	probeWait   map[string]*probeWaiter                  // tunnelID("vp-") -> 探测结果 + 归属 Agent
-	installWait map[string]chan *protocol.VncInstallResp // agentID -> 安装结果
-	last        map[string]*protocol.VncInstallResp      // agentID -> 最近一次安装/启动结果（口令）
-	ports       []portRange                              // 允许作为隧道目标的目标端口（空=不限制）
-	portSpec    string                                   // 端口清单原文，只用于错误提示
+	viewer      map[string]*viewerConn                    // tunnelID -> 查看器连接
+	viewersBySs map[string]int                            // 操作员会话键 -> 并发查看器数
+	probeWait   map[string]*probeWaiter                   // tunnelID("vp-") -> 探测结果 + 归属 Agent
+	installWait map[string]chan *protocol.VncInstallResp  // agentID -> 安装结果
+	last        map[string]*protocol.VncInstallResp       // agentID -> 最近一次安装/启动结果（口令）
+	pwWait      map[string]chan *protocol.VncPasswordResp // agentID -> 口令读取结果
+	ports       []portRange                               // 允许作为隧道目标的目标端口（空=不限制）
+	portSpec    string                                    // 端口清单原文，只用于错误提示
 	// mismatchAt 记录每台 Agent 上一次"越权隧道回传"的留痕时间，用于限频。
 	mismatchAt map[string]time.Time
 	seq        uint64
@@ -123,6 +124,7 @@ func NewMgr(sess *session.Manager) *Mgr {
 		probeWait:   make(map[string]*probeWaiter),
 		installWait: make(map[string]chan *protocol.VncInstallResp),
 		last:        make(map[string]*protocol.VncInstallResp),
+		pwWait:      make(map[string]chan *protocol.VncPasswordResp),
 		mismatchAt:  make(map[string]time.Time),
 		ports:       def,
 	}
@@ -507,6 +509,66 @@ func (m *Mgr) NotifyInstall(agentID string, resp *protocol.VncInstallResp) {
 		m.last[agentID] = resp
 	}
 	ch, ok := m.installWait[agentID]
+	m.mu.Unlock()
+	if ok {
+		ch <- resp
+	}
+}
+
+// ReadPassword 向目标 Agent 读取本机当前生效的 VNC 口令（只读）。
+//
+// 为什么必须实时去读，而不是回放 m.last 里缓存的上次安装口令：
+//   - 服务端一重启，缓存就没了，可机器上的 VNC 还在正常跑；
+//   - 换个人或换一套服务端操作过同一主机，本进程同样没有缓存；
+//   - VNC 若是手工装的，从来就没有过缓存。
+//
+// 这几种情况下缓存都答不上"现在的口令是什么"，而重装一次又会打断正在使用的会话。
+// 另外，VNC 隧道本身经 Agent 中转 —— Agent 离线时即便有口令也连不上，
+// 所以"用缓存兜底"在这里没有实际价值：实时读取失败就如实报失败，不返回可能过期的值。
+func (m *Mgr) ReadPassword(agentID string) *protocol.VncPasswordResp {
+	nf := func(msg string) *protocol.VncPasswordResp {
+		return &protocol.VncPasswordResp{OK: false, Message: msg}
+	}
+	if agentID == "" {
+		return nf("未指定目标主机")
+	}
+	a := m.sess.Get(agentID)
+	if a == nil {
+		return nf("目标主机离线")
+	}
+	ch := make(chan *protocol.VncPasswordResp, 1)
+	m.mu.Lock()
+	if _, busy := m.pwWait[agentID]; busy {
+		m.mu.Unlock()
+		return nf("该主机已有口令读取任务进行中，请稍候")
+	}
+	m.pwWait[agentID] = ch
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.pwWait, agentID)
+		m.mu.Unlock()
+	}()
+
+	if err := a.Write(protocol.TypeVncPasswordReq, &protocol.VncPasswordReq{AgentID: agentID}); err != nil {
+		return nf("下发口令读取指令失败: " + err.Error())
+	}
+	select {
+	case r := <-ch:
+		if r == nil {
+			return nf("Agent 未返回口令读取结果")
+		}
+		return r
+	case <-time.After(20 * time.Second):
+		// 读取只是读文件，20 秒足够；超时通常意味着 Agent 侧卡住
+		return nf("读取超时（Agent 未在 20 秒内响应）")
+	}
+}
+
+// NotifyPassword 接收 Agent 回传的口令读取结果。
+func (m *Mgr) NotifyPassword(agentID string, resp *protocol.VncPasswordResp) {
+	m.mu.Lock()
+	ch, ok := m.pwWait[agentID]
 	m.mu.Unlock()
 	if ok {
 		ch <- resp

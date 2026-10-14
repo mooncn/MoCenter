@@ -77,6 +77,34 @@ func TestPublicRoutesHaveSeparateBudget(t *testing.T) {
 //
 // 缓存由后台仪表盘那条 store.All() 路径负责填；访客没有资格消耗出网额度
 // （免费接口有配额，且本可走 -proxy-ip）。
+// TestPublicStateOmitsFieldCatalog 回归 L-4：匿名 /state 不得回全量字段目录。
+//
+// 目录里带每个字段的 sensitive 标记与分组，匿名下发等于把"后台展示开关清单"
+// 摊给任何扫到这条端点的人。前端渲染只看 config.fields 这张键值表（visible(key)），
+// 目录本身只有登录后的 /api/site/config 用得到。
+func TestPublicStateOmitsFieldCatalog(t *testing.T) {
+	p := newGuardedPublicSite(t, "web-01")
+	rec := publicGet(t, p.stateHandler(), "/api/public/state")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("state 应 200，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if len(publicFieldCatalog()) == 0 {
+		t.Fatal("字段目录为空，本用例失去意义")
+	}
+	for _, leak := range []string{`"sensitive"`, `"group"`} {
+		if strings.Contains(body, leak) {
+			t.Errorf("匿名 state 泄漏了字段目录元数据 %q: %s", leak, body)
+		}
+	}
+	// 可见性开关必须保留：前端渲染只靠它
+	out := decodePublic(t, rec)
+	cfgm, _ := out["config"].(map[string]interface{})
+	if _, ok := cfgm["fields"]; !ok {
+		t.Errorf("config.fields 必须保留（前端唯一依赖），实际 %s", body)
+	}
+}
+
 func TestPublicNodesDoNotDriveGeoOutbound(t *testing.T) {
 	p, _ := newPublicKeyedSite(t, 0x7f, "web-01")
 	var calls int32

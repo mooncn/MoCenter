@@ -180,9 +180,9 @@ printf '%s' 'your-password' > /etc/mocenter/initial-password && chmod 600 /etc/m
 # Linux：只需要服务端地址 + 注册凭据，无需任何证书文件
 # 注册凭据取 Web 控制台「Agent 接入」页为该机签发的一次性令牌（推荐）；
 # 过渡期也可填 <data>/agent.key 的共享注册密钥
-./mocenter-agent -server your.server.com:9000 -agentid host-01 -agent-key <一次性令牌>
+./mocenter-agent -server mc.example.com:9000 -agentid host-01 -agent-key <一次性令牌>
 # 后台守护 + 崩溃自启
-./mocenter-agent -server your.server.com:9000 -agentid host-01 -agent-key <一次性令牌> -daemon
+./mocenter-agent -server mc.example.com:9000 -agentid host-01 -agent-key <一次性令牌> -daemon
 
 # Windows 交叉编译
 bash agent/build.sh windows   # 生成 mocenter-agent.exe
@@ -421,7 +421,7 @@ sudo bash scripts/deploy/install-linux.sh --role=server \
      --user=admin --password='强口令'
 sudo bash scripts/deploy/install-linux.sh --role=agent  \
      --bin=build/bin/agent/linux/mocenter-agent-amd64 \
-     --server=your.server.com:9000
+     --server=mc.example.com:9000
 sudo bash scripts/deploy/install-linux.sh --role=all status
 sudo bash scripts/deploy/install-linux.sh --role=server uninstall --purge   # --purge 连配置数据一起删
 ```
@@ -469,7 +469,7 @@ scripts\build-all.bat --type=installer
 
 ```bat
 REM Windows：注册为系统服务（需管理员）。免安装 zip 解压后自带该脚本
-scripts\deploy\install-windows.bat install your.server.com:9000 [agentid] [proxy]
+scripts\deploy\install-windows.bat install mc.example.com:9000 [agentid] [proxy]
 scripts\deploy\install-windows.bat install-server [user] [password] [listen] [http]
 scripts\deploy\install-windows.bat status
 scripts\deploy\install-windows.bat uninstall
@@ -477,7 +477,7 @@ scripts\deploy\install-windows.bat uninstall
 
 ```bash
 # Linux：安装/升级（需 root），Agent 与 Server 共用同一脚本
-sudo bash scripts/deploy/install-linux.sh --role=agent  --bin=./mocenter-agent --server=your.server.com:9000
+sudo bash scripts/deploy/install-linux.sh --role=agent  --bin=./mocenter-agent --server=mc.example.com:9000
 sudo bash scripts/deploy/install-linux.sh --role=server --bin=./mocenter-server --user=admin --password='强口令'
 
 # 升级：配置已存在即按升级处理，只换二进制与服务，**不动配置**
@@ -712,7 +712,7 @@ Agent TCP 通道要求每台 Agent 在**首次接入**时出示注册凭据，�
 - ✅ **文件传输断点续传**：分片收发、MD5 校验、ACK/NACK、断点续传、合并落盘
 - ✅ **文件分发到主机**：Web 上传文件 → 服务端中转 → Agent 指定路径落盘（分片 + MD5 校验）。落盘路径被限制在 Agent 的**文件根目录**内（默认 `<配置目录>/files`，需要写到别处由运维在本机用 `-file-roots` 扩大，服务端无法下发新根目录）
 - ✅ **批量命令**：一次下发到多台在线主机，审计留痕
-- ✅ **远程升级 Agent**：下载升级包（仅 https）→ SHA-256 + Ed25519 签名校验（未配置公钥时默认拒绝，**没有跳过验签的开关**）→ 备份 → 替换 → 自动重启，失败回滚。**签名的消息含目标版本号**（`MoCenter-Upgrade-v1\n<版本>\n<包内容>`），因此一个合法签过的旧包无法冒充任意版本；低于当前版本按降级拒绝，除非显式勾选允许回退。签名用 `scripts/signpkg` 离线生成，公钥经服务端 `-upgrade-pubkey` 随一键部署写进 Agent 配置，用法见 [部署指南](docs/deployment.md)
+- ✅ **远程升级 Agent**：下载升级包（仅 https）→ SHA-256 + Ed25519 签名校验（未配置公钥时默认拒绝，**没有跳过验签的开关**）→ 备份 → 替换 → 自动重启，失败回滚。**签名的消息含目标版本号**（`MoCenter-Upgrade-v1\n<版本>\n<包内容>`），因此一个合法签过的旧包无法冒充任意版本；低于当前版本按降级拒绝，除非显式勾选允许回退。签名用 `scripts/signpkg` 离线生成，公钥经服务端 `-upgrade-pubkey` 写进**新部署**的 Agent 配置（已在运行且未带公钥的 Agent 需手工补配置或删除配置后重新部署一次），用法见 [部署指南](docs/deployment.md)
 - ✅ 离线机器列表、操作审计界面
 - ✅ **操作审计分页与分类**：命令执行 / 运维操作 / 登录认证三类留痕，服务端分页检索（类别、关键字、操作人、时间范围筛选）+ CSV 导出；审计日志按留存策略自动清理
 - ✅ **数据增长治理**：审计/探针等持续增长的数据统一采用服务端分页 + 降采样 + 留存清理，长时间跨度趋势图自动按桶聚合，避免全量返回拖垮浏览器与内存
@@ -731,7 +731,7 @@ Agent TCP 通道要求每台 Agent 在**首次接入**时出示注册凭据，�
 - ✅ **延迟监测（ICMP / TCP / HTTP + 历史曲线）**：Agent 侧按目标探测往返延迟（ICMP 走系统 ping、TCP 测握手、HTTP 测首字节），服务端存历史并按时间窗出曲线；**超时点画成断点而不是 0**（否则完全不通的机器会看起来"最快"），逐目标统计平均/最小/最大与丢包率；目标可按主机下发（每行一个，最多 8 个）
 - ✅ **离线本地 GeoIP**：支持 MaxMind DB 格式离线库（GeoLite2-Country / City、DB-IP、IPinfo），配置 `-mmdb` / `mmdb_path` 后**本地优先解析**，未命中再降级到外部接口；解决无外网部署、免费接口按分钟限流（批量上线互相挤额度）、以及主源不支持 IPv6 三类问题
 - ✅ **备份 / 恢复**：一键导出数据目录为单个 zip（含 manifest 清单与每个文件的 SHA-256），恢复前可查看包内明细；SQLite 走 `VACUUM INTO` 在线一致快照（WAL 下直接拷文件会丢未 checkpoint 的事务）；恢复端做白名单 + 路径穿越校验 + 体积上限 + 摘要校验，覆盖前自动留存 `*.before-restore`；`agent.key` 这类凭据文件**默认不打包**（勾选后才带，并记入审计）
-- ✅ **后台一键部署 Agent（Linux）**：在 Web 后台填目标机地址与账号/密码（或私钥），SSH 登录后自动上传 Agent、写入配置（服务端地址 / Agent 名称 / 注册密钥 / 延迟目标）并注册为 systemd 服务；支持"先探测再安装"（仅探测连通性、架构、权限，不做任何改动）；凭证不落盘、不入日志，所有拼进 shell 的变量都经过引号转义与白名单校验；目标机主机密钥按 known_hosts TOFU 校验（首次记录、变更即拒绝，表单可填指纹强制钉扎，无忽略校验的开关）
+- ✅ **后台一键部署 Agent（Linux）**：在 Web 后台填目标机地址与账号/密码（或私钥），SSH 登录后自动上传 Agent、写入配置（服务端地址 / Agent 名称 / 注册密钥 / 延迟目标）并注册为 systemd 服务；支持"先探测再安装"（仅探测连通性、架构、权限，不做任何改动）；凭证不落盘、不入日志，所有拼进 shell 的变量都经过引号转义与白名单校验；目标机主机密钥按 known_hosts TOFU 校验（首次记录、变更即拒绝，表单可填指纹强制钉扎，无忽略校验的开关）。**升级语义**：目标机已有 `/etc/mocenter/mocenter-agent.json` 时**只替换二进制并重启服务，配置原样保留**（与 `install-linux.sh` 一致）—— 因此重复部署即可当升级用，本机定制（`file_roots` / `proxy_ip` / 延迟目标）与设备身份都不会被冲掉；要按总控侧的值重写配置，需先删除该文件再部署。
 - ✅ **版本号独立管理**：Server（`server/internal/version`）与 Agent（`agent/internal/version`）各自维护版本号，**互相独立、不做一致性校验** —— Agent 只按自身功能迭代节奏发版，服务端发版不会牵动全网 Agent，反之亦然；`AgentInfo.AgentVersion` 随注册上报并由 `/api/version` 展示；升级包的 version 只表示"本次要升到哪个版本"，**必填**（服务端不再代填：它参与包签名，代填的症状会是"签名校验失败"，看起来像包被动过），与当前服务端版本不同也能下发，但低于 Agent 自身版本时按降级拒绝（需显式 `allow_downgrade`）；打包脚本与 Inno Setup 版本号同步
 - ✅ **多架构打包**：Windows x86/x86_64/ARM64、Linux amd64/arm64/arm/386 二进制，及 .deb/.rpm 安装包
 - ✅ **系统服务注册**：Agent 一键注册为 Windows 服务 / Linux systemd 服务，开机自启
@@ -866,7 +866,7 @@ bash scripts/build-linux-all.sh --type=agent,server --package=deb --arch=amd64,a
 ```bash
 sudo bash scripts/deploy/install-linux.sh --role=agent \
      --bin=build/bin/agent/linux/mocenter-agent-amd64 \
-     --server=your.server.com:9000
+     --server=mc.example.com:9000
 # 也可用 --bin-dir 指定目录，按 mocenter-<role>[-<arch>] 自动匹配
 ```
 
@@ -948,7 +948,7 @@ sudo dnf install -y rpm-build file      # Fedora / RHEL / openSUSE
 
 ```bat
 REM 被控机
-mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key <注册密钥>
+mocenter-deploy.exe install -role agent -server mc.example.com:9000 -agent-key <注册密钥>
 
 REM 总控机
 mocenter-deploy.exe install -role server -user admin -password <登录密码>
@@ -958,7 +958,7 @@ mocenter-deploy.exe upgrade -role agent
 REM 升级时无需重复提供 -server / -agent-key / -user / -password
 
 REM 清理重装：删除既有配置与数据后重来
-mocenter-deploy.exe install -role agent -server your.server.com:9000 -agent-key <注册密钥> -force
+mocenter-deploy.exe install -role agent -server mc.example.com:9000 -agent-key <注册密钥> -force
 
 REM 查看状态（无需管理员）/ 卸载（默认保留配置与数据）
 mocenter-deploy.exe status -role all

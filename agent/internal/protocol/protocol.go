@@ -8,7 +8,6 @@ const (
 	TypeCommandReq       = "CommandReq"
 	TypeCommandResp      = "CommandResp"
 	TypeProbeDataReq     = "ProbeDataReq"
-	TypeProbeDataResp    = "ProbeDataResp"
 	TypeFileUploadReq    = "FileUploadReq"
 	TypeFileDownloadReq  = "FileDownloadReq"
 	TypeFilePushReq      = "FilePushReq" // Server -> Agent 文件分发分片
@@ -25,6 +24,8 @@ const (
 	TypeInteractiveClose = "InteractiveClose" // Web->Server->Agent 断开交互终端并结束相关进程
 	TypeVncInstallReq    = "VncInstallReq"    // Server->Agent 下发 VNC 安装/启动指令
 	TypeVncInstallResp   = "VncInstallResp"   // Agent->Server VNC 安装/启动结果
+	TypeVncPasswordReq   = "VncPasswordReq"   // Server->Agent 读取本机当前 VNC 口令（只读）
+	TypeVncPasswordResp  = "VncPasswordResp"  // Agent->Server 当前 VNC 口令
 	TypePkgFetchReq      = "PackageFetchReq"  // Agent->Server 请求拉取服务端托管的安装包
 	TypePkgFetchResp     = "PackageFetchResp" // Server->Agent 安装包拉取结果（分片之后回执）
 	TypeEnrollReq        = "EnrollReq"        // Agent->Server 注册凭证交换请求（换取客户端证书）
@@ -117,12 +118,6 @@ type ProbeDataReq struct {
 	Load1  *float64 `json:"load1,omitempty"`
 	Load5  *float64 `json:"load5,omitempty"`
 	Load15 *float64 `json:"load15,omitempty"`
-}
-
-// ProbeDataResp Server -> Agent
-type ProbeDataResp struct {
-	ProbeID   string `json:"probe_id"`
-	Timestamp int64  `json:"timestamp"`
 }
 
 // FileUploadReq Agent -> Server
@@ -273,6 +268,23 @@ type VncInstallResp struct {
 	Password string `json:"password,omitempty"` // 安装时生成的随机口令（仅服务端按需交付给前端）
 	// Mode 实际生效的模式（可能因降级与请求值不同）。
 	Mode string `json:"mode,omitempty"`
+}
+
+// VncPasswordReq Server->Agent：读取本机当前生效的 VNC 口令。
+//
+// 与 VncInstallReq 分开成独立消息，而不是给安装请求加个 action 字段：
+// 读取凭据是**只读**操作（不改配置、不重启服务、不打断在用的会话），
+// 与"安装/重置"的副作用完全不同，分开才好各自留痕与各自设闸。
+type VncPasswordReq struct {
+	AgentID string `json:"agent_id"`
+}
+
+// VncPasswordResp Agent->Server：当前 VNC 口令读取结果。
+type VncPasswordResp struct {
+	OK       bool   `json:"ok"`
+	Message  string `json:"message"`
+	Password string `json:"password,omitempty"` // 仅在读取成功时有值
+	Mode     string `json:"mode,omitempty"`     // 口令所属模式：interactive / service
 }
 
 // PackageFetchReq Agent->Server：请求从服务端拉取托管的安装包。

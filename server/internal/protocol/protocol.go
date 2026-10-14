@@ -14,25 +14,20 @@ const (
 	TypeCommandReq        = "CommandReq"
 	TypeCommandResp       = "CommandResp"
 	TypeProbeDataReq      = "ProbeDataReq"
-	TypeProbeDataResp     = "ProbeDataResp"
 	TypeFileUploadReq     = "FileUploadReq"
 	TypeFileDownloadReq   = "FileDownloadReq"
 	TypeFilePushReq       = "FilePushReq"       // Server->Agent 文件分发分片
 	TypeFilePushAck       = "FilePushAck"       // Agent->Server 文件分发分片确认
-	TypeFileAck           = "FileAck"           // Server<->Agent 分片确认
 	TypeFileTransferOp    = "FileTransferOp"    // Web->Server 文件传输操作
 	TypeFileTransferState = "FileTransferState" // Server->Web 文件传输状态
 	TypeInteractiveIn     = "InteractiveInputReq"
 	TypeInteractiveOut    = "InteractiveOutput"
-	TypeOnline            = "AgentOnline"  // Agent 上线通知（Agent->Server）
-	TypeAgentList         = "AgentList"    // Server->Web 主机列表
-	TypePortMapOp         = "PortMapOp"    // Web->Server 端口映射操作
-	TypePortMapState      = "PortMapState" // Server->Web 端口映射状态
-	TypeAuth              = "AuthReq"      // Web->Server 登录/鉴权
-	TypeAuthResp          = "AuthResp"
+	TypeOnline            = "AgentOnline"      // Agent 上线通知（Agent->Server）
+	TypeAgentList         = "AgentList"        // Server->Web 主机列表
+	TypePortMapOp         = "PortMapOp"        // Web->Server 端口映射操作
+	TypePortMapState      = "PortMapState"     // Server->Web 端口映射状态
 	TypeUpgradeReq        = "UpgradeReq"       // Server->Agent 远程升级
 	TypeUpgradeResp       = "UpgradeResp"      // Agent->Server 升级结果
-	TypeBatchCommand      = "BatchCommand"     // Server->Agent 批量命令（预留）
 	TypeTunnelOpen        = "TunnelOpenReq"    // Server->Agent 端口映射隧道建立请求
 	TypeTunnelOpenResp    = "TunnelOpenResp"   // Agent->Server 隧道建立响应
 	TypeTunnelData        = "TunnelData"       // Server<->Agent 隧道双向数据
@@ -40,6 +35,8 @@ const (
 	TypeInteractiveClose  = "InteractiveClose" // Web->Server->Agent 断开交互终端并结束相关进程
 	TypeVncInstallReq     = "VncInstallReq"    // Server->Agent 下发 VNC 安装/启动指令
 	TypeVncInstallResp    = "VncInstallResp"   // Agent->Server VNC 安装/启动结果
+	TypeVncPasswordReq    = "VncPasswordReq"   // Server->Agent 读取本机当前 VNC 口令（只读）
+	TypeVncPasswordResp   = "VncPasswordResp"  // Agent->Server 当前 VNC 口令
 	TypePkgFetchReq       = "PackageFetchReq"  // Agent->Server 请求拉取服务端托管的安装包
 	TypePkgFetchResp      = "PackageFetchResp" // Server->Agent 安装包拉取结果（分片之后回执）
 	TypeEnrollReq         = "EnrollReq"        // Agent->Server 注册凭证交换请求（换取客户端证书）
@@ -141,12 +138,6 @@ type ProbeDataReq struct {
 	LatencyMS map[string]float64 `json:"latency_ms,omitempty"`
 	// LatencyTargets 本机生效的延迟探测目标（服务端据此知道该上报哪些目标）。
 	LatencyTargets []string `json:"latency_targets,omitempty"`
-}
-
-// ProbeDataResp Server -> Agent 探针确认
-type ProbeDataResp struct {
-	ProbeID   string `json:"probe_id"`
-	Timestamp int64  `json:"timestamp"`
 }
 
 // AgentInfo Server 保存/向 Web 推送的主机信息
@@ -417,6 +408,23 @@ type VncInstallResp struct {
 	Password string `json:"password,omitempty"` // 安装时生成的随机口令（服务端按需交付给前端）
 	// Mode 实际生效的模式（可能因降级与请求值不同）。
 	Mode string `json:"mode,omitempty"`
+}
+
+// VncPasswordReq Server->Agent：读取本机当前生效的 VNC 口令。
+//
+// 与 VncInstallReq 分开成独立消息，而不是给安装请求加个 action 字段：
+// 读取凭据是**只读**操作（不改配置、不重启服务、不打断在用的会话），
+// 与"安装/重置"的副作用完全不同，分开才好各自留痕与各自设闸。
+type VncPasswordReq struct {
+	AgentID string `json:"agent_id"`
+}
+
+// VncPasswordResp Agent->Server：当前 VNC 口令读取结果。
+type VncPasswordResp struct {
+	OK       bool   `json:"ok"`
+	Message  string `json:"message"`
+	Password string `json:"password,omitempty"` // 仅在读取成功时有值
+	Mode     string `json:"mode,omitempty"`     // 口令所属模式：interactive / service
 }
 
 // PackageFetchReq Agent->Server：请求从服务端拉取托管的安装包。

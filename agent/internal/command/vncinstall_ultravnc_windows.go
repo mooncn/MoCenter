@@ -79,21 +79,16 @@ func installAndStartUltraVNCService(port int, cfg VncConfig, res *VncInstallResu
 		vddMsg = msg
 	}
 
-	// 3) 写入 ultravnc.ini（含 WritePrivateProfileStruct 格式口令）
-	if err := writeUltraVNCIni(filepath.Dir(exe), port, res.Password); err != nil {
-		res.Message = "写入 UltraVNC 配置失败: " + err.Error()
+	// 3) 让配置真正生效：清环境 → 写配置 → 读回校验。
+	//    顺序不可颠倒：winvnc.exe 退出时会把内存中的设置回写 ultravnc.ini，
+	//    先写配置会被旧实例的退出回写覆盖成旧口令 —— 这正是「前端拿到新口令却
+	//    认证失败」且时有时无的来源。
+	if err := prepareUltraVNCConfig(filepath.Dir(exe), port, res.Password); err != nil {
+		res.Message = err.Error()
 		return false
 	}
 
-	// 4) 停掉可能抢占端口的其它 VNC（旧版残留）与 winvnc 实例。
-	stopConflictingVNC()
-	// 关键：应用模式（非服务）的 winvnc.exe 不受服务管理器管辖，sc stop 管不到它，
-	// 必须显式结束。否则它会一直占着端口 → 服务绑定失败 → 而端口「已被监听」会让
-	// 仅检查端口的旧实现误判为成功，前端拿到本次新口令、真正应答的却是旧实例，
-	// 结果就是认证失败、连接被断开。
-	killWinvncProcesses()
-
-	// 5) 注册并启动 uvnc_service
+	// 4) 注册并启动 uvnc_service
 	if err := registerUltraVNCService(exe); err != nil {
 		res.Message = "注册 UltraVNC 服务失败: " + err.Error()
 		return false
@@ -112,9 +107,13 @@ func installAndStartUltraVNCService(port int, cfg VncConfig, res *VncInstallResu
 		return false
 	}
 
-	// 6) 等待端口就绪
+	// 6) 等待端口就绪，并确认监听者确实是本次启动的实例
 	if !waitPortOpen(port, 20*time.Second) {
 		res.Message = "UltraVNC 服务已启动但端口未监听，请检查服务状态（sc query " + uvncServiceName + "）与配置文件"
+		return false
+	}
+	if err := confirmPortIsOurs(port); err != nil {
+		res.Message = "UltraVNC 服务已启动但端口归属异常: " + err.Error()
 		return false
 	}
 	res.Message = "UltraVNC 服务模式已就绪（端口 " + itoa(port) + "）。锁屏/登录界面亦可查看。口令请使用本次下发值。"
@@ -155,33 +154,35 @@ func installAndStartUltraVNCApp(port int, cfg VncConfig, res *VncInstallResult) 
 		vddMsg = msg
 	}
 
-	// 4) 写入 ultravnc.ini（与服务模式共用）
-	if err := writeUltraVNCIni(filepath.Dir(exe), port, res.Password); err != nil {
-		res.Message = "写入 UltraVNC 配置失败: " + err.Error()
+	// 4) 让配置真正生效：清环境 → 写配置 → 读回校验。
+	//    应用模式与服务模式共用同一份 ultravnc.ini，同样受"旧实例退出回写"影响，
+	//    顺序理由见 prepareUltraVNCConfig。
+	if err := prepareUltraVNCConfig(filepath.Dir(exe), port, res.Password); err != nil {
+		res.Message = err.Error()
 		return false
 	}
 
-	// 5) 应用模式不注册服务：停掉服务、其它 VNC 与残留 winvnc 实例，避免争抢端口。
-	// 残留实例必须先清掉，否则旧实例仍占着端口，新实例绑定失败却因「端口已监听」
-	// 被误判为成功，前端拿到新口令而应答的是旧实例 → 认证失败。
-	stopConflictingVNC()
-	stopUltraVNCService()
-	killWinvncProcesses()
-
-	// 6) 优先直接启动（Agent 若在交互会话中则立即可见）；
+	// 5) 优先直接启动（Agent 若在交互会话中则立即可见）；
 	//    未就绪则通过计划任务在交互会话中启动，解决 Session 0 隔离。
 	startWinvncDirect(exe)
 	if !waitPortOpen(port, 5*time.Second) {
-		// 直启实例未监听（多为 Agent 在 Session 0）：结束它，改由计划任务拉进交互会话
-		_ = exec.Command("taskkill.exe", "/IM", "winvnc.exe", "/F").Run()
+		// 直启实例未监听（多为 Agent 在 Session 0）：结束它并**等确认退出**，
+		// 再由计划任务拉进交互会话。只发 taskkill 就往下走会让残留实例占着端口，
+		// 使后续的"端口已监听"判断失真。
+		killWinvncProcesses()
+		_ = waitNoWinvnc(10 * time.Second)
 		startInUserSession(exe)
 	}
 	if !waitPortOpen(port, 10*time.Second) {
 		res.Message = "UltraVNC 应用模式启动后端口未监听（可能需管理员权限，或交互会话未就绪）"
 		return false
 	}
+	if err := confirmPortIsOurs(port); err != nil {
+		res.Message = "UltraVNC 应用模式端口归属异常: " + err.Error()
+		return false
+	}
 
-	// 7) 登录自启任务：系统重启后自动在交互会话中拉起
+	// 6) 登录自启任务：系统重启后自动在交互会话中拉起
 	ensureVncLogonTask(exe)
 
 	res.Message = "UltraVNC 应用模式已就绪（端口 " + itoa(port) + "）。锁屏/登录界面不可见，需要时请改用服务模式。口令请使用本次下发值。"
@@ -544,7 +545,143 @@ func serviceState(name string) string {
 // killWinvncProcesses 结束所有 winvnc.exe 进程：应用模式实例、以及可能残留的
 // 服务工作进程。UltraVNC 的应用模式进程不在服务管理器管辖范围内，切换模式时
 // 必须显式结束，否则会一直占用端口导致另一种模式绑定失败。
+//
+// 注意：taskkill /F 只是「请求结束」，返回时进程往往仍然存活。调用方必须再用
+// waitNoWinvnc 确认真的退出了 —— 不能靠 sleep 猜（见 prepUltraVNCEnv）。
 func killWinvncProcesses() {
 	_ = exec.Command("taskkill.exe", "/IM", "winvnc.exe", "/F").Run()
-	time.Sleep(1 * time.Second)
+}
+
+// winvncPIDs 返回当前存活的 winvnc.exe 进程 PID 列表。
+func winvncPIDs() []string {
+	out, err := exec.Command("tasklist.exe", "/FI", "IMAGENAME eq winvnc.exe",
+		"/NH", "/FO", "CSV").Output()
+	if err != nil {
+		return nil
+	}
+	return parseTasklistCSV(string(out))
+}
+
+// parseTasklistCSV 从 tasklist /NH /FO CSV 的输出里取第二列（PID）。
+//
+// 单独抽出来是为了可测：解析是这段逻辑里唯一容易出错、又不需要真实进程的部分。
+// 无匹配时 tasklist 会打印一行本地化提示（不以引号开头），据此跳过 ——
+// 不能按文本匹配，否则换系统语言就失效。
+func parseTasklistCSV(out string) []string {
+	var pids []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, `"`) {
+			continue
+		}
+		fields := strings.Split(line, `","`)
+		if len(fields) < 2 {
+			continue
+		}
+		if pid := strings.Trim(fields[1], `" `); pid != "" {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
+// waitNoWinvnc 轮询等待所有 winvnc.exe 退出，返回是否已清空。
+func waitNoWinvnc(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if len(winvncPIDs()) == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+// prepareUltraVNCConfig 让配置真正生效：清环境 → 写配置 → 读回校验。
+//
+// 这三步必须按此顺序、且放在同一个函数里 —— 顺序本身就是正确性的一部分
+// （winvnc.exe 退出会回写 ultravnc.ini）。分散到各调用方，早晚会被改错顺序，
+// 而后果是间歇性的认证失败，极难排查。
+func prepareUltraVNCConfig(installDir string, port int, password string) error {
+	if err := prepUltraVNCEnv(); err != nil {
+		return fmt.Errorf("清理既有 VNC 环境失败: %w", err)
+	}
+	if err := writeUltraVNCIni(installDir, port, password); err != nil {
+		return fmt.Errorf("写入 UltraVNC 配置失败: %w", err)
+	}
+	if err := verifyUltraVNCIni(installDir, password); err != nil {
+		return fmt.Errorf("UltraVNC 配置写入后校验失败: %w", err)
+	}
+	return nil
+}
+
+// prepUltraVNCEnv 在写配置之前把环境清干净：停冲突 VNC、停服务、结束所有 winvnc 实例，
+// 并**等到确认清空**才返回。
+//
+// 顺序是关键：UltraVNC 的 winvnc.exe 在退出时会把内存中的设置**回写** ultravnc.ini。
+// 若先写配置再杀旧实例，旧实例退出时会用旧口令覆盖刚写入的内容 —— 表现为
+// 「口令写入成功、前端拿到新口令，但认证始终失败」，且是否发生取决于时序，
+// 因此是间歇性的。正确顺序：清干净 → 写配置 → 启动。
+func prepUltraVNCEnv() error {
+	stopConflictingVNC()
+	stopUltraVNCService()
+	killWinvncProcesses()
+	if !waitNoWinvnc(15 * time.Second) {
+		return fmt.Errorf("winvnc.exe 未能全部退出（仍有 PID: %s）；旧实例会继续占用端口并用旧口令应答",
+			strings.Join(winvncPIDs(), ","))
+	}
+	return nil
+}
+
+// iniPasswordValue 读回 ini 中 [UltraVNC] 段的 passwd 值；读不到返回空串。
+// 注意 "passwd2=" 不会误匹配：这里要求 "passwd" 之后紧跟 '='。
+func iniPasswordValue(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if strings.HasPrefix(strings.ToLower(line), "passwd=") {
+			return strings.TrimSpace(line[len("passwd="):])
+		}
+	}
+	return ""
+}
+
+// verifyUltraVNCIni 校验 UltraVNC 实际读取的那份 ini 里确实是我们本次下发的口令。
+//
+// 为什么必须读回：WriteFile 返回 nil 只证明"写这个路径成功了"，不能证明"生效了"。
+// 旧实例回写、并发写入、权限导致的静默失败，都会让文件内容不是我们写的那份 ——
+// 而前端已经拿着新口令去连了，结果就是认证失败却查不出原因。
+func verifyUltraVNCIni(installDir, password string) error {
+	want := privateProfileStructValue(vncObfuscatePassword(password))
+	// UltraVNC 默认读 exe 同目录的 ini（安装器模式下另写一份到 ProgramData）。
+	// 以 exe 目录这份为准校验。
+	primary := filepath.Join(installDir, "ultravnc.ini")
+	got := iniPasswordValue(primary)
+	switch {
+	case got == want:
+		return nil
+	case got == "":
+		return fmt.Errorf("%s 中读不到 passwd（文件缺失或不可读）", primary)
+	default:
+		return fmt.Errorf("%s 中的 passwd 与本次下发的口令不一致"+
+			"（典型原因是旧实例退出时回写了旧配置）", primary)
+	}
+}
+
+// confirmPortIsOurs 确认端口上的监听者确实是本次启动的 winvnc。
+//
+// 调用前必须已用 prepUltraVNCEnv 证明过"启动前没有任何 winvnc"，
+// 因此此刻只要端口开着就应当有 winvnc 进程；没有就说明端口被别的程序占着，
+// 本次启动其实没成功 —— 这正是旧实现"端口已监听即判定成功"漏掉的情况。
+func confirmPortIsOurs(port int) error {
+	pids := winvncPIDs()
+	if len(pids) == 0 {
+		return fmt.Errorf("端口 %d 已被监听，但不存在 winvnc.exe 进程，端口被其它程序占用", port)
+	}
+	return nil
 }

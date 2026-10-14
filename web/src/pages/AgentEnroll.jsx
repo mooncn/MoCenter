@@ -270,8 +270,20 @@ export default function AgentEnroll() {
     return <div className="page"><div className="card"><p className="muted">加载中…</p></div></div>
   }
 
-  const host = (info.listen || '').replace(/^:/, '')
-  const server = host && !host.startsWith('0.0.0.0') ? host : '<总控地址>:9000'
+  // 从 -listen 拆出主机与端口，并把「通配/空主机」补成服务端探测到的公网 IP。
+  //
+  // 为什么必须这么拼：-listen 的常见写法是 ":9000" 或 "0.0.0.0:9000"，两者都没有可用主机名。
+  // 原实现只把开头的 ':' 去掉，于是 ":9000" 会变成 "9000" —— 生成的命令成了
+  // `-server 9000`，Agent 拿去连必然失败，而运维从命令表面看不出哪里不对。
+  //
+  // 端口必须取自 -listen（Agent TCP 端口），**不能**用 location.host：
+  // 那是控制台的 HTTP 端口（如 8080），Agent 连过去会连到 Web 服务上。
+  const listenPort = (info.listen || '').match(/:(\d+)\s*$/)?.[1] || '9000'
+  const listenHost = (info.listen || '').replace(/:\d+\s*$/, '').replace(/^\[|\]$/g, '').trim()
+  const wildcardHost = !listenHost || listenHost === '0.0.0.0' || listenHost === '::' || listenHost === '*'
+  // 探测不到公网 IP 时退回占位符，而不是拼一个连不上的地址
+  const serverHost = wildcardHost ? (info.public_ip || '') : listenHost
+  const server = serverHost ? `${serverHost}:${listenPort}` : `<总控地址>:${listenPort}`
   // 只把**刚签发的该主机一次性令牌**放进命令：省掉"复制令牌→粘进命令"这一步。
   // 未签发时留占位符而不是填入共享注册密钥 —— 那把是全网身份根，
   // 出现在可直接粘贴的命令里就等于被贴进工单/聊天/截图，泄露面比密钥本身还大。
@@ -379,6 +391,12 @@ export default function AgentEnroll() {
         <p className="muted" style={{ fontSize: 13 }}>
           先在 ② 里为该主机签发令牌，下面的命令会自动带上它（令牌与主机名一起替换进命令）。
         </p>
+        {!serverHost && (
+          <p className="muted" style={{ fontSize: 13 }}>
+            ⚠ 未探测到本机公网 IP（服务端需能访问外网回显服务），命令里的 &lt;总控地址&gt;
+            请手工替换成被控机能访问到的地址。
+          </p>
+        )}
         <p className="muted" style={{ fontSize: 13 }}>Linux</p>
         <div className="row-inline">
           <code className="cmd-box">{linuxCmd}</code>

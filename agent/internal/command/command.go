@@ -24,7 +24,7 @@ var (
 
 // Result 命令执行结果。
 type Result struct {
-	Status   int    // 0=成功 1=失败 2=超时
+	Status   int // 0=成功 1=失败 2=超时
 	ExitCode int
 	Stdout   string
 	Stderr   string
@@ -249,5 +249,3 @@ func killProc(cmd *exec.Cmd) {
 	}
 	_ = cmd.Process.Release()
 }
-
-

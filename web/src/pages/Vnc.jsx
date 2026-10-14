@@ -31,6 +31,9 @@ export default function VncPage({ agents }) {
   const [vncUp, setVncUp] = useState(false)
   const [installing, setInstalling] = useState(false)
   const [password, setPassword] = useState('')
+  // 口令默认遮蔽（同屏/录屏时不至于直接暴露），但必须能一眼看到 ——
+  // 否则"读取口令"这个功能形同虚设：要手抄到 VNC 客户端里才能用。
+  const [pwVisible, setPwVisible] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
   // 连接工具栏（右下角）展开状态：窄屏默认收起，避免遮挡桌面
   const [toolsOpen, setToolsOpen] = useState(false)
@@ -292,6 +295,45 @@ export default function VncPage({ agents }) {
     setNotice('')
   }
 
+  // 读取目标机上**当前生效**的 VNC 口令。
+  //
+  // 服务端是实时向 Agent 取的（Agent 从 ultravnc.ini / x11vnc 口令文件还原），
+  // 不是回放服务端缓存的上次安装结果 —— 服务端重启、换人操作、或 VNC 是手工装的，
+  // 缓存都答不上来。读取是只读操作：不改配置、不重启 VNC、不打断正在用的会话。
+  //
+  // 与「一键安装/重置口令」的分工：口令只是"找不到了"用这个；需要换一个口令
+  // （或 VNC 本身坏了要重装）才用安装按钮。
+  const fetchPassword = async () => {
+    if (!host) { setNotice('请先选择目标主机'); return }
+    setNotice('正在读取 VNC 口令...')
+    try {
+      const r = await Api.vncPassword(host)
+      if (r && r.ok && r.password) {
+        setPassword(r.password)
+        setPwVisible(true) // 取到就直接展示，省掉一次点击
+        sessionStorage.setItem(pwKey(), r.password)
+        const modeLabel = r.mode === 'service' ? '服务模式' : r.mode === 'interactive' ? '交互会话模式' : ''
+        setNotice('✅ 已读取当前 VNC 口令' + (modeLabel ? `（${modeLabel}）` : ''))
+        return
+      }
+      setNotice('❌ ' + ((r && r.msg) || '读取失败'))
+    } catch (ex) {
+      setNotice('❌ 读取失败：' + (ex?.response?.data?.msg || ex?.message || '网络异常'))
+    }
+  }
+
+  const copyPassword = async () => {
+    if (!password) { setNotice('当前没有口令可复制'); return }
+    try {
+      await navigator.clipboard.writeText(password)
+      setNotice('✅ 口令已复制到剪贴板')
+    } catch {
+      // 剪贴板在非安全上下文或无权限时不可用：退化为"显示出来让用户手工复制"
+      setPwVisible(true)
+      setNotice('复制失败（浏览器限制），已显示口令，请手动复制')
+    }
+  }
+
   // 一键安装/启动 VNC；成功后自动回填服务端下发的口令。
   // 若安装较慢导致本次请求超时，轮询 /vnc/status 补取结果，再按需向 /vnc/password 取口令。
   const install = async () => {
@@ -410,13 +452,48 @@ export default function VncPage({ agents }) {
           </div>
           <div className="form-row">
             <label>VNC 口令</label>
-            <input type="password" value={password} placeholder="一键安装后自动填充" onChange={(e) => setPassword(e.target.value)} style={{ width: 220 }} autoComplete="off" />
+            <input
+              type={pwVisible ? 'text' : 'password'}
+              value={password}
+              placeholder="一键安装后自动填充，或点「获取口令」读取"
+              onChange={(e) => setPassword(e.target.value)}
+              style={{ width: 220 }}
+              autoComplete="off"
+            />
+            <button
+              className="secondary"
+              type="button"
+              onClick={fetchPassword}
+              disabled={!host}
+              title="从目标机读取当前生效的口令。只读：不改配置、不重启 VNC，不会打断正在使用的远程会话。"
+            >
+              获取口令
+            </button>
+            <button
+              className="secondary"
+              type="button"
+              onClick={() => setPwVisible((v) => !v)}
+              disabled={!password}
+              title="显示 / 隐藏口令"
+            >
+              {pwVisible ? '隐藏' : '显示'}
+            </button>
+            <button className="secondary" type="button" onClick={copyPassword} disabled={!password} title="复制口令到剪贴板">
+              复制
+            </button>
           </div>
         </div>
 
         <div className="terminal-toolbar">
           <button className="primary" onClick={connect} disabled={!host || status === 'connecting'}>连接桌面</button>
-          <button className="secondary danger" onClick={install} disabled={!host || installing}>{installing ? '安装中…' : '一键安装VNC'}</button>
+          <button
+            className="secondary danger"
+            onClick={install}
+            disabled={!host || installing}
+            title="未安装则安装 UltraVNC 并配置口令；已安装则结束现有 VNC 实例、重置口令后重新启动。注意：会重置口令并重启 VNC，可能打断正在使用的远程会话。只想查看当前口令请用「获取口令」。"
+          >
+            {installing ? '安装中…' : '一键安装/重置口令'}
+          </button>
           {vncUp && <button className="secondary" onClick={disconnect} disabled={status === 'disconnected' || status === 'idle'}>断开</button>}
         </div>
 
