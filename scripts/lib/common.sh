@@ -66,11 +66,11 @@ mc_go_version() {
 # 环境变量 MOCENTER_AGENT_VERSION / MOCENTER_SERVER_VERSION 可覆盖。
 mc_agent_version() {
   [ -n "${MOCENTER_AGENT_VERSION:-}" ] && { printf '%s' "$MOCENTER_AGENT_VERSION"; return; }
-  mc_go_version "agent/internal/version/version.go" "Version" "1.0.1"
+  mc_go_version "agent/internal/version/version.go" "Version" "1.0.2"
 }
 mc_server_version() {
   [ -n "${MOCENTER_SERVER_VERSION:-}" ] && { printf '%s' "$MOCENTER_SERVER_VERSION"; return; }
-  mc_go_version "server/internal/version/version.go" "Version" "1.0.1"
+  mc_go_version "server/internal/version/version.go" "Version" "1.0.2"
 }
 
 # ---------- 架构映射 ----------

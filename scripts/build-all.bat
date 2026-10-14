@@ -198,9 +198,9 @@ for %%A in (%OPT_ARCH:,= %) do (
 if defined ARCH_LIST set "ARCH_LIST=%ARCH_LIST:~1%"
 
 if "%OPT_OUTDIR%"=="" set "OPT_OUTDIR=%ROOT_DIR%\build"
-call :read_version "%ROOT_DIR%\server\internal\version\version.go" "1.0.1"
+call :read_version "%ROOT_DIR%\server\internal\version\version.go" "1.0.2"
 if "%OPT_SERVER_VERSION%"=="" set "OPT_SERVER_VERSION=%RSV%"
-call :read_version "%ROOT_DIR%\agent\internal\version\version.go" "1.0.1"
+call :read_version "%ROOT_DIR%\agent\internal\version\version.go" "1.0.2"
 if "%OPT_AGENT_VERSION%"=="" set "OPT_AGENT_VERSION=%RSV%"
 if "%MOCENTER_SERVER_VERSION%"=="" set "MOCENTER_SERVER_VERSION=%OPT_SERVER_VERSION%"
 if "%MOCENTER_AGENT_VERSION%"==""  set "MOCENTER_AGENT_VERSION=%OPT_AGENT_VERSION%"

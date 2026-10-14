@@ -19,10 +19,10 @@ package version
 // Version 当前 MoCenter 服务端版本号（独立于 Agent 版本号）。
 //
 // 发布纪律：**只有在明确发版时才修改此值**。
-const Version = "1.0.1"
+const Version = "1.0.2"
 
 // Name 产品名（用于「关于」页与 User-Agent 等展示）。
 const Name = "MoCenter"
 
-// Full 返回完整的版本标识，如 "MoCenter/1.0.1"。
+// Full 返回完整的版本标识，如 "MoCenter/1.0.2"。
 func Full() string { return Name + "/" + Version }

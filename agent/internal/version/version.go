@@ -28,10 +28,10 @@ package version
 // 构建脚本统一按 `${MOCENTER_AGENT_VERSION:-从本文件读到的值}` 注入，
 // 所以默认行为与 const 完全一致（不注入就是这里写的值）。
 // 运行期不可修改：没有任何命令行参数或环境变量能改它。
-var Version = "1.0.1"
+var Version = "1.0.2"
 
 // Name 产品名。
 const Name = "MoCenter"
 
-// Full 返回完整的版本标识，如 "MoCenter-Agent/1.0.1"。
+// Full 返回完整的版本标识，如 "MoCenter-Agent/1.0.2"。
 func Full() string { return Name + "-Agent/" + Version }
