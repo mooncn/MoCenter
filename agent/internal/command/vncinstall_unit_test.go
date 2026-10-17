@@ -114,3 +114,20 @@ func TestX11VNCPkgName(t *testing.T) {
 		t.Errorf("架构后缀不符合预期（应为 amd64/arm64/arm/386）: %q", name)
 	}
 }
+
+// 回归保护：headless 分支必须关闭虚拟屏的屏保清屏。
+//
+// 背景：Xvfb 默认约 600s 无输入即把屏幕刷黑，远程查看表现为"连上了但全黑"
+// （实测踩过：浏览器画布 100% #000000，x11vnc 只发出 1 个 16 字节整屏填充帧）。
+// 必须限定在虚拟屏分支内 —— 真实桌面 :0 上用户的屏保策略不该被改动。
+func TestVncStartScriptDisablesBlankOnXvfb(t *testing.T) {
+	script := buildVncStartScript(5900, "/tmp/pw", "/root/.mocenter/vnc.log")
+	di := strings.Index(script, "export DISPLAY=:99")
+	xi := strings.Index(script, "xset s off")
+	if xi < 0 {
+		t.Fatalf("headless 兜底脚本未关闭屏保清屏（Xvfb 约 600s 无输入会刷黑，远程表现为连接成功但全黑）:\n%s", script)
+	}
+	if di < 0 || xi < di {
+		t.Errorf("xset s off 应位于 headless（虚拟屏 :99）分支内，避免影响真实桌面的屏保策略:\n%s", script)
+	}
+}

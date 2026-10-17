@@ -79,6 +79,9 @@ type viewerConn struct {
 	ready        bool
 	pending      [][]byte
 	pendingBytes int
+	// relayed 已成功写向浏览器的字节数（仅诊断：closeViewer 日志带上它，
+	// "连上却黑屏"要能区分"对面根本没回数据"与"数据在服务端这段丢了"）。
+	relayed int64
 }
 
 type probeResult struct {
@@ -302,20 +305,33 @@ func (m *Mgr) logMismatch(from, owner, tunnelID, kind string) {
 }
 
 // closeViewer 关闭查看器连接并清理。注意：调用方不应持有 vw.wmu 锁。
-func (m *Mgr) closeViewer(tunnelID string) {
+// closeViewer 关闭查看器连接并通知 Agent 拆掉本地隧道。
+//
+// reason 只为日志存在：以前这条隧道怎么没的，服务端一个字都不说，
+// 浏览器端只剩"连接断开"。真机排障时（远程桌面连上却没画面）只能靠猜。
+// 用变参是为了不逼着所有调用点和测试都改签名 —— 但新加的调用点应当给原因。
+func (m *Mgr) closeViewer(tunnelID string, reason ...string) {
 	m.mu.Lock()
 	vw, ok := m.viewer[tunnelID]
 	if ok {
 		delete(m.viewer, tunnelID)
 	}
 	m.mu.Unlock()
-	if ok && vw != nil {
-		m.releaseViewer(vw.session)
-		vw.wmu.Lock()
-		_ = vw.ws.Close()
-		vw.wmu.Unlock()
-		m.sendTunnelClose(tunnelID, vw.agentID, "viewer-closed")
+	if !ok || vw == nil {
+		return // 已经被关过：不打日志，否则一次关闭出现两条，排障时反而误导
 	}
+	r := "未记录原因"
+	if len(reason) > 0 && reason[0] != "" {
+		r = reason[0]
+	}
+	// 这条日志是排障的唯一抓手：远程桌面"连上就断/没画面"时，以前服务端什么都没说。
+	m.releaseViewer(vw.session)
+	vw.wmu.Lock()
+	relayed := vw.relayed
+	_ = vw.ws.Close()
+	vw.wmu.Unlock()
+	log.Printf("[vnc] 关闭隧道 %s agent=%s 原因=%s 已转发=%dB", tunnelID, vw.agentID, r, relayed)
+	m.sendTunnelClose(tunnelID, vw.agentID, r)
 }
 
 // Probe 探测目标 Agent 的 VNC 端口是否可连。可连时立即释放隧道（仅探测）。
@@ -426,9 +442,10 @@ func (m *Mgr) DeliverTunnelData(tunnelID, agentID string, data []byte) {
 	_ = vw.ws.SetWriteDeadline(time.Now().Add(viewerWriteWait))
 	if err := vw.ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
 		vw.wmu.Unlock()
-		m.closeViewer(tunnelID)
+		m.closeViewer(tunnelID, "写查看器失败（WS 写超时或浏览器已关）")
 		return
 	}
+	vw.relayed += int64(len(data))
 	vw.wmu.Unlock()
 }
 
@@ -461,7 +478,7 @@ func (m *Mgr) DeliverOpenResp(tunnelID, agentID string, ok bool, msg string) {
 		_ = vw.ws.SetWriteDeadline(time.Now().Add(viewerWriteWait))
 		_ = vw.ws.WriteMessage(websocket.TextMessage, []byte("{\"type\":\"vnc_unavailable\",\"message\":\""+msg+"\"}"))
 		vw.wmu.Unlock()
-		m.closeViewer(tunnelID)
+		m.closeViewer(tunnelID, "Agent 回隧道不可用")
 		return
 	}
 	// 隧道就绪：标记 ready 并 flush 缓冲的浏览器数据
@@ -475,12 +492,12 @@ func (m *Mgr) DeliverOpenResp(tunnelID, agentID string, ok bool, msg string) {
 
 	agent := m.sess.Get(vw.agentID)
 	if agent == nil {
-		m.closeViewer(tunnelID)
+		m.closeViewer(tunnelID, "转发缓冲前发现 Agent 已断开")
 		return
 	}
 	for _, d := range pending {
 		if err := agent.Write(protocol.TypeTunnelData, &protocol.TunnelData{TunnelID: tunnelID, Data: d}); err != nil {
-			m.closeViewer(tunnelID)
+			m.closeViewer(tunnelID, "flush 缓冲数据写向 Agent 失败")
 			return
 		}
 	}
@@ -499,7 +516,7 @@ func (m *Mgr) NotifyTunnelClosed(tunnelID, agentID string) {
 		m.logMismatch(agentID, vw.agentID, tunnelID, "隧道关闭通知")
 		return
 	}
-	m.closeViewer(tunnelID)
+	m.closeViewer(tunnelID, "Agent 侧已关闭隧道")
 }
 
 // NotifyInstall 接收 Agent 回传的 VNC 安装/启动结果（始终缓存最近结果，便于口令补发）。
@@ -640,7 +657,7 @@ func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken
 	if err := a.Write(protocol.TypeTunnelOpen, &protocol.TunnelOpenReq{
 		TunnelID: tunnelID, AgentID: agentID, LocalHost: "127.0.0.1", LocalPort: port,
 	}); err != nil {
-		m.closeViewer(tunnelID)
+		m.closeViewer(tunnelID, "向 Agent 发 TunnelOpen 失败")
 		return
 	}
 
@@ -659,7 +676,7 @@ func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken
 		v.wmu.Unlock()
 		if !ready {
 			log.Printf("[vnc] 隧道建立超时 %s，关闭查看器", tid)
-			m.closeViewer(tid)
+			m.closeViewer(tid, "隧道建立超时（Agent 未回 openResp）")
 		}
 	}(tunnelID)
 

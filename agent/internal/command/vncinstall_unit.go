@@ -110,6 +110,15 @@ if ! pgrep -f 'Xvfb :99' >/dev/null 2>&1; then
   sleep 1
 fi
 export DISPLAY=:99
+
+# 关掉虚拟屏的屏保清屏：X 默认约 600s 无输入即把画面刷黑，远程查看的表现是
+# "连上了但全黑"（实测踩过）。虚拟屏没有本地用户，无现场需要保护。
+# xset 缺失时静默跳过，不影响后续拉起。
+if command -v xset >/dev/null 2>&1; then
+  xset s off 2>/dev/null || true
+  xset -dpms 2>/dev/null || true
+fi
+
 command -v openbox >/dev/null 2>&1 && pgrep -x openbox >/dev/null 2>&1 || (openbox &)
 sleep 0.5
 command -v xterm >/dev/null 2>&1 && pgrep -x xterm >/dev/null 2>&1 || (xterm -geometry 100x30+0+0 &)

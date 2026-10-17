@@ -693,8 +693,17 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 		if json.Unmarshal(env.Data, &td) != nil {
 			return
 		}
-		if conn := c.getTunnel(td.TunnelID); conn != nil {
-			_, _ = conn.Write(td.Data)
+		conn := c.getTunnel(td.TunnelID)
+		if conn == nil {
+			// 静默丢弃 = 最难查的一类故障：服务端以为画面数据已经送到，本机一个字节都没落地。
+			log.Printf("[agent] 丢弃隧道数据 %s（%d 字节）：本机没有这条隧道", td.TunnelID, len(td.Data))
+			return
+		}
+		if _, err := conn.Write(td.Data); err != nil {
+			// 写不进去说明本地 VNC 已经不接受输入了；继续留着隧道只会让浏览器对着空气发指令。
+			log.Printf("[agent] 写本地 VNC 失败，关闭隧道 %s: %v", td.TunnelID, err)
+			c.closeTunnel(td.TunnelID)
+			_ = c.write(protocol.TypeTunnelClose, &protocol.TunnelClose{TunnelID: td.TunnelID, Reason: "local-write-failed"})
 		}
 	case protocol.TypeTunnelClose:
 		var tc protocol.TunnelClose
@@ -1085,17 +1094,27 @@ func (c *Client) openTunnel(req protocol.TunnelOpenReq) {
 // readTunnel 读取内网服务的回包，封装为 TunnelData 回传服务端。
 func (c *Client) readTunnel(tunnelID string, conn net.Conn) {
 	buf := make([]byte, 64*1024)
+	var total int64
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
+			total += int64(n)
 			if c.write(protocol.TypeTunnelData, &protocol.TunnelData{TunnelID: tunnelID, Data: buf[:n]}) != nil {
 				break
 			}
 		}
 		if err != nil {
+			// 不带原因的退出会把"内网服务自己关了"和"回写服务端失败"混成同一种现象，
+			// 而这两种情况在控制台上看起来都只是"远程桌面黑屏/断线"。
+			if !errors.Is(err, net.ErrClosed) {
+				log.Printf("[agent] 隧道 %s 读内网服务结束: %v", tunnelID, err)
+			}
 			break
 		}
 	}
+	// 字节总数必须留痕：只有"隧道建立成功"而没有它，"连上却黑屏"就无从判断
+	// 是内网服务根本没回数据，还是数据丢在回传服务端的路上。
+	log.Printf("[agent] 隧道 %s 结束：共读内网服务 %d 字节", tunnelID, total)
 	// 内网服务关闭 -> 通知服务端关闭隧道
 	_ = c.write(protocol.TypeTunnelClose, &protocol.TunnelClose{TunnelID: tunnelID, Reason: "local-closed"})
 	c.closeTunnel(tunnelID)
