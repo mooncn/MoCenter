@@ -119,3 +119,56 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// TestLoadAgentKeyFromFile 覆盖 -agent-key-file 的三条要害：
+// 文件优先于命令行给出的值、空文件不算成功、读完必须删掉落盘的凭据。
+func TestLoadAgentKeyFromFile(t *testing.T) {
+	t.Run("文件值覆盖旗标值并删除文件", func(t *testing.T) {
+		dir := t.TempDir()
+		pf := filepath.Join(dir, "ak.tmp")
+		if err := os.WriteFile(pf, []byte("  TOK-from-file  \n"), 0600); err != nil {
+			t.Fatalf("写凭据文件失败: %v", err)
+		}
+		o := options{agentKey: "TOK-from-cmdline", agentKeyFile: pf}
+		if err := loadAgentKeyFromFile(&o); err != nil {
+			t.Fatalf("不该失败: %v", err)
+		}
+		if o.agentKey != "TOK-from-file" {
+			t.Errorf("agentKey = %q，期望去空白后的文件内容", o.agentKey)
+		}
+		if _, err := os.Stat(pf); !os.IsNotExist(err) {
+			t.Error("凭据文件读完没删，磁盘上多留了一份可读凭据")
+		}
+	})
+
+	t.Run("空文件报错且不覆盖既有值", func(t *testing.T) {
+		pf := filepath.Join(t.TempDir(), "empty.tmp")
+		if err := os.WriteFile(pf, []byte(" \t\n"), 0600); err != nil {
+			t.Fatalf("写空凭据文件失败: %v", err)
+		}
+		o := options{agentKey: "keepme", agentKeyFile: pf}
+		if err := loadAgentKeyFromFile(&o); err == nil {
+			t.Fatal("空凭据文件应当报错：静默当作「没有密钥」会让安装失败得更难懂")
+		}
+		if o.agentKey != "keepme" {
+			t.Errorf("agentKey 被空文件改成了 %q", o.agentKey)
+		}
+	})
+
+	t.Run("文件不存在报错", func(t *testing.T) {
+		o := options{agentKeyFile: filepath.Join(t.TempDir(), "nope.tmp")}
+		if err := loadAgentKeyFromFile(&o); err == nil {
+			t.Fatal("读不到凭据文件必须报错，不能退回空密钥")
+		}
+	})
+
+	t.Run("未给该旗标时不动 agentKey", func(t *testing.T) {
+		o := options{agentKey: "only-cmdline"}
+		if err := loadAgentKeyFromFile(&o); err != nil {
+			t.Fatalf("不该失败: %v", err)
+		}
+		if o.agentKey != "only-cmdline" {
+			t.Errorf("agentKey = %q，应保持原值", o.agentKey)
+		}
+	})
+}

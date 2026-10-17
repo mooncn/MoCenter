@@ -34,6 +34,7 @@ type options struct {
 	agentUUID     string // 设备硬件 UUID（设备身份；留空由 Agent 自动探测并持久化）
 	proxyIP       string
 	agentKey      string // Agent 注册预共享密钥（与服务端 agent.key 相同）
+	agentKeyFile  string // 注册凭据所在文件（优先于 agentKey；读后立即删除，见 doInstall）
 	adminUser     string // Server 的登录用户名
 	adminPass     string // Server 的登录密码
 	adminPassFile string // Server 登录密码所在文件（优先于 adminPass）
@@ -64,6 +65,7 @@ func main() {
 	flag.StringVar(&o.agentUUID, "uuid", "", "设备硬件 UUID（设备身份，留空则由 Agent 自动探测并写入配置）")
 	flag.StringVar(&o.proxyIP, "proxy-ip", "", "国内加速代理前缀（可选）")
 	flag.StringVar(&o.agentKey, "agent-key", "", "Agent 注册凭据：优先用控制台「Agent 接入」页签发的一次性注册令牌（一台一份、用后即废）；服务端 <data>\\agent.key 的共享密钥仍可用一个过渡版本（role 含 agent 时必填）")
+	flag.StringVar(&o.agentKeyFile, "agent-key-file", "", "从文件读取 Agent 注册凭据（优先于 -agent-key；读后立即删除该文件。图形安装程序走这条路径，避免密钥出现在同机命令行里）")
 	flag.StringVar(&o.adminUser, "user", "", "Server 的登录用户名（role 含 server 时必填）")
 	flag.StringVar(&o.adminPass, "password", "", "Server 的登录密码（role 含 server 时必填）")
 	flag.StringVar(&o.adminPassFile, "password-file", "", "从文件读取 Server 登录密码（优先于 -password；图形安装程序走这条路径，避免口令出现在命令行里）")
@@ -246,6 +248,9 @@ func usage() {
 
 示例:
   REM 在被控机上安装 Agent（-agent-key 取总控机 <data>\agent.key 的内容）
+  REM 推荐：注册密钥走文件（读后立即删除），不进命令行
+  mocenter-deploy.exe install -role agent -server mc.example.com:9000 -agent-key-file C:\Windows\Temp\mc-ak.tmp
+  REM 也可以直接给值，但安装那几十秒内同机任何进程都能读到这条命令行
   mocenter-deploy.exe install -role agent -server mc.example.com:9000 -agent-key <注册密钥>
 
   REM 在总控机上安装 Server

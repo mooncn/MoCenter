@@ -141,6 +141,36 @@ begin
   Result := p;
 end;
 
+// AgentKeyPath 注册凭据文件路径（与口令文件同一套做法，见 WritePasswordFile）。
+var
+  AgentKeyPath: String;
+
+// WriteAgentKeyFile 把注册密钥写进临时文件，只把**路径**交给安装引擎（-agent-key-file）。
+//
+// 为什么单独做一遍而不像以前那样直接拼 -agent-key "<值>"：命令行在安装那几十秒里
+// 对同机任意进程可见（wmic process get commandline / 任务管理器"命令行"列），
+// 而注册密钥是 C-1 那套一次性令牌的根凭据 —— 泄露面比后台口令更大，
+// 偏偏它以前就明晃晃地挂在这条最容易被人路过一眼的通道上。
+//
+// 写失败时同样**不降级**回命令行传参，宁可停下来说明原因。
+function WriteAgentKeyFile(const Key: String): String;
+var
+  p: String;
+begin
+  Result := '';
+  if Key = '' then
+    Exit;
+  p := ExpandConstant('{tmp}\mc-agent-key');
+  if not SaveStringToFile(p, Key, False) then
+  begin
+    MsgBox('无法写入临时注册凭据文件：' + p + #13#10#13#10 +
+           '请不要改回用 -agent-key 命令行传参（那会让密钥对同机其他用户可见）。',
+           mbCriticalError, MB_OK);
+    Abort;
+  end;
+  Result := p;
+end;
+
 // BuildInstallParams 把向导收集的参数拼成 mocenter-deploy.exe 的命令行。
 function BuildInstallParams(Param: String): String;
 var
@@ -154,7 +184,12 @@ begin
   if Pos('agent', role) > 0 then
   begin
     s := s + ' -server "' + SafeVal(PageBasic.Values[0]) + '"';
-    s := s + ' -agent-key "' + SafeVal(PageBasic.Values[3]) + '"';
+    // 注册密钥只走文件，不拼进命令行 —— 引擎读完即删该文件（见 WriteAgentKeyFile）。
+    // 命令行在安装那几十秒里对同机任意进程可见，而这是 C-1 一次性令牌的根凭据。
+    // 留空时干脆不传：引擎会明确报"必须指定 -agent-key 或 -agent-key-file"，
+    // 比偷偷退回命令行传参好（那条路正是这里要避免的）。
+    if AgentKeyPath <> '' then
+      s := s + ' -agent-key-file "' + AgentKeyPath + '"';
   end;
 
   if Pos('server', role) > 0 then
@@ -296,9 +331,12 @@ begin
   if CurStep = ssPostInstall then
   begin
     WizardForm.StatusLabel.Caption := '正在注册系统服务并启动...';
-    // 口令先落文件（仅本次安装有效；安装引擎读完会立即删除）
+    // 口令与注册密钥都先落文件（只在本次安装期间存在；安装引擎读完会立即删除）。
+    // 拼在命令行上会让它们对同机任意进程可见 —— 任务管理器"命令行"列就能看到。
     if Pos('server', GetRoleStr('')) > 0 then
       PasswordPath := WritePasswordFile(SafeVal(PageBasic.Values[2]));
+    if Pos('agent', GetRoleStr('')) > 0 then
+      AgentKeyPath := WriteAgentKeyFile(SafeVal(PageBasic.Values[3]));
     if not Exec(ExpandConstant('{app}\mocenter-deploy.exe'), BuildInstallParams(''),
                 ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, rc) then
     begin

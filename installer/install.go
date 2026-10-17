@@ -55,6 +55,35 @@ func serviceNameOf(role string) string {
 	return agentServiceName
 }
 
+// loadAgentKeyFromFile 把 -agent-key-file 的内容搬到 o.agentKey，然后删掉那个文件。
+//
+// 为什么要走文件：Inno 图形安装程序以命令行调起本引擎，而"安装那几十秒的命令行"
+// 对同机任意进程可见（wmic process get commandline / 任务管理器的"命令行"列）。
+// 注册密钥比后台口令更该避这条路径 —— 它是 C-1 那套一次性令牌的根凭据。
+//
+// 为什么单独成函数而不是内联在 doInstall 里：doInstall 需要管理员权限，
+// 内联就等于这三条要害（读不到要报错、空文件不算成功、用完必须删）永远测不到。
+func loadAgentKeyFromFile(o *options) error {
+	kf := strings.TrimSpace(o.agentKeyFile)
+	if kf == "" {
+		return nil
+	}
+	b, err := os.ReadFile(kf)
+	if err != nil {
+		return fmt.Errorf("读取注册凭据文件 %s 失败: %w", kf, err)
+	}
+	key := strings.TrimSpace(string(b))
+	if key == "" {
+		return fmt.Errorf("注册凭据文件 %s 为空", kf)
+	}
+	o.agentKey = key
+	// 删不掉不当失败处理（可能被安全软件占用），但一定要提示。
+	if derr := os.Remove(kf); derr != nil {
+		fmt.Printf("  警告: 注册凭据文件 %s 未能删除（%v），请手动删除\n", kf, derr)
+	}
+	return nil
+}
+
 // doInstall 安装并注册服务。
 func doInstall(o options) error {
 	if !isElevated() {
@@ -62,6 +91,9 @@ func doInstall(o options) error {
 	}
 	roles, err := parseRoles(o.role)
 	if err != nil {
+		return err
+	}
+	if err := loadAgentKeyFromFile(&o); err != nil {
 		return err
 	}
 	for _, r := range roles {
@@ -76,9 +108,9 @@ func doInstall(o options) error {
 				"若本机已装过（配置存在），可省略该参数直接升级")
 		}
 		if r == "agent" && strings.TrimSpace(o.agentKey) == "" {
-			return errors.New("安装 Agent 必须指定 -agent-key（取总控机数据目录下 agent.key 的内容）：" +
-				"服务端要求 Agent 携带注册密钥，否则连接会被拒绝。" +
-				"若本机已装过（配置存在），可省略该参数直接升级")
+			return errors.New("安装 Agent 必须指定 -agent-key 或 -agent-key-file（取总控机数据目录下 agent.key 的内容）：" +
+				"服务端要求 Agent 出示注册凭据，否则连接会被拒绝。" +
+				"推荐用 -agent-key-file（密钥不进命令行）；若本机已装过（配置存在），可省略直接升级")
 		}
 		if r == "server" && (strings.TrimSpace(o.adminUser) == "" || (strings.TrimSpace(o.adminPass) == "" && strings.TrimSpace(o.adminPassFile) == "")) {
 			return errors.New("安装 Server 必须指定 -user 与 -password（后台登录账号）；" +
@@ -271,16 +303,24 @@ func writeConfig(role, path string, o options) error {
 		}
 	} else {
 		if strings.TrimSpace(o.agentKey) == "" {
-			return errors.New("安装 Agent 必须指定 -agent-key（取服务端 <data>\\agent.key 的内容）：" +
+			return errors.New("安装 Agent 必须指定 -agent-key 或 -agent-key-file（取服务端 <data>\\agent.key 的内容）：" +
 				"服务端默认要求 Agent 携带注册密钥，否则连接会被拒绝")
 		}
 		obj = map[string]any{
-			"server":    o.server,
-			"agent_key": strings.TrimSpace(o.agentKey),
-			"daemon":    true,
+			"server": o.server,
+			"daemon": true,
 			// 首次启动用注册密钥换取客户端证书（服务端内置 CA 签发），
 			// 换取成功后该字段会被清空、证书落到 creds\ 下 —— 运维无需手工准备证书。
 			"enrollment_secret": strings.TrimSpace(o.agentKey),
+		}
+		// 只写一份凭据的条件：走 -agent-key-file 进来的是一台一份、用后即废的注册令牌。
+		// 把它同时抄进长期字段 agent_key 没有任何好处 —— 令牌在服务端已作废，
+		// "服务端换 CA 后拿 agent_key 自动重签"这条路救不回来，
+		// 结果只是让一个凭据形状的值永久躺在配置里。
+		// 反之，运维显式用 -agent-key 提供 <data>\agent.key 共享密钥时，
+		// 它就是长期凭据，两处都写才符合那条恢复路径的本意。
+		if strings.TrimSpace(o.agentKeyFile) == "" {
+			obj["agent_key"] = strings.TrimSpace(o.agentKey)
 		}
 		if strings.TrimSpace(o.serverFingerprint) != "" {
 			obj["server_fingerprint"] = strings.TrimSpace(o.serverFingerprint)
