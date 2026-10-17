@@ -25,8 +25,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -162,15 +165,25 @@ func installAndStartUltraVNCApp(port int, cfg VncConfig, res *VncInstallResult) 
 		return false
 	}
 
-	// 5) 优先直接启动（Agent 若在交互会话中则立即可见）；
-	//    未就绪则通过计划任务在交互会话中启动，解决 Session 0 隔离。
-	startWinvncDirect(exe)
-	if !waitPortOpen(port, 5*time.Second) {
-		// 直启实例未监听（多为 Agent 在 Session 0）：结束它并**等确认退出**，
-		// 再由计划任务拉进交互会话。只发 taskkill 就往下走会让残留实例占着端口，
-		// 使后续的"端口已监听"判断失真。
-		killWinvncProcesses()
-		_ = waitNoWinvnc(10 * time.Second)
+	// 5) 启动路径按 Agent 自身所在会话分流。
+	//    真机撞出的缺陷（2026-10-16，Win10）：服务形态的 Agent 跑在 Session 0，
+	//    直启的 winvnc 继承 Session 0 —— 它能抢到 5900 端口（waitPortOpen 于是
+	//    "成功"），却没有任何交互桌面可抓，客户端 ClientInit 一到就被关闭；
+	//    而 schtasks /it 的交互会话回退因为端口已开被跳过。所以：
+	//    只有 Agent 自己跑在交互会话（便携形态）才允许直启；
+	//    Session 0 一律跳过直启，直接由计划任务拉进交互会话。
+	if currentSessionID() != 0 {
+		startWinvncDirect(exe)
+		if !waitPortOpen(port, 5*time.Second) {
+			// 直启实例未监听：结束它并**等确认退出**，再由计划任务拉进交互会话。
+			// 只发 taskkill 就往下走会让残留实例占着端口，
+			// 使后续的"端口已监听"判断失真。
+			killWinvncProcesses()
+			_ = waitNoWinvnc(10 * time.Second)
+			startInUserSession(exe)
+		}
+	} else {
+		log.Printf("[vnc-install] Agent 运行在 Session 0（服务形态），跳过直启，改由交互会话任务拉起")
 		startInUserSession(exe)
 	}
 	if !waitPortOpen(port, 10*time.Second) {
@@ -179,6 +192,15 @@ func installAndStartUltraVNCApp(port int, cfg VncConfig, res *VncInstallResult) 
 	}
 	if err := confirmPortIsOurs(port); err != nil {
 		res.Message = "UltraVNC 应用模式端口归属异常: " + err.Error()
+		return false
+	}
+	// 应用模式的 winvnc 必须真的跑在**交互会话**里。全部落在 Session 0 意味着
+	// "端口通了但没有桌面可抓"，与启动失败无异 —— 必须报出来而不是报成功
+	// （真机缺陷的另一半：以前只验证"端口有人听"，不验证"听的人看得见桌面"）。
+	if !winvncInteractiveRunning() {
+		res.Message = "UltraVNC 应用模式的 winvnc 未运行在交互会话中（无法抓取桌面）。" +
+			"常见原因：目标机当前没有已登录用户，或计划任务未能进入交互会话。" +
+			"请先登录目标机后重试；需要免登录查看时请改用服务模式（可看锁屏/登录界面）。"
 		return false
 	}
 
@@ -193,9 +215,44 @@ func installAndStartUltraVNCApp(port int, cfg VncConfig, res *VncInstallResult) 
 }
 
 // startWinvncDirect 以独立进程方式启动 winvnc.exe（继承 Agent 当前会话）。
+// 调用方必须先确认 Agent 不在 Session 0（见 currentSessionID），
+// 否则启动出来的 winvnc 没有交互桌面可抓。
 func startWinvncDirect(exe string) {
 	psCmd := "Start-Process -FilePath " + psQuote(exe) + " -WindowStyle Hidden"
 	_ = exec.Command("powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", psCmd).Run()
+}
+
+// processSessionID 返回给定 PID 所在的终端会话 ID；查询失败返回 -1。
+// 会话 0 是服务会话（无交互桌面），用户会话从 1 起。
+func processSessionID(pid uint32) int {
+	var sid uint32
+	if err := windows.ProcessIdToSessionId(pid, &sid); err != nil {
+		return -1
+	}
+	return int(sid)
+}
+
+// currentSessionID 返回当前进程所在的终端会话 ID（0 = Session 0，即服务会话）。
+// Agent 以 Windows 服务运行时必为 0；便携双击/手工启动时是登录用户的会话。
+func currentSessionID() int {
+	return processSessionID(uint32(os.Getpid()))
+}
+
+// winvncInteractiveRunning 是否存在运行在**交互会话**（非 Session 0）里的 winvnc。
+//
+// 应用模式的验收标准不是"端口有人听"，而是"听的人看得见桌面"：
+// Session 0 里的 winvnc 能完成 RFB 握手却给不出任何画面。
+func winvncInteractiveRunning() bool {
+	for _, p := range winvncPIDs() {
+		n, err := strconv.Atoi(p)
+		if err != nil || n <= 0 {
+			continue
+		}
+		if s := processSessionID(uint32(n)); s > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // stopUltraVNCService 停止 uvnc_service 并改为手动启动，避免它与应用模式实例争抢端口。

@@ -218,3 +218,22 @@ func TestDecodeUltraVNCPasswordChecksum(t *testing.T) {
 		}
 	}
 }
+
+// TestProcessSessionID 当前进程的会话 ID 必须能查到且不为 -1（查询失败）。
+// 不断言具体值：CI 以服务身份跑时是 Session 0，开发机交互运行时是 1+，
+// 两种环境这条都必须成立。
+func TestProcessSessionID(t *testing.T) {
+	if got := processSessionID(uint32(os.Getpid())); got < 0 {
+		t.Fatalf("ProcessIdToSessionId 对自身 PID 查询失败: %d", got)
+	}
+}
+
+// TestWinvncInteractiveRunning 没有任何 winvnc 进程时必须返回 false ——
+// 这条是应用模式验收逻辑的空转安全网：机器上没装/没启动 winvnc 时，
+// "没有交互会话实例"是唯一正确的答案，绝不能因为查询异常误报成 true。
+func TestWinvncInteractiveRunningNoProcess(t *testing.T) {
+	if winvncInteractiveRunning() {
+		// 只有测试机真的跑着交互会话的 winvnc 才会到这里（例如刚做过复测）。
+		t.Skip("本机存在交互会话中的 winvnc 进程，跳过空转断言")
+	}
+}

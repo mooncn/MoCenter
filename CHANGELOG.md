@@ -4,6 +4,29 @@
 `server/internal/version/version.go` 与 `agent/internal/version/version.go` 维护；
 安装包版本由 `installer/setup.iss` 的 `AppVersion` 决定。发布纪律：只在明确发版时修改版本号。
 
+## 未发布
+
+### Agent
+
+- **修复：交互会话模式的 winvnc 在 Session 0 直启（真机缺陷候选，已定性为真缺陷）** ——
+  服务形态的 Agent 跑在 Session 0，直启的 winvnc 继承 Session 0：能抢到 5900 端口
+  （`waitPortOpen` 误判成功），却没有任何交互桌面可抓，客户端 ClientInit 一到即被关闭；
+  交互会话回退分支因端口已开被跳过。现在按 Agent 自身会话分流（`currentSessionID()`，
+  Session 0 一律跳过直启、直接走 `schtasks /it`），且验收加严：端口通了之后还必须确认
+  至少一个 winvnc 运行在交互会话里（`winvncInteractiveRunning()`），否则明确报错并
+  建议改用服务模式。
+
+### 构建与安装
+
+- **Windows 口令入口收口（H-9 残留 (i) 另一半）**：
+  - `install-windows.bat` 移除 `install-server` 的位置式口令（调用方命令行对同机任意
+    进程可见），检测到旧写法明确报错；口令改走 `--password-file=<路径>` /
+    `MOCENTER_PASSWORD` / 标准输入一行 / 交互输入 / 留空自动生成随机强口令。
+    顺带修掉一个真 bug：旧口令生成逻辑在括号块内用 `%S_PASS%` 判断结果 —— cmd 对
+    括号块先整体解析后执行，展开的永远是空串，"已生成初始口令（仅本次显示）"从未显示过。
+  - `mocenter-deploy.exe` 的 `-password` 旗标退役（保留但拒收非空值，给出明确报错），
+    新增 `-password-stdin` 从标准输入读一行。
+
 ## 1.0.2（2026-10-14）
 
 ### Agent
