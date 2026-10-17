@@ -470,7 +470,7 @@ scripts\build-all.bat --type=installer
 ```bat
 REM Windows：注册为系统服务（需管理员）。免安装 zip 解压后自带该脚本
 scripts\deploy\install-windows.bat install mc.example.com:9000 [agentid] [proxy]
-scripts\deploy\install-windows.bat install-server [user] [password] [listen] [http]
+scripts\deploy\install-windows.bat install-server [user] [listen] [http] [--password-file=^<路径^>]
 scripts\deploy\install-windows.bat status
 scripts\deploy\install-windows.bat uninstall
 ```
@@ -577,8 +577,10 @@ mocenter-server -user admin -password-file /etc/mocenter/initial-password -totp-
 > 本仓库自己的三条安装路径**都不会把口令留在服务定义里**：`install-linux.sh` 收到 `--password=*** 直接
 > 报错并只提示 `--password-file=<路径>` 与"`--password` 从标准输入读一行"两种写法（`MOCENTER_PASSWORD`
 > 环境变量仍可用），生成的单元与保活脚本都只引用 0600 的 `initial-password` 文件；Windows 侧
-> `install-windows.bat` 的 `binPath` 同样只写 `-password-file`（**注意**：该脚本自身的第 3 个位置参数
-> 仍是口令，走它时口令会出现在命令行里 —— 优先用留空让它生成随机强口令，或改用 Linux 侧的文件/stdin）。
+> `install-windows.bat` 的 `binPath` 同样只写 `-password-file`，且**脚本自身的位置式口令也已移除**
+> （调用方命令行对同机任意进程可见）—— 口令改走 `--password-file=<路径>`、`MOCENTER_PASSWORD`
+> 环境变量、标准输入一行或留空自动生成随机强口令；`mocenter-deploy.exe` 的 `-password` 旗标同样
+> 只保留用于给出明确报错，实际入口是 `-password-file` 与 `-password-stdin`。
 >
 > 服务端对 `-password-file` 是 **fail-closed** 的：文件不存在、是目录、内容为空、
 > 或权限宽松到同组/其他用户可读，都会**拒绝启动并说明原因**，而不是静默回退到随机口令 ——

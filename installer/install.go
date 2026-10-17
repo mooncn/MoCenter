@@ -3,9 +3,11 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,6 +86,43 @@ func loadAgentKeyFromFile(o *options) error {
 	return nil
 }
 
+// resolveAdminPass 处理 Server 登录口令的入口收口（H-9 残留 (i)）。
+//
+// 背景：安装进程的命令行对同机任意进程可见（wmic process get commandline /
+// 任务管理器的"命令行"列），明文口令放 -password 等于当众广播。与
+// install-linux.sh 拒绝 --password=<明文> 的口径保持一致：
+//
+//   - -password 给了非空值 → 直接报错并指路（旗标保留但不收值）；
+//   - -password-stdin → 从 in 读一行作为口令（type pw.txt | mocenter-deploy.exe ...）；
+//   - 都没给 → 交由 doInstall 的"必须指定"校验或升级路径处理。
+//
+// 单独成函数（而不是散在 main）是为了能注入 io.Reader 做单测；
+// 与 loadAgentKeyFromFile 同理，内联在需要管理员权限的 doInstall 里就永远测不到。
+func resolveAdminPass(o *options, in io.Reader) error {
+	if strings.TrimSpace(o.adminPass) != "" {
+		return errors.New("不再接受 -password <明文>：安装进程的命令行对同机任意进程可见（H-9）。\n" +
+			"  请改用以下任一方式：\n" +
+			"    -password-file <路径>    口令放在仅管理员可读的文件里（图形安装程序走这条）\n" +
+			"    -password-stdin          从标准输入读一行（type pw.txt | mocenter-deploy.exe install -role server ...）\n" +
+			"  若本机已装过（配置存在），可两项都省略直接升级")
+	}
+	if !o.adminPassStdin {
+		return nil
+	}
+	line, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && line == "" {
+		return fmt.Errorf("读取标准输入失败（-password-stdin 需要一行口令，如 type pw.txt | mocenter-deploy.exe ...）: %w", err)
+	}
+	o.adminPass = strings.TrimRight(line, "\r\n")
+	// 口令本身允许含空格，但首尾空白按惯例视作录入噪声（与 -password-file 的
+	// TrimSpace 口径一致）。全空白等于没给，让 doInstall 的校验去报错。
+	o.adminPass = strings.TrimSpace(o.adminPass)
+	if o.adminPass == "" {
+		return errors.New("-password-stdin 读到的口令为空：请在标准输入给一行非空白口令")
+	}
+	return nil
+}
+
 // doInstall 安装并注册服务。
 func doInstall(o options) error {
 	if !isElevated() {
@@ -113,8 +152,9 @@ func doInstall(o options) error {
 				"推荐用 -agent-key-file（密钥不进命令行）；若本机已装过（配置存在），可省略直接升级")
 		}
 		if r == "server" && (strings.TrimSpace(o.adminUser) == "" || (strings.TrimSpace(o.adminPass) == "" && strings.TrimSpace(o.adminPassFile) == "")) {
-			return errors.New("安装 Server 必须指定 -user 与 -password（后台登录账号）；" +
-				"若本机已装过（配置存在），可省略这两项直接升级")
+			return errors.New("安装 Server 必须指定 -user 与 -password-file（或 -password-stdin）：" +
+				"口令不收命令行明文（安装进程的命令行对同机任意进程可见）。" +
+				"若本机已装过（配置存在），可省略这些参数直接升级")
 		}
 	}
 

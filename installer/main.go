@@ -35,9 +35,10 @@ type options struct {
 	proxyIP       string
 	agentKey      string // Agent 注册预共享密钥（与服务端 agent.key 相同）
 	agentKeyFile  string // 注册凭据所在文件（优先于 agentKey；读后立即删除，见 doInstall）
-	adminUser     string // Server 的登录用户名
-	adminPass     string // Server 的登录密码
-	adminPassFile string // Server 登录密码所在文件（优先于 adminPass）
+	adminUser      string // Server 的登录用户名
+	adminPass      string // Server 的登录密码（已退役：只保留旗标用于给出明确报错，见 resolveAdminPass）
+	adminPassFile  string // Server 登录密码所在文件
+	adminPassStdin bool   // Server 登录密码改从标准输入读一行
 	listen        string // Server 的 Agent TCP 监听
 	httpAddr      string // Server 的 HTTP 监听
 	webDir        string // Server 托管的 Web 静态资源目录
@@ -67,8 +68,9 @@ func main() {
 	flag.StringVar(&o.agentKey, "agent-key", "", "Agent 注册凭据：优先用控制台「Agent 接入」页签发的一次性注册令牌（一台一份、用后即废）；服务端 <data>\\agent.key 的共享密钥仍可用一个过渡版本（role 含 agent 时必填）")
 	flag.StringVar(&o.agentKeyFile, "agent-key-file", "", "从文件读取 Agent 注册凭据（优先于 -agent-key；读后立即删除该文件。图形安装程序走这条路径，避免密钥出现在同机命令行里）")
 	flag.StringVar(&o.adminUser, "user", "", "Server 的登录用户名（role 含 server 时必填）")
-	flag.StringVar(&o.adminPass, "password", "", "Server 的登录密码（role 含 server 时必填）")
-	flag.StringVar(&o.adminPassFile, "password-file", "", "从文件读取 Server 登录密码（优先于 -password；图形安装程序走这条路径，避免口令出现在命令行里）")
+	flag.StringVar(&o.adminPass, "password", "", "（已退役）不接受明文口令：安装进程的命令行对同机任意进程可见。给出非空值会直接报错")
+	flag.StringVar(&o.adminPassFile, "password-file", "", "从文件读取 Server 登录密码（图形安装程序走这条路径，避免口令出现在命令行里）")
+	flag.BoolVar(&o.adminPassStdin, "password-stdin", false, "从标准输入读取一行 Server 登录密码（如 type pw.txt | mocenter-deploy.exe install ...）")
 	flag.StringVar(&o.listen, "listen", ":9000", "Server 的 Agent TCP 监听地址")
 	flag.StringVar(&o.httpAddr, "http", ":8080", "Server 的 REST/WebSocket 监听地址")
 	flag.StringVar(&o.webDir, "web", "", "Server 托管的 Web 静态资源目录（留空则不托管前端）")
@@ -100,6 +102,15 @@ func main() {
 		args = args[1:]
 	}
 	_ = flag.CommandLine.Parse(args)
+
+	// 口令入口收口（H-9 残留 (i)）：安装进程的命令行对同机任意进程可见，
+	// 所以明文口令不允许再走 -password。旗标本身保留（而不是删掉），为的是
+	// 给还在用旧写法的脚本一句能看懂的报错，而不是 flag 包的
+	// "flag provided but not defined"。所有子命令统一走这一关。
+	if err := resolveAdminPass(&o, os.Stdin); err != nil {
+		fmt.Fprintf(os.Stderr, "\n[错误] %v\n", err)
+		os.Exit(2)
+	}
 	if cmd == "" {
 		// 兼容「旗标在前」的写法：mocenter-deploy.exe -role server install
 		cmd = "install"
@@ -236,7 +247,7 @@ func usage() {
 升级 semantics:
   · 检测到 <数据目录>\<角色>\mocenter-<角色>.json 已存在时按**升级**处理：
     只替换二进制与服务定义，账号/连接参数/数据库全部保留；
-  · 升级时无需重复提供 -server / -agent-key / -user / -password；
+  · 升级时无需重复提供 -server / -agent-key / -user / -password-file；
   · 要清理重装（删除既有配置与数据）需显式加 -force。
 
 保活:
@@ -253,9 +264,9 @@ func usage() {
   REM 也可以直接给值，但安装那几十秒内同机任何进程都能读到这条命令行
   mocenter-deploy.exe install -role agent -server mc.example.com:9000 -agent-key <注册密钥>
 
-  REM 在总控机上安装 Server
-  mocenter-deploy.exe install -role server -user admin -password-file <0600 口令文件>   # 推荐
-  mocenter-deploy.exe install -role server -user admin -password <登录密码>            # 不推荐：口令会出现在命令行里
+  REM 在总控机上安装 Server（口令不收命令行明文：命令行对同机任意进程可见）
+  mocenter-deploy.exe install -role server -user admin -password-file <0600 口令文件>
+  type pw.txt | mocenter-deploy.exe install -role server -user admin -password-stdin
 
   REM 一台机器同时装两者
   mocenter-deploy.exe install -role all -server 127.0.0.1:9000 -user admin -password-file <0600 口令文件>

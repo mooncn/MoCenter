@@ -172,3 +172,55 @@ func TestLoadAgentKeyFromFile(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveAdminPass 覆盖 Server 口令入口收口（H-9 残留 (i)）的三条要害：
+// 命令行明文必须被拒、stdin 读一行能落进 adminPass、stdin 空行不算成功。
+func TestResolveAdminPass(t *testing.T) {
+	t.Run("拒绝 -password 明文", func(t *testing.T) {
+		o := options{adminPass: "leaked-via-cmdline"}
+		err := resolveAdminPass(&o, strings.NewReader(""))
+		if err == nil {
+			t.Fatal("明文口令必须被拒绝：安装进程的命令行对同机任意进程可见")
+		}
+		if !contains(err.Error(), "-password-file") {
+			t.Errorf("报错应指路 -password-file / -password-stdin，实际: %v", err)
+		}
+	})
+
+	t.Run("stdin 读一行", func(t *testing.T) {
+		o := options{adminPassStdin: true}
+		if err := resolveAdminPass(&o, strings.NewReader("pw-from-stdin\n")); err != nil {
+			t.Fatalf("不该失败: %v", err)
+		}
+		if o.adminPass != "pw-from-stdin" {
+			t.Errorf("adminPass = %q，期望去掉行尾换行后的内容", o.adminPass)
+		}
+	})
+
+	t.Run("stdin 兼容 CRLF 与首尾空白", func(t *testing.T) {
+		o := options{adminPassStdin: true}
+		if err := resolveAdminPass(&o, strings.NewReader("  padded-pw  \r\n")); err != nil {
+			t.Fatalf("不该失败: %v", err)
+		}
+		if o.adminPass != "padded-pw" {
+			t.Errorf("adminPass = %q，期望去 CRLF 与首尾空白后的内容", o.adminPass)
+		}
+	})
+
+	t.Run("stdin 空行报错", func(t *testing.T) {
+		o := options{adminPassStdin: true}
+		if err := resolveAdminPass(&o, strings.NewReader("\n")); err == nil {
+			t.Fatal("空行口令应报错，不能静默当作成功")
+		}
+	})
+
+	t.Run("未给任何口令时不报错（交给 doInstall 校验）", func(t *testing.T) {
+		o := options{}
+		if err := resolveAdminPass(&o, strings.NewReader("")); err != nil {
+			t.Fatalf("不该失败: %v", err)
+		}
+		if o.adminPass != "" {
+			t.Errorf("adminPass 被改成 %q", o.adminPass)
+		}
+	})
+}
