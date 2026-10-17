@@ -18,6 +18,8 @@
 #   --role=agent|server|all     要安装/操作的组件，默认 agent
 #   --force                     清理重装：删除既有配置后重新生成（默认是升级模式，保留配置）
 #   --no-keepalive              不注册保活任务（默认注册：systemd timer，无 systemd 时用 cron）
+#   --open-firewall             服务端角色：检测到 firewalld 未放行服务端口时直接放行
+#                               （默认只打印该执行的命令；只加运行时规则，不写 --permanent）
 #   --dry-run                   只打印将要执行的动作，不修改系统
 #   --bin=<路径>                单个组件时可直接指定二进制路径
 #   --bin-dir=<目录>            在该目录下按 mocenter-<role>[-<arch>] 自动查找
@@ -78,6 +80,9 @@ PURGE=0
 FORCE=0
 NO_KEEPALIVE=0
 DRY_RUN=0
+# --open-firewall：检测到 firewalld 在跑且服务端端口没放行时，真的去放行。
+# 默认**只提示不执行**：改本机防火墙是有爆炸半径的动作，不能由安装脚本顺手替你做。
+OPEN_FIREWALL=0
 
 BIN_DIR_DEFAULT="/usr/local/bin"
 CONF_DIR="/etc/mocenter"
@@ -131,6 +136,7 @@ while [ $# -gt 0 ]; do
     --force-config) FORCE_CONF=1 ;;
     --force)       FORCE=1 ;;
     --no-keepalive) NO_KEEPALIVE=1 ;;
+    --open-firewall) OPEN_FIREWALL=1 ;;
     --dry-run)     DRY_RUN=1 ;;
     --purge)       PURGE=1 ;;
     --help|-h)     usage ;;
@@ -487,6 +493,76 @@ do_status_role() {
   fi
 }
 
+# ---------------------------------------------------------------- 服务端可达性自检
+#
+# 为什么非要安装阶段主动查这两件事：它们的症状都不落在服务端自己身上。
+#  · 防火墙没放行端口：服务端日志一切正常，被管机只是"连接超时"，
+#    在本机翻 journal 看不出任何名堂（2026-10-15 真机就被这个卡了一整轮）。
+#  · 时钟没同步：注册报文的时间戳容差只有 60 秒（agentauth.MaxClockSkew），
+#    服务端慢几分钟就拒发所有客户端证书，拒绝理由写在审计的 auth 类里，
+#    而运维通常不会去查审计。
+# 两条都属于"装完当下看起来成功、之后全部 Agent 接不上"的坑，宁可在安装输出里啰嗦一次。
+listen_port_of() {
+  local p="${1##*:}"
+  case "$p" in ('' | *[!0-9]*) printf '' ;; (*) printf '%s' "$p" ;; esac
+}
+
+# firewall_missing_ports：<端口列表> —— 输出未放行的端口（空格分隔），全放行则返回 1。
+# 只认 firewalld 在跑的情况；iptables/nftables 直接交回给运维，脚本不猜。
+firewall_missing_ports() {
+  command -v firewall-cmd >/dev/null 2>&1 || return 1
+  firewall-cmd --state >/dev/null 2>&1 || return 1
+  local allowed got p
+  allowed=" $(firewall-cmd --list-ports 2>/dev/null) "
+  got=""
+  for p in $1; do
+    [ -n "$p" ] || continue
+    case "$allowed" in
+      *" ${p}/tcp "*) ;;
+      *) got="$got ${p}/tcp" ;;
+    esac
+  done
+  [ -n "$got" ] || return 1
+  printf '%s' "${got# }"
+}
+
+server_reachability_check() {
+  local ports missing p ntp
+  ports="$(listen_port_of "$S_LISTEN") $(listen_port_of "$S_HTTP")"
+
+  if missing="$(firewall_missing_ports "$ports")"; then
+    if [ "$OPEN_FIREWALL" = 1 ]; then
+      for p in $missing; do
+        # 这里不能图省事走 run：run 在 --dry-run 下恒返回 0，
+        # 那样下面那句"已放行"就成了假话。
+        if [ "$DRY_RUN" = 1 ]; then
+          info "  [dry-run] firewall-cmd --add-port=$p"
+          continue
+        fi
+        if firewall-cmd --add-port="$p" >/dev/null 2>&1; then
+          ok "firewalld 已放行 $p（仅运行时规则；重启失效，要持久请自行加 --permanent 并 --reload）"
+        else
+          info "  !! 放行 $p 失败，请手动执行：firewall-cmd --add-port=$p"
+        fi
+      done
+    else
+      info "   !! firewalld 正在运行，但没放行服务端口：$missing"
+      info "      症状不在服务端身上：Agent 只会看到连接超时，本机日志一切正常。"
+      for p in $missing; do info "        firewall-cmd --add-port=$p"; done
+      info "      要持久化就每条再加 --permanent 并 firewall-cmd --reload；"
+      info "      或重跑安装并带上 --open-firewall，由本脚本执行上面这几条。"
+    fi
+  fi
+
+  ntp="$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)"
+  if [ "$ntp" = "no" ]; then
+    info "   !! 系统时钟未同步（timedatectl NTPSynchronized=no）。"
+    info "      注册报文的时间戳容差只有 60 秒，两端时钟差几分钟就会有 Agent"
+    info "      换不到客户端证书，审计里写「注册报文时间戳偏差过大」。"
+    info "      先同步再接入：timedatectl set-ntp true（离线环境请指向内网 NTP 源）"
+  fi
+}
+
 case "$ACTION" in install|upgrade) need_root ;; esac
 
 for r in "${ROLES[@]}"; do
@@ -509,5 +585,10 @@ if [ "$INSTALL_ACTION" = 1 ]; then
   else
     printf '   保活: 无 systemd —— 已改用 cron 计划任务（@reboot + 每 5 分钟巡检）\n'
   fi
+  # 装了服务端就顺手把"端口放行了没有、时钟同步了没有"查一遍：
+  # 这两项不查，安装输出全绿，而后面每一个 Agent 都接不上（见 server_reachability_check）。
+  for r in "${ROLES[@]}"; do
+    [ "$r" = server ] && server_reachability_check
+  done
   exit 0
 fi

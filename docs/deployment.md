@@ -130,6 +130,19 @@ sudo bash scripts/deploy/install-linux.sh upgrade --role=server \
 > 服务只监听 `:9000`（Agent 长连接）与 `:8080`（Web 控制台 / REST API）。
 > 生产环境请配置 TLS 证书（`MOCENTER_TLS_CERT` / `MOCENTER_TLS_KEY`，并可用
 > `MOCENTER_CA_CERT` 启用 mTLS）、设置 `MOCENTER_WHITELIST`，并用防火墙限制来源网段。
+>
+> **装完必须自查两件事，否则症状不会出现在服务端身上**（`install-linux.sh` 装服务端角色时
+> 会自动检查并打印整改命令，加 `--open-firewall` 可让它直接放行）：
+>
+> 1. **防火墙要放行这两个端口**。firewalld 默认的 `public` 区只开 `ssh/cockpit/dhcpv6-client`，
+>    新机器装完服务端，Agent 侧的表现只是"连接超时"，而服务端日志一切正常，在本机查不出名堂。
+>    `firewall-cmd --list-ports` 应当看到 `9000/tcp 8080/tcp`（缺哪个补哪个）：
+>    `firewall-cmd --add-port=9000/tcp --add-port=8080/tcp`，要持久化再加 `--permanent` 并 `--reload`。
+> 2. **两端时钟要同步**。注册报文带时间戳且只认 ±60 秒（防重放），服务端自己慢几分钟
+>    就会导致所有 Agent 换不到客户端证书，拒绝理由写在审计的 `auth` 类里：
+>    「注册报文时间戳偏差过大（…，请检查两端时钟）」。`timedatectl` 里
+>    `NTPSynchronized=no` 就先 `timedatectl set-ntp true`（离线环境指向内网 NTP 源）。
+>    虚拟机从挂起恢复后常出现这种偏移，测试环境尤其容易撞上。
 > 证书生成：`bash scripts/build-linux-all.sh --help` 中的 `gen-certs`，或
 > `bash scripts/gen-cert.sh ./certs`（需 openssl）、`cd scripts/gencerts && go run . all`
 > （默认按本机公网 IP 写入 SAN）。
