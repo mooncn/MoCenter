@@ -139,6 +139,29 @@ func TestSearchAudits(t *testing.T) {
 	}
 }
 
+// TestAuditFieldsTruncated 大命令/大结果不得原样常驻内存。
+//
+// 背景：8 台主机场景下，每条命令结果几十 KB、内存保留上万条，
+// 单这一项就能把常驻内存推到数百 MB。截断后内存副本与库内记录都有明确上限。
+func TestAuditFieldsTruncated(t *testing.T) {
+	r := NewRouter(nil, nil)
+	const cmdID = "cmd-big"
+	r.Audit(&AuditLog{Time: 1, AgentID: "a1", CommandID: cmdID, Command: strings.Repeat("c", auditCommandMax*2)})
+	r.CompleteByCommand(cmdID, "a1", strings.Repeat("r", auditResultMemoryMax*4), 0, 1)
+
+	logs := r.Audits()
+	if len(logs) != 1 {
+		t.Fatalf("期望 1 条审计，实得 %d", len(logs))
+	}
+	const marker = "已截断"
+	if len(logs[0].Command) > auditCommandMax+64 || !strings.Contains(logs[0].Command, marker) {
+		t.Fatalf("命令字段未按上限截断: len=%d", len(logs[0].Command))
+	}
+	if len(logs[0].Result) > auditResultMemoryMax+64 || !strings.Contains(logs[0].Result, marker) {
+		t.Fatalf("内存结果未按上限截断: len=%d", len(logs[0].Result))
+	}
+}
+
 // TestCompleteByCommand 验证命令结果回填：不新增记录，只补齐结果字段。
 func TestCompleteByCommand(t *testing.T) {
 	sess := session.NewManager()

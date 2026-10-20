@@ -31,6 +31,48 @@ type Result struct {
 	Duration int64
 }
 
+// 单条命令每个输出流的保留上限。
+//
+// 命令输出会**整包**回传服务端并写入审计；不设上限时一条 `cat 大日志`
+// 就能让 Agent 与服务端同时占用数百 MB（服务端每连接扫描缓冲上限 16 MiB，
+// 超限还会直接把 Agent 踢下线）。上限取小一些还有一层考虑：JSON 编码会把
+// 控制字符转义成 \u00XX，最坏情况下体积翻 6 倍，1 MiB 输出仍在扫描缓冲内。
+const (
+	maxStdoutCapture = 1 << 20
+	maxStderrCapture = 256 << 10
+)
+
+// cappedBuffer 是带容量上限的 io.Writer。
+//
+// 超限后仍返回 len(p), nil：os/exec 把短写当成写失败并可能让命令收到 EPIPE，
+// 而这里要的是「结果被截断」，不是「命令被打断」。
+type cappedBuffer struct {
+	buf       strings.Builder
+	limit     int
+	truncated bool
+}
+
+func (w *cappedBuffer) Write(p []byte) (int, error) {
+	if room := w.limit - w.buf.Len(); room > 0 {
+		if len(p) > room {
+			w.buf.Write(p[:room])
+			w.truncated = true
+		} else {
+			w.buf.Write(p)
+		}
+	} else {
+		w.truncated = true
+	}
+	return len(p), nil
+}
+
+func (w *cappedBuffer) String() string {
+	if !w.truncated {
+		return w.buf.String()
+	}
+	return w.buf.String() + fmt.Sprintf("\n\n[输出超过 %d KiB，已截断]", w.limit>>10)
+}
+
 // buildCmd 根据 shell_type 构造命令行参数。
 // 交互模式（req.Interactive）下返回登录式 shell（不带 -c），
 // 使会话可连续执行多条命令，而非“一命令一进程一退出”。
@@ -147,10 +189,11 @@ func runCmd(req *protocol.CommandReq, ctx context.Context, cmdOut **exec.Cmd) *R
 	}
 	cmd.Env = env
 
-	var stdout, stderr strings.Builder
+	stdout := &cappedBuffer{limit: maxStdoutCapture}
+	stderr := &cappedBuffer{limit: maxStderrCapture}
 	// cmd 已通过 chcp 65001 强制 UTF-8，其他 shell 默认 UTF-8，直接透传原始字节
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	err := cmd.Run()
 	res := &Result{

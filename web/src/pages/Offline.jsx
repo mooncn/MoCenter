@@ -1,5 +1,6 @@
 import React from 'react'
 import { Api } from '../api/api.js'
+import { hostName } from '../utils/hostName.js'
 
 // 离线机器列表：记录历史注册过的主机，展示最后上线时间与离线时长
 export default function Offline({ agents }) {
@@ -11,7 +12,7 @@ export default function Offline({ agents }) {
     .sort((x, y) => (y.last_seen || 0) - (x.last_seen || 0))
 
   const removeAgent = async (a) => {
-    const name = a.remark || a.hostname || a.agent_id
+    const name = hostName(a)
     const ok = window.confirm(
       `删除主机「${name}」？\n\n` +
       '将清除本服务端保存的主机记录、备注、探针/延迟历史与端口映射规则。\n' +
@@ -54,8 +55,12 @@ export default function Offline({ agents }) {
             {(offline || []).map((a) => (
               <tr key={a.uuid || a.agent_id}>
                 <td data-label="主机">
-                  <b>{a.remark || a.hostname}</b>
-                  <div style={{ color: '#8b98a5', fontSize: 12 }}>{a.hostname !== a.agent_id ? a.hostname + ' · ' : ''}{a.agent_id}</div>
+                  <b>{hostName(a)}</b>
+                  {(a.remark || a.hostname) && (
+                    <div style={{ color: '#8b98a5', fontSize: 12 }}>
+                      {a.remark ? [a.hostname, a.agent_id].filter(Boolean).join(' · ') : a.agent_id}
+                    </div>
+                  )}
                   {a.uuid ? (
                     <div
                       style={{ color: '#6b7280', fontSize: 10, fontFamily: 'Menlo, Consolas, monospace', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}

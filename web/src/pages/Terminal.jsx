@@ -5,6 +5,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { Api } from '../api/api.js'
 import { SocketContext } from '../App.jsx'
+import { hostLabel, hostLabelById } from '../utils/hostName.js'
 
 // 远程终端：基于 xterm.js + 服务端交互会话（PTY/ConPTY）。
 // 连接后在目标主机保持一个持久 shell，可连续执行多条命令，
@@ -173,7 +174,7 @@ export default function TerminalPage({ agents }) {
             <select value={host} onChange={(e) => setHost(e.target.value)} disabled={status === 'connecting'}>
               <option value="">请选择在线主机...</option>
               {onlineHosts.map((a) => (
-                <option key={a.agent_id} value={a.agent_id}>{a.hostname} ({a.agent_id})</option>
+                <option key={a.agent_id} value={a.agent_id}>{hostLabel(a)}</option>
               ))}
             </select>
           </div>
@@ -194,8 +195,8 @@ export default function TerminalPage({ agents }) {
           </span>
           <span className="host-label">
             {sessId
-              ? (onlineHosts.find((h) => h.agent_id === sessRef.current?.agent)?.hostname || sessRef.current?.agent)
-              : (host ? onlineHosts.find((h) => h.agent_id === host)?.hostname + '（未连接）' : '未选择主机')}
+              ? hostLabelById(onlineHosts, sessRef.current?.agent)
+              : (host ? hostLabelById(onlineHosts, host) + '（未连接）' : '未选择主机')}
           </span>
           <button className="primary" onClick={connect} disabled={!host || status === 'connecting'}>
             {sessId ? '重连' : '连接'}
@@ -208,7 +209,7 @@ export default function TerminalPage({ agents }) {
         </div>
         {wantedHost && !wantedOnline && (agents || []).length > 0 && (
           <div className="notice err">
-            {wantedHost} 当前不在线（或已注销），无法打开远程终端；请确认 Agent 已上线后重试。
+            {hostLabelById(agents, wantedHost)} 当前不在线（或已注销），无法打开远程终端；请确认 Agent 已上线后重试。
           </div>
         )}
         <div className="terminal-wrap">

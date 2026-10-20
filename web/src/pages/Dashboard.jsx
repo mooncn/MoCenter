@@ -4,6 +4,7 @@ import { Api } from '../api/api.js'
 import Flag from '../components/Flag.jsx'
 import Pagination from '../components/Pagination.jsx'
 import Modal from '../components/Modal.jsx'
+import { hostName as nameOf, hostLabel } from '../utils/hostName.js'
 
 // ============================================================
 // 排序（按列点击表头）
@@ -30,10 +31,7 @@ const SORT_COLUMNS = {
 // 动态列：点了会提示"不参与排序"，避免用户以为表头坏了
 const DYNAMIC_COLUMNS = new Set(['publicip', 'cpu', 'mem', 'network', 'latency'])
 
-// 显示名：备注优先，其次主机名，最后 agent_id
-function nameOf(a) {
-  return (a.remark || a.hostname || a.agent_id || '')
-}
+// 显示名（备注 → 主机名 → agent_id）统一由 utils/hostName.js 提供。
 
 function lastSeenTs(a) {
   // 在线的用 last_seen；离线的用"最后一次离线时间"，缺失时退回 last_seen
@@ -324,11 +322,12 @@ export default function Dashboard({ agents }) {
               return (
               <tr key={a.agent_id} className={a.online ? '' : 'row-offline'}>
                 <td data-label="主机">
-                  <b>{a.remark || a.hostname}</b>
-                  <div style={{ color: '#8b98a5', fontSize: 12 }}>
-                    {a.hostname}
-                    {a.remark ? ' · ' + a.agent_id : ''}
-                  </div>
+                  <b>{nameOf(a)}</b>
+                  {(a.remark || a.hostname) && (
+                    <div style={{ color: '#8b98a5', fontSize: 12 }}>
+                      {a.remark ? [a.hostname, a.agent_id].filter(Boolean).join(' · ') : a.agent_id}
+                    </div>
+                  )}
                   {a.uuid ? (
                     <div
                       style={{ color: '#6b7280', fontSize: 10, fontFamily: 'Menlo, Consolas, monospace', maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
@@ -412,7 +411,7 @@ export default function Dashboard({ agents }) {
       {actionTarget && (
         <Modal
           title={`操作 · ${nameOf(actionTarget)}`}
-          subtitle={`${actionTarget.hostname || actionTarget.agent_id} · ${actionTarget.agent_id}${actionTarget.online ? '' : ' · 离线'}`}
+          subtitle={`${hostLabel(actionTarget)}${actionTarget.online ? '' : ' · 离线'}`}
           onClose={() => setActionAgent('')}
           footer={!actionTarget.online ? (
             <button
@@ -460,7 +459,7 @@ export default function Dashboard({ agents }) {
         <Modal
           wide
           title={`探针历史趋势 · ${nameOf(trendTarget)}`}
-          subtitle={`${trendTarget.hostname || trendTarget.agent_id} · ${trendTarget.agent_id}`}
+          subtitle={hostLabel(trendTarget)}
           onClose={() => setTrendAgent('')}
         >
           <div className="row-inline" style={{ marginBottom: 10, alignItems: 'center', gap: 8 }}>
@@ -604,7 +603,7 @@ function ShareControlModal({ agent, onClose }) {
   return (
     <Modal
       title={`分享控制 · ${nameOf(agent)}`}
-      subtitle={`${agent.hostname || agent.agent_id} · ${agent.agent_id}`}
+      subtitle={hostLabel(agent)}
       onClose={onClose}
       footer={<button className="secondary" onClick={onClose}>关闭</button>}
     >

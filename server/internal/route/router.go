@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"mocenter/server/internal/protocol"
 	"mocenter/server/internal/session"
@@ -570,8 +571,9 @@ func (r *Router) Audit(l *AuditLog) int64 {
 	if l == nil {
 		return 0
 	}
-	l.Command = MaskCommand(l.Command)
-	l.Result = MaskCommand(l.Result)
+	l.Command = truncateAuditText(MaskCommand(l.Command), auditCommandMax)
+	fullResult := truncateAuditText(MaskCommand(l.Result), auditResultStoreMax)
+	l.Result = truncateAuditText(fullResult, auditResultMemoryMax)
 	if l.Operator != "" {
 		l.Operator = sanitizeAuditField(l.Operator)
 	}
@@ -601,7 +603,7 @@ func (r *Router) Audit(l *AuditLog) int64 {
 			AgentID:     l.AgentID,
 			CommandID:   l.CommandID,
 			Command:     l.Command,
-			Result:      l.Result,
+			Result:      fullResult,
 			ExitCode:    l.ExitCode,
 			Blocked:     l.Blocked,
 			BlockReason: l.BlockReason,
@@ -642,12 +644,13 @@ func (r *Router) Audit(l *AuditLog) int64 {
 // 并同步更新内存中的同一条记录，避免产生重复审计条目。
 // 若 ID 为 0（异步落库尚未返回 ID）则按 agent_id 就近匹配尚未有结果的记录。
 func (r *Router) Complete(id int64, agentID, result string, exitCode int, duration int64) {
-	result = MaskCommand(result)
+	result = truncateAuditText(MaskCommand(result), auditResultStoreMax)
+	memResult := truncateAuditText(result, auditResultMemoryMax)
 	r.auditMu.Lock()
 	for i := len(r.audits) - 1; i >= 0; i-- {
 		l := r.audits[i]
 		if (id > 0 && l.ID == id) || (id <= 0 && l.AgentID == agentID && l.Result == "") {
-			l.Result = result
+			l.Result = memResult
 			l.ExitCode = exitCode
 			l.Duration = duration
 			if id <= 0 {
@@ -672,13 +675,14 @@ func (r *Router) Complete(id int64, agentID, result string, exitCode int, durati
 // 'push-'+Date.now() 完全可猜）就能改写到别人的审计行；批量下发时同一 ID
 // 又对应多条记录，不看 agent 会回填到任意一条上。
 func (r *Router) completeByCommandID(commandID, agentID, result string, exitCode int, duration int64) {
-	result = MaskCommand(result)
+	result = truncateAuditText(MaskCommand(result), auditResultStoreMax)
+	memResult := truncateAuditText(result, auditResultMemoryMax)
 	r.auditMu.Lock()
 	var id int64
 	for i := len(r.audits) - 1; i >= 0; i-- {
 		l := r.audits[i]
 		if l.CommandID == commandID && l.AgentID == agentID {
-			l.Result = result
+			l.Result = memResult
 			l.ExitCode = exitCode
 			l.Duration = duration
 			id = l.ID
@@ -742,7 +746,34 @@ type AuditPage struct {
 const auditMaxPageSize = 500
 
 // auditMemoryKeep 内存中保留的审计日志条数上限。
-const auditMemoryKeep = 10000
+//
+// 历史全量数据由 SQLite 承载，内存这份只用于「数据库暂时不可用」时的兜底查询，
+// 因此不需要与库同量级。原值 10000 在每条结果都完整保存时，单是
+// 「几条几十 KB 的命令输出 × 上万条」就能把常驻内存推到数百 MB。
+const auditMemoryKeep = 2000
+
+// 审计字段的长度闸门。
+//
+// 命令输出由被管主机回传，长度完全不可控（`cat` 一个大日志就能到几十 MB）。
+// 结果写库上限 64 KiB，足够事后定位问题；内存副本再收紧到 8 KiB，
+// 因为内存这份只服务于兜底查询，完整内容本来就在库里。
+const (
+	auditCommandMax      = 8 << 10
+	auditResultStoreMax  = 64 << 10
+	auditResultMemoryMax = 8 << 10
+)
+
+// truncateAuditText 将文本截断到 limit 字节（回退到 UTF-8 字符边界）并附提示。
+func truncateAuditText(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n\n[内容过长，已截断]"
+}
 
 // normalizePage 归一化分页参数：limit 取 (0,500]，offset 非负。
 func normalizePage(offset, limit int) (int, int) {

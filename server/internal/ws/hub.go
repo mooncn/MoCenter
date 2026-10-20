@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -40,6 +41,12 @@ const (
 	// 故 1 MiB 既能容下正常用法，又不给"声明超大帧让服务端按长度分配"留空间。
 	// 与公开页那条（public_site.go 的 64 字节，按设计零上行）不同口径。
 	wsReadLimit = 1 << 20
+	// maxClientQueueBytes 单个连接发送队列的字节预算。
+	//
+	// 队列原来只限 256 帧，但"帧"没有大小口径：一条命令结果、一份主机列表
+	// 都可以是几 MB，256 帧就等于把单个慢客户端的积压放大到上 GB。
+	// 这里再按字节设一道闸，超过即丢帧（与队列满同语义，前端靠下一次全量推送收敛）。
+	maxClientQueueBytes = 8 << 20
 )
 
 var upgrader = websocket.Upgrader{
@@ -88,6 +95,8 @@ type Client struct {
 	done     chan struct{}
 	operator string // 该连接的操作者（登录用户名），用于审计留痕
 	session  string // 会话键（见 SessionKey），用于把命令输出定向回发起方
+	// queued 已入队但尚未写出的字节数（见 maxClientQueueBytes）。
+	queued atomic.Int64
 	// guest 标记分享访客连接：只收本会话的定向消息。
 	// 全局广播（主机清单、端口映射状态等）对访客是越权信息面，
 	// 一条只分享 A 机桌面的链接不应该换来整张资产表。
@@ -343,9 +352,17 @@ func (h *Hub) deliver(env []byte, match func(*Client) bool) {
 		} else if !match(c) {
 			continue
 		}
+		size := int64(len(env))
+		// 队列里已有积压时按字节限额丢弃；空队列允许单帧超预算通过，
+		// 否则一条略超 8 MiB 的命令结果会在队列空时也被静默扔掉。
+		if cur := c.queued.Load(); cur > 0 && cur+size > maxClientQueueBytes {
+			continue
+		}
+		c.queued.Add(size)
 		select {
 		case c.send <- env:
 		default:
+			c.queued.Add(-size)
 		}
 	}
 }
@@ -375,6 +392,7 @@ func (h *Hub) writePump(c *Client) {
 	for {
 		select {
 		case msg := <-c.send:
+			c.queued.Add(-int64(len(msg)))
 			_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				return

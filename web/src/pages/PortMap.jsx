@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Api } from '../api/api.js'
+import { hostLabel, hostLabelById } from '../utils/hostName.js'
 
 // 端口映射管理界面：配置/查看/管理内网主机端口映射规则
 // 通过服务端 REST API 持久化管理规则，公网端口由服务端反向代理转发到内网
@@ -58,7 +59,7 @@ export default function PortMap({ agents }) {
         local_port: l,
         source_ip: sourceIp || '',
       })
-      setNotice(`映射规则已创建：公网 :${p} -> ${agent}:${l}`)
+      setNotice(`映射规则已创建：公网 :${p} -> ${hostLabelById(allAgents, agent)}:${l}`)
       setPubPort('')
       setLocalPort('')
       setSourceIp('')
@@ -102,7 +103,7 @@ export default function PortMap({ agents }) {
                 <option value="">选择主机...</option>
                 {selectable.map((a) => (
                   <option key={a.agent_id} value={a.agent_id}>
-                    {a.hostname} ({a.agent_id}){a.online ? '' : ' · 离线'}
+                    {hostLabel(a)}{a.online ? '' : ' · 离线'}
                   </option>
                 ))}
               </select>
@@ -149,7 +150,7 @@ export default function PortMap({ agents }) {
             {rules.map((r) => (
               <tr key={r.public_port || r.id}>
                 <td data-label="规则 ID">{r.id || `rule-${r.public_port}`}</td>
-                <td data-label="目标主机">{r.agent_id}</td>
+                <td data-label="目标主机">{hostLabelById(allAgents, r.agent_id)}</td>
                 <td data-label="公网端口">{r.public_port}</td>
                 <td data-label="内网端口">{r.local_port}</td>
                 <td data-label="源 IP 白名单">{r.source_ip_whitelist || r.source_ip || '不限'}</td>

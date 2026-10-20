@@ -1,10 +1,17 @@
 package route
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"unicode/utf8"
 )
+
+// maxInteractiveLine 单行交互输入的缓冲上限。
+//
+// 黑名单检查必须等整行到齐，因此半行输入会一直驻留内存。正常命令远小于此值；
+// 粘贴一大段无换行文本（或恶意刷输入）时，不能让缓冲无界增长。
+const maxInteractiveLine = 64 << 10
 
 // InteractiveGuard 对交互终端的输入做逐行黑名单检查。
 //
@@ -98,6 +105,12 @@ func (r *Router) FilterInteractive(key, data string) (safe, blocked string) {
 			buf.Reset()
 			out.WriteRune(rn)
 		default:
+			// 单行缓冲设上限：无法完成黑名单校验的超长行一律拒绝，
+			// 否则粘贴一段无换行文本就能让服务端长期持有一份大字符串。
+			if buf.Len()+size > maxInteractiveLine {
+				buf.Reset()
+				return out.String(), fmt.Sprintf("输入行超过 %d KiB，已拒绝执行", maxInteractiveLine>>10)
+			}
 			buf.WriteRune(rn)
 			out.WriteRune(rn)
 		}

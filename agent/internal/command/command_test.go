@@ -2,10 +2,36 @@ package command
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 
 	"mocenter/agent/internal/protocol"
 )
+
+// TestCappedBufferTruncates 输出超限时只保留前 limit 字节并附带截断提示，
+// 同时仍向 os/exec 报告全部写成功 —— 否则命令会因短写收到 EPIPE。
+func TestCappedBufferTruncates(t *testing.T) {
+	w := &cappedBuffer{limit: 1024}
+	payload := strings.Repeat("x", 4096)
+	n, err := w.Write([]byte(payload))
+	if err != nil || n != len(payload) {
+		t.Fatalf("超限写入应回报全部字节: n=%d err=%v", n, err)
+	}
+	got := w.String()
+	if !strings.HasPrefix(got, payload[:1024]) {
+		t.Fatal("应保留前 1024 字节原内容")
+	}
+	if !strings.Contains(got, "已截断") {
+		t.Fatalf("应带截断提示，实得 %q", got[len(got)-40:])
+	}
+	// 已满后继续写：不增长、不报错
+	if n, err := w.Write([]byte("more")); err != nil || n != 4 {
+		t.Fatalf("满额后写入仍应成功: n=%d err=%v", n, err)
+	}
+	if len(w.buf.String()) != 1024 {
+		t.Fatalf("缓冲不应继续增长，实得 %d", w.buf.Len())
+	}
+}
 
 func TestBuildCmd(t *testing.T) {
 	wantDefault := "/bin/bash"

@@ -1,6 +1,7 @@
 import React, { useState, useContext } from 'react'
 import { Api } from '../api/api.js'
 import { SocketContext } from '../App.jsx'
+import { hostLabel, hostLabelById } from '../utils/hostName.js'
 
 // 运维操作页面：批量命令、远程升级、文件传输
 export default function Ops({ agents }) {
@@ -145,7 +146,7 @@ export default function Ops({ agents }) {
             {online.map((a) => (
               <label key={a.agent_id} className="checkbox-item">
                 <input type="checkbox" checked={selected.includes(a.agent_id)} onChange={() => toggleSelect(a.agent_id)} />
-                {a.hostname} ({a.agent_id})
+                {hostLabel(a)}
               </label>
             ))}
             {online.length === 0 && <span style={{ color: '#8b98a5' }}>暂无在线主机</span>}
@@ -187,7 +188,7 @@ export default function Ops({ agents }) {
               <tbody>
                 {batchResult.map((r) => (
                   <tr key={r.agent_id}>
-                    <td data-label="目标主机">{r.agent_id}</td>
+                    <td data-label="目标主机">{hostLabelById(agents, r.agent_id)}</td>
                     <td data-label="下发状态"><span className={`badge ${r.ok ? 'online' : 'offline'}`}>{r.ok ? '已下发' : '失败'}</span></td>
                     <td data-label="说明">{r.msg || '-'}</td>
                   </tr>
@@ -210,7 +211,7 @@ export default function Ops({ agents }) {
               <select value={upAgent} onChange={(e) => setUpAgent(e.target.value)}>
                 <option value="">选择主机...</option>
                 {online.map((a) => (
-                  <option key={a.agent_id} value={a.agent_id}>{a.hostname} ({a.agent_id})</option>
+                  <option key={a.agent_id} value={a.agent_id}>{hostLabel(a)}</option>
                 ))}
               </select>
             </div>
@@ -269,7 +270,7 @@ export default function Ops({ agents }) {
               <select value={pushAgent} onChange={(e) => setPushAgent(e.target.value)}>
                 <option value="">选择主机...</option>
                 {online.map((a) => (
-                  <option key={a.agent_id} value={a.agent_id}>{a.hostname} ({a.agent_id})</option>
+                  <option key={a.agent_id} value={a.agent_id}>{hostLabel(a)}</option>
                 ))}
               </select>
             </div>

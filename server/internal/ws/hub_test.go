@@ -29,6 +29,33 @@ func TestSubscribePublicStopIdempotent(t *testing.T) {
 	}
 }
 
+// TestDeliverByteBudget 单连接发送队列按字节限额：积压超过预算时丢新帧，
+// 而不是让 256 帧的队列装下任意大小的消息。
+func TestDeliverByteBudget(t *testing.T) {
+	h := NewHub()
+	c := &Client{send: make(chan []byte, 300), done: make(chan struct{})}
+	h.register(c)
+	defer h.unregister(c)
+
+	half := make([]byte, maxClientQueueBytes/2+1)
+	h.deliver(half, nil) // 空队列：允许（即使单帧略大）
+	if got := len(c.send); got != 1 {
+		t.Fatalf("空队列应接收首帧，实得 %d", got)
+	}
+	h.deliver(half, nil) // 已有 4MiB 积压，再加会超预算 → 丢弃
+	if got := len(c.send); got != 1 {
+		t.Fatalf("超预算帧应被丢弃，队列长度 %d", got)
+	}
+
+	// 模拟 writePump 取走一帧并归还额度后，应能继续接收
+	msg := <-c.send
+	c.queued.Add(-int64(len(msg)))
+	h.deliver(half, nil)
+	if got := len(c.send); got != 1 {
+		t.Fatalf("额度归还后应恢复投递，实得 %d", got)
+	}
+}
+
 // TestBroadcastPublicSkipsStopped 停止后的订阅者不再收到广播。
 func TestBroadcastPublicSkipsStopped(t *testing.T) {
 	h := NewHub()

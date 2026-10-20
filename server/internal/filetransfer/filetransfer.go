@@ -36,10 +36,15 @@ const DefaultChunkSize = 64 * 1024
 const (
 	// maxActiveUploadTasks 同时在途的上传任务数上限。
 	maxActiveUploadTasks = 64
-	// maxUploadTaskBytes 单个上传任务可暂存的最大字节数。
-	maxUploadTaskBytes = 256 << 20 // 256 MiB
+	// maxUploadTaskBytes 单个上传任务的暂存上限。
+	//
+	// 分片在收齐之前**全量驻内存**，所以这个值直接就是内存峰值口径。
+	// 本产品的典型载荷是 7–15 MiB 的 Agent 安装包、几十 MB 的日志；
+	// 64 MiB 留有充分余量，同时把「8 台机器同时传」的最坏情况压在可接受范围内
+	// （原值 256 MiB/512 MiB 会让 GC 后的常驻内存轻松到 500 MiB 以上）。
+	maxUploadTaskBytes = 64 << 20 // 64 MiB
 	// maxStoredBytes 全部在途任务暂存字节的上限（内存总量的闸门）。
-	maxStoredBytes = 512 << 20 // 512 MiB
+	maxStoredBytes = 128 << 20 // 128 MiB
 	// uploadTaskTTL 任务闲置超过这个时间即视为中断，回收其分片。
 	// 取 30 分钟：断点续传的重试间隔量级在秒到分钟，再长就不是"慢"而是"死了"。
 	uploadTaskTTL = 30 * time.Minute
@@ -47,7 +52,7 @@ const (
 
 // Manager 文件传输管理器。
 type Manager struct {
-	mu     sync.RWMutex
+	mu sync.RWMutex
 	// uploads 记录进行中的上传任务（含断点续传的已完成分片）
 	uploads map[string]*uploadTask
 	// stored 全部在途任务当前暂存的字节数（受 mu 保护）

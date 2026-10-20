@@ -2,6 +2,7 @@ package route
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -78,6 +79,19 @@ func TestInteractiveGuardEvictsOldestNotWholeTable(t *testing.T) {
 	// 最新的键仍在（其半行状态没被清掉）
 	if _, b := r.FilterInteractive(newKey, "z"); b != "" {
 		t.Fatal("不该被拦")
+	}
+}
+
+// TestFilterInteractiveRejectsOversizedLine 超长单行不得无界驻留内存。
+func TestFilterInteractiveRejectsOversizedLine(t *testing.T) {
+	r := NewRouter(nil, nil)
+	key := InteractiveKey("a", "big")
+	if _, b := r.FilterInteractive(key, strings.Repeat("x", maxInteractiveLine+1)); b == "" {
+		t.Fatal("超过单行上限的输入应被拒绝")
+	}
+	// 拒绝后缓冲必须清空，后续正常输入不受影响
+	if _, b := r.FilterInteractive(key, "uptime\n"); b != "" {
+		t.Fatalf("超长行之后的新行不该被拦: %s", b)
 	}
 }
 

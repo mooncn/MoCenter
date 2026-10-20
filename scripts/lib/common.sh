@@ -216,21 +216,23 @@ mc_assert_platform_supported() {
 # 一个损坏的 GOMODCACHE 条目会让 go 报 "zip: not a valid zip file" 并连带
 # 所有依赖它的 import 全部失败，看起来像源码坏了，其实只是本地下载残破。
 # 自愈策略：清缓存 + 换镜像代理重试一次（与 Windows 版 build-all.bat 一致）。
+
+# _mc_go_env_apply <GOOS> <GOARCH>：为当前 shell 设置交叉编译环境。
+#
+# 刻意不用 `env GOOS=... go build`：某些开发机的 PATH 里存在同名 `env` 垫片
+# （例如 ~/.local/bin/env 只是"把 ~/.local/bin 加进 PATH"的片段），它不会执行
+# 后续命令、却返回 0 —— 表现为"构建成功但产物不存在"，极难排查。
+# export 赋值是 POSIX 语法，在 Bash/dash 下行为一致，也不依赖外部命令。
+_mc_go_env_apply() {
+  GOOS="$1"; GOARCH="$2"; CGO_ENABLED=0
+  export GOOS GOARCH CGO_ENABLED
+  if [ "$2" = "arm" ]; then GOARM=7; export GOARM; else unset GOARM; fi
+}
+
 mc_go_build() {
   # mc_go_build <模块目录> <输出文件> <GOOS> <GOARCH> [额外 ldflags]
   local dir="$1" out="$2" goos="$3" goarch="$4" extra="${5:-}" rc=0
   mc_assert_platform_supported "$goos" "$goarch"
-  # 注意：这里刻意不用 bash 数组（local -a envs=(...)）。
-  # 数组是 Bash 扩展，若本库被 /bin/sh（Debian/Ubuntu 上是 dash）加载，
-  # 会在解析期直接报 Syntax error: "(" unexpected 并让调用方以退出码 2 终止
-  # ——CI 的 PR 阶段就用 `. scripts/lib/common.sh` 触发过这个坑。
-  # 改为用「换行分隔的字符串」承接，展开时靠词拆分（GOOS/GOARCH 值不含空格，
-  # 不会被二次拆分），语法在 POSIX sh 与 Bash 下都成立。
-  envs="GOOS=$goos
-GOARCH=$goarch
-CGO_ENABLED=0"
-  [ "$goarch" = "arm" ] && envs="$envs
-GOARM=7"
   # 输出路径转成绝对路径：下面会 cd 进模块目录，相对路径会被解析成相对模块，
   # 于是二进制落到 agent/installer/payload/ 这类意外位置（且后续查找必然失败）。
   case "$out" in
@@ -238,29 +240,53 @@ GOARM=7"
     *)  out="$(pwd)/$out" ;;
   esac
   mkdir -p "$(dirname "$out")"
-  ( cd "$dir" && env $envs go mod download ) || true
-  ( cd "$dir" && env $envs go build -ldflags "-s -w $extra" -o "$out" . ) || rc=$?
+  ( cd "$dir" && _mc_go_env_apply "$goos" "$goarch" && go mod download ) || true
+  ( cd "$dir" && _mc_go_env_apply "$goos" "$goarch" && go build -ldflags "-s -w $extra" -o "$out" . ) || rc=$?
   if [ "$rc" != 0 ]; then
     warn "构建失败，清理模块缓存后经镜像代理重试：$dir"
     go clean -modcache >/dev/null 2>&1 || true
     local mirror="${GOPROXY_MIRROR:-https://goproxy.cn,direct}" mrc=0
-    ( cd "$dir" && GOPROXY="$mirror" env $envs go mod download ) || true
-    ( cd "$dir" && GOPROXY="$mirror" env $envs go build -ldflags "-s -w $extra" -o "$out" . ) || mrc=$?
+    ( cd "$dir" && _mc_go_env_apply "$goos" "$goarch" && GOPROXY="$mirror" go mod download ) || true
+    ( cd "$dir" && _mc_go_env_apply "$goos" "$goarch" && GOPROXY="$mirror" go build -ldflags "-s -w $extra" -o "$out" . ) || mrc=$?
     [ "$mrc" = 0 ] || die "构建失败：$dir（可手动执行 GOPROXY=$mirror go build 排查）"
   fi
+  # 兜底：命令返回 0 但产物缺失时明确报错，而不是让调用方在 du 上看到
+  # 一句莫名其妙的 "No such file or directory"。
+  [ -f "$out" ] || die "go build 返回成功但产物不存在：$out（检查 PATH 中是否有伪造的 go/env 命令）"
 }
 
 # ---------- 简单文件树打包（不依赖 fpm / rpmbuild / zip 命令行） ----------
-# 用 python3 写 PKZIP，避免为了出一个 Windows 免安装 zip 而要求构建机装 zip 命令；
-# python3 在 CI 与主流发行版上都默认可用，缺失时自动回退到 zip(1)。
+# 用 python 写 PKZIP，避免为了出一个 Windows 免安装 zip 而要求构建机装 zip 命令；
+# python 在 CI 与主流发行版上都默认可用，缺失时自动回退到 zip(1)。
+
+# mc_python_interpreter 返回一个**真正可执行**的 Python 解释器名。
+#
+# 不能只看 command -v：Windows 自带的 WindowsApps\python3.exe 是商店占位程序，
+# 能被找到，但执行时直接返回 49 且没有任何输出（首次使用还会弹应用商店）。
+# 在 set -e 下这会让整个构建在 zip 步骤静默中止。这里真实调用一次做筛查。
+mc_python_interpreter() {
+  local c
+  for c in python3 python; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    if "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)' >/dev/null 2>&1; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
 mc_make_zip() {
   # mc_make_zip <源目录> <输出zip> [归档内顶层目录名]
   local src="$1" out="$2" top="${3:-}"
   [ -d "$src" ] || die "打包源目录不存在：$src"
   mkdir -p "$(dirname "$out")"
   rm -f "$out"
-  if command -v python3 >/dev/null 2>&1; then
-    MC_ZIP_SRC="$src" MC_ZIP_OUT="$out" MC_ZIP_TOP="$top" python3 - <<'PY'
+  local py=""
+  if py="$(mc_python_interpreter)"; then
+    # 失败必须走 die：stderr 里的解释器若直接失败，set -e 会让脚本带着
+    # 解释器自己的退出码（如商店占位的 49）静默中止，看不到任何原因。
+    if ! MC_ZIP_SRC="$src" MC_ZIP_OUT="$out" MC_ZIP_TOP="$top" "$py" - <<'PY'
 import os, sys, zipfile
 
 src, out, top = os.environ["MC_ZIP_SRC"], os.environ["MC_ZIP_OUT"], os.environ["MC_ZIP_TOP"]
@@ -284,24 +310,26 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         sys.exit(3)
 print(f"MC_ZIP_OK {count}")
 PY
-    [ $? -eq 0 ] || die "python3 打包 zip 失败（源目录为空？）：$src -> $out"
+    then
+      die "python 打包 zip 失败（源目录为空？）：$src -> $out"
+    fi
   elif command -v zip >/dev/null 2>&1; then
     ( cd "$(dirname "$src")" && zip -q -r -9 "$out" "$(basename "$src")" ) || die "zip 打包失败：$out"
   else
-    die "生成 zip 需要 python3 或 zip 命令（安装其一后重试，或用 --package=none 只要二进制）"
+    die "生成 zip 需要可用的 python 或 zip 命令（安装其一后重试，或用 --package=none 只要二进制）"
   fi
   [ -s "$out" ] || die "zip 产物为空：$out"
 }
 
-# 用 unzip(1) 或 python3 解包校验 zip 可读、条目数与摘要一致。
+# 用 unzip(1) 或 python 解包校验 zip 可读、条目数与摘要一致。
 mc_verify_zip() {
-  local zip="$1" entries
+  local zip="$1" entries py
   if command -v unzip >/dev/null 2>&1; then
     entries="$(unzip -Z1 "$zip" 2>/dev/null | wc -l)"
     [ "$entries" -gt 0 ] || die "zip 校验失败（无法列出条目）：$zip"
     unzip -tqq "$zip" >/dev/null 2>&1 || die "zip 完整性校验失败：$zip"
-  elif command -v python3 >/dev/null 2>&1; then
-    entries="$(python3 -c 'import sys,zipfile;z=zipfile.ZipFile(sys.argv[1]);print(len(z.namelist()))' "$zip")" \
+  elif py="$(mc_python_interpreter)"; then
+    entries="$("$py" -c 'import sys,zipfile;z=zipfile.ZipFile(sys.argv[1]);print(len(z.namelist()))' "$zip")" \
       || die "zip 校验失败：$zip"
   fi
   ok "zip 校验通过：$(basename "$zip")（${entries} 个条目）"

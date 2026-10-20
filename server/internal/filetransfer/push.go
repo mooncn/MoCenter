@@ -26,14 +26,16 @@ import (
 //   - 开完不传完 → 半截分片永不回收；
 //   - 单任务猛灌 → 内存直接打满。
 //
-// 阈值与上传侧同一口径：单人自用的一次分发通常是几十 MB 的安装包或日志，离上限很远。
+// 阈值与上传侧同一口径：分片收齐前全量驻内存，单任务 64 MiB、总量 128 MiB。
+// 典型载荷（7–15 MiB 的 Agent 包、几十 MB 的日志）离上限很远，但足够
+// 把「多台机器同时分发」的内存峰值压住。
 //
-// 用 var 只为测试能便宜地触发这些分支（真灌 256 MB 进单测不合理）；
+// 用 var 只为测试能便宜地触发这些分支（真灌 64 MiB 进单测不合理）；
 // 运行期没有任何入口能改它们。
 var (
 	maxActivePushTasks = 64
-	maxPushTaskBytes   = int64(256 << 20)
-	maxPushStoredBytes = int64(512 << 20)
+	maxPushTaskBytes   = int64(64 << 20)
+	maxPushStoredBytes = int64(128 << 20)
 	pushTaskTTL        = 30 * time.Minute
 )
 

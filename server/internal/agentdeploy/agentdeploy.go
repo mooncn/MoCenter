@@ -51,8 +51,11 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
-// maxUploadSize 单个上传文件的大小上限（200 MB，够放各架构 Agent 二进制）。
-const maxUploadSize = 200 << 20
+// maxUploadSize 单个上传文件的大小上限（64 MB，够放各架构 Agent 二进制）。
+//
+// uploadFile 会先把整个文件读进内存再经 SSH 写入，所以这个值同时是
+// 「一次部署占多少内存」的上限；200 MB 在并发部署多台机器时会直接放大成 GB 级峰值。
+const maxUploadSize = 64 << 20
 
 // knownHostsFileName 部署通道的主机密钥记账文件（位于数据目录下）。
 //
@@ -985,19 +988,21 @@ func runScript(client *ssh.Client, script string, root bool) (string, error) {
 //
 // 为什么不走 SFTP：很多精简发行版/容器里的 sshd 未启用 sftp 子系统，
 // 而 `cat` 是任何 shell 都有的。代价是要自己做 shell 层的提权与权限设置。
+//
+// 以流式方式喂给 SSH，而不是先 io.ReadAll 进内存：Agent 二进制约 7–15 MB，
+// 并发部署多台时「每台一份完整副本」会直接放大成几十上百 MB 的峰值。
 func uploadFile(client *ssh.Client, src io.Reader, size int64, remotePath string, root bool) error {
-	b, err := io.ReadAll(io.LimitReader(src, maxUploadSize+1))
-	if err != nil {
-		return err
-	}
-	if int64(len(b)) > maxUploadSize {
+	if size > maxUploadSize {
 		return fmt.Errorf("文件过大（超过 %d MB）", maxUploadSize>>20)
 	}
-	return uploadBytes(client, b, remotePath, root)
+	return uploadReader(client, io.LimitReader(src, maxUploadSize+1), remotePath, root)
 }
 
-// uploadBytes 把字节内容写到远端路径。
 func uploadBytes(client *ssh.Client, data []byte, remotePath string, root bool) error {
+	return uploadReader(client, bytes.NewReader(data), remotePath, root)
+}
+
+func uploadReader(client *ssh.Client, data io.Reader, remotePath string, root bool) error {
 	sess, err := client.NewSession()
 	if err != nil {
 		return err
@@ -1005,7 +1010,7 @@ func uploadBytes(client *ssh.Client, data []byte, remotePath string, root bool) 
 	defer sess.Close()
 	var stderr bytes.Buffer
 	sess.Stderr = &stderr
-	sess.Stdin = bytes.NewReader(data)
+	sess.Stdin = data
 	// umask 0077：二进制与配置含密钥，落地时就要收紧权限，
 	// 而不是先放开再 chmod（中间窗口期可被同机其他用户读走）。
 	pre := "umask 0077; "

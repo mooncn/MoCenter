@@ -624,7 +624,9 @@ fi
 exit 0
 EOF
   # 把 %post/%preun 换成脚本内容（spec 里直接内联，避免额外机制）
-  python3 - "$top/SPECS/${pkg}.spec" <<'PY'
+  # 用真实可执行的解释器（Windows 商店的 python3 占位程序会被 command -v 找到但直接退出 49）
+  local spec_py; spec_py="$(mc_python_interpreter)" || die "生成 rpm spec 需要可用的 python"
+  "$spec_py" - "$top/SPECS/${pkg}.spec" <<'PY'
 import sys, re
 p = sys.argv[1]
 s = open(p, encoding="utf-8").read()

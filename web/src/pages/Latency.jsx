@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { Api } from '../api/api.js'
+import { hostLabel } from '../utils/hostName.js'
 
 // 延迟监测页（ICMP / TCP / HTTP + 历史曲线）。
 //
@@ -102,7 +103,7 @@ export default function Latency({ agents = [] }) {
             <select value={agentId} onChange={(e) => setAgentId(e.target.value)}>
               {agents.map((a) => (
                 <option key={a.agent_id} value={a.agent_id}>
-                  {(a.remark || a.hostname || a.agent_id)} {a.online ? '（在线）' : '（离线）'}
+                  {hostLabel(a)} {a.online ? '（在线）' : '（离线）'}
                 </option>
               ))}
             </select>

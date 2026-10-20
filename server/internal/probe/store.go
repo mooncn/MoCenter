@@ -26,6 +26,16 @@ import (
 	"mocenter/server/internal/storage"
 )
 
+// 内存历史采样的保留条数。
+//
+// 有数据库时趋势/流量查询都走 SQLite，这份内存历史只是「库不可用」时的兜底；
+// 1000 条 × N 台设备（每条约含一个延迟 map 与若干字符串）在长期运行时纯属冗余。
+// 无数据库（内存模式）才需要更长的窗口，让趋势图仍有足够多的点。
+const (
+	historyCapWithDB = 200
+	historyCapNoDB   = 1000
+)
+
 // deviceKey 由 UUID 计算设备主键；UUID 为空时回退到 agent_id。
 func deviceKey(uuid, agentID string) string {
 	if u := normalizeUUID(uuid); u != "" {
@@ -548,8 +558,12 @@ func (s *Store) UpdateProbe(p *protocol.ProbeDataReq) {
 	// 历史采样里的 agent_id 统一写成设备当前 agent_id，保证趋势图/查询口径一致
 	p.AgentID = s.deviceAgentIDLocked(key, p.AgentID)
 	h = append(h, p)
-	if len(h) > 1000 { // 保留最近 1000 条采样
-		h = h[len(h)-1000:]
+	historyCap := historyCapNoDB
+	if s.db != nil {
+		historyCap = historyCapWithDB
+	}
+	if len(h) > historyCap {
+		h = h[len(h)-historyCap:]
 	}
 	s.history[key] = h
 	s.mu.Unlock()

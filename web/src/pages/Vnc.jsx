@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import RFB from '@novnc/novnc'
 import { Api } from '../api/api.js'
 import { createVncPointer, WHEEL_STEP_DELTA } from '../utils/vncPointer.js'
+import { hostLabel, hostLabelById } from '../utils/hostName.js'
 
 // 远端光标显示尺寸档位：相对「按视口等比缩放」基准的倍数。
 // 基准 = 显示宽度 / 远端分辨率宽度，这样光标与缩放过后的桌面比例一致。
@@ -444,7 +445,7 @@ export default function VncPage({ agents }) {
             <select value={host} onChange={(e) => { setHost(e.target.value); setStatus('idle'); setNotice('') }}>
               <option value="">请选择在线主机...</option>
               {onlineHosts.map((a) => (
-                <option key={a.agent_id} value={a.agent_id}>{a.hostname} ({a.agent_id})</option>
+                <option key={a.agent_id} value={a.agent_id}>{hostLabel(a)}</option>
               ))}
             </select>
           </div>
@@ -509,7 +510,7 @@ export default function VncPage({ agents }) {
 
         {wantedHost && !wantedOnline && (agents || []).length > 0 && (
           <div className="notice err">
-            {wantedHost} 当前不在线（或已注销），无法打开远程桌面；请确认 Agent 与 VNC 均已就绪。
+            {hostLabelById(agents, wantedHost)} 当前不在线（或已注销），无法打开远程桌面；请确认 Agent 与 VNC 均已就绪。
           </div>
         )}
 

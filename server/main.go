@@ -676,6 +676,7 @@ func main() {
 	// 探针历史定期清理（保留 30 天）+ 审计日志留存清理（保留 180 天）
 	go probeHistoryCleaner(db)
 	go auditRetentionCleaner(db)
+	go memStatsLogger()
 
 	// 启动 HTTP 服务（REST + WebSocket）
 	mux := http.NewServeMux()
@@ -4052,6 +4053,25 @@ func auditRetentionCleaner(db *storage.DB) {
 		} else if n > 0 {
 			log.Printf("[server] 清理了 %d 条超出 %d 天留存期的审计日志", n, keepDays)
 		}
+	}
+}
+
+// memStatsLogger 周期记录 Go 堆占用，供事后定位内存增长。
+//
+// 只在堆超过阈值时留痕：空载通常只有十几 MB，固定间隔打印只会刷屏。
+// 取 HeapAlloc（存活对象）而不是 Sys（含保留地址空间，Windows 上参考价值低）。
+func memStatsLogger() {
+	const threshold = 64 << 20
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		if m.HeapAlloc < threshold {
+			continue
+		}
+		log.Printf("[mem] heap=%dMiB heap_sys=%dMiB sys=%dMiB goroutines=%d",
+			m.HeapAlloc>>20, m.HeapSys>>20, m.Sys>>20, runtime.NumGoroutine())
 	}
 }
 
