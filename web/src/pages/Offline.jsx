@@ -1,4 +1,5 @@
 import React from 'react'
+import { Api } from '../api/api.js'
 
 // 离线机器列表：记录历史注册过的主机，展示最后上线时间与离线时长
 export default function Offline({ agents }) {
@@ -8,6 +9,24 @@ export default function Offline({ agents }) {
     .filter((a) => !a.online)
     .slice()
     .sort((x, y) => (y.last_seen || 0) - (x.last_seen || 0))
+
+  const removeAgent = async (a) => {
+    const name = a.remark || a.hostname || a.agent_id
+    const ok = window.confirm(
+      `删除主机「${name}」？\n\n` +
+      '将清除本服务端保存的主机记录、备注、探针/延迟历史与端口映射规则。\n' +
+      '不会卸载目标机上的 Agent，也不清除证书绑定与未使用的注册令牌。\n\n' +
+      '若该机 Agent 仍在运行，它会重新注册并再次出现。'
+    )
+    if (!ok) return
+    try {
+      const d = await Api.deleteAgent(a.agent_id)
+      if (!d?.ok) { alert(d?.msg || '删除失败'); return }
+      window.dispatchEvent(new Event('mc-agents-refresh'))
+    } catch (e) {
+      alert('删除失败：' + (e.response?.data?.msg || e.message))
+    }
+  }
 
   return (
     <div>
@@ -28,6 +47,7 @@ export default function Offline({ agents }) {
               <th>最后上线时间</th>
               <th>离线时长</th>
               <th>状态</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -49,10 +69,17 @@ export default function Offline({ agents }) {
                 <td data-label="最后上线">{fmtTime(a.last_seen)}</td>
                 <td data-label="离线时长">{offlineDuration(a)}</td>
                 <td data-label="状态"><span className="badge offline">离线</span></td>
+                <td data-label="操作">
+                  <button
+                    className="secondary danger btn-sm"
+                    onClick={() => removeAgent(a)}
+                    title="删除这台离线主机的登记与历史数据"
+                  >删除</button>
+                </td>
               </tr>
             ))}
             {offline.length === 0 && (
-              <tr><td colSpan="5" className="table-empty">当前没有离线主机</td></tr>
+              <tr><td colSpan="6" className="table-empty">当前没有离线主机</td></tr>
             )}
           </tbody>
         </table>

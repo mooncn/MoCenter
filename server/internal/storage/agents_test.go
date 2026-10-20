@@ -64,6 +64,50 @@ func TestUpsertAgentMergesByUUID(t *testing.T) {
 	}
 }
 
+// TestDeleteAgentData 删除主机时只清目标设备的记录与历史，别名一并清理，
+// 其它主机不受影响。
+func TestDeleteAgentData(t *testing.T) {
+	db := openTestDB(t)
+	for _, id := range []string{"keep-id", "del-id"} {
+		if err := db.UpsertAgent(&AgentRow{AgentID: id, UUID: "uuid-" + id, Hostname: id, LastSeen: 100}); err != nil {
+			t.Fatalf("写入主机 %s 失败: %v", id, err)
+		}
+		if err := db.InsertProbeHistory(&ProbeHistoryRow{AgentID: id, Timestamp: 100, CPUUsage: 1}); err != nil {
+			t.Fatalf("写入探针历史 %s 失败: %v", id, err)
+		}
+	}
+	if err := db.InsertLatencyHistory([]*LatencyRow{
+		{AgentID: "keep-id", Timestamp: 100, Target: "icmp:1.1.1.1", LatencyMS: 5, OK: true},
+		{AgentID: "del-id", Timestamp: 100, Target: "icmp:1.1.1.1", LatencyMS: 5, OK: true},
+	}); err != nil {
+		t.Fatalf("写入延迟历史失败: %v", err)
+	}
+
+	if err := db.DeleteAgentData([]string{"del-id", "old-del-id"}); err != nil {
+		t.Fatalf("删除主机失败: %v", err)
+	}
+
+	rows, err := db.LoadAgents()
+	if err != nil {
+		t.Fatalf("读取主机失败: %v", err)
+	}
+	if len(rows) != 1 || rows[0].AgentID != "keep-id" {
+		t.Fatalf("只应保留 keep-id，实得 %+v", rows)
+	}
+	if h, _ := db.QueryProbeHistory("del-id", 0, 10); len(h) != 0 {
+		t.Fatalf("目标主机的探针历史应被清除，实得 %d 条", len(h))
+	}
+	if h, _ := db.QueryProbeHistory("keep-id", 0, 10); len(h) != 1 {
+		t.Fatalf("其它主机的探针历史不应受影响，实得 %d 条", len(h))
+	}
+	if h, _ := db.QueryLatencyHistory("del-id", 0, "", 10); len(h) != 0 {
+		t.Fatalf("目标主机的延迟历史应被清除，实得 %d 条", len(h))
+	}
+	if h, _ := db.QueryLatencyHistory("keep-id", 0, "", 10); len(h) != 1 {
+		t.Fatalf("其它主机的延迟历史不应受影响，实得 %d 条", len(h))
+	}
+}
+
 // TestDedupOnMigration 回归：老库中同一 UUID 的重复行应在启动迁移时被合并，
 // 且不因唯一索引创建失败导致服务端起不来。
 func TestDedupOnMigration(t *testing.T) {

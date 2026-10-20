@@ -492,4 +492,7 @@ type EnrollResp struct {
 	ServerFingerprint string `json:"server_fingerprint,omitempty"`
 	// Identity 部署身份名（安装时生成，可辨识"这台机器连的是哪套总控"）。
 	Identity string `json:"identity,omitempty"`
+	// CredSource 本次换取所凭的凭证类型：token（一次性令牌）/ shared-key / anonymous。
+	// 供 Agent 在成功后清理"被误填进长期字段的一次性令牌"（见 Agent 侧说明）。
+	CredSource string `json:"cred_source,omitempty"`
 }

@@ -123,6 +123,7 @@ func New(cfg Config) *Client {
 
 // Run 启动 Agent：连接服务端并运行主循环，断线自动重连。
 func (c *Client) Run() {
+	c.logCredentialPlan()
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
 	for {
@@ -145,6 +146,87 @@ func (c *Client) Run() {
 	}
 }
 
+// logCredentialPlan 在启动时说明本轮到底凭哪样东西接入。
+//
+// 为什么值得单独打印：Agent 只要有可用证书就**不会**再出示令牌 —— 这是正确的
+// （令牌是一次性的，换过就该留着证书），但运维在命令行里刚粘完令牌、回到控制台
+// 却看到令牌仍是「待使用」时，会以为令牌没生效。把"跳过了换取"写进日志，
+// 才能让这条因果链自己解释清楚。
+func (c *Client) logCredentialPlan() {
+	cert := c.clientCert()
+	if cert == nil {
+		if c.hasEnrollSecret() {
+			log.Printf("[agent] 本机尚无客户端证书，将用注册凭据换取（agent_id=%q）", c.cfg.AgentID)
+		} else {
+			log.Printf("[agent] 警告: 本机无客户端证书且未配置注册凭据，服务端会拒绝接入")
+		}
+		return
+	}
+	cn := certCommonName(cert)
+	if cn == "" {
+		cn = c.cfg.AgentID
+	}
+	if !c.hasEnrollSecret() {
+		log.Printf("[agent] 本机已有客户端证书（身份 %s），直接以证书接入", cn)
+		return
+	}
+	log.Printf("[agent] 本机已有客户端证书（身份 %s），直接以证书接入：配置里的注册凭据本次不会被使用，"+
+		"控制台的一次性令牌会保持「待使用」", cn)
+	if !c.usesExternalCert() {
+		log.Printf("[agent] 若要改用新令牌重新换取：删除 %s 下的 client.crt 与 ca.crt（保留 client.key）后重启",
+			c.credDir())
+	}
+}
+
+// ensureCertIdentity 拦住"证书身份与配置 agent_id 不一致"的静默错位。
+//
+// 服务端以证书 CN 作为连接身份：本机配置写着 vm-win10、creds 里却是上一轮
+// 以机器 UUID 换来的证书时，界面上线的主机名仍然是 UUID —— 看起来"装好了"，
+// 但所有按 agent_id 下发的操作都会打到另一台身份上。这里主动丢弃旧证书
+// （保留私钥，避免 TOFU 绑定把重签挡死），再用当前凭据重新换取。
+func (c *Client) ensureCertIdentity() error {
+	if c.usesExternalCert() {
+		return nil // 运维手工指定的证书不归我们处置
+	}
+	want := strings.TrimSpace(c.cfg.AgentID)
+	if want == "" {
+		return nil
+	}
+	cert := c.clientCert()
+	if cert == nil {
+		return nil
+	}
+	cn := certCommonName(cert)
+	if cn == "" || cn == want {
+		return nil
+	}
+	if !c.hasEnrollSecret() {
+		return fmt.Errorf("本机客户端证书的身份是 %q，与配置 agent_id %q 不一致，且没有注册凭据可重新换取："+
+			"请删除 %s 下的 client.crt 与 ca.crt（保留 client.key），并配置注册密钥或一次性令牌后重启",
+			cn, want, c.credDir())
+	}
+	log.Printf("[agent] 本机客户端证书身份 %q 与配置 agent_id %q 不一致；丢弃旧证书并用注册凭据重新换取", cn, want)
+	if err := c.discardServerIssuedCreds(); err != nil {
+		return fmt.Errorf("清理旧客户端证书失败（请手动删除 %s 下的 client.crt 与 ca.crt）: %w", c.credDir(), err)
+	}
+	// 配置里的路径指向刚删掉的文件：一并清空，避免本轮重建 TLS 时再报"加载失败"。
+	c.cfg.ClientCert = ""
+	c.cfg.CACert = ""
+	c.cred = nil
+	return nil
+}
+
+// usesExternalCert 判断客户端证书是否由运维手工指定（而不是换取后落在 creds/ 下的）。
+// handleEnrolled 会把换取结果写回 client_cert/client_key 配置，因此不能只看
+// "配置里有没有这两个字段"，要比对路径是否就是 creds/client.crt。
+func (c *Client) usesExternalCert() bool {
+	if strings.TrimSpace(c.cfg.ClientCert) == "" || strings.TrimSpace(c.cfg.ClientKey) == "" {
+		return false
+	}
+	managed := filepath.Join(c.credDir(), "client.crt")
+	return filepath.Clean(c.cfg.ClientCert) != filepath.Clean(managed)
+}
+
 // connectAndServe 建立连接并进入消息循环，返回时连接已断开。
 //
 // 传输层策略：**默认就是 TLS**，不在 Agent 侧做"能不能加密"的判断。
@@ -153,6 +235,9 @@ func (c *Client) Run() {
 //   - 服务端是旧版本、根本没监听 TLS 时：退回明文，身份仍由 HMAC 注册凭证保证
 //     （这条路径只为兼容存量部署，日志会明确提示）。
 func (c *Client) connectAndServe() error {
+	if err := c.ensureCertIdentity(); err != nil {
+		return err
+	}
 	tlsCfg, err := c.buildTLSConfig()
 	if err != nil {
 		return err
@@ -1151,6 +1236,10 @@ type CredentialFiles struct {
 	CertFile string
 	KeyFile  string
 	CAFile   string
+	// Source 服务端认定的凭证类型（protocol.CredSource*）；旧服务端为空。
+	Source string
+	// UsedField 本机实际出示凭据的配置字段：enrollment_secret / agent_key。
+	UsedField string
 }
 
 // SetOnEnrolled 注册换取成功回调（在证书落盘之后调用）。

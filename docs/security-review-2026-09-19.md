@@ -787,3 +787,48 @@ L-3 / L-4 / L-6 / L-7 收口时的口径（2026-10-01，LOW 项收尾）：`serv
 - **Win10 服务模式：能出图 ✅（RFB 字节级 + 人眼双重证据）**。「服务模式」一键安装成功（输出确认"已就绪（端口 5900）。锁屏/登录界面亦可查看"）→ 浏览器连接全链路通过：RFB 握手（ServerInit `2271×1200`、屏名 `desktop-4qn7tm1 ( 192.168.117.131 ) - service mode`）→ **85 条 s2c 消息 / 396,140 字节像素流、无断开**（对照：交互模式失败时 36B 即断）→ noVNC 画布（2,929 种颜色）导出 JPEG 传回本地 → 人眼确认：**完整 Windows 桌面**（左侧图标列 + 中文文件管理器窗口 + 底部任务栏与托盘时钟）。证据：`.testtools/win10-service-mode2.jpg` —— 12,804 字符 base64 由七块分片拼成（逐片 FNV-1a 校验 + 全串终核 `fnv=5f03e4fe`）再解码；**过程教训**：长 base64 让模型"复读"落盘会被长重复段腐蚀（42KB 级全损、4KB 级部分损），必须分片 + 哈希校验，一次性整块复读只有运气好时才完好。
 - **Win10 交互会话模式：不能出图 ❌（产品缺陷候选，本轮不修、如实记账）**。同页「交互会话模式」连接后 ClientInit 即断（服务端日志 `原因=Agent 回隧道关闭。已转发=36B`，隧道与认证均无问题）。根因假设（未实锤、未修）：`installAndStartUltraVNCApp` 第 5 步由 Session-0 的 agent 服务**直启 `winvnc` 并先赢下 5900 端口**，`waitPortOpen` 因此成功、`schtasks /it` 的交互会话回退分支被跳过；Session-0 里的 winvnc 没有交互桌面可用，接受 ClientInit 后即关闭连接。候选修复方向（三选一）：① 直启/安装前判定当前会话（`qwinsta` / `tasklist Session#`）—— 无交互会话时明确报错而不是"看起来启动成功"；② 强制走 `schtasks /it` 路径；③ 直启前先判 5900 是否已被 Session-0 的 winvnc 占用（本项会掩盖①的差错报）。**服务模式已是可用替代路径**（锁屏/登录界面亦可查看），故排期优先级低。**→ 已修（2026-10-17，取方向①+验收加严）**：`installAndStartUltraVNCApp` 第 5 步按 Agent 自身会话分流 —— 新增 `currentSessionID()`（`ProcessIdToSessionId`，服务形态必为 0），**Session 0 一律跳过直启**、直接走 `schtasks /it` 拉进交互会话；只有便携形态（交互会话）才直启。验收端同步加严：新增 `winvncInteractiveRunning()`，端口通了之后还要确认**至少一个 winvnc 真的运行在交互会话里**（Session 0 的 winvnc 能完成 RFB 握手却给不出画面，"端口有人听"不再是充分条件），否则明确报错并建议改用服务模式 —— 不再"看起来启动成功"。配套单测 2 例（自身会话可查且非失败、无 winvnc 进程时空转必须返回 false）。**待真机复验**：Win10 服务形态 Agent 下重装"交互会话模式"，预期行为变为要么成功出图、要么明确报错。
 - **留档**：Win10 测试机当前装的是「服务模式」形态（UltraVNC 服务 `uvnc_service` 接手 5900），要复测交互模式需在页面切回并重装；Rocky8 侧的黑屏修复只落仓库代码（工作区未提交）—— 本轮判定未把含该修复的新构建重推测试机，修复要等下次部署生效。
+
+**2026-10-20 用户实测问题修复（一次性令牌接入 / 删除离线主机 / 接入教程 / Windows 兼容性）**
+
+用户在当前系统安装 `MoCenter-Setup-1.0.2.exe` 后报告：`/admin/enroll` ② 签发的一次性令牌在 Agent 注册时报「令牌无效」。逐项落地：
+
+- **根因（真机日志 + 当前源码）**：令牌签给 `agent_id=test`，而 Agent 实际以**机器 UUID** 上报（12:42:48–51 连续三次 `注册凭证校验失败`，12:43:23 改用共享密钥后才上线）。旧的通用错误串无法指路；更深一层是 **Windows 图形安装向导（1.0.2）根本没有 agent_id 输入项**，`BuildInstallParams` 也从不传 `-agentid`，GUI 安装的 Agent 只能回退到机器 UUID，与令牌绑定名必然不一致。修复：
+  - `server/internal/agentauth/agentauth.go`：错误串改为可操作提示（仍不区分"令牌不存在 / 证明不对"，不制造 agent_id oracle）；
+  - `installer/setup.iss`：向导新增「Agent 名称/ID」并接入 `BuildInstallParams` 的 `-agentid`；注册凭据输入项文案改为「注册密钥或一次性令牌」，校验提示同步；
+  - `web/src/pages/AgentEnroll.jsx`：② 增加"令牌只认签发时填写的 agent_id / 未指定时回退为机器 UUID / 名称不匹配不消耗令牌"提示与已登记主机名 datalist；④ 重写为 Linux/Windows 分列教程（Linux 两步：前台换取证书 → `install-linux.sh` 装 systemd；Windows：图形向导与 `-agent-key-file` 静默安装；含配置/证书/日志路径与自查命令）；FAQ 增补该报错。
+- **删除离线主机**：新增 `POST /api/agents/delete`（`server/main.go`；`probe.Store.DeleteOffline` 仅允许离线，清理设备记录、别名、探针历史；`storage.DeleteAgentData` 清理 `agents` / `probe_history` / `latency_history`；`portmap.DeleteRulesForAgents` 停监听并删规则；清备注；写 `category=op` 审计）。**不删除**证书 TOFU 绑定与未使用令牌，也**不卸载**目标机 Agent（仍在运行会重新注册）。仪表盘与「离线机器」页均只在离线行显示删除按钮，确认框列明清理范围。
+- **Windows 兼容性**：结论写入 `docs/deployment.md`「Windows 版本兼容性」——Win10 1809+ / Server 2019+ 支持；Win11 24H2 本次实机验证基础链路；Win7/8/8.1 不支持（Go 1.26 + `MinVersion=10.0`）；仅 x64。
+- **本轮真实验证（工作树构建，非单测复述）**：在本机起临时 Server（`127.0.0.1:18080/19000`，二进制与数据目录均在 `.testtools/regress`），浏览器真实登录 → `/admin/enroll` 页面签发 `regress-demo` 令牌 → 先用错误 `agent_id=regress-wrong` 注册，Agent 日志收到新错误串（证明可指路）；**同一枚令牌**改用 `regress-demo` 注册成功（证明名称不匹配不消耗令牌），页面显示「已使用」并建立 SPKI 绑定；停止 Agent 后在线→离线，仪表盘出现「删除」按钮，点击确认后主机消失、空态出现，服务端审计 `operator=admin agent=regress-demo cmd="删除离线主机 regress-demo"`。`npm run build`、`go build ./...`、`go test ./internal/storage ./internal/probe ./internal/portmap ./internal/agentauth` 全绿。
+- **残留**：① 1.0.2 安装包不含本次向导改动，需重新构建 Setup 才生效（本机无 `ISCC.exe`，未做编译验证）；② 现网 Web 需重新构建/替换 `web/dist`；③ Win11 上的 VNC 与虚拟显示未单独复测；④ 变更未提交（按约定保留在工作区）。
+
+**2026-10-20 增补：Windows 安装向导改进（角色分页 / 卸载清理配置）**
+
+- **按角色分页**：`installer/setup.iss` 拆成 `PageAgent`（服务端地址 / Agent 名称 ID / 注册凭据）、`PageServer`（后台用户名 / 口令）、`PageAdv`（数据目录 / 代理 / 额外 TLS 参数）、`PageAdvServer`（Agent 与 HTTP 监听）；`ShouldSkipPage` 按角色选择跳过专有页 —— 只装 Agent 不再看到 Server 账号与端口，只装 Server 不再看到 Agent 连接参数；角色页同时校验"至少选一个"。
+- **卸载清理选项**：`CurUninstallStepChanged(usUninstall)` 弹窗询问是否删除配置与数据（**默认保留**）；确认后调用 `mocenter-deploy.exe uninstall ... -purge`。**为什么不放 `[UninstallRun]`**：Inno 在安装阶段就把该节参数求值并写入卸载日志，卸载时才产生的选择带不进去 —— 这一点是本次实现中最容易踩错的时序。静默卸载不弹窗，显式传 `/PURGE` 才清理。
+- **数据目录记录**：安装时写 `HKLM\Software\MoCenter\DataDir`，卸载按同一目录清理，自定义 `-data` 也能删对地方；升级检测也会回读该值，避免旧版自定义目录被误判为"未安装"。
+- **残留**：本机仍无 `ISCC.exe`，脚本改动**未做编译验证**；1.0.2 安装包不含本次改动，需重新构建 Setup 后才会出现在图形向导中。变更未提交。
+
+**2026-10-20 增补：命令行注册成功但 GUI 服务未注册 / 令牌一直「待使用」**
+
+用户实测：同一台 Win10 上 `mocenter-agent.exe -server 192.168.117.1:9000 -agent-key <令牌>` 命令行注册成功；用 1.0.2 安装包安装为服务、填同一枚令牌却只打出「服务模式启动 / 未配置 -upgrade-pubkey」后没有下文；且命令行那次用过令牌后，控制台仍显示「待使用」。逐条定位如下。
+
+- **根因 A（GUI 服务注册失败，令牌不匹配）**：1.0.2 图形向导没有「Agent 名称/ID」输入项，`BuildInstallParams` 也不传 `-agentid`，服务形态只能回退为**机器 UUID** 作为身份。服务端日志给出直接证据：`拒绝为 Agent "BF674D56-7E0D-70DB-A9FF-103DE56368D8" 换发证书: 注册凭证校验失败` —— 而控制台令牌是签给 `vm-win10` / `vm-2` 的。身份在匹配阶段就不一致，服务端不会消费令牌，因此那两枚令牌至今仍是「待使用」，可在 TTL 内继续使用。
+- **根因 B（命令行用过后仍「待使用」，属令牌语义但不可见）**：命令行那次 `Desktop\MoCenter` 下**已有 `creds\client.crt`**（此前用共享密钥换过证书），Agent 直接以 mTLS 接入，`tryEnroll` 根本没有执行；服务端自然没有消费令牌。这是正确行为（一次性令牌只在换证时消费），但原实现对此完全静默，用户只能看到「注册成功 + 令牌待使用」这一对矛盾现象。
+- **修复（服务端 / Agent）**：
+  - `server/internal/protocol`、`agent/internal/protocol`：`EnrollResp` 新增 `cred_source`（`token` / `shared-key` / `anonymous`）；`server/main.go` 的 `enrollAgentCert` 将本次实际凭据来源回传。
+  - `agent/main.go`：换取成功且来源确为 `token` 时，清掉可能被误存进 `agent_key` 的一次性令牌（仅当两个字段相等或确由 `agent_key` 提供时才清，不会误删独立的长期共享密钥）。
+  - `agent/internal/client/client.go`：启动时先打印凭据计划 —— 有证书就明确写「直接以证书接入：配置里的注册凭据本次不会被使用，控制台的一次性令牌会保持『待使用』」，并给出「删除 `client.crt` 与 `ca.crt`（保留 `client.key`）后重启」的换证办法。
+  - **身份漂移自愈**：新增 `ensureCertIdentity()`。当证书 CN 与配置 `agent_id` 不一致且手头有注册凭据时，自动丢弃服务端签发的 `client.crt`/`ca.crt`（**保留 `client.key`**，避免把自己的 TOFU 绑定挡死），随即用当前凭据重新换取；没有凭据则给出可操作的错误而不是静默按旧身份上线。清理后同时清空配置里指向已删文件的路径，避免重建 TLS 时刷「加载证书失败」。
+  - `agent/internal/client/enroll.go`：换取被拒时错误串带上本机 `agent_id` 与「令牌绑定的 agent_id 必须与本机完全一致」的指向；日志记录凭据来自 `enrollment_secret` 还是 `agent_key`。
+- **修复（Windows 安装器）**：
+  - `installer/install.go`：升级安装不再"整份覆盖"或"整份跳过"，而是**把显式传入的 `-server` / `-agentid` / 注册凭据合并进现有配置**；升级时不再强制要求重新填写密钥；只有显式提供了 `agent_id` 且与原值不同时，才删除 `creds/client.crt` 与 `ca.crt`（保留 `client.key`）并打印清理数量，让服务按新身份重新换证。
+  - `installer/setup.iss`：Agent 页说明 `agent_id` 必须与签发令牌时填写的一致，并给出取机器 UUID 的命令 `(Get-CimInstance Win32_ComputerSystemProduct).UUID`；升级时留空表示沿用现有配置。
+  - `installer/install_test.go`：新增升级合并、保留独立共享密钥、升级不填密钥、清理证书保留私钥四组用例。
+- **修复（接入教程）**：`web/src/pages/AgentEnroll.jsx` 的 Linux 命令改用 `-enroll-secret`（一次性令牌的专用入口），补充「已有证书不会消费令牌」与强制换证办法；Windows 图形向导段落说明新版升级会自动应用 Agent ID/令牌并在身份变化时清旧证书；FAQ 增加「令牌签发后一直待使用」条目。
+- **本轮真实端到端验证（工作树构建）**：临时服务端 `127.0.0.1:18080/19000`（数据在 `.testtools/e2e-20261020`，一次性口令文件，未复用现网凭据）。
+  1. 为 `e2e-agent` 签发令牌 1 → Agent 用 `-agent-key` 启动：日志出现「凭据来自 enrollment_secret」与「一次性令牌已在服务端标记为已使用」；配置中 `agent_key` / `enrollment_secret` 均被清空；API 显示 `used_at` 非零、`source=token`、待使用数降为 0。
+  2. 再签令牌 2 → Agent 带着已有证书启动：日志明确打出「直接以证书接入 … 令牌会保持『待使用』」及删除证书的指引；连接成功，令牌 2 的 `used_at=0`，与说明一致。
+  3. 身份漂移：把配置 `agent_id` 改为 `e2e-agent-drift`（证书 CN 仍是旧值）→ 日志出现「证书身份与配置 agent_id 不一致；丢弃旧证书并用注册凭据重新换取」，令牌被消费、绑定表新增该 ID，连接上线；重复一次（`drift2`）结果相同，且清理后不再出现证书加载噪声。
+  - `go test ./...`（agent、installer）全绿；`npm run build` 成功。
+- **现场处置建议**：① 已在 1.0.2 图形向导安装的服务，若想用 `vm-win10` 这枚令牌，重跑**新构建**的安装包并把「Agent 名称/ID」填成 `vm-win10`（升级会覆盖配置、清旧证书并重新换证）；不想重装则按服务日志里的 UUID 另签一枚令牌，用命令行或改配置后重启服务。② 命令行那台若希望消费掉手头令牌，删除 `Desktop\MoCenter\creds\client.crt` 与 `ca.crt`（保留 `client.key`）后重启，日志会明确显示换证结果。
+- **残留**：① 1.0.2 安装包不含上述向导/安装器改动，必须重新构建 Setup 才生效（本机仍无 `ISCC.exe`，未做编译验证）；② 真机 GUI 安装 + 服务形态注册需用新安装包复测；③ 现网 Web 需重新部署 `web/dist` 才能看到新教程；④ **Server 角色**的升级仍会重写配置（本次只收口了 Agent 角色），如后续需要保留 Server 侧手工调整，应另做同样的合并逻辑；⑤ 跳过换证时，用户显式填写的令牌会按设计留在配置里（仍有效，日志已解释），不是残留缺陷；⑥ 变更未提交，按约定保留在工作区。

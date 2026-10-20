@@ -723,6 +723,49 @@ func (s *Store) GetByUUID(uuid string) *protocol.AgentInfo {
 	return a
 }
 
+// DeleteOffline 删除一台离线主机及其历史数据，返回被删除的设备与它用过的
+// 全部 agent_id（别名）。
+//
+// 只允许删离线主机：在线设备的记录会在下一次探针上报时被重新写回，删除等于
+// 制造一次「界面上没了、几秒后又回来」的假动作；要清理在线的机器，应当先停掉
+// 该主机上的 Agent。删除的是**本服务端的登记**，不会卸载目标机上的 Agent ——
+// 若 Agent 仍在运行，它会重新注册并再次出现。
+//
+// 数据库删除失败时不动内存：否则重启服务后这条记录会"复活"，而运维已经看到
+// 删除成功的提示。
+func (s *Store) DeleteOffline(agentID string) (*protocol.AgentInfo, []string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key, ok := s.byAgent[agentID]
+	if !ok || s.devices[key] == nil {
+		return nil, nil, fmt.Errorf("主机不存在")
+	}
+	info := s.devices[key]
+	if info.Online {
+		return nil, nil, fmt.Errorf("主机当前在线，无法删除；请先停止该主机上的 Agent 或等待其离线")
+	}
+	aliases := make([]string, 0, 4)
+	for id, k := range s.byAgent {
+		if k == key {
+			aliases = append(aliases, id)
+		}
+	}
+	if s.db != nil {
+		if err := s.db.DeleteAgentData(aliases); err != nil {
+			return nil, nil, fmt.Errorf("删除主机数据失败: %w", err)
+		}
+	}
+	delete(s.devices, key)
+	for _, id := range aliases {
+		delete(s.byAgent, id)
+	}
+	delete(s.history, key)
+
+	clone := *info
+	return &clone, aliases, nil
+}
+
 // All 返回全部 Agent（含离线），并对未命中缓存的公网 IP 触发后台 GeoIP 解析。
 func (s *Store) All() []*protocol.AgentInfo {
 	return s.snapshot(true)

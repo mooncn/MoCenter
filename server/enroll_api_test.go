@@ -124,13 +124,13 @@ func TestEnrollAPITokenShownOnceAndNeverAudited(t *testing.T) {
 }
 
 // TestEnrollAPIRejectsBadAgentID agent_id 会进证书 CN、日志与审计，必须先校验再落库。
+// 留空是合法的（不绑定令牌），见 TestEnrollAPIIssuesUnboundToken。
 func TestEnrollAPIRejectsBadAgentID(t *testing.T) {
 	store, authz, router := newEnrollAPIFixture(t)
 	verifier := agentauth.NewVerifier("shared")
 	verifier.SetEnrollStore(store)
 	issue := enrollTokensHandler(store, verifier, authz, router)
 	for _, body := range []string{
-		`{"agent_id":""}`,
 		`{"agent_id":"host 01"}`,
 		`{"agent_id":"` + strings.Repeat("a", 200) + `"}`,
 		`{"agent_id":"host\ttab"}`,
@@ -145,6 +145,55 @@ func TestEnrollAPIRejectsBadAgentID(t *testing.T) {
 	}
 	if len(store.ListTokens()) != 0 {
 		t.Fatal("非法请求不应留下令牌")
+	}
+}
+
+// TestEnrollAPIIssuesUnboundToken 签发时 agent_id 可留空：不绑定令牌对任何主机
+// 都可用一次，身份由客户端决定（未指定 agent_id 时回退为机器 UUID）。
+func TestEnrollAPIIssuesUnboundToken(t *testing.T) {
+	store, authz, router := newEnrollAPIFixture(t)
+	verifier := agentauth.NewVerifier("")
+	verifier.SetEnrollStore(store)
+	issue := enrollTokensHandler(store, verifier, authz, router)
+
+	rec := doJSON(t, issue, http.MethodPost, `{"label":"any-host","ttl_seconds":3600}`, "test-token")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("签发应成功，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		OK      bool   `json:"ok"`
+		Token   string `json:"token"`
+		AgentID string `json:"agent_id"`
+		Unbound bool   `json:"unbound"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if !created.OK || created.Token == "" || created.AgentID != "" || !created.Unbound {
+		t.Fatalf("不绑定令牌的签发响应异常: %s", rec.Body.String())
+	}
+
+	// 客户端未指定 agent_id → 以机器 UUID 上报
+	const uuid = "BF674D56-7E0D-70DB-A9FF-103DE56368D8"
+	ts := time.Now().Unix()
+	nonce := agentauth.NewNonce()
+	src, err := verifier.Verify(uuid, nonce, agentauth.Proof(created.Token, uuid, nonce, ts), ts)
+	if err != nil || src != agentauth.CredToken {
+		t.Fatalf("不绑定令牌应能换取 UUID 身份的证书，得到 src=%q err=%v", src, err)
+	}
+
+	listRec := doJSON(t, issue, http.MethodGet, "", "test-token")
+	var list struct {
+		Tokens []map[string]interface{} `json:"tokens"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Tokens) != 1 || list.Tokens[0]["unbound"] != true || list.Tokens[0]["used_at"] == int64(0) {
+		t.Fatalf("列表中不绑定令牌的状态异常: %+v", list.Tokens)
+	}
+	if strings.Contains(listRec.Body.String(), created.Token) {
+		t.Fatal("令牌列表回显了明文")
 	}
 }
 

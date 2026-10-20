@@ -184,6 +184,25 @@ export default function Dashboard({ agents }) {
 
   const sinceMap = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800 }
 
+  const removeAgent = async (a) => {
+    const name = nameOf(a)
+    const ok = window.confirm(
+      `删除主机「${name}」？\n\n` +
+      '将清除本服务端保存的主机记录、备注、探针/延迟历史与端口映射规则。\n' +
+      '不会卸载目标机上的 Agent，也不清除证书绑定与未使用的注册令牌。\n\n' +
+      '若该机 Agent 仍在运行，它会重新注册并再次出现。'
+    )
+    if (!ok) return
+    try {
+      const d = await Api.deleteAgent(a.agent_id)
+      if (!d?.ok) { alert(d?.msg || '删除失败'); return }
+      if (selectedAgent === a.agent_id) setSelectedAgent('')
+      window.dispatchEvent(new Event('mc-agents-refresh'))
+    } catch (e) {
+      alert('删除失败：' + (e.response?.data?.msg || e.message))
+    }
+  }
+
   // 每 5 秒探测服务端存活状态（/api/health 无需鉴权）
   useEffect(() => {
     let alive = true
@@ -350,6 +369,14 @@ export default function Dashboard({ agents }) {
                   <button className="secondary btn-sm" onClick={() => setSelectedAgent(trendOpen ? '' : a.agent_id)}>
                     {trendOpen ? '收起' : '查看'}
                   </button>
+                  {!a.online && (
+                    <button
+                      className="secondary danger btn-sm"
+                      style={{ marginLeft: 6 }}
+                      onClick={() => removeAgent(a)}
+                      title="删除这台离线主机的登记与历史数据"
+                    >删除</button>
+                  )}
                 </td>
               </tr>
               {/* 趋势图**紧跟该条记录下方**展开（原实现放在列表最底部，移动端要滚很久） */}

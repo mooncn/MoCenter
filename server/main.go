@@ -674,6 +674,7 @@ func main() {
 	// 版本信息（服务端版本 + 各 Agent 在线版本与升级判定）
 	mux.HandleFunc("/api/version", versionHandler(store, geoResolver, authz))
 	mux.HandleFunc("/api/agents/remark", setRemarkHandler(remarks, authz))
+	mux.HandleFunc("/api/agents/delete", deleteAgentHandler(store, remarks, pm, authz, router))
 	mux.HandleFunc("/api/audits", auditsHandler(router, authz))
 	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
 	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz, router))
@@ -1497,6 +1498,7 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 	resp.CAPEM = string(identity.CACertPEM())
 	resp.ServerFingerprint = identity.Fingerprint()
 	resp.Identity = identity.Name()
+	resp.CredSource = credSource
 	log.Printf("[server] 已为 Agent %q 签发客户端证书（凭证类型 %s，来自 %s）", er.AgentID, credSource, tlsInfo(conn))
 	if credSource == agentauth.CredSharedKey {
 		// 双轨过渡期的提醒：还靠"一把密钥认全网"上来的主机，是 C-1 未收口的部分。
@@ -2348,6 +2350,64 @@ func setRemarkHandler(remarks *remark.Store, authz *auth.Auth) http.HandlerFunc 
 			return
 		}
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "备注已保存"})
+	}
+}
+
+// deleteAgentHandler 删除一台离线主机的登记与历史数据。
+//
+// 只清服务端这一侧：主机记录、备注、探针/延迟历史、端口映射规则。
+// 不碰证书 TOFU 绑定与未使用的一次性令牌 —— 那些是"这台机器还能不能换证书"
+// 的信任状态，误清会把一道安全闸门一起删掉；需要时在「Agent 接入」页单独清除。
+// 也不卸载目标机上的 Agent：若它仍在运行，会重新注册并再次出现在列表里。
+func deleteAgentHandler(store *probe.Store, remarks *remark.Store, pm *portmap.Manager, authz *auth.Auth, router *route.Router) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			AgentID string `json:"agent_id"`
+		}
+		if !decodeJSON(w, r, maxJSONBody, &body) {
+			return
+		}
+		body.AgentID = strings.TrimSpace(body.AgentID)
+		if body.AgentID == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+			return
+		}
+		info, aliases, err := store.DeleteOffline(body.AgentID)
+		if err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+			return
+		}
+		for _, id := range aliases {
+			if err := remarks.Set(id, ""); err != nil {
+				log.Printf("[server] 删除主机 %q 的备注失败: %v", id, err)
+			}
+		}
+		removed := 0
+		if pm != nil {
+			removed = pm.DeleteRulesForAgents(aliases)
+		}
+		router.Audit(&route.AuditLog{
+			Time:       time.Now().Unix(),
+			Operator:   authz.Operator(r.Header.Get("Authorization")),
+			OperatorIP: auth.LoginIPOf(r.RemoteAddr),
+			AgentID:    info.AgentID,
+			Command:    "删除离线主机 " + info.AgentID,
+			Result:     "ok",
+			Category:   "op",
+		})
+		writeJSON(w, map[string]interface{}{
+			"ok":              true,
+			"agent_id":        info.AgentID,
+			"portmap_removed": removed,
+			"msg":             "主机已删除",
+		})
 	}
 }
 

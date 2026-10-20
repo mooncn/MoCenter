@@ -7,7 +7,10 @@
 // CN = 受害者 agent_id 的合法客户端证书，从此被服务端当成那台主机。
 // "一把密钥 = 全网身份"必须收敛为"一把令牌 = 一台主机、一次机会"：
 //
-//   - 令牌与 agent_id 绑定：拿 A 机的令牌换不到 B 机的证书；
+//   - 令牌默认与 agent_id 绑定：拿 A 机的令牌换不到 B 机的证书；
+//   - 令牌可以显式"不绑定"（签发时 agent_id 留空）：任何主机可用一次，身份由该机决定
+//     （客户端未指定 agent_id 时回退为机器 UUID）。便利的代价是它本质为一次性 bearer
+//     令牌 —— 谁先拿到谁就能用，控制台必须把这一点写清楚；
 //   - 一次性：换取时即作废（用后即焚），泄露面随时间收敛；
 //   - 带有效期：没在窗口内使用的令牌自动失效，不积累长期凭据；
 //   - TOFU：同一 agent_id 第二次以**不同公钥**换取证书时，除非出示该主机的新令牌，
@@ -95,6 +98,8 @@ func (t *EnrollToken) Public(now int64) map[string]interface{} {
 		"used_at":    t.UsedAt,
 		"source":     t.Source,
 		"expired":    t.UsedAt == 0 && t.expiredAt(now),
+		// Unbound 为 true 表示签发时没有绑定 agent_id：任何主机可用一次。
+		"unbound": t.AgentID == "",
 	}
 }
 
@@ -157,8 +162,8 @@ func NewEnrollStore(path string) (*EnrollStore, error) {
 		return nil, fmt.Errorf("解析 %s 失败: %w", path, err)
 	}
 	for _, pt := range st.Tokens {
-		if pt.ID == "" || pt.AgentID == "" || st.Secrets[pt.ID] == "" {
-			continue // 缺字段的记录无法校验也无法使用，丢弃
+		if pt.ID == "" || st.Secrets[pt.ID] == "" {
+			continue // 缺 id/secret 的记录无法校验也无法使用，丢弃；agent_id 允许为空（不绑定令牌）
 		}
 		s.tokens = append(s.tokens, &EnrollToken{
 			ID: pt.ID, AgentID: pt.AgentID, Label: pt.Label,
@@ -208,13 +213,12 @@ func (s *EnrollStore) saveLocked() error {
 	return os.Rename(tmp, s.path)
 }
 
-// CreateToken 为指定 agent_id 生成一次性注册令牌。
-// 返回的明文只在这一次给出，控制台与列表接口都不会再出现它。
+// CreateToken 生成一次性注册令牌。
+// agentID 为空表示"不绑定"：任何主机都可用它换取一次证书，身份由客户端决定
+// （客户端未指定 agent_id 时默认机器 UUID）。返回的明文只在这一次给出，
+// 控制台与列表接口都不会再出现它。
 func (s *EnrollStore) CreateToken(agentID, label string, ttl time.Duration) (string, *EnrollToken, error) {
 	agentID = strings.TrimSpace(agentID)
-	if agentID == "" {
-		return "", nil, fmt.Errorf("必须指定令牌绑定的 agent_id")
-	}
 	switch {
 	case ttl <= 0:
 		ttl = TokenDefaultTTL
@@ -248,8 +252,9 @@ func (s *EnrollStore) CreateToken(agentID, label string, ttl time.Duration) (str
 			unused++
 		}
 	}
+	// 未绑定令牌共用一个桶：它们不对应任何一台主机，按同一签发目标限制数量。
 	if unused >= maxTokens || pending >= maxTokensPerAgent {
-		return "", nil, fmt.Errorf("未使用令牌已达上限（单台 %d / 总量 %d），请先吊销", maxTokensPerAgent, maxTokens)
+		return "", nil, fmt.Errorf("未使用令牌已达上限（同一签发目标 %d / 总量 %d），请先吊销", maxTokensPerAgent, maxTokens)
 	}
 	tok := &EnrollToken{
 		ID: id, AgentID: agentID, Label: strings.TrimSpace(label),
@@ -321,11 +326,13 @@ func (s *EnrollStore) RevokeAgentTokens(agentID string) int {
 	return n
 }
 
-// matchConsume 按 agent_id 找出与该证明匹配的未使用令牌，并当场作废它。
+// matchConsume 找出与本次证明匹配的未使用令牌，并当场作废它。
 //
-// 一台主机最多 8 条候选，逐个算 HMAC 的代价可忽略；比对用常数时间，避免把
-// 匹配位置泄露成时序信号。作废与落盘在持锁内一次完成 —— "一次性"必须是硬保证，
-// 即使写文件失败也只影响重启后的状态，不影响本次进程内的单次使用。
+// 绑定令牌只在 t.AgentID == agentID 时参与；不绑定令牌（t.AgentID == ""）对任何
+// agent_id 都参与，证明值用**本次请求的 agent_id** 计算 —— Agent 侧本来就是这么算的，
+// 因此客户端无需知道令牌是否绑定。一台主机最多 8 条候选，逐个算 HMAC 的代价可忽略；
+// 比对用常数时间，避免把匹配位置泄露成时序信号。作废与落盘在持锁内一次完成 ——
+// "一次性"必须是硬保证，即使写文件失败也只影响重启后的状态，不影响本次进程内的单次使用。
 func (s *EnrollStore) matchConsume(agentID, nonce, proof string, ts int64) *EnrollToken {
 	if agentID == "" || proof == "" {
 		return nil
@@ -333,7 +340,7 @@ func (s *EnrollStore) matchConsume(agentID, nonce, proof string, ts int64) *Enro
 	want := strings.ToLower(strings.TrimSpace(proof))
 	now := s.now().Unix()
 	for _, t := range s.tokens {
-		if t.AgentID != agentID || !t.usable(now) {
+		if (t.AgentID != "" && t.AgentID != agentID) || !t.usable(now) {
 			continue
 		}
 		got := Proof(t.secret, agentID, nonce, ts)

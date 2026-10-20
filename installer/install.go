@@ -184,6 +184,12 @@ func installRole(m *mgr.Mgr, o options, role string) error {
 	// **不动配置与数据**（服务端地址、注册密钥、账号、数据库原样保留）。
 	// 要推倒重来必须显式加 -force，避免一次误操作抹掉现场。
 	upgrade := !o.force && existingInstall(o, role)
+	oldAgentID := ""
+	if role == "agent" && upgrade {
+		if obj, ok, _ := loadConfigObject(confPath); ok {
+			oldAgentID, _ = obj["agent_id"].(string)
+		}
+	}
 
 	fmt.Printf("\n=== %s %s ===\n", map[bool]string{true: "升级", false: "安装"}[upgrade], role)
 	fmt.Printf("  服务名  : %s\n", name)
@@ -261,6 +267,23 @@ func installRole(m *mgr.Mgr, o options, role string) error {
 	}
 	hardenQuiet(confPath)
 	fmt.Printf("  [2/5] 已写入配置 %s\n", confPath)
+	if role == "agent" && upgrade {
+		if o.agentID != "" {
+			fmt.Printf("  [agent] 已应用本次输入的 Agent 名称/ID：%s\n", o.agentID)
+		}
+		if o.agentKey != "" {
+			fmt.Printf("  [agent] 已应用本次输入的注册凭据（不回显）\n")
+		}
+		// 服务端以证书 CN 作为连接身份：agent_id 变了但旧证书还在，
+		// 服务仍会以旧身份上线，配置看着改了、行为没改。
+		if strings.TrimSpace(o.agentID) != "" && strings.TrimSpace(o.agentID) != strings.TrimSpace(oldAgentID) {
+			n, cerr := resetAgentServerCerts(dataDir)
+			if cerr != nil {
+				return fmt.Errorf("Agent 名称/ID 已变更，但清理旧客户端证书失败: %w", cerr)
+			}
+			fmt.Printf("  [agent] 已清理旧客户端证书 %d 个（保留 client.key），服务将按新身份重新换取\n", n)
+		}
+	}
 
 	// 4) 注册服务。命令行只带 -config（Server 另带 -data），
 	//    账号密码不进命令行 —— 密码只以摘要落在 users.json（见 ensureServerAccount），
@@ -320,6 +343,44 @@ func existingInstall(o options, role string) bool {
 	return false
 }
 
+// loadConfigObject 读取既有配置为可合并的 map。
+//
+// 返回 exists=false 表示这是全新安装；文件存在但解析失败时返回错误 ——
+// 升级时把一份读不懂的配置直接覆盖掉，比停下来让运维处理更糟。
+func loadConfigObject(path string) (obj map[string]any, exists bool, err error) {
+	b, rerr := os.ReadFile(path)
+	if os.IsNotExist(rerr) {
+		return nil, false, nil
+	}
+	if rerr != nil {
+		return nil, false, rerr
+	}
+	if uerr := json.Unmarshal(b, &obj); uerr != nil || obj == nil {
+		return nil, true, fmt.Errorf("既有配置 %s 无法解析: %v（确认无需保留后可加 -force 清理重装）", path, uerr)
+	}
+	return obj, true, nil
+}
+
+// resetAgentServerCerts 删除由服务端签发的旧客户端证书（保留 client.key）。
+//
+// agent_id 变更后必须删：服务端以证书 CN 作为连接身份，旧证书会让新配置
+// 形同虚设（界面仍显示旧身份）。私钥必须保留，否则服务端 TOFU 绑定会因
+// 公钥指纹变化拒绝重签，只能再签发一枚新令牌才能恢复。
+func resetAgentServerCerts(dataDir string) (int, error) {
+	dir := filepath.Join(dataDir, "creds")
+	removed := 0
+	for _, name := range []string{"client.crt", "ca.crt"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 // writeConfig 写配置文件。
 //
 // 这里刻意不引用 agent/server 的 config 包（三者是独立 module），只按它们的 JSON
@@ -342,37 +403,80 @@ func writeConfig(role, path string, o options) error {
 			obj["server_name"] = strings.TrimSpace(o.serverName)
 		}
 	} else {
-		if strings.TrimSpace(o.agentKey) == "" {
-			return errors.New("安装 Agent 必须指定 -agent-key 或 -agent-key-file（取服务端 <data>\\agent.key 的内容）：" +
-				"服务端默认要求 Agent 携带注册密钥，否则连接会被拒绝")
+		existing, exists, err := loadConfigObject(path)
+		if err != nil {
+			return err
 		}
-		obj = map[string]any{
-			"server": o.server,
-			"daemon": true,
-			// 首次启动用注册密钥换取客户端证书（服务端内置 CA 签发），
-			// 换取成功后该字段会被清空、证书落到 creds\ 下 —— 运维无需手工准备证书。
-			"enrollment_secret": strings.TrimSpace(o.agentKey),
-		}
-		// 只写一份凭据的条件：走 -agent-key-file 进来的是一台一份、用后即废的注册令牌。
-		// 把它同时抄进长期字段 agent_key 没有任何好处 —— 令牌在服务端已作废，
-		// "服务端换 CA 后拿 agent_key 自动重签"这条路救不回来，
-		// 结果只是让一个凭据形状的值永久躺在配置里。
-		// 反之，运维显式用 -agent-key 提供 <data>\agent.key 共享密钥时，
-		// 它就是长期凭据，两处都写才符合那条恢复路径的本意。
-		if strings.TrimSpace(o.agentKeyFile) == "" {
-			obj["agent_key"] = strings.TrimSpace(o.agentKey)
-		}
-		if strings.TrimSpace(o.serverFingerprint) != "" {
-			obj["server_fingerprint"] = strings.TrimSpace(o.serverFingerprint)
-		}
-		if o.agentID != "" {
-			obj["agent_id"] = o.agentID
-		}
-		if strings.TrimSpace(o.agentUUID) != "" {
-			obj["uuid"] = strings.TrimSpace(o.agentUUID)
-		}
-		if o.proxyIP != "" {
-			obj["proxy_ip"] = o.proxyIP
+		if !exists {
+			if strings.TrimSpace(o.agentKey) == "" {
+				return errors.New("安装 Agent 必须指定 -agent-key 或 -agent-key-file（取服务端 <data>\\agent.key 的内容）：" +
+					"服务端要求 Agent 出示注册凭据，否则连接会被拒绝")
+			}
+			obj = map[string]any{
+				"server": o.server,
+				"daemon": true,
+				// 首次启动用注册密钥换取客户端证书（服务端内置 CA 签发），
+				// 换取成功后该字段会被清空、证书落到 creds\ 下 —— 运维无需手工准备证书。
+				"enrollment_secret": strings.TrimSpace(o.agentKey),
+			}
+			// 只写一份凭据的条件：走 -agent-key-file 进来的是一台一份、用后即废的注册令牌。
+			// 把它同时抄进长期字段 agent_key 没有任何好处 —— 令牌在服务端已作废，
+			// "服务端换 CA 后拿 agent_key 自动重签"这条路救不回来，
+			// 结果只是让一个凭据形状的值永久躺在配置里。
+			// 反之，运维显式用 -agent-key 提供 <data>\agent.key 共享密钥时，
+			// 它就是长期凭据，两处都写才符合那条恢复路径的本意。
+			if strings.TrimSpace(o.agentKeyFile) == "" {
+				obj["agent_key"] = strings.TrimSpace(o.agentKey)
+			}
+			if strings.TrimSpace(o.serverFingerprint) != "" {
+				obj["server_fingerprint"] = strings.TrimSpace(o.serverFingerprint)
+			}
+			if o.agentID != "" {
+				obj["agent_id"] = o.agentID
+			}
+			if strings.TrimSpace(o.agentUUID) != "" {
+				obj["uuid"] = strings.TrimSpace(o.agentUUID)
+			}
+			if o.proxyIP != "" {
+				obj["proxy_ip"] = o.proxyIP
+			}
+		} else {
+			// 升级：只覆盖本次显式给出的项，其余原样保留。
+			// 旧实现会整份重写，且把"可省略参数"的升级路径卡在"必须给密钥"上；
+			// 更关键的是，用户想用一次覆盖安装修正 agent_id / 换令牌时，
+			// 输入会被直接丢掉 —— 现象就是"安装成功了，但服务仍以旧身份连"。
+			obj = existing
+			obj["daemon"] = true
+			if s := strings.TrimSpace(o.server); s != "" {
+				obj["server"] = s
+			}
+			if key := strings.TrimSpace(o.agentKey); key != "" {
+				oldSecret, _ := existing["enrollment_secret"].(string)
+				oldKey, _ := existing["agent_key"].(string)
+				obj["enrollment_secret"] = key
+				if strings.TrimSpace(o.agentKeyFile) == "" {
+					// -agent-key：运维显式提供共享密钥，长期字段也要更新。
+					obj["agent_key"] = key
+				} else if oldSecret != "" && oldKey == oldSecret {
+					// -agent-key-file：这是一台一份的一次性令牌，只应进 enrollment_secret。
+					// 若旧配置把同一个值同时写进了两处（1.0.2 安装器如此），
+					// 顺手删掉长期字段里那份死凭据；与 enrollment_secret 不同的
+					// agent_key 可能是真正的共享密钥，不能碰。
+					delete(obj, "agent_key")
+				}
+			}
+			if o.agentID != "" {
+				obj["agent_id"] = o.agentID
+			}
+			if strings.TrimSpace(o.agentUUID) != "" {
+				obj["uuid"] = strings.TrimSpace(o.agentUUID)
+			}
+			if o.proxyIP != "" {
+				obj["proxy_ip"] = o.proxyIP
+			}
+			if strings.TrimSpace(o.serverFingerprint) != "" {
+				obj["server_fingerprint"] = strings.TrimSpace(o.serverFingerprint)
+			}
 		}
 	}
 	b, err := json.MarshalIndent(obj, "", "  ")

@@ -224,3 +224,115 @@ func TestResolveAdminPass(t *testing.T) {
 		}
 	})
 }
+
+// TestWriteConfigUpgradeMergesExplicitInputs 覆盖"覆盖安装修正 Agent 身份"这条路径：
+// 升级时必须把本次显式输入的 agent_id 与令牌写进去，而不是原样保留旧配置 ——
+// 否则 1.0.2 装出来的"无 agent_id + 令牌写两处"永远改不过来。
+func TestWriteConfigUpgradeMergesExplicitInputs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mocenter-agent.json")
+	old := `{
+  "server": "old:9000",
+  "daemon": true,
+  "enrollment_secret": "old-token",
+  "agent_key": "old-token",
+  "retry": 7
+}`
+	if err := os.WriteFile(path, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	o := options{
+		role: "agent", server: "192.168.117.1:9000", agentID: "vm-win10",
+		agentKey: "new-token", agentKeyFile: `C:\Temp\mc-agent-key`,
+	}
+	if err := writeConfig("agent", path, o); err != nil {
+		t.Fatalf("升级写配置失败: %v", err)
+	}
+	var got map[string]any
+	raw, _ := os.ReadFile(path)
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["server"] != "192.168.117.1:9000" {
+		t.Errorf("server = %v，期望应用本次输入", got["server"])
+	}
+	if got["agent_id"] != "vm-win10" {
+		t.Errorf("agent_id = %v，期望应用本次输入", got["agent_id"])
+	}
+	if got["enrollment_secret"] != "new-token" {
+		t.Errorf("enrollment_secret = %v，期望更新为本次令牌", got["enrollment_secret"])
+	}
+	if _, ok := got["agent_key"]; ok {
+		t.Errorf("旧配置里与 enrollment_secret 同值的 agent_key 应被清掉，实际 %v", got["agent_key"])
+	}
+	if got["retry"] != float64(7) {
+		t.Errorf("未识别的既有字段应原样保留，retry = %v", got["retry"])
+	}
+}
+
+// TestWriteConfigUpgradeKeepsDistinctSharedKey 升级不得误删真正的共享密钥：
+// 只有与旧 enrollment_secret 同值的那份才是一次性令牌的重复拷贝。
+func TestWriteConfigUpgradeKeepsDistinctSharedKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mocenter-agent.json")
+	old := `{"server":"old:9000","enrollment_secret":"old-token","agent_key":"shared-key"}`
+	if err := os.WriteFile(path, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	o := options{server: "old:9000", agentKey: "new-token", agentKeyFile: "x"}
+	if err := writeConfig("agent", path, o); err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	raw, _ := os.ReadFile(path)
+	_ = json.Unmarshal(raw, &got)
+	if got["agent_key"] != "shared-key" {
+		t.Errorf("agent_key = %v，真正的共享密钥必须保留", got["agent_key"])
+	}
+	if got["enrollment_secret"] != "new-token" {
+		t.Errorf("enrollment_secret = %v，期望更新", got["enrollment_secret"])
+	}
+}
+
+// TestWriteConfigUpgradeWithoutKey 升级可以不带任何凭据：此时不得报错，也不得清空既有值。
+func TestWriteConfigUpgradeWithoutKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mocenter-agent.json")
+	old := `{"server":"old:9000","enrollment_secret":"old-token","agent_id":"vm-win10"}`
+	if err := os.WriteFile(path, []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeConfig("agent", path, options{}); err != nil {
+		t.Fatalf("无凭据升级应允许: %v", err)
+	}
+	var got map[string]any
+	raw, _ := os.ReadFile(path)
+	_ = json.Unmarshal(raw, &got)
+	if got["enrollment_secret"] != "old-token" || got["agent_id"] != "vm-win10" || got["server"] != "old:9000" {
+		t.Errorf("既有配置被改动: %v", got)
+	}
+}
+
+// TestResetAgentServerCertsKeepsKey agent_id 变更时只清服务端签发的证书，私钥必须留下。
+func TestResetAgentServerCertsKeepsKey(t *testing.T) {
+	dir := t.TempDir()
+	creds := filepath.Join(dir, "creds")
+	if err := os.MkdirAll(creds, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"client.crt", "client.key", "ca.crt"} {
+		if err := os.WriteFile(filepath.Join(creds, n), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := resetAgentServerCerts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("删除数 = %d，期望 2（client.crt/ca.crt）", n)
+	}
+	if _, err := os.Stat(filepath.Join(creds, "client.key")); err != nil {
+		t.Fatal("client.key 必须保留，否则 TOFU 绑定会挡住重新签发")
+	}
+}

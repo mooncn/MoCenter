@@ -28,16 +28,16 @@ import (
 
 // Track 单条连接跟踪记录。
 type Track struct {
-	TunnelID   string    `json:"tunnel_id"`
-	PublicPort int       `json:"public_port"`
-	PublicConnID string  `json:"public_conn_id"`
-	AgentID    string    `json:"agent_id"`
-	AgentConnID string   `json:"agent_conn_id"`
-	CreatedAt  time.Time `json:"created_at"`
-	LastActiveAt time.Time `json:"last_active_at"`
-	BytesSent  int64     `json:"bytes_sent"`
-	BytesReceived int64  `json:"bytes_received"`
-	Status     string    `json:"status"` // Active/Closed/Timeout
+	TunnelID      string    `json:"tunnel_id"`
+	PublicPort    int       `json:"public_port"`
+	PublicConnID  string    `json:"public_conn_id"`
+	AgentID       string    `json:"agent_id"`
+	AgentConnID   string    `json:"agent_conn_id"`
+	CreatedAt     time.Time `json:"created_at"`
+	LastActiveAt  time.Time `json:"last_active_at"`
+	BytesSent     int64     `json:"bytes_sent"`
+	BytesReceived int64     `json:"bytes_received"`
+	Status        string    `json:"status"` // Active/Closed/Timeout
 }
 
 // Rule 一条端口映射规则。
@@ -69,17 +69,17 @@ var (
 
 // Manager 端口映射管理器，负责隧道建立、连接跟踪与双向转发。
 type Manager struct {
-	mu          sync.RWMutex
-	tracks      map[string]*Track            // key: TunnelID
-	byAgent     map[string]map[string]*Track // 二级索引：agentID -> TunnelID -> Track
-	pub         map[string]*publicTrack      // key: TunnelID -> 公网连接
-	rules       map[int]*Rule
-	listeners   map[int]net.Listener
-	sessions    *session.Manager
-	db          *storage.DB                  // SQLite 持久化
+	mu           sync.RWMutex
+	tracks       map[string]*Track            // key: TunnelID
+	byAgent      map[string]map[string]*Track // 二级索引：agentID -> TunnelID -> Track
+	pub          map[string]*publicTrack      // key: TunnelID -> 公网连接
+	rules        map[int]*Rule
+	listeners    map[int]net.Listener
+	sessions     *session.Manager
+	db           *storage.DB      // SQLite 持久化
 	agentForPort func(int) string // 由 Server 注入：根据公网端口找到目标 AgentID
-	idleTimeout time.Duration
-	seq         uint64
+	idleTimeout  time.Duration
+	seq          uint64
 }
 
 // NewManager 创建端口映射管理器。可选传入 SQLite DB 启用持久化。
@@ -306,6 +306,33 @@ func (m *Manager) DeleteRule(publicPort int) {
 	}
 }
 
+// DeleteRulesForAgents 删除目标主机（含历史别名）的全部端口映射规则，
+// 返回删除的规则数。删除主机时调用：规则指向一台已不存在的设备，继续监听
+// 只会让公网连接被接受后无处可转。
+func (m *Manager) DeleteRulesForAgents(agentIDs []string) int {
+	want := make(map[string]bool, len(agentIDs))
+	for _, id := range agentIDs {
+		if id != "" {
+			want[id] = true
+		}
+	}
+	if len(want) == 0 {
+		return 0
+	}
+	ports := make([]int, 0, 4)
+	m.mu.RLock()
+	for port, r := range m.rules {
+		if r != nil && want[r.AgentID] {
+			ports = append(ports, port)
+		}
+	}
+	m.mu.RUnlock()
+	for _, port := range ports {
+		m.DeleteRule(port)
+	}
+	return len(ports)
+}
+
 // DisableRule 停用规则：停止公网监听，但保留规则供后续重新启用。
 //
 // 规则对象会被 Rules() 交给 API 层并发序列化，因此状态变更一律"换对象"而不是
@@ -440,13 +467,13 @@ func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, r *Rule)
 	m.mu.Unlock()
 
 	m.TrackConn(&Track{
-		TunnelID:    tunnelID,
+		TunnelID:     tunnelID,
 		PublicConnID: tunnelID,
-		PublicPort:  publicPort,
-		AgentID:     r.AgentID,
-		CreatedAt:   time.Now(),
+		PublicPort:   publicPort,
+		AgentID:      r.AgentID,
+		CreatedAt:    time.Now(),
 		LastActiveAt: time.Now(),
-		Status:      "Active",
+		Status:       "Active",
 	})
 
 	// 通知 Agent 建立到内网服务的隧道

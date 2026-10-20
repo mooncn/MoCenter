@@ -35,6 +35,9 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
   const [err, setErr] = useState('')
   const [form, setForm] = useState({ agentId: '', label: '', ttl: 24 * 3600 })
   const [busy, setBusy] = useState(false)
+  // 已登记主机的 agent_id：给签发表单做候选。重装/重接入时直接选原名称，
+  // 避免"看起来像"的手填值把令牌签给另一台主机。
+  const [knownIDs, setKnownIDs] = useState([])
 
   const reload = useCallback(() => {
     Api.enrollTokens()
@@ -46,10 +49,21 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
 
   useEffect(() => { reload() }, [reload])
 
+  useEffect(() => {
+    Api.agents()
+      .then((d) => setKnownIDs((Array.isArray(d) ? d : []).map((a) => a.agent_id).filter(Boolean)))
+      .catch(() => {})
+  }, [])
+
   const issue = async (e) => {
     e.preventDefault()
     const agentId = form.agentId.trim()
-    if (!agentId) { setErr('必须先填写要接入的主机 agent_id'); return }
+    // 不绑定令牌是"一次性通行证"：谁先拿到谁就能用，且能覆盖同名主机的证书绑定。
+    // 留空是合法用法，但必须让人在签发前明确知道自己在发什么。
+    if (!agentId && !window.confirm(
+      '未填写 agent_id：这枚令牌不绑定任何主机，任何拿到它的主机都能用它换取一次证书，' +
+      '身份由该机决定（未指定时默认机器 UUID）。\n\n' +
+      '请只通过可信渠道交付。确定签发不绑定令牌？')) return
     setBusy(true)
     try {
       const d = await Api.issueEnrollToken({ agent_id: agentId, label: form.label.trim(), ttl_seconds: Number(form.ttl) })
@@ -94,17 +108,31 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
 
   return (
     <div className="card">
-      <h3>② 一次性注册令牌 <span className="muted" style={{ fontWeight: 'normal', fontSize: 13 }}>（推荐：一台一份、用后即废）</span></h3>
+      <h3>② 一次性注册令牌 <span className="muted" style={{ fontWeight: 'normal', fontSize: 13 }}>（agent_id 选填；用后即废）</span></h3>
       <p className="muted" style={{ fontSize: 13 }}>
         令牌把"谁能从我这里拿到一张合法客户端证书"从"知道部署密钥"收窄成"这台主机的这一次接入动作"：
-        它与 <code>agent_id</code> 绑定（A 机的令牌换不到 B 机的身份）、到期作废、换取成功即消耗。
-        同时会记住该主机证书的公钥指纹，之后有人拿泄露的共享密钥为该 <code>agent_id</code> 换一把新私钥会被直接拒绝。
+        <code>agent_id</code> <strong>选填</strong> —— 填写时令牌只认该主机（A 机的令牌换不到 B 机的身份），
+        留空则不绑定主机、任何主机可用一次（身份由该机决定，未指定时默认机器 UUID）。
+        两种令牌都到期作废、换取成功即消耗。服务端还会记住该主机证书的公钥指纹，
+        之后有人拿泄露的共享密钥为该 <code>agent_id</code> 换一把新私钥会被直接拒绝。
       </p>
+      <div className="notice" style={{ background: 'var(--panel-2)', color: 'var(--muted)' }}>
+        <strong>绑定令牌只认签发时填写的 agent_id；留空则谁先拿到谁就能用一次。</strong>
+        Agent 启动时若没有指定 <code>-agentid</code>（Linux）或安装向导里的「Agent 名称/ID」（Windows），
+        会回退成<strong>机器硬件 UUID</strong>（探测不到才用主机名）。绑定令牌与名称不一致时，服务端只会报
+        「注册凭证校验失败」—— 名称不匹配<strong>不会消耗令牌</strong>，改成一致的名称后可直接重试。
+        不绑定令牌没有这个限制，但它是一次性通行证，请只通过可信渠道交付。
+        {knownIDs.length > 0 && ' 下方输入框会提示已登记主机的名称。'}
+      </div>
       {err && <div className="notice err">{err}</div>}
 
       <form className="row-inline" onSubmit={issue} style={{ flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-        <input style={{ width: 220 }} placeholder="agent_id（如 web-01）" value={form.agentId} autoComplete="off"
+        <input style={{ width: 220 }} placeholder="agent_id（选填，留空=不绑定）" value={form.agentId} autoComplete="off"
+          list="enroll-known-ids"
           onChange={(e) => setForm({ ...form, agentId: e.target.value })} />
+        <datalist id="enroll-known-ids">
+          {knownIDs.map((id) => <option key={id} value={id} />)}
+        </datalist>
         <input style={{ width: 160 }} placeholder="备注（可选）" value={form.label} autoComplete="off"
           onChange={(e) => setForm({ ...form, label: e.target.value })} />
         <select style={{ width: 120 }} value={form.ttl} onChange={(e) => setForm({ ...form, ttl: e.target.value })}>
@@ -116,7 +144,12 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
 
       {issued && (
         <div className="notice ok" style={{ marginTop: 12 }}>
-          <div>已为 <code>{issued.agent_id}</code> 签发令牌 —— <strong>明文只显示这一次</strong>，关掉本页就再也取不到：</div>
+          <div>
+            {issued.unbound
+              ? <>已签发<strong>不绑定</strong>令牌（任何主机一次，身份按该机上报）</>
+              : <>已为 <code>{issued.agent_id}</code> 签发令牌</>}
+            {' '}—— <strong>明文只显示这一次</strong>，关掉本页就再也取不到：
+          </div>
           <div className="row-inline" style={{ marginTop: 6, alignItems: 'center' }}>
             <code className="key-box">{issued.token}</code>
             <button className="btn-mini" onClick={() => copy(issued.token, 'tok')}>{copied === 'tok' ? '已复制' : '复制'}</button>
@@ -127,7 +160,7 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
       <div className="table-scroll" style={{ marginTop: 12 }}>
         <table>
           <thead>
-            <tr><th>主机</th><th>状态</th><th>备注</th><th>创建</th><th>到期</th><th>操作</th></tr>
+            <tr><th>绑定主机</th><th>状态</th><th>备注</th><th>创建</th><th>到期</th><th>操作</th></tr>
           </thead>
           <tbody>
             {tokens.length === 0 && <tr><td colSpan={6} className="table-empty">尚无注册令牌</td></tr>}
@@ -135,7 +168,7 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
               const st = tokenState(t)
               return (
                 <tr key={t.id}>
-                  <td><code>{t.agent_id}</code></td>
+                  <td>{t.unbound ? <span className="muted">不绑定（按该机上报身份）</span> : <code>{t.agent_id}</code>}</td>
                   <td><span className={`badge ${st.cls}`}>{st.text}</span></td>
                   <td className="cell-sub">{t.label || '—'}</td>
                   <td className="cell-sub">{fmtTime(t.created_at)}</td>
@@ -143,7 +176,7 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
                   <td>
                     {!t.used_at && (
                       <button className="btn-mini"
-                        onClick={() => revoke({ id: t.id }, `吊销这枚 ${t.agent_id} 的令牌？`)}>
+                        onClick={() => revoke({ id: t.id }, `吊销这枚 ${t.unbound ? '不绑定' : t.agent_id} 的令牌？`)}>
                         吊销
                       </button>
                     )}
@@ -154,16 +187,27 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
           </tbody>
         </table>
       </div>
-      {tokens.some((t) => !t.used_at && !t.expired) && (
+      {form.agentId.trim() && tokens.some((t) => !t.used_at && !t.expired && !t.unbound && t.agent_id === form.agentId.trim()) && (
         <p className="muted" style={{ fontSize: 12 }}>
           某台机器不再允许接入时，可一次清掉它全部未使用的令牌：
           {' '}
           <button className="btn-mini" type="button"
-            onClick={() => revoke({ agent_id: (form.agentId || '').trim() }, '按上方 agent_id 吊销该机全部未使用令牌？')}>
+            onClick={() => revoke({ agent_id: form.agentId.trim() }, '按上方 agent_id 吊销该机全部未使用令牌？')}>
             按 agent_id 全部吊销
           </button>
         </p>
       )}
+      {tokens.some((t) => t.unbound && !t.used_at && !t.expired) && (
+        <p className="muted" style={{ fontSize: 12 }}>
+          不绑定令牌不对应任何主机，无法按 agent_id 批量吊销 —— 请在表格里逐条吊销。
+        </p>
+      )}
+      <p className="muted" style={{ fontSize: 12 }}>
+        令牌只在<strong>换取客户端证书</strong>时消耗。已经持有证书的机器重连只出示证书，
+        不会再消耗令牌 —— 若命令行粘贴了令牌但仍显示「待使用」，说明该机
+        <code>creds/</code> 里已有可用证书，删掉 <code>client.crt</code> 与 <code>ca.crt</code>
+        （保留 <code>client.key</code>）后重启即可重新换取。
+      </p>
 
       {data && data.shared_key_enabled && (
         <div className="notice err" style={{ marginTop: 12 }}>
@@ -288,16 +332,31 @@ export default function AgentEnroll() {
   // 未签发时留占位符而不是填入共享注册密钥 —— 那把是全网身份根，
   // 出现在可直接粘贴的命令里就等于被贴进工单/聊天/截图，泄露面比密钥本身还大。
   const keyArg = issued?.token || '<一次性注册令牌>'
-  const agentIdArg = issued?.agent_id || '<主机名>'
-  const linuxCmd = `./mocenter-agent -server ${server} -agentid ${agentIdArg} -agent-key ${keyArg} -daemon`
-  const winCmd = `mocenter-deploy.exe install -role agent -server ${server} -agentid ${agentIdArg} -agent-key ${keyArg}`
+  // 不绑定令牌不带 -agentid：让 Agent 走默认身份（未指定时回退机器 UUID）；
+  // 绑定令牌则必须原样带上签发时的名称，否则服务端会拒绝。
+  const agentIdArg = issued ? (issued.unbound ? '' : issued.agent_id) : '<主机名>'
+  const agentIdFlag = agentIdArg ? ` -agentid ${agentIdArg}` : ''
+  const serviceAgentId = agentIdArg ? ` --agentid=${agentIdArg}` : ''
+  // Linux：先用前台进程完成首次换取（看到上线后 Ctrl+C），再交给 systemd。
+  // 两步分开写是因为 install-linux.sh 不接受注册凭据：先手工换取，
+  // 证书落到 /etc/mocenter/creds，之后服务只凭证书启动，凭据不再落盘。
+  const linuxEnrollCmd = [
+    'sudo install -m 0755 ./mocenter-agent /usr/local/bin/mocenter-agent',
+    'sudo mkdir -p /etc/mocenter && sudo chmod 700 /etc/mocenter',
+    `sudo /usr/local/bin/mocenter-agent -config /etc/mocenter/mocenter-agent.json -server ${server}${agentIdFlag} -enroll-secret ${keyArg}`,
+  ].join('\n')
+  const linuxServiceCmd = `sudo bash scripts/deploy/install-linux.sh --role=agent --bin=/usr/local/bin/mocenter-agent --server=${server}${serviceAgentId}`
+  // Windows：图形向导（推荐）或静默命令。凭据走临时文件，安装器读完即删，
+  // 不进命令行 —— 安装那几十秒里同机任何进程都能看到别人的命令行。
+  const winCmd = `mocenter-deploy.exe install -role agent -server ${server}${agentIdFlag} -agent-key-file C:\\Windows\\Temp\\mc-token.txt`
   const fpCmd = `./mocenter-agent -server ${server} -agentid <主机名> -server-fingerprint ${info.fingerprint || '<指纹>'}`
 
   return (
     <div className="page">
       <h2 className="page-title">Agent 接入</h2>
       <p className="muted" style={{ marginTop: -6 }}>
-        接入一台新主机只需要下面这一条命令 —— 加密与双向认证会自动完成，无需在本机准备任何证书文件。
+        接入分三步：签发一次性令牌（<code>agent_id</code> 可选）→ 在被控机安装 Agent（Linux / Windows 分别见 ④）→ 回仪表盘确认上线。
+        加密与双向认证自动完成，无需在本机准备任何证书文件。
       </p>
 
       <div className="card">
@@ -387,9 +446,11 @@ export default function AgentEnroll() {
       </div>
 
       <div className="card">
-        <h3>④ 在新主机上执行</h3>
+        <h3>④ 在新主机上安装 Agent</h3>
         <p className="muted" style={{ fontSize: 13 }}>
-          先在 ② 里为该主机签发令牌，下面的命令会自动带上它（令牌与主机名一起替换进命令）。
+          先在 ② 里签发令牌，下面的命令会自动带上它：绑定令牌连 <code>agent_id</code> 一起写进命令，
+          不绑定令牌则不带名称、由该机自行决定身份。命令里的端口是 Agent 通道（服务端 <code>-listen</code>，默认 9000），<strong>不是</strong>浏览器访问控制台的 8080 ——
+          写反的表现是 Agent 一直重连、仪表盘始终不上线。
         </p>
         {!serverHost && (
           <p className="muted" style={{ fontSize: 13 }}>
@@ -397,21 +458,74 @@ export default function AgentEnroll() {
             请手工替换成被控机能访问到的地址。
           </p>
         )}
-        <p className="muted" style={{ fontSize: 13 }}>Linux</p>
-        <div className="row-inline">
-          <code className="cmd-box">{linuxCmd}</code>
-          <button className="btn-mini" onClick={() => copy(linuxCmd, 'linux')}>{copied === 'linux' ? '已复制' : '复制'}</button>
+        <p className="muted" style={{ fontSize: 12 }}>
+          {issued ? (
+            issued.unbound ? (
+              <>当前命令填的是刚签发的<strong>不绑定</strong>令牌：命令不带 <code>-agentid</code>／「Agent 名称/ID」，
+                Agent 会以<strong>机器硬件 UUID</strong> 上线。若想用自定义名称，自行加上
+                <code>-agentid &lt;名称&gt;</code> 即可（无需与令牌一致）。</>
+            ) : (
+              <>当前命令填的是刚为 <code>{issued.agent_id}</code> 签发的令牌；安装时的
+                <code>-agentid</code>／「Agent 名称/ID」必须与此<strong>完全一致</strong>。</>
+            )
+          ) : (
+            <>还没有签发令牌：命令里是占位符。先完成 ② 再复制，或手工把占位符替换成令牌与主机名。</>
+          )}
+        </p>
+
+        <h4 style={{ marginBottom: 4 }}>Linux</h4>
+        <p className="muted" style={{ fontSize: 13 }}>
+          <strong>第 1 步 · 首次换取证书（只做一次）</strong>：把 <code>mocenter-agent</code> 拷到目标机，执行下面的命令。
+          日志出现「已从服务端换取客户端证书」、仪表盘显示在线后，按 <code>Ctrl+C</code> 结束前台进程。
+          一次性令牌用 <code>-enroll-secret</code> 传入；只有仍在使用部署级共享密钥的旧机器才用
+          <code>-agent-key</code>（两者的区别见 ③）。
+        </p>
+        <div className="row-inline" style={{ alignItems: 'flex-start' }}>
+          <pre className="cmd-box" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0 }}>{linuxEnrollCmd}</pre>
+          <button className="btn-mini" onClick={() => copy(linuxEnrollCmd, 'linux1')}>{copied === 'linux1' ? '已复制' : '复制'}</button>
         </div>
-        <p className="muted" style={{ fontSize: 13 }}>Windows（静默安装为服务）</p>
+        <p className="muted" style={{ fontSize: 13 }}>
+          <strong>第 2 步 · 注册为 systemd 服务</strong>：证书已在 <code>/etc/mocenter/creds</code>，服务只凭证书启动，
+          不再需要令牌。
+        </p>
+        <div className="row-inline">
+          <code className="cmd-box">{linuxServiceCmd}</code>
+          <button className="btn-mini" onClick={() => copy(linuxServiceCmd, 'linux2')}>{copied === 'linux2' ? '已复制' : '复制'}</button>
+        </div>
+        <p className="muted" style={{ fontSize: 13 }}>
+          <strong>第 3 步 · 确认</strong>：<code>systemctl status mocenter-agent --no-pager</code> 为 active；
+          <code>sudo ls -l /etc/mocenter/creds/</code> 能看到 <code>client.crt</code>／<code>client.key</code>；
+          日志用 <code>journalctl -u mocenter-agent -n 50 --no-pager</code> 查看。
+        </p>
+
+        <h4 style={{ marginBottom: 4 }}>Windows</h4>
+        <p className="muted" style={{ fontSize: 13, marginTop: 4 }}>
+          <strong>方式 A · 图形安装向导（推荐）</strong>：以管理员身份运行 <code>MoCenter-Setup-*.exe</code>，
+          角色选 <strong>Agent</strong>，填写服务端地址与一次性注册令牌。
+          「Agent 名称/ID」：绑定令牌<strong>必须</strong>填 ② 里签发时用的 <code>agent_id</code>；
+          不绑定令牌可留空（默认机器 UUID），也可自定名称。
+          若向导里没有「Agent 名称/ID」这一项（1.0.2 及更早版本）：不绑定令牌可直接用；
+          绑定令牌请改用方式 B，否则 Agent 会以机器 UUID 上报，令牌必然校验失败。
+          已经用旧版装过的机器，用新版安装包<strong>覆盖安装</strong>即可：升级会把本次填写的「Agent 名称/ID」与令牌
+          写进既有配置，并在身份变化时清掉旧证书（保留 <code>client.key</code>）后重新换取；
+          其余配置项留空即沿用原值。
+        </p>
+        <p className="muted" style={{ fontSize: 13 }}>
+          <strong>方式 B · 命令行静默安装</strong>：先把令牌<strong>单独一行</strong>写进
+          <code>C:\Windows\Temp\mc-token.txt</code>，再以管理员身份执行（安装器读完会自动删除该文件，
+          令牌不进命令行历史）：
+        </p>
         <div className="row-inline">
           <code className="cmd-box">{winCmd}</code>
           <button className="btn-mini" onClick={() => copy(winCmd, 'win')}>{copied === 'win' ? '已复制' : '复制'}</button>
         </div>
-        {issued && (
-          <p className="muted" style={{ fontSize: 12 }}>
-            当前命令里填的是刚为 <code>{issued.agent_id}</code> 签发的令牌（<code>-agentid</code> 已同步成该主机）。
-          </p>
-        )}
+        <p className="muted" style={{ fontSize: 13 }}>
+          <strong>第 3 步 · 确认</strong>：<code>sc query MoCenterAgent</code> 为 <code>RUNNING</code>；
+          配置在 <code>C:\ProgramData\MoCenter\agent\mocenter-agent.json</code>（<code>enrollment_secret</code>
+          换取成功后被清空），证书在 <code>C:\ProgramData\MoCenter\agent\creds\</code>；
+          日志在 <code>C:\ProgramData\MoCenter\agent\logs\MoCenterAgent.log</code>。
+          安装失败时先看引擎日志 <code>&lt;安装目录&gt;\mocenter-deploy.log</code>。
+        </p>
       </div>
 
       <div className="card">
@@ -429,6 +543,21 @@ export default function AgentEnroll() {
       <div className="card">
         <h3>常见问题</h3>
         <ul className="muted" style={{ fontSize: 13, lineHeight: 1.9 }}>
+          <li><strong>令牌签发后一直显示「待使用」</strong>：先看目标机日志里有没有
+            「本机已有客户端证书……注册凭据本次不会被使用」。有证书的 Agent 重连只出示证书，
+            不会再消耗令牌（这是正常的）；要改用令牌重换，请删除该机 <code>creds/client.crt</code>
+            与 <code>creds/ca.crt</code>、<strong>保留 <code>client.key</code></strong> 后重启。
+            若日志里是「服务端拒绝换取客户端证书（本机 agent_id=…）」，则按上一条核对名称；
+            名称不匹配同样<strong>不会消耗令牌</strong>。</li>
+          <li><strong>Agent 报「注册凭证校验失败」/「令牌无效」</strong>：若令牌签发时 <code>agent_id</code> 留空
+            （不绑定令牌），不会因名称不一致被拒，可跳过下面的名称核对，先确认令牌未过期、未被使用。
+            绑定令牌则先核对 <code>agent_id</code>，而不是怀疑令牌抄错。
+            Agent 未指定名称时会回退成<strong>机器硬件 UUID</strong>（Windows 安装向导 1.0.2 及更早没有名称项），
+            与签发令牌时填写的名字不一致，服务端就无法区分"名字不匹配"与"凭据不对"（刻意不给出探测口）。
+            在目标机日志里能找到实际使用的名称（开头的「[agent] 启动 …，Agent …」或
+            「未指定 AgentID，使用设备 UUID」）；按该名称重签令牌，
+            或在启动参数／安装向导里显式指定签发时的名称即可。名称不匹配<strong>不会消耗令牌</strong>。
+            若令牌已过期或已使用，重新签发一枚。</li>
           <li><strong>Agent 报"身份指纹不一致" / "服务端部署身份 CA 已变化"</strong>：服务端重装或换过 CA。
             把本页显示的<strong>新指纹</strong>填进被控机的 <code>server_fingerprint</code>（写在
             <code>mocenter-agent.json</code> 里远程下发即可），Agent 会<strong>自动</strong>重新换取证书，无需登录被控机。

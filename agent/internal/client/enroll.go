@@ -53,6 +53,10 @@ type enrollmentCredential struct {
 	CAFile    string
 	Identity  string
 	Fingerprt string
+	// Source 服务端认定的凭证类型（token / shared-key / anonymous）。
+	Source string
+	// UsedField 本机实际出示凭据的配置字段（enrollment_secret / agent_key）。
+	UsedField string
 }
 
 // tryEnroll 用注册密钥换取客户端证书并落盘。返回的凭证供后续连接直接使用。
@@ -63,12 +67,15 @@ type enrollmentCredential struct {
 // 重新换取"就永远走不通 —— 那正是"必须先人肉删 creds/ 才能恢复"的根因之一。
 func (c *Client) tryEnroll() (*enrollmentCredential, error) {
 	secret := strings.TrimSpace(c.cfg.EnrollmentSecret)
+	usedField := "enrollment_secret"
 	if secret == "" {
 		secret = strings.TrimSpace(c.cfg.AgentKey)
+		usedField = "agent_key"
 	}
 	if secret == "" {
 		return nil, fmt.Errorf("未配置注册密钥（enrollment_secret / agent_key 均为空），无法换取客户端证书")
 	}
+	logf("[agent] 正在用注册凭据换取客户端证书（agent_id=%q，凭据来自 %s）…", c.cfg.AgentID, usedField)
 	// 客户端私钥：本机有则复用，没有才新生成（私钥永不离开本机）。
 	// 复用不是省事：服务端按 agent_id → 证书公钥指纹(SPKI) 做 TOFU 绑定，
 	// 换私钥就等于换机器身份。若每次重签都换新钥，服务端换过 CA 之后
@@ -129,7 +136,13 @@ func (c *Client) tryEnroll() (*enrollmentCredential, error) {
 			return nil, err
 		}
 		if !resp.OK || resp.CertPEM == "" {
-			return nil, fmt.Errorf("服务端拒绝签发证书: %s", resp.Message)
+			// 把本机实际使用的 agent_id 一并带出来：令牌是按 agent_id 绑定的，
+			// 服务端刻意不区分"名字不匹配/令牌不对"，排障只能靠本机这一侧把
+			// "我到底是谁"写清楚，否则只剩一句"注册凭证校验失败"。
+			return nil, fmt.Errorf("服务端拒绝换取客户端证书（本机 agent_id=%q）：%s"+
+				"；请核对控制台签发令牌时填写的 agent_id 与本机是否完全一致"+
+				"（安装向导的「Agent 名称/ID」或 -agentid；留空会回退为机器 UUID）",
+				c.cfg.AgentID, resp.Message)
 		}
 		// 身份连续性：先确认"回应我们的确实是本机认可的那套总控"，再落地任何东西。
 		// 这一步顺序很关键 —— 先查后写，才算真正"不信任陌生人"。
@@ -149,15 +162,20 @@ func (c *Client) tryEnroll() (*enrollmentCredential, error) {
 		}
 		cred := &enrollmentCredential{
 			Cert: cert, Identity: resp.Identity, Fingerprt: respFP,
+			Source: resp.CredSource, UsedField: usedField,
 		}
 		if err := c.saveCredential(cred, resp.CertPEM, resp.CAPEM, keyPEMText); err != nil {
 			return nil, err
 		}
+		used := ""
+		if resp.CredSource == protocol.CredSourceToken {
+			used = "，一次性令牌已在服务端标记为已使用"
+		}
 		if caFP != "" {
-			logf("[agent] 已从服务端换取客户端证书（身份 %s，服务端指纹 %s）；证书已保存，后续连接直接携带",
-				resp.Identity, DisplayFingerprint(caFP))
+			logf("[agent] 已从服务端换取客户端证书（身份 %s%s，服务端指纹 %s）；证书已保存，后续连接直接携带",
+				resp.Identity, used, DisplayFingerprint(caFP))
 		} else {
-			logf("[agent] 已从服务端换取客户端证书（身份 %s）；证书已保存，后续连接直接携带", resp.Identity)
+			logf("[agent] 已从服务端换取客户端证书（身份 %s%s）；证书已保存，后续连接直接携带", resp.Identity, used)
 		}
 		return cred, nil
 	}
@@ -321,7 +339,10 @@ func (c *Client) saveCredential(cred *enrollmentCredential, certPEM, caPEM strin
 		c.onEnrolled(cred)
 	}
 	if c.onEnrolledFiles != nil {
-		c.onEnrolledFiles(CredentialFiles{CertFile: cred.CertFile, KeyFile: cred.KeyFile, CAFile: cred.CAFile})
+		c.onEnrolledFiles(CredentialFiles{
+			CertFile: cred.CertFile, KeyFile: cred.KeyFile, CAFile: cred.CAFile,
+			Source: cred.Source, UsedField: cred.UsedField,
+		})
 	}
 	return nil
 }

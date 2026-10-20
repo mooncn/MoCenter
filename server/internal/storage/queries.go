@@ -652,6 +652,46 @@ func (db *DB) UpdateAgentIdentity(oldID, newID, uuid string) error {
 	return nil
 }
 
+// DeleteAgentData 删除主机记录及其探针/延迟历史。
+//
+// agentIDs 传入同一设备当前与历史用过的所有 agent_id（别名）：设备按 UUID 归并后，
+// 库里只保留一行，但历史采样可能还挂在旧别名下。端口映射规则由调用方经
+// portmap.Manager 删除（那里同时负责停止监听），不在这里删。
+func (db *DB) DeleteAgentData(agentIDs []string) error {
+	ids := make([]string, 0, len(agentIDs))
+	seen := make(map[string]bool, len(agentIDs))
+	for _, id := range agentIDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("开始删除主机事务失败: %w", err)
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"agents", "probe_history", "latency_history"} {
+		if _, err := tx.Exec("DELETE FROM "+table+" WHERE agent_id IN ("+placeholders+")", args...); err != nil {
+			return fmt.Errorf("删除主机数据失败（%s）: %w", table, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交删除主机事务失败: %w", err)
+	}
+	return nil
+}
+
 // LoadAgent 加载单个主机信息。
 func (db *DB) LoadAgent(agentID string) (*AgentRow, error) {
 	var a AgentRow

@@ -10,6 +10,29 @@
 | Agent | Linux（CentOS/RHEL 7/8、Ubuntu 18.04~22.04、Debian 10/11）、Windows 10 1809+ / Server 2019+，x86_64 为主 |
 | Web | 浏览器 Chrome/Edge/Firefox 最新两个大版本 |
 
+### Windows 版本兼容性（2026-10-20 评估）
+
+| 版本 | 结论 | 依据 |
+|------|------|------|
+| Windows 10 **1809（17763）及以上** | **支持** | 本项目支持口径为 1809+；`installer/setup.iss` 的 `MinVersion=10.0`；既有真机复测已在 Win10 19044 跑通安装、注册与 VNC「服务模式」 |
+| Windows 11（21H2–24H2） | **支持（基础链路已实机验证）** | 2026-10-20 在 Windows 11 24H2（10.0.26100，x64）用当前工作树构建实跑：Server 托管 Web、Agent 注册上线 / 探针 / 离线判定 / 一次性令牌换取证书全链路通过；VNC 与虚拟显示本轮未在 Win11 单独复测（UltraVNC 1.8.2.4 官方支持 Win11） |
+| Windows 10 1809 以下 / Server 2016 | **不在支持范围** | 安装器只校验主版本号，可能能装上，但超出支持口径，未做兼容性验证 |
+| Windows 7 / 8 / 8.1 / Server 2008 R2 | **不支持** | Go 1.21 起已移除对 Win7/8/8.1 的支持（本项目 `go 1.26.6`）；`setup.iss` 的 `MinVersion=10.0` 会直接拒绝安装；绕过安装也不保证运行时可用 |
+| 32 位 Windows | **不支持** | `ArchitecturesAllowed=x64compatible` / `ArchitecturesInstallIn64BitMode=x64compatible`，图形安装器只提供 x64 |
+
+> 本表只讨论 Windows 客户端/被控端。Server 角色推荐部署在 Linux；Windows 上同时装 Server 也能运行，但未纳入上表的长期支持承诺。
+
+### Windows 图形安装程序（MoCenter-Setup）
+
+- **按角色分页**：只选 Agent 时，向导只显示服务端地址、Agent 名称/ID（选填；绑定令牌须与签发时一致，留空则用机器 UUID）与注册凭据，
+  不出现 Server 的后台账号和监听端口；只选 Server 时反之；两者都选才显示全部页面。
+- **升级不重填**：检测到既有配置即按升级处理，只替换二进制与服务，连接参数与账号沿用原配置。
+- **卸载可选清数据**：卸载时会弹窗询问「是否同时删除配置与数据」，默认**保留**
+  （`%ProgramData%\MoCenter\<角色>`）；安装时已把数据目录记入
+  `HKLM\Software\MoCenter\DataDir`，自定义目录也能删对地方。
+- **静默卸载**同样默认保留；要一并清理请显式传参：
+  `"C:\Program Files\MoCenter\unins000.exe" /SILENT /PURGE`。
+
 ## 二、部署方式
 
 > 仓库里保留着 `server/Dockerfile`，但**容器不是本项目的交付形态**：不发镜像、不做兼容性维护，
@@ -493,14 +516,18 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
 
    **注册凭据：优先用一次性令牌**
 
-   Web「Agent 接入」页（或 `POST /api/enroll/tokens`）可为指定 `agent_id` 签发**一次性注册令牌**：
-   绑定主机名、默认 24 小时过期、用后即废，泄露只影响那一台那一次。相关的存储与行为：
+   Web「Agent 接入」页（或 `POST /api/enroll/tokens`）可签发**一次性注册令牌**：
+   默认绑定 `agent_id`、24 小时过期、用后即废，泄露只影响那一台那一次。相关的存储与行为：
 
    - `<data>/enroll.json`（0600）：待用令牌 + 每台主机的 `agent_id → 客户端公钥指纹(SPKI)` 绑定。
      令牌以明文存储是必要的 —— 注册凭证要拿去做 HMAC，服务端必须能还原原文；
      安全收益来自"按台绑定 + 短有效期 + 单次消费"，而不是存储形态。
+   - **`agent_id` 可留空（不绑定令牌）**：任何主机可用一次，身份以该机上报为准（Agent 未指定
+     `-agentid` 时回退为机器 UUID/主机名）。它本质是一次性 bearer 凭据 —— 谁先拿到谁就能用，
+     且可用于覆盖同名主机的 TOFU 绑定，只应通过可信渠道交付。填写了 `agent_id` 的令牌仍严格按名称校验，
+     名称不匹配**不消耗令牌**。
    - **TOFU 绑定**：首次注册记下公钥指纹；同一 `agent_id` 换不同密钥的证书再来注册会被拒，
-     除非带上一份新签发的**一次性令牌**（`enroll.json` 记录 `rebinds` 次数，控制台可清除绑定）。
+     除非带上一份新签发的**一次性令牌**（绑定或不绑定均可；`enroll.json` 记录 `rebinds` 次数，控制台可清除绑定）。
    - **在线 `agent_id` 拒发**：目标主机已有活动会话时不签发证书，避免"趁在线冒名顶替"。
      凭据校验在这一步**之前**完成（否则这里就成了"某主机是否在线"的探测口），
      所以被拒时那枚令牌也已经消耗掉，需要重新签发。

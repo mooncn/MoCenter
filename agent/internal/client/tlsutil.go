@@ -125,6 +125,19 @@ func (c *Client) clientCert() *tls.Certificate {
 	return &cert
 }
 
+// certCommonName 取客户端证书 DN 里的 CN（服务端就是拿它当连接身份的）。
+// 解析失败或没有 CN 时返回空串，调用方应跳过身份一致性判断。
+func certCommonName(cert *tls.Certificate) string {
+	if cert == nil || len(cert.Certificate) == 0 {
+		return ""
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(leaf.Subject.CommonName)
+}
+
 // spkiFingerprint 取证书公钥指纹（SHA-256 前 16 位 hex）。
 // 用公钥而不是整证书：换签发有效期、换 SAN 都不会改变指纹。
 func spkiFingerprint(cert *x509.Certificate) string {

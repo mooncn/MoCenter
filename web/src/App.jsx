@@ -67,9 +67,12 @@ function Layout() {
     // 共用一份来源，避免"登录前一个标题、登录后又变回去"。
     PublicApi.branding().then((b) => applySiteTitle(b.site_title)).catch(() => {})
 
-    // 备注保存后刷新主机列表，使备注在仪表盘即时生效
-    const onRemarkSaved = () => Api.agents().then((d) => setAgents(Array.isArray(d) ? d : [])).catch(() => {})
+    // 备注保存 / 删除主机后刷新主机列表，不必等下一次 5 秒推送
+    const reloadAgents = () => Api.agents().then((d) => setAgents(Array.isArray(d) ? d : [])).catch(() => {})
+    const onRemarkSaved = reloadAgents
+    const onAgentsRefresh = reloadAgents
     window.addEventListener('mc-remark-saved', onRemarkSaved)
+    window.addEventListener('mc-agents-refresh', onAgentsRefresh)
 
     // 建立 WebSocket，接收实时推送
     const token = localStorage.getItem('mc_token')
@@ -79,7 +82,11 @@ function Layout() {
     })
     socket.connect()
     socketRef.current = socket
-    return () => { socket.close(); window.removeEventListener('mc-remark-saved', onRemarkSaved) }
+    return () => {
+      socket.close()
+      window.removeEventListener('mc-remark-saved', onRemarkSaved)
+      window.removeEventListener('mc-agents-refresh', onAgentsRefresh)
+    }
   }, [])
 
   // 登出：先通知服务端吊销当前会话 Token，再清除本地凭据

@@ -69,6 +69,11 @@ export const Api = {
     const { data } = await api.get('/agents')
     return data
   },
+  // 删除一台离线主机的登记与历史数据（不会卸载目标机上的 Agent）
+  async deleteAgent(agentId) {
+    const { data } = await api.post('/agents/delete', { agent_id: agentId })
+    return data
+  },
   // 获取主机历史探针趋势；max 控制返回采样点上限（服务端按需降采样）
   async history(agent, since, max) {
     const { data } = await api.get('/agents/history', { params: { agent, since, max } })

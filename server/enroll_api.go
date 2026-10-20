@@ -49,8 +49,10 @@ func enrollTokensHandler(store *agentauth.EnrollStore, verifier *agentauth.Verif
 				return
 			}
 			agentID := strings.TrimSpace(body.AgentID)
-			if !validAgentID(agentID) {
-				writeJSON(w, map[string]interface{}{"ok": false, "msg": "agent_id 非法（不能为空、含空白或超过 128 字符）"})
+			// agent_id 可留空：留空表示"不绑定"，任何主机可用一次，身份由该机决定
+			// （客户端未指定 agent_id 时回退为机器 UUID）。填写时仍必须通过合法性校验。
+			if agentID != "" && !validAgentID(agentID) {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "agent_id 非法（不能含空白或超过 128 字符；留空表示不绑定）"})
 				return
 			}
 			token, rec, err := store.CreateToken(agentID, body.Label, time.Duration(body.TTLSeconds)*time.Second)
@@ -58,12 +60,21 @@ func enrollTokensHandler(store *agentauth.EnrollStore, verifier *agentauth.Verif
 				writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 				return
 			}
+			binding := "绑定 agent_id=" + agentID
+			if agentID == "" {
+				binding = "不绑定 agent_id（任意主机一次，默认按机器 UUID 上线）"
+			}
 			auditEnrollOp(r, authz, router, agentID, "签发一次性注册令牌",
-				"令牌 "+rec.ID+"，有效期至 "+time.Unix(rec.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+				"令牌 "+rec.ID+"，"+binding+"，有效期至 "+time.Unix(rec.ExpiresAt, 0).Format("2006-01-02 15:04:05"))
+			msg := "令牌已签发（只显示这一次）。填进该机的 agent_key 或 enrollment_secret 后启动 Agent 即可"
+			if agentID == "" {
+				msg = "不绑定令牌已签发（只显示这一次）：任意主机可用一次，身份由该机决定（未指定 agent_id 时默认机器 UUID）。填进 agent_key 或 enrollment_secret 后启动 Agent 即可"
+			}
 			writeJSON(w, map[string]interface{}{
 				"ok": true, "token": token, "id": rec.ID, "agent_id": rec.AgentID,
+				"unbound":    rec.AgentID == "",
 				"expires_at": rec.ExpiresAt,
-				"msg":        "令牌已签发（只显示这一次）。填进该机的 agent_key 或 enrollment_secret 后启动 Agent 即可",
+				"msg":        msg,
 			})
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

@@ -24,6 +24,7 @@ import (
 	"mocenter/agent/internal/config"
 	"mocenter/agent/internal/daemon"
 	probepkg "mocenter/agent/internal/probe"
+	"mocenter/agent/internal/protocol"
 	"mocenter/agent/internal/version"
 	"mocenter/agent/internal/winapp"
 )
@@ -273,6 +274,20 @@ func main() {
 		cfg.ClientKey = cred.KeyFile
 		if cfg.CACert == "" {
 			cfg.CACert = cred.CAFile
+		}
+		// 一次性令牌用完即废，不能留在配置里：
+		//   · CLI 用 -agent-key <令牌> 时，令牌被写进长期字段 agent_key；
+		//   · 1.0.2 图形安装器把同一个令牌同时写进 enrollment_secret 与 agent_key。
+		// 后两种情况只清 enrollment_secret 会留下一条永远换不到证书的死凭据 ——
+		// 服务端换 CA 时自动重签会拿它去试，失败后现象看起来像"证书机制坏了"。
+		//
+		// 只在能确认 agent_key 就是这次用掉的一次性令牌时才清：
+		//   · 本次凭据本来就取自 agent_key；或
+		//   · 两个字段的值相同（安装器把同一枚令牌写了两份）。
+		// 若 agent_key 是另一把共享密钥，必须保留 —— 那是 CA 轮换后的恢复路径。
+		if cred.Source == protocol.CredSourceToken &&
+			(cred.UsedField == "agent_key" || cfg.AgentKey == cfg.EnrollmentSecret) {
+			cfg.AgentKey = ""
 		}
 		cfg.EnrollmentSecret = ""
 		if err := config.Save(*configPath, cfg); err != nil {

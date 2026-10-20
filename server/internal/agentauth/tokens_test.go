@@ -64,6 +64,94 @@ func TestTokenBoundToAgentID(t *testing.T) {
 	}
 }
 
+// TestUnboundTokenAcceptsAnyAgentOnce 不绑定令牌（签发时留空 agent_id）：
+// 任何主机都能用它换取一次证书，身份以它上报的 agent_id 为准；用掉即焚。
+func TestUnboundTokenAcceptsAnyAgentOnce(t *testing.T) {
+	store := newTestStore(t)
+	secret, _, err := store.CreateToken("", "any-host", time.Hour)
+	if err != nil {
+		t.Fatalf("签发不绑定令牌失败: %v", err)
+	}
+	v := NewVerifier("")
+	v.SetEnrollStore(store)
+	ts := time.Now().Unix()
+
+	// 客户端未指定 agent_id 时会以机器 UUID 上报，这里直接模拟该形态
+	const uuid = "BF674D56-7E0D-70DB-A9FF-103DE56368D8"
+	nonce := NewNonce()
+	if src, err := v.Verify(uuid, nonce, Proof(secret, uuid, nonce, ts), ts); err != nil || src != CredToken {
+		t.Fatalf("不绑定令牌应接受任意 agent_id，得到 src=%q err=%v", src, err)
+	}
+
+	// 同一枚令牌不能被第二台主机再用
+	nonce2 := NewNonce()
+	const other = "host-02"
+	if _, err := v.Verify(other, nonce2, Proof(secret, other, nonce2, ts), ts); err == nil {
+		t.Fatal("不绑定令牌也只能用一次")
+	}
+
+	// 列表里要能看出它不绑定、且已被使用
+	for _, rec := range store.ListTokens() {
+		if rec["unbound"] != true {
+			t.Fatalf("列表应标记 unbound: %+v", rec)
+		}
+		if rec["used_at"] == int64(0) {
+			t.Fatalf("使用后 used_at 应更新: %+v", rec)
+		}
+	}
+}
+
+// TestUnboundTokenProofBindsPresentedID 不绑定令牌不意味着证明可以跨身份复用：
+// HMAC 的输入含本次请求的 agent_id，拿 A 的证明冒充 B 必须失配。
+func TestUnboundTokenProofBindsPresentedID(t *testing.T) {
+	store := newTestStore(t)
+	secret, _, err := store.CreateToken("", "", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := NewVerifier("")
+	v.SetEnrollStore(store)
+	ts := time.Now().Unix()
+	nonce := NewNonce()
+	proofA := Proof(secret, "host-a", nonce, ts)
+	if _, err := v.Verify("host-b", nonce, proofA, ts); err == nil {
+		t.Fatal("以 A 的证明冒充 B 必须被拒（证明绑定本次上报的 agent_id）")
+	}
+	// 失败不应消耗令牌：正确的身份与证明仍可用
+	nonce2 := NewNonce()
+	if src, err := v.Verify("host-a", nonce2, Proof(secret, "host-a", nonce2, ts), ts); err != nil || src != CredToken {
+		t.Fatalf("失配请求不应消耗令牌，得到 src=%q err=%v", src, err)
+	}
+}
+
+// TestUnboundTokenPersistsAcrossReload 空 agent_id 也是合法记录，
+// 重载时不能被当成"缺字段"丢弃（否则重启后令牌凭空消失）。
+func TestUnboundTokenPersistsAcrossReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), EnrollStoreFileName)
+	s1, err := NewEnrollStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _, err := s1.CreateToken("", "reload", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewEnrollStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(s2.ListTokens()); n != 1 {
+		t.Fatalf("不绑定令牌未持久化，重载后剩 %d 条", n)
+	}
+	v := NewVerifier("")
+	v.SetEnrollStore(s2)
+	nonce := NewNonce()
+	ts := time.Now().Unix()
+	if _, err := v.Verify("host-01", nonce, Proof(secret, "host-01", nonce, ts), ts); err != nil {
+		t.Fatalf("重载后不绑定令牌应仍可用: %v", err)
+	}
+}
+
 // TestTokenExpiry 过期令牌不再可用，且列表里标记为已过期。
 //
 // 只推进令牌存储的时钟：校验器的时间窗仍按真实时间判定，这样"被拒"的原因

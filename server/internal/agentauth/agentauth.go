@@ -309,7 +309,14 @@ func (v *Verifier) Verify(agentID, nonce, proof string, ts int64) (string, error
 			return CredSharedKey, nil
 		}
 	}
-	return "", fmt.Errorf("注册凭证校验失败")
+	// 错误串仍不区分「令牌不存在 / 证明不对 / 共享密钥不对」——避免把这条
+	// 未鉴权通道变成探测某个 agent_id 是否配过令牌的 oracle。但要把最常见、
+	// 且运维自己能修的原因写出来：令牌与 agent_id 是绑定关系，而被控机未显式
+	// 指定 agent_id 时会回退成机器 UUID/主机名（实测踩过：为 "test" 签发令牌，
+	// Agent 却以机器 UUID 注册，日志只报一句"注册凭证校验失败"，无从下手）。
+	return "", fmt.Errorf("注册凭证校验失败：请确认被控机的 agent_id 与签发令牌时填写的完全一致" +
+		"（未指定 -agentid 时会回退为机器 UUID/主机名），且令牌未过期、未被使用；" +
+		"使用共享注册密钥时请确认与服务端 agent.key 一致")
 }
 
 // claimNonce 记录本次使用的 nonce；若已被使用则判定为重放。

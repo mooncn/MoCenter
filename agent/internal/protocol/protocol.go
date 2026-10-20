@@ -351,4 +351,15 @@ type EnrollResp struct {
 	ServerFingerprint string `json:"server_fingerprint,omitempty"`
 	// Identity 部署身份名。
 	Identity string `json:"identity,omitempty"`
+	// CredSource 本次换取所凭的凭证类型：token（一次性令牌）/ shared-key / anonymous。
+	// Agent 据此判断成功后能否把 agent_key 里同值的一次性令牌一并清掉 ——
+	// 令牌用完即废，留在配置里只会在下次重签时变成一条永远失败的凭据。
+	CredSource string `json:"cred_source,omitempty"`
 }
+
+// 注册凭证类型，取值与服务端 agentauth.Cred* 保持一致。
+const (
+	CredSourceToken     = "token"
+	CredSourceSharedKey = "shared-key"
+	CredSourceAnonymous = "anonymous"
+)
