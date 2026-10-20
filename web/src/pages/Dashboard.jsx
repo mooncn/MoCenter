@@ -1,7 +1,9 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react'
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Api } from '../api/api.js'
 import Flag from '../components/Flag.jsx'
 import Pagination from '../components/Pagination.jsx'
+import Modal from '../components/Modal.jsx'
 
 // ============================================================
 // 排序（按列点击表头）
@@ -142,8 +144,13 @@ function Th({ col, label, sortKey, dir, onClick }) {
 
 // 主机探针信息面板：展示各主机 CPU/内存/磁盘/流量等实时状态与历史趋势
 export default function Dashboard({ agents }) {
+  const navigate = useNavigate()
   const [since, setSince] = useState('24h')
-  const [selectedAgent, setSelectedAgent] = useState('')
+  // 趋势/操作/分享三种弹窗各自只记 agent_id：主机列表每 5 秒整表替换，
+  // 存对象会拿着上一帧的旧数据渲染弹窗。展示时再从最新列表里取。
+  const [trendAgent, setTrendAgent] = useState('')
+  const [actionAgent, setActionAgent] = useState('')
+  const [shareAgent, setShareAgent] = useState('')
   const [history, setHistory] = useState(null)
   // 服务端存活状态：null=检测中 true=在线 false=离线
   const [serverAlive, setServerAlive] = useState(null)
@@ -188,7 +195,7 @@ export default function Dashboard({ agents }) {
     const name = nameOf(a)
     const ok = window.confirm(
       `删除主机「${name}」？\n\n` +
-      '将清除本服务端保存的主机记录、备注、探针/延迟历史与端口映射规则。\n' +
+      '将清除本服务端保存的主机记录、备注、探针/延迟历史、端口映射规则与分享链接。\n' +
       '不会卸载目标机上的 Agent，也不清除证书绑定与未使用的注册令牌。\n\n' +
       '若该机 Agent 仍在运行，它会重新注册并再次出现。'
     )
@@ -196,7 +203,9 @@ export default function Dashboard({ agents }) {
     try {
       const d = await Api.deleteAgent(a.agent_id)
       if (!d?.ok) { alert(d?.msg || '删除失败'); return }
-      if (selectedAgent === a.agent_id) setSelectedAgent('')
+      setActionAgent('')
+      if (trendAgent === a.agent_id) setTrendAgent('')
+      if (shareAgent === a.agent_id) setShareAgent('')
       window.dispatchEvent(new Event('mc-agents-refresh'))
     } catch (e) {
       alert('删除失败：' + (e.response?.data?.msg || e.message))
@@ -215,18 +224,34 @@ export default function Dashboard({ agents }) {
     return () => { alive = false; clearInterval(t) }
   }, [])
 
-  // 加载选中主机的历史探针趋势
+  // 加载选中主机的历史探针趋势（只在趋势弹窗打开时请求）
   useEffect(() => {
-    if (!selectedAgent) {
+    if (!trendAgent) {
       setHistory(null)
       return
     }
+    let alive = true
     const sinceTs = new Date(Date.now() - sinceMap[since] * 1000).toISOString()
+    setHistory(null)
     // max=300：请求服务端降采样，避免长时间跨度返回海量采样点
-    Api.history(selectedAgent, sinceTs, 300)
-      .then((data) => setHistory(data))
-      .catch(() => setHistory([]))
-  }, [selectedAgent, since])
+    Api.history(trendAgent, sinceTs, 300)
+      .then((data) => { if (alive) setHistory(data) })
+      .catch(() => { if (alive) setHistory([]) })
+    return () => { alive = false }
+  }, [trendAgent, since])
+
+  // 弹窗数据从最新列表取：主机被删除/改名后不会停留在旧快照上。
+  const actionTarget = actionAgent ? (agents || []).find((a) => a.agent_id === actionAgent) : null
+  // 趋势弹窗允许主机刚从列表消失时继续展示（历史数据仍可读），用 id 兜底标题
+  const trendTarget = trendAgent
+    ? ((agents || []).find((a) => a.agent_id === trendAgent) || { agent_id: trendAgent, hostname: trendAgent })
+    : null
+  const shareTarget = shareAgent ? (agents || []).find((a) => a.agent_id === shareAgent) : null
+
+  const openHostPage = (path) => {
+    if (!actionTarget) return
+    navigate(`${path}?agent=${encodeURIComponent(actionTarget.agent_id)}`)
+  }
 
   return (
     <div>
@@ -242,12 +267,6 @@ export default function Dashboard({ agents }) {
           <span className={`dot ${serverAlive === false ? 'offline' : serverAlive ? 'online' : ''}`} />{' '}
           {serverAlive === null ? '服务端检测中…' : serverAlive ? '服务端在线' : '服务端离线'}
         </span>
-        <select value={since} onChange={(e) => setSince(e.target.value)} style={{ width: 150 }}>
-          <option value="1h">最近 1 小时</option>
-          <option value="6h">最近 6 小时</option>
-          <option value="24h">最近 24 小时</option>
-          <option value="7d">最近 7 天</option>
-        </select>
         {/* 回首页：公开节点状态页（未开放时该页会给出提示） */}
         <a className="btn-login btn-home" href="/" title="返回公开节点状态页">🏠 回首页</a>
       </div>
@@ -297,16 +316,13 @@ export default function Dashboard({ agents }) {
               <Th col="latency" label="延迟" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
               <Th col="version" label="版本" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
               <Th col="lastseen" label="最后在线" sortKey={sortKey} dir={sortDir} onClick={clickSort} />
-              <th>趋势</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
             {pagedAgents.map((a) => {
-              const trendOpen = selectedAgent === a.agent_id
               return (
-              <React.Fragment key={a.agent_id}>
-              {/* 离线节点整行标红：红点位于卡片右上角（与在线绿点同一位置） */}
-              <tr className={a.online ? '' : 'row-offline'}>
+              <tr key={a.agent_id} className={a.online ? '' : 'row-offline'}>
                 <td data-label="主机">
                   <b>{a.remark || a.hostname}</b>
                   <div style={{ color: '#8b98a5', fontSize: 12 }}>
@@ -365,35 +381,14 @@ export default function Dashboard({ agents }) {
                   <AgentVersionCell agent={a} />
                 </td>
                 <td data-label="最后在线">{a.online ? fmtTime(a.last_seen) : `离线 ${fmtOffline(a)}`}</td>
-                <td data-label="趋势">
-                  <button className="secondary btn-sm" onClick={() => setSelectedAgent(trendOpen ? '' : a.agent_id)}>
-                    {trendOpen ? '收起' : '查看'}
-                  </button>
-                  {!a.online && (
-                    <button
-                      className="secondary danger btn-sm"
-                      style={{ marginLeft: 6 }}
-                      onClick={() => removeAgent(a)}
-                      title="删除这台离线主机的登记与历史数据"
-                    >删除</button>
-                  )}
+                <td data-label="操作">
+                  <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
+                    <button className="secondary btn-sm" onClick={() => setActionAgent(a.agent_id)}>
+                      操作
+                    </button>
+                  </span>
                 </td>
               </tr>
-              {/* 趋势图**紧跟该条记录下方**展开（原实现放在列表最底部，移动端要滚很久） */}
-              {trendOpen && (
-                <tr className="trend-row">
-                  <td colSpan="13" data-label="趋势图">
-                    <div className="trend-inline">
-                      <div className="trend-title">
-                        探针历史趋势 · {nameOf(a)}
-                        <span className="trend-tip">与上方「最近时段」筛选联动</span>
-                      </div>
-                      <TrendChart history={history || []} />
-                    </div>
-                  </td>
-                </tr>
-              )}
-              </React.Fragment>
               )
             })}
             {sortedAgents.length === 0 && (
@@ -412,7 +407,298 @@ export default function Dashboard({ agents }) {
         />
       </div>
 
+      {/* 主机操作菜单：把原先挤在表格最后一列的按钮收进弹窗，
+          跳转类动作带上 ?agent=，目标页面会预选这台主机。 */}
+      {actionTarget && (
+        <Modal
+          title={`操作 · ${nameOf(actionTarget)}`}
+          subtitle={`${actionTarget.hostname || actionTarget.agent_id} · ${actionTarget.agent_id}${actionTarget.online ? '' : ' · 离线'}`}
+          onClose={() => setActionAgent('')}
+          footer={!actionTarget.online ? (
+            <button
+              className="secondary danger"
+              onClick={() => removeAgent(actionTarget)}
+              title="删除这台离线主机的登记与历史数据"
+            >删除这台离线主机</button>
+          ) : null}
+        >
+          <div className="action-grid">
+            <ActionItem
+              icon="📈" title="查看趋势" desc="CPU / 内存 / 磁盘历史折线"
+              onClick={() => { setTrendAgent(actionTarget.agent_id); setActionAgent('') }}
+            />
+            <ActionItem
+              icon="💻" title="远程终端" desc="打开该主机的交互 shell"
+              disabled={!actionTarget.online}
+              onClick={() => openHostPage('/admin/terminal')}
+            />
+            <ActionItem
+              icon="🖥" title="远程桌面" desc="浏览器内查看 / 操作桌面"
+              disabled={!actionTarget.online}
+              onClick={() => openHostPage('/admin/vnc')}
+            />
+            <ActionItem
+              icon="🔀" title="端口映射" desc="把该主机端口映射到公网"
+              onClick={() => openHostPage('/admin/portmap')}
+            />
+            <ActionItem
+              icon="🔗" title="分享控制" desc="生成有时效的邀请链接"
+              disabled={!actionTarget.online}
+              onClick={() => { setShareAgent(actionTarget.agent_id); setActionAgent('') }}
+            />
+          </div>
+          {!actionTarget.online && (
+            <div className="notice" style={{ background: 'var(--panel-2)', color: 'var(--muted)', marginTop: 12 }}>
+              该主机当前离线：远程终端、远程桌面与分享不可用；仍可查看历史趋势、预先配置端口映射，
+              或删除这台主机的登记。
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {trendTarget && (
+        <Modal
+          wide
+          title={`探针历史趋势 · ${nameOf(trendTarget)}`}
+          subtitle={`${trendTarget.hostname || trendTarget.agent_id} · ${trendTarget.agent_id}`}
+          onClose={() => setTrendAgent('')}
+        >
+          <div className="row-inline" style={{ marginBottom: 10, alignItems: 'center', gap: 8 }}>
+            <label className="muted" style={{ fontSize: 13 }}>统计区间</label>
+            <select value={since} onChange={(e) => setSince(e.target.value)} style={{ width: 150 }}>
+              <option value="1h">最近 1 小时</option>
+              <option value="6h">最近 6 小时</option>
+              <option value="24h">最近 24 小时</option>
+              <option value="7d">最近 7 天</option>
+            </select>
+            <span className="muted" style={{ fontSize: 12 }}>折线按服务端降采样（最多 300 个点）</span>
+          </div>
+          <TrendChart history={history || []} />
+        </Modal>
+      )}
+
+      {shareTarget && (
+        <ShareControlModal agent={shareTarget} onClose={() => setShareAgent('')} />
+      )}
+
     </div>
+  )
+}
+
+// ActionItem 操作弹窗里的单个入口。离线主机把依赖实时连接的入口置灰，
+// 并在按钮上保留 title 说明原因 —— 不是"点了没反应"。
+function ActionItem({ icon, title, desc, onClick, disabled }) {
+  return (
+    <button
+      type="button"
+      className="action-item"
+      onClick={onClick}
+      disabled={disabled}
+      title={disabled ? '该主机离线，恢复在线后可用' : desc}
+    >
+      <span className="action-icon">{icon}</span>
+      <span className="action-text">
+        <b>{title}</b>
+        <small>{desc}</small>
+      </span>
+    </button>
+  )
+}
+
+const SHARE_FEATURE_OPTIONS = [
+  { key: 'terminal', label: '远程终端', desc: '交互 shell，可连续执行命令' },
+  { key: 'vnc', label: '远程桌面', desc: '浏览器内查看 / 操作桌面' },
+  { key: 'portmap', label: '端口转发', desc: '维护该主机的端口映射规则' },
+]
+const SHARE_FEATURE_LABELS = Object.fromEntries(SHARE_FEATURE_OPTIONS.map((f) => [f.key, f.label]))
+const SHARE_TTL_OPTIONS = [
+  { value: 3600, label: '1 小时' },
+  { value: 8 * 3600, label: '8 小时' },
+  { value: 24 * 3600, label: '24 小时' },
+  { value: 7 * 24 * 3600, label: '7 天' },
+]
+
+// ShareControlModal 生成/撤销"邀请远程管理"链接。
+//
+// 链接 token 只出现在创建响应里一次：列表接口不存明文，页面也不缓存到
+// localStorage。对方打开 /share#<token> 即可使用被勾选的功能，到期或撤销即失效。
+function ShareControlModal({ agent, onClose }) {
+  const [features, setFeatures] = useState(['terminal', 'vnc'])
+  const [ttl, setTtl] = useState(2 * 3600)
+  const [label, setLabel] = useState('')
+  const [vncPort, setVncPort] = useState(5900)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const [created, setCreated] = useState(null)
+  const [copied, setCopied] = useState('')
+  const [shares, setShares] = useState([])
+  const [loading, setLoading] = useState(true)
+
+  const reload = useCallback(async () => {
+    try {
+      const d = await Api.listShares(agent.agent_id)
+      if (d?.ok) {
+        setShares(d.shares || [])
+        setErr('')
+      } else {
+        setErr(d?.msg || '获取分享列表失败')
+      }
+    } catch (e) {
+      setErr(e?.response?.data?.msg || e.message || '获取分享列表失败')
+    } finally {
+      setLoading(false)
+    }
+  }, [agent.agent_id])
+
+  useEffect(() => { reload() }, [reload])
+
+  const toggleFeature = (key) => {
+    setFeatures((prev) => (prev.includes(key) ? prev.filter((x) => x !== key) : [...prev, key]))
+  }
+
+  const create = async () => {
+    if (features.length === 0) { setErr('至少选择一个分享功能'); return }
+    setBusy(true)
+    setErr('')
+    try {
+      const d = await Api.createShare({
+        agent_id: agent.agent_id,
+        label: label.trim(),
+        features,
+        ttl_seconds: Number(ttl),
+        vnc_port: features.includes('vnc') ? Number(vncPort) : 0,
+      })
+      if (!d?.ok || !d.token) { setErr(d?.msg || '创建失败'); return }
+      setCreated({ ...d, url: `${window.location.origin}${d.link}` })
+      setLabel('')
+      reload()
+    } catch (e) {
+      setErr(e?.response?.data?.msg || e.message || '创建失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const revoke = async (id) => {
+    if (!window.confirm('撤销这条分享链接？已打开的终端/桌面会立即断开，链接无法再使用。')) return
+    try {
+      const d = await Api.revokeShare(id)
+      if (!d?.ok) { setErr(d?.msg || '撤销失败'); return }
+      setErr('')
+      reload()
+    } catch (e) {
+      setErr(e?.response?.data?.msg || e.message || '撤销失败')
+    }
+  }
+
+  const copyText = async (text) => {
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      window.prompt('复制下面的链接（Ctrl+C）', text)
+    }
+    setCopied(text)
+    setTimeout(() => setCopied(''), 1600)
+  }
+
+  return (
+    <Modal
+      title={`分享控制 · ${nameOf(agent)}`}
+      subtitle={`${agent.hostname || agent.agent_id} · ${agent.agent_id}`}
+      onClose={onClose}
+      footer={<button className="secondary" onClick={onClose}>关闭</button>}
+    >
+      <p className="muted" style={{ fontSize: 13, marginBottom: 10 }}>
+        生成一条有时效的能力链接：拿到链接的人<strong>无需登录</strong>，即可使用下方勾选的功能，
+        且只能访问这一台主机。到期或撤销后立即失效。
+      </p>
+      {err && <div className="notice err">{err}</div>}
+
+      <div className="share-feature-list">
+        {SHARE_FEATURE_OPTIONS.map((f) => (
+          <label key={f.key} className={`share-feature ${features.includes(f.key) ? 'on' : ''}`}>
+            <input
+              type="checkbox"
+              checked={features.includes(f.key)}
+              onChange={() => toggleFeature(f.key)}
+            />
+            <span>
+              <b>{f.label}</b>
+              <small>{f.desc}</small>
+            </span>
+          </label>
+        ))}
+      </div>
+
+      <div className="row-inline" style={{ flexWrap: 'wrap', gap: 8, alignItems: 'center', marginTop: 10 }}>
+        <input
+          style={{ width: 180 }}
+          placeholder="备注（可选，如：给张工排障）"
+          value={label}
+          autoComplete="off"
+          onChange={(e) => setLabel(e.target.value)}
+        />
+        <select style={{ width: 130 }} value={ttl} onChange={(e) => setTtl(e.target.value)}>
+          {SHARE_TTL_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        {features.includes('vnc') && (
+          <input
+            style={{ width: 130 }}
+            type="number"
+            min={1}
+            max={65535}
+            value={vncPort}
+            title="分享桌面时固定的 VNC 端口（访客不能改连其它端口）"
+            onChange={(e) => setVncPort(e.target.value)}
+          />
+        )}
+        <button className="primary" onClick={create} disabled={busy || features.length === 0}>
+          {busy ? '生成中…' : '生成分享链接'}
+        </button>
+      </div>
+
+      {created && (
+        <div className="notice ok" style={{ marginTop: 12 }}>
+          <div><strong>链接已生成，只显示这一次</strong>（关闭后无法再取回，只能重新生成）：</div>
+          <div className="row-inline" style={{ marginTop: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+            <code className="key-box" style={{ wordBreak: 'break-all' }}>{created.url}</code>
+            <button className="btn-mini" onClick={() => copyText(created.url)}>
+              {copied === created.url ? '已复制' : '复制'}
+            </button>
+          </div>
+          <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+            功能：{(created.features || []).map((f) => SHARE_FEATURE_LABELS[f] || f).join(' / ')} ·
+            有效期至 {fmtTime(created.expires_at)}
+          </div>
+        </div>
+      )}
+
+      <h4 style={{ marginTop: 16, marginBottom: 6 }}>该主机当前的分享</h4>
+      <div className="table-scroll">
+        <table>
+          <thead>
+            <tr><th>备注</th><th>功能</th><th>创建</th><th>到期</th><th>最近使用</th><th>操作</th></tr>
+          </thead>
+          <tbody>
+            {shares.length === 0 && (
+              <tr><td colSpan={6} className="table-empty">{loading ? '加载中…' : '暂无有效分享'}</td></tr>
+            )}
+            {shares.map((s) => (
+              <tr key={s.id}>
+                <td>{s.label || <span className="muted">—</span>}</td>
+                <td>{(s.features || []).map((f) => SHARE_FEATURE_LABELS[f] || f).join(' / ')}</td>
+                <td className="cell-sub">{fmtTime(s.created_at)}</td>
+                <td className="cell-sub">{fmtTime(s.expires_at)}</td>
+                <td className="cell-sub">{s.last_used_at ? fmtTime(s.last_used_at) : '未使用'}</td>
+                <td>
+                  <button className="btn-mini" onClick={() => revoke(s.id)}>撤销</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Modal>
   )
 }
 

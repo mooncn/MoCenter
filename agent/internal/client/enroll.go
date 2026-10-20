@@ -94,7 +94,7 @@ func (c *Client) tryEnroll() (*enrollmentCredential, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn, err := dialForEnroll(c.cfg.ServerAddr, tlsCfg)
+	conn, err := dialForEnroll(c.cfg.ServerAddr, tlsCfg, !c.hasTrustAnchor())
 	if err != nil {
 		return nil, err
 	}
@@ -204,10 +204,10 @@ func (c *Client) verifyEnrollServer(respFP, caFP string) error {
 
 	// 1) 显式 pin：只认它，别的都要拒绝
 	if len(pinned) > 0 {
-		if respFP != "" && respFP != pinned[0] {
+		if respFP != "" && !fingerprintMatches(pinned[0], respFP) {
 			return errors.New("服务端与配置的 server_fingerprint 不一致：" + trustNewCAError(pinned[0], respFP, c.hasEnrollSecret()).Error())
 		}
-		if caFP != "" && caFP != pinned[0] {
+		if caFP != "" && !fingerprintMatches(pinned[0], caFP) {
 			return errors.New(trustNewCAError(pinned[0], caFP, c.hasEnrollSecret()).Error())
 		}
 		if respFP == "" && caFP == "" {
@@ -224,7 +224,7 @@ func (c *Client) verifyEnrollServer(respFP, caFP string) error {
 	// 2) 同一套总控 / 3) 首次接入
 	matched := false
 	for _, fp := range known {
-		if fp == respFP || (caFP != "" && fp == caFP) {
+		if fingerprintMatches(fp, respFP) || (caFP != "" && fingerprintMatches(fp, caFP)) {
 			matched = true
 			break
 		}
@@ -255,18 +255,30 @@ func firstNonEmptyStr(vals ...string) string {
 // dialForEnroll 拨号：优先 TLS；TLS 握手因**证书校验**失败时，改用"只加密不验签"再试一次
 // （换取阶段是信任引导，见文件头说明：这一跳的安全性由注册密钥保证），
 // 仍失败才退回明文 —— 目的是让"服务端根本没启用 TLS"能给出明确错误，而不是静默跑起来。
-func dialForEnroll(addr string, tlsCfg *tls.Config) (net.Conn, error) {
+//
+// allowUnverified 必须为假的情况（L-6）：本机已经有一个身份锚 —— 配了 server_fingerprint
+// 或有可用 CA。此时"校验失败"的含义恰恰是**对端不是那套总控**（换过部署身份，或在中间人位置），
+// 而旧实现会照样重拨一次不验签的连接，把刚建立的注册凭据交出去：填了指纹却不生效，
+// 等于把"我信任这套总控"这个决定悄悄改成了"我谁都不信也能签"。
+// 没有锚的第一次接入才是这条降级路径真正的服务对象（自签部署没有 CA 文件是常态）。
+func dialForEnroll(addr string, tlsCfg *tls.Config, allowUnverified bool) (net.Conn, error) {
 	conn, err := tls.Dial("tcp", addr, tlsCfg)
 	if err == nil {
 		return conn, nil
 	}
 	// 换取阶段容忍未受信任的自签证书（CI/内网自签、尚无 CA 文件是常态）
 	if isCertVerifyFailure(err) {
+		if !allowUnverified {
+			return nil, fmt.Errorf("服务端证书与本机已有的身份锚不符，已拒绝连接（本次不会降级为不验签）：%v", err)
+		}
 		loose := tlsCfg.Clone()
 		loose.InsecureSkipVerify = true
 		loose.VerifyPeerCertificate = nil
 		loose.VerifyConnection = nil
 		if c2, e2 := tls.Dial("tcp", addr, loose); e2 == nil {
+			logf("[agent] 警告: 换取证书前本机没有可用身份锚（未配 server_fingerprint / ca_cert），"+
+				"本次 TLS 未校验服务端身份；请把服务端「Agent 接入」页的部署身份指纹填进配置，"+
+				"或在 %s 落好 ca.crt 后重新接入", "creds/ca.crt")
 			return c2, nil
 		}
 	}

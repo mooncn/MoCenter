@@ -12,11 +12,13 @@ package command
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -201,10 +203,8 @@ func serviceActive(name string) bool {
 
 // x11vncPath 返回 x11vnc 的绝对路径（systemd 单元要求绝对路径）；未找到时返回空串。
 func x11vncPath() string {
-	if out, err := exec.Command("bash", "-c", "command -v x11vnc").Output(); err == nil {
-		if p := strings.TrimSpace(string(out)); p != "" {
-			return p
-		}
+	if p, err := exec.LookPath("x11vnc"); err == nil && p != "" {
+		return p
 	}
 	cands := []string{
 		"/usr/bin/x11vnc",
@@ -451,8 +451,14 @@ func installX11VNCBinary(src string) bool {
 		return false
 	}
 	dst := filepath.Join(homeDir(), ".local", "bin", "x11vnc")
-	_ = exec.Command("bash", "-c", "mkdir -p '"+filepath.Dir(dst)+"'").Run()
-	if err := exec.Command("bash", "-c", "cp '"+src+"' '"+dst+"' && chmod +x '"+dst+"'").Run(); err != nil {
+	// 用 os/exec 的直接调用而不是 `bash -c "mkdir -p '...' && cp '...' '...'"`（L-9）：
+	// 单引号包裹只在"路径里没有单引号"时成立，而 HOME 是本机可控变量。
+	// 这里是纯文件操作，本来就不需要 shell。
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		log.Printf("[vnc-install] 创建 %s 失败: %v", filepath.Dir(dst), err)
+		return false
+	}
+	if err := copyExecutable(src, dst); err != nil {
 		log.Printf("[vnc-install] 安装 x11vnc 二进制失败: %v", err)
 		return false
 	}
@@ -460,8 +466,33 @@ func installX11VNCBinary(src string) bool {
 	return true
 }
 
+// copyExecutable 把 src 复制到 dst 并赋予可执行权限（0755）。
+//
+// O_NOFOLLOW：dst 是用户目录下的可预测路径，若被预先放成指向其它文件的符号链接，
+// 直接 O_TRUNC 会以 Agent 的权限覆盖那个目标。拒绝跟随链接即可堵住这条本机提权链。
+func copyExecutable(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY|syscall.O_NOFOLLOW, 0755)
+	if err != nil {
+		return err
+	}
+	if _, cerr := io.Copy(out, in); cerr != nil {
+		_ = out.Close()
+		return cerr
+	}
+	return out.Close()
+}
+
+// hasBin 判断命令是否可在 PATH 中解析到。
+// 用 exec.LookPath 而不是 `bash -c "command -v <name>"`（L-9）：后者把 name 拼进 shell
+// 命令行，name 里带一个 `;` 或 `$(...)` 就成了本机命令执行 —— 而它只是想知道"有没有这个程序"。
 func hasBin(name string) bool {
-	return exec.Command("bash", "-c", "command -v "+name+" >/dev/null 2>&1").Run() == nil
+	_, err := exec.LookPath(name)
+	return err == nil
 }
 
 func homeDir() string {

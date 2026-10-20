@@ -35,15 +35,15 @@ import (
 //     server_fingerprint 一致（或显式配置了 ca-cert 且新 CA 与之一致），
 //     就视为运维已授权，自动丢弃旧证书并重新换取，无需登录被控机。
 
-// certPublicFingerprint 取证书公钥指纹（SHA-256 前 16 位 hex）。
-// 与 server/internal/agentauth.Fingerprint 口径一致：绑定**公钥**，
+// certPublicFingerprint 取证书公钥指纹（完整 SHA-256，64 位 hex）。
+// 与 server/internal/agentauth.certFingerprint 口径一致：绑定**公钥**，
 // 因此同一个 CA 重签证书、换有效期都不会改变它。
 func certPublicFingerprint(cert *x509.Certificate) string {
 	if cert == nil {
 		return ""
 	}
 	sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
-	return hex.EncodeToString(sum[:])[:16]
+	return hex.EncodeToString(sum[:])
 }
 
 // caFingerprintFromPEM 解析 PEM 链中第一张证书并取公钥指纹。
@@ -82,7 +82,7 @@ func (c *Client) configCAFingerprint() string {
 //
 // 注意 creds/ca.crt 属于"上一次的身份"，只用于判定"服务端是否换过"，不作为放行依据。
 func (c *Client) knownServerFingerprints() (pinned, known []string) {
-	if fp := normFingerprint(c.cfg.ServerFingerprint); len(fp) >= 8 {
+	if fp := normFingerprint(c.cfg.ServerFingerprint); len(fp) == legacyFingerprintLen || len(fp) == 64 {
 		pinned = append(pinned, fp)
 	}
 	for _, fp := range []string{c.credCAFingerprint(), c.configCAFingerprint()} {

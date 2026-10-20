@@ -68,6 +68,22 @@ func TestUserManagerOTPRequired(t *testing.T) {
 	}
 }
 
+// 同一验证码不能重放：否则截获者可以在 30 秒有效窗口内反复登录。
+func TestUserManagerTOTPReplayRejected(t *testing.T) {
+	m := NewUserManager(filepath.Join(t.TempDir(), "u.json"))
+	secret := "JBSWY3DPEHPK3PXP"
+	if err := m.InitFromFlags("admin", "pass", secret); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	code := codeFor(t, secret)
+	if err := m.Authenticate("admin", "pass", code); err != nil {
+		t.Fatalf("first login with valid otp should pass: %v", err)
+	}
+	if err := m.Authenticate("admin", "pass", code); err != ErrBadOTP {
+		t.Fatalf("replayed otp should be rejected, got %v", err)
+	}
+}
+
 func TestChangePassword(t *testing.T) {
 	m := NewUserManager(filepath.Join(t.TempDir(), "u.json"))
 	if err := m.InitFromFlags("admin", "oldpass1", ""); err != nil {

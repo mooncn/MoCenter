@@ -1,4 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import RFB from '@novnc/novnc'
 import { Api } from '../api/api.js'
 import { createVncPointer, WHEEL_STEP_DELTA } from '../utils/vncPointer.js'
@@ -50,6 +51,15 @@ export default function VncPage({ agents }) {
   }, [status])
 
   const onlineHosts = (agents || []).filter((a) => a.online)
+  // 仪表盘「操作 → 远程桌面」带 ?agent=：只预选主机，连接仍由人触发
+  // （打开桌面会占用目标机的 VNC 会话，不该由跳转隐式发起）。
+  const [params] = useSearchParams()
+  const wantedHost = (params.get('agent') || '').trim()
+  const wantedOnline = !!wantedHost && onlineHosts.some((a) => a.agent_id === wantedHost)
+
+  useEffect(() => {
+    if (wantedOnline && !host) setHost(wantedHost)
+  }, [wantedOnline, wantedHost, host])
 
   // 口令按(主机,端口)存于 sessionStorage，会话结束即销毁
   const pwKey = () => `mc_vnc_pw_${host}_${port}`
@@ -496,6 +506,12 @@ export default function VncPage({ agents }) {
           </button>
           {vncUp && <button className="secondary" onClick={disconnect} disabled={status === 'disconnected' || status === 'idle'}>断开</button>}
         </div>
+
+        {wantedHost && !wantedOnline && (agents || []).length > 0 && (
+          <div className="notice err">
+            {wantedHost} 当前不在线（或已注销），无法打开远程桌面；请确认 Agent 与 VNC 均已就绪。
+          </div>
+        )}
 
         <div
           ref={wrapRef}

@@ -41,6 +41,38 @@ func TestTrackAndCleanup(t *testing.T) {
 	if m.GetTrack("t2") == nil {
 		t.Fatal("t2 active should remain")
 	}
+	// GetTrack 返回快照：改返回值不能影响内部记录（否则 API 序列化会与转发协程竞争）。
+	snap := m.GetTrack("t2")
+	snap.BytesSent = 99999
+	if again := m.GetTrack("t2"); again.BytesSent != 100 {
+		t.Fatalf("GetTrack 应返回副本，内部仍应为 100，实得 %d", again.BytesSent)
+	}
+}
+
+// TestRuleLimit 规则总数必须有上限：每条规则占一个真实监听端口，
+// 不设限时能持续创建规则的一方可以耗尽进程的 fd/端口资源。
+func TestRuleLimit(t *testing.T) {
+	m := NewManager(nil, nil)
+	// 覆盖已有端口只是替换，不应受上限影响；用真实空闲端口验证监听确实被换上。
+	port := freePort(t)
+	m.mu.Lock()
+	m.rules[port] = &Rule{PublicPort: port, AgentID: "a1"}
+	for p := 20000; len(m.rules) < maxRules; p++ {
+		if p == port {
+			continue
+		}
+		m.rules[p] = &Rule{PublicPort: p, AgentID: "a1"}
+	}
+	m.mu.Unlock()
+
+	err := m.CreateRule(&Rule{PublicPort: 40000, LocalPort: 80, AgentID: "a1"})
+	if err == nil {
+		t.Fatal("达到规则上限后新建规则应被拒绝")
+	}
+	if err := m.CreateRule(&Rule{PublicPort: port, LocalPort: 81, AgentID: "a1"}); err != nil {
+		t.Fatalf("覆盖已有规则不应受上限影响: %v", err)
+	}
+	m.DeleteRule(port)
 }
 
 func TestRuleValidation(t *testing.T) {

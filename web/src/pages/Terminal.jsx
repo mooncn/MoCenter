@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useContext } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -18,8 +19,17 @@ export default function TerminalPage({ agents }) {
   const [shell, setShell] = useState('auto')
   const [status, setStatus] = useState('idle') // idle/connecting/connected
   const [notice, setNotice] = useState('')
+  const [params] = useSearchParams()
 
   const onlineHosts = (agents || []).filter((a) => a.online)
+  // 从仪表盘「操作」跳转时带 ?agent=：自动选中，但不自动连接
+  // （连接会开一个远端 shell，必须由人再点一次）。
+  const wantedHost = (params.get('agent') || '').trim()
+  const wantedOnline = !!wantedHost && onlineHosts.some((a) => a.agent_id === wantedHost)
+
+  useEffect(() => {
+    if (wantedOnline && !host) setHost(wantedHost)
+  }, [wantedOnline, wantedHost, host])
 
   // 会话状态（ref 供事件回调读取，state 供渲染）
   const sessRef = useRef(null) // { id, agent }
@@ -196,6 +206,11 @@ export default function TerminalPage({ agents }) {
             断开连接
           </button>
         </div>
+        {wantedHost && !wantedOnline && (agents || []).length > 0 && (
+          <div className="notice err">
+            {wantedHost} 当前不在线（或已注销），无法打开远程终端；请确认 Agent 已上线后重试。
+          </div>
+        )}
         <div className="terminal-wrap">
           <div ref={termRef} className="terminal-body" style={{ height: 'clamp(280px, 55vh, 560px)' }} />
         </div>

@@ -425,7 +425,8 @@ npm run check:flag   # 校验字形数据与解码逻辑是否自洽（无需网
    被拒时返回 `429 + Retry-After`。**它与登录额度完全分开**：访客刷公开页不会把
    管理员挡在自己的后台外面。**注意**：计数只看 TCP 对端地址（不信任
    `X-Forwarded-For`），因此反向代理之后全站访客共用一个源 IP、共享这 30 次/分钟；
-   对外访问量级大时请把公开页的轮询频率调低，或为 `/api/public/*` 单独加一层缓存。
+   反代之后要让限流按真实访客计，请显式配置 `-trusted-proxies <代理网段>`（见参数表），
+   否则就把公开页的轮询频率调低，或为 `/api/public/*` 单独加一层缓存。
    单次历史趋势最多返回 300 点、回溯窗口上限 30 天。
 4. **匿名请求不出网**：公开页读的是地理位置**缓存**（`AllCached`），不会替访客去
    请求外部 GeoIP 接口 —— 额度只由后台仪表盘的推送路径消耗，访客再多也打不空它。
@@ -513,6 +514,8 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
    | `-creds-dir`（Agent） | 客户端证书落盘目录（默认 `<配置目录>/creds`） |
    | `-upgrade-pubkey`（服务端 / Agent） | 升级包验签公钥（Ed25519 hex）。服务端配了就会写进**新部署**的 Agent 配置（已有配置不会被覆盖，见「一键部署」的升级语义）；**Agent 没配它就不接受任何升级指令**，没有跳过验签的开关 |
    | `-file-roots`（Agent） | 文件分发/取回允许的根目录（逗号分隔），默认 `<配置目录>/files`；只认本机配置与命令行，服务端指令改不了 |
+   | `-tunnel-hosts`（Agent） | 端口映射/VNC 隧道允许指向的**非回环**目标（逗号分隔 IP/主机名）。默认空=只允许本机回环：隧道的落点是这台机器所在的网络，放开任意目标等于把本机变成总控的内网代理跳板。与 `-file-roots` 同性质，**只认本机配置**（`MOCENTER_TUNNEL_HOSTS`），服务端指令打不开 |
+   | `-trusted-proxies`（服务端） | 自有反向代理的可信网段（逗号分隔 CIDR/裸 IP）。配置后 IP 白名单、每 IP 限速、登录退避、审计来源、公开页并发都按 `X-Forwarded-For` 还原的真实客户端地址判定；**留空=完全不信任 XFF，按 TCP 对端判定（默认）**。只在反代之后且代理是自己人时才配 |
 
    **注册凭据：优先用一次性令牌**
 
@@ -635,6 +638,15 @@ curl -s http://your-host/api/public/state | grep -Ei 'agent_id|uuid|remote_addr|
      -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
      -H "Sec-WebSocket-Protocol: mocenter,<会话Token>" https://mocenter.example.com/ws
    ```
+
+   **反代之后的 IP 白名单与限速（要显式授权才认 `X-Forwarded-For`）**：服务端所有来源判定
+   默认只看 TCP 对端地址 —— 那个头由客户端自写，采信它等于任人都能伪造来源过白名单。
+   代价是反代之后**全站访客在眼里都是代理那一个 IP**：`-whitelist` 要么整体放行、要么把
+   后台关死，而 120 次/分的额度由所有访客共享（匿名公开页足以把管理员挡在自己的后台外面）。
+   代理是自己人时，用 `-trusted-proxies 127.0.0.1,<代理网段>` 显式声明：只有 TCP 对端落在
+   这些网段里才还原客户端地址，还原口径是"从右往左第一个非可信跳"（不是客户端可写的最左值）。
+   不配置时行为与从前完全一致；配置了白名单却没配它，启动日志会给出提示。
+   实现与理由见 `server/internal/auth/proxy.go`。
 
 ## 六、高级运维能力
 

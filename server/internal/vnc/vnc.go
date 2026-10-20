@@ -13,6 +13,7 @@
 package vnc
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -474,9 +475,16 @@ func (m *Mgr) DeliverOpenResp(tunnelID, agentID string, ok bool, msg string) {
 		return
 	}
 	if !ok {
+		// msg 来自 Agent 报文，必须经 json.Marshal 再出去：字符串拼接时
+		// 一个 `","type":"...` 就能越出字段边界，让被攻陷的主机给运维的
+		// 桌面通道注入任意帧（或提前终止 RFB 解析）。
+		notice, nerr := json.Marshal(map[string]string{"type": "vnc_unavailable", "message": msg})
+		if nerr != nil {
+			notice = []byte(`{"type":"vnc_unavailable","message":"隧道建立失败"}`)
+		}
 		vw.wmu.Lock()
 		_ = vw.ws.SetWriteDeadline(time.Now().Add(viewerWriteWait))
-		_ = vw.ws.WriteMessage(websocket.TextMessage, []byte("{\"type\":\"vnc_unavailable\",\"message\":\""+msg+"\"}"))
+		_ = vw.ws.WriteMessage(websocket.TextMessage, notice)
 		vw.wmu.Unlock()
 		m.closeViewer(tunnelID, "Agent 回隧道不可用")
 		return
@@ -592,19 +600,49 @@ func (m *Mgr) NotifyPassword(agentID string, resp *protocol.VncPasswordResp) {
 	}
 }
 
+// CloseSession 关闭某会话键下的全部远程桌面查看器（分享撤销/过期时使用）。
+// 返回被关闭的隧道数。
+func (m *Mgr) CloseSession(session string) int {
+	if session == "" {
+		return 0
+	}
+	m.mu.Lock()
+	ids := make([]string, 0, 4)
+	for id, vw := range m.viewer {
+		if vw != nil && vw.session == session {
+			ids = append(ids, id)
+		}
+	}
+	m.mu.Unlock()
+	for _, id := range ids {
+		m.closeViewer(id, "分享已撤销或过期")
+	}
+	return len(ids)
+}
+
 // HandleViewer 处理浏览器查看器 WebSocket：升级为 WS，建立到 Agent 内网 VNC 的隧道，
 // 双向中继 RFB 字节流。
 // 关键修复：浏览器 RFB 数据可能在隧道建立前到达，此时先缓冲，等 TunnelOpenResp
 // 确认隧道就绪后再转发，避免 RFB 握手数据丢失导致黑屏。
 func (m *Mgr) HandleViewer(w http.ResponseWriter, r *http.Request, validateToken func(string) bool) {
+	m.handleViewer(w, r, func(token, _ string, _ int) bool { return validateToken(token) })
+}
+
+// HandleViewerScoped 同 HandleViewer，但把 token 校验扩展到「主机 + 端口」：
+// 分享链接只能看它被授权的那台主机、那个 VNC 端口，不能换参数去看别处。
+func (m *Mgr) HandleViewerScoped(w http.ResponseWriter, r *http.Request, validate func(token, agentID string, port int) bool) {
+	m.handleViewer(w, r, validate)
+}
+
+func (m *Mgr) handleViewer(w http.ResponseWriter, r *http.Request, validate func(token, agentID string, port int) bool) {
 	// Token 优先取子协议头（避免出现在 URL 里被日志留存），兼容旧 query 传参
 	token := ws.WSToken(r)
-	if !validateToken(token) {
+	agentID := agentOf(r)
+	port := portOf(r, defaultVNCPort)
+	if validate == nil || !validate(token, agentID, port) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	agentID := agentOf(r)
-	port := portOf(r, defaultVNCPort)
 	if agentID == "" {
 		http.Error(w, "missing agent", http.StatusBadRequest)
 		return

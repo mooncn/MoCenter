@@ -14,6 +14,7 @@ import Deploy from './pages/Deploy.jsx'
 import Backup from './pages/Backup.jsx'
 import AgentEnroll from './pages/AgentEnroll.jsx'
 import Login from './pages/Login.jsx'
+import ShareConsole from './pages/ShareConsole.jsx'
 import PublicStatus, { PublicNode } from './pages/PublicStatus.jsx'
 import { Api, PublicApi, MCSocket } from './api/api.js'
 import { applySiteTitle } from './utils/siteBranding.js'
@@ -129,6 +130,7 @@ function Layout() {
             </span>
           </div>
           {/* fallback 给懒加载期间一个明确反馈，避免弱网下"点了没反应" */}
+          <SecurityBanner />
           <Suspense fallback={<div className="route-loading">正在加载页面…</div>}>
             <Routes>
               <Route path="/" element={<Dashboard agents={agents} />} />
@@ -154,6 +156,51 @@ function Layout() {
   )
 }
 
+// SecurityBanner 把"身份保障已被削弱"的服务端状态常驻显示在后台顶部（L-8）。
+//
+// 为什么不是只在启动日志里说一次：-allow-unauthenticated-agents、Agent 通道退回明文、
+// 仍在用部署级共享注册密钥这三件事，都会一直生效，而运维从来不会翻服务日志。
+// 现象通常是"某天发现主机列表里多了一台不认识的主机"，那时已经晚了。
+//
+// 只在真的处于风险状态时才占版面；三项都正常时整个横幅不渲染。
+function SecurityBanner() {
+  const [info, setInfo] = useState(null)
+  useEffect(() => {
+    Api.serverInfo().then(setInfo).catch(() => {})
+  }, [])
+  if (!info) return null
+  const issues = []
+  if (info.allow_anon_agents) {
+    issues.push('Agent 允许无凭证注册（-allow-unauthenticated-agents）：任何能连到 Agent 端口的主机都能冒名接入。请尽快关掉。')
+  }
+  if (info.agent_tls_on === false) {
+    issues.push('Agent 通道当前是明文传输：注册凭据与全部报文可被同网段嗅探。请检查服务端证书能否正常签发。')
+  }
+  if (info.shared_key_enabled && !info.shared_key_disabled) {
+    issues.push('仍在使用部署级共享注册密钥（一把密钥认全网）：请为每台主机改用一次性注册令牌，迁移完成后加 -disable-shared-agent-key 收口。')
+  }
+  if (!issues.length) return null
+  return (
+    <div
+      style={{
+        margin: '0 0 12px',
+        padding: '10px 14px',
+        borderRadius: 8,
+        background: 'rgba(239,68,68,0.12)',
+        border: '1px solid rgba(239,68,68,0.45)',
+        color: '#fecaca',
+        fontSize: 13,
+        lineHeight: 1.6,
+      }}
+    >
+      <strong style={{ color: '#ef4444' }}>⚠️ 接入身份保障已降级</strong>
+      <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+        {issues.map((t) => <li key={t}>{t}</li>)}
+      </ul>
+    </div>
+  )
+}
+
 function Guard({ children }) {
   const location = useLocation()
   const token = localStorage.getItem('mc_token')
@@ -172,6 +219,8 @@ export default function App() {
       <Route path="/" element={<PublicStatus />} />
       <Route path="/public" element={<PublicStatus />} />
       <Route path="/public/node/:nodeId" element={<PublicNode />} />
+      {/* 邀请远程管理：访客凭链接片段里的分享 token 访问，**不走后台登录守卫** */}
+      <Route path="/share" element={<ShareConsole />} />
       {/* 后台登录：/login 保留为旧地址别名（书签/文档里可能仍是它） */}
       <Route path="/admin/login" element={<Login />} />
       <Route path="/login" element={<Navigate to="/admin/login" replace />} />

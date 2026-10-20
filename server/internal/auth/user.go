@@ -15,12 +15,12 @@ import (
 
 // 登录与改密相关错误。
 var (
-	ErrNoUsers         = errors.New("未配置可登录用户")
-	ErrBadLogin        = errors.New("用户名或密码错误")
-	ErrBadOTP          = errors.New("一次性验证码无效")
-	ErrBadUsername     = errors.New("用户不存在")
-	ErrBadOldPassword  = errors.New("当前密码错误")
-	ErrBadNewPassword  = errors.New("新密码为空或过短")
+	ErrNoUsers        = errors.New("未配置可登录用户")
+	ErrBadLogin       = errors.New("用户名或密码错误")
+	ErrBadOTP         = errors.New("一次性验证码无效")
+	ErrBadUsername    = errors.New("用户不存在")
+	ErrBadOldPassword = errors.New("当前密码错误")
+	ErrBadNewPassword = errors.New("新密码为空或过短")
 )
 
 // User 一个可登录账号。
@@ -34,12 +34,19 @@ type User struct {
 type UserManager struct {
 	mu    sync.RWMutex
 	users map[string]*User
-	path  string
+	// otpLast 记录每个用户最近一次通过校验的 TOTP 时间步，用于拒绝重放：
+	// 同一窗口内（含 ±1 步容差）的验证码只能用一次，否则截获者可在有效期内复用。
+	otpLast map[string]int64
+	path    string
 }
 
 // NewUserManager 创建基于指定文件持久化的用户管理器。
 func NewUserManager(path string) *UserManager {
-	return &UserManager{users: map[string]*User{}, path: path}
+	return &UserManager{
+		users:   map[string]*User{},
+		otpLast: map[string]int64{},
+		path:    path,
+	}
 }
 
 // Load 从文件加载账号（文件不存在则保持为空）。
@@ -204,6 +211,8 @@ func (m *UserManager) BindTOTP(username, secret string) error {
 		return ErrBadUsername
 	}
 	u.TOTPSecret = secret
+	// 换密钥后旧的重放水位没有意义（时间步与旧密钥绑定）。
+	delete(m.otpLast, username)
 	return m.Save()
 }
 
@@ -222,6 +231,7 @@ func (m *UserManager) UnbindTOTP(username, password, otp string) error {
 		return ErrBadOTP
 	}
 	u.TOTPSecret = ""
+	delete(m.otpLast, username)
 	return m.Save()
 }
 
@@ -276,6 +286,8 @@ func (m *UserManager) Authenticate(username, password, otp string) error {
 	u, ok := m.users[username]
 	m.mu.RUnlock()
 	if !ok {
+		// 走一次同成本的口令校验：用户不存在与口令错误的耗时一致，避免枚举账号。
+		_, _ = verifyPassword(dummyPasswordHash, password)
 		return ErrBadLogin
 	}
 	passOK, needsUpgrade := verifyPassword(u.PasswordHash, password)
@@ -283,9 +295,20 @@ func (m *UserManager) Authenticate(username, password, otp string) error {
 		return ErrBadLogin
 	}
 	if u.TOTPSecret != "" {
-		if !validateTOTP(u.TOTPSecret, otp, 1) {
+		step, ok := validateTOTPStep(u.TOTPSecret, otp, 1)
+		if !ok {
 			return ErrBadOTP
 		}
+		m.mu.Lock()
+		if m.otpLast == nil {
+			m.otpLast = map[string]int64{}
+		}
+		if last, seen := m.otpLast[username]; seen && step <= last {
+			m.mu.Unlock()
+			return ErrBadOTP
+		}
+		m.otpLast[username] = step
+		m.mu.Unlock()
 	}
 	if needsUpgrade {
 		m.upgradeHash(username, password)

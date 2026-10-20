@@ -7,9 +7,10 @@
 //   - 提供 REST API（鉴权、主机列表、命令下发、端口映射管理等）
 //   - 端口映射反向代理与连接跟踪
 //
-// 用法：go run . 或 ./server -listen :9000 -http :8080 -user admin -password <密码>
-// 登录凭证只有一种：用户名 + 密码（可选 OTP）。首次启动未指定 -user 时
-// 会自动创建内置账号 admin/123456。
+// 用法：go run . 或 ./server -listen :9000 -http :8080 -user admin -password-file <文件>
+// 登录凭证只有一种：用户名 + 密码（可选 OTP）。首次启动未指定 -user/-password 时
+// 会创建 admin 与**随机**初始口令（写到 <data>/initial-password.txt，0600），
+// 不再使用固定弱口令。
 package main
 
 import (
@@ -38,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -56,6 +58,7 @@ import (
 	"mocenter/server/internal/remark"
 	"mocenter/server/internal/route"
 	"mocenter/server/internal/session"
+	"mocenter/server/internal/share"
 	"mocenter/server/internal/siteconfig"
 	"mocenter/server/internal/storage"
 	"mocenter/server/internal/version"
@@ -68,6 +71,12 @@ func main() {
 	addr := flag.String("listen", ":9000", "Agent TCP 长连接监听地址")
 	httpAddr := flag.String("http", ":8080", "REST API / WebSocket 监听地址")
 	whitelist := flag.String("whitelist", os.Getenv("MOCENTER_WHITELIST"), "IP 白名单，逗号分隔")
+	// 反代场景下的"哪几层代理可信"（L-7）。默认空 = 完全不信任 X-Forwarded-For，
+	// 所有安全判定按 TCP 对端（与旧版一致）；填了它才按 XFF 还原真实客户端地址。
+	trustedProxies := flag.String("trusted-proxies", os.Getenv("MOCENTER_TRUSTED_PROXIES"),
+		"反向代理的可信网段（逗号分隔 CIDR 或裸 IP，如 127.0.0.1,10.0.0.0/8）。"+
+			"仅在前面挂了自有反代时配置：配置后 IP 白名单/限速/审计来源按 X-Forwarded-For 还原的客户端地址判定；"+
+			"留空表示不信任任何代理（默认，按 TCP 对端判定）")
 	webDir := flag.String("web", os.Getenv("MOCENTER_WEB_DIR"), "Web 静态资源目录，留空则不托管前端")
 	tlsCert := flag.String("tls-cert", "", "Agent TCP 连接 TLS 证书文件路径")
 	tlsKey := flag.String("tls-key", "", "Agent TCP 连接 TLS 私钥文件路径")
@@ -111,6 +120,13 @@ func main() {
 	// 空串参数归一（原因见 flags.go）。-vnc-ports 排除在外：它的帮助文本明写
 	// 「显式传空串表示不限制」，那是一个有效取值，不能被当成"未配置"。
 	blankFlags := normalizeBlankFlags(flag.CommandLine, "vnc-ports")
+	// 命令行是否**显式给出**某参数。配置回填必须让位给它：
+	// `-admin-tls-days 0` 这类"显式关掉"的取值恰好等于…不，它的默认值是 30，
+	// 于是"值等于默认就当没传"的老写法会把运维的显式意图吞掉 ——
+	// 表现是"命令行写了 -admin-tls-days 0 却仍然起 TLS"，只能改配置文件。
+	givenFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { givenFlags[f.Name] = true })
+	clearBlankExplicit(givenFlags, blankFlags)
 
 	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
 	cfg, err := config.Load(*configPath)
@@ -119,16 +135,17 @@ func main() {
 	}
 	if cfg == nil {
 		cfg = &config.Config{
-			Listen:    *addr,
-			HTTP:      *httpAddr,
-			Whitelist: *whitelist,
-			WebDir:    *webDir,
-			TLSCert:   *tlsCert,
-			TLSKey:    *tlsKey,
-			CACert:    *caCert,
-			Insecure:  *insecure,
-			DataDir:   *dataDir,
-			User:      *user,
+			Listen:         *addr,
+			HTTP:           *httpAddr,
+			Whitelist:      *whitelist,
+			WebDir:         *webDir,
+			TrustedProxies: *trustedProxies,
+			TLSCert:        *tlsCert,
+			TLSKey:         *tlsKey,
+			CACert:         *caCert,
+			Insecure:       *insecure,
+			DataDir:        *dataDir,
+			User:           *user,
 			// 不落盘明文密码与 TOTP 密钥：账号以哈希持久化到 users.json
 			Password:          "",
 			TOTPSecret:        "",
@@ -196,6 +213,11 @@ func main() {
 		if cfg.TOTPSecret != "" && *totpSecret == "" {
 			*totpSecret = cfg.TOTPSecret
 		}
+		// 可信代理网段同样要从配置回填：服务模式不带命令行参数，
+		// 不回填就表现为"配了 trusted_proxies 却不生效"。
+		if cfg.TrustedProxies != "" && *trustedProxies == os.Getenv("MOCENTER_TRUSTED_PROXIES") {
+			*trustedProxies = cfg.TrustedProxies
+		}
 		if cfg.WebTLSCert != "" && *webTLSCert == "" {
 			*webTLSCert = cfg.WebTLSCert
 		}
@@ -234,7 +256,7 @@ func main() {
 		if cfg.DisableSharedAgentKey {
 			*disableSharedAgentKey = true
 		}
-		if cfg.AdminTLSDays != 0 {
+		if cfg.AdminTLSDays != 0 && !givenFlags["admin-tls-days"] {
 			*adminTLSDays = cfg.AdminTLSDays
 		}
 		if cfg.ServerName != "" && *serverName == "" {
@@ -251,16 +273,14 @@ func main() {
 	// 命令行显式传入的参数（flag.Visit）优先级最高，并自动保存回配置文件，
 	// 这样下次可直接按最新参数启动，无需重复传参。密码/TOTP 不落盘。
 	{
-		explicit := map[string]bool{}
-		flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
-		// 传空串的参数已按「未配置」归一，不能再算「显式给出」：
-		// 否则 -user "" 这类会把配置文件里已存的用户名回写成空。
-		clearBlankExplicit(explicit, blankFlags)
+		// 与上面的配置回填共用同一份「显式给出」判定（已剔除被归一化的空值参数）
+		explicit := givenFlags
 		// flag 名 -> (配置字段指针, 命令行变量值)
 		field := map[string]func(){
 			"listen":                   func() { cfg.Listen = *addr },
 			"http":                     func() { cfg.HTTP = *httpAddr },
 			"whitelist":                func() { cfg.Whitelist = *whitelist },
+			"trusted-proxies":          func() { cfg.TrustedProxies = *trustedProxies },
 			"web":                      func() { cfg.WebDir = *webDir },
 			"web-tls-cert":             func() { cfg.WebTLSCert = *webTLSCert },
 			"web-tls-key":              func() { cfg.WebTLSKey = *webTLSKey },
@@ -284,7 +304,7 @@ func main() {
 			"upgrade-pubkey":           func() { cfg.UpgradePubKey = *upgradePubKey },
 		}
 		dirty := false
-		for _, name := range []string{"listen", "http", "whitelist", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "password-file", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl", "require-agent-cert", "disable-shared-agent-key", "admin-tls-days", "server-name", "vnc-ports", "upgrade-pubkey"} {
+		for _, name := range []string{"listen", "http", "whitelist", "trusted-proxies", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "password-file", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl", "require-agent-cert", "disable-shared-agent-key", "admin-tls-days", "server-name", "vnc-ports", "upgrade-pubkey"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -589,6 +609,18 @@ func main() {
 
 	hub := ws.NewHub()
 
+	// 「邀请远程管理」的分享链接存储（<data>/shares.json，0600）。
+	// 加载失败只降级本功能：主机监控/命令/桌面等既有能力不应因一份分享文件损坏而停服。
+	shareStore, shareErr := share.NewStore(filepath.Join(*dataDir, share.StoreFileName))
+	if shareErr != nil {
+		log.Printf("[server] 警告: 分享存储不可用（%v）—— 本次启动「分享控制」将返回错误", shareErr)
+		shareStore = nil
+	}
+	shareSvc := &shareAPI{
+		store: shareStore, probes: store, authz: authz, router: router,
+		hub: hub, vnc: vncMgr, sess: sess, pm: pm,
+	}
+
 	// 地理位置异步解析完成后补推一次主机列表。
 	// 解析走外部接口（可达数秒），因此列表推送先返回缓存、解析完成后自动补一帧，
 	// 而不是在推送路径上同步等待 —— 后者是首屏长时间空白的主因。
@@ -631,7 +663,7 @@ func main() {
 
 	// WebSocket 收到 Web 消息后的统一处理入口
 	hub.SetMessageHandler(func(sessionKey, operator string, data []byte) {
-		handleWebMessage(sessionKey, operator, data, sess, store, router, hub, ft, pm, pushMgr, vncMgr)
+		handleWebMessage(sessionKey, operator, data, sess, store, router, hub, ft, pm, pushMgr, vncMgr, shareStore)
 	})
 
 	// 主机列表的节流广播入口：探针这类高频数据源走 soon()（合并），
@@ -640,24 +672,80 @@ func main() {
 
 	// 服务端启动后台任务
 	go heartbeatSweeper(sess, store, refresh)
-	go cleanupSweeper(pm, hub, ft)
+	go cleanupSweeper(pm, hub, ft, pushMgr)
 	// 探针历史定期清理（保留 30 天）+ 审计日志留存清理（保留 180 天）
 	go probeHistoryCleaner(db)
 	go auditRetentionCleaner(db)
 
 	// 启动 HTTP 服务（REST + WebSocket）
 	mux := http.NewServeMux()
+	// Agent 通道最终是否真的加密，要到 start() 里签证书时才知道（自动签发可能失败退回明文），
+	// 而 /api/server-info 在此之前就要注册 —— 用原子量把结论带过去（L-8：这些"降级状态"
+	// 必须能在后台被看见，只写在启动日志里等于没人看）。
+	var agentChannelTLS atomic.Bool
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		if !guardWS(w, r, authz) {
+		if !guardGate(w, r, authz) {
 			return
 		}
-		hub.HandleUpgrade(w, r, authz.ValidateToken, authz.OperatorOf)
+		token := ws.WSToken(r)
+		if authz.ValidateToken(token) {
+			hub.HandleUpgrade(w, r, authz.ValidateToken, authz.OperatorOf)
+			return
+		}
+		// 分享访客：凭分享 token 建立推送通道。这里只放行「远程终端」作用域，
+		// 且只允许上行终端输入（见 handleWebMessage 的 share 分支）。
+		if shareStore == nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		sh, err := shareStore.Validate(token, "", share.FeatureTerminal)
+		if err != nil || store.Get(sh.AgentID) == nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		hub.HandleUpgradeShare(w, r, sh.SessionKey, shareOperator(sh))
+		// 到期主动收口：连接建立后不再有握手校验，必须有人按 ExpiresAt 关掉它。
+		scheduleShareExpiry(sh, func() {
+			hub.CloseSession(sh.SessionKey)
+			closeShareCommands(router, sess, sh.SessionKey)
+		})
 	})
 	mux.HandleFunc("/vnc-ws", func(w http.ResponseWriter, r *http.Request) {
-		if !guardWS(w, r, authz) {
+		if !guardGate(w, r, authz) {
 			return
 		}
-		vncMgr.HandleViewer(w, r, authz.ValidateToken)
+		token := ws.WSToken(r)
+		if authz.ValidateToken(token) {
+			vncMgr.HandleViewer(w, r, authz.ValidateToken)
+			return
+		}
+		// 分享访客的桌面：主机与端口都必须与分享作用域完全一致，
+		// 不能拿一条桌面分享去连别的主机或别的端口。
+		if shareStore == nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		agentID := r.URL.Query().Get("agent")
+		port := 5900
+		if s := r.URL.Query().Get("port"); s != "" {
+			if v, e := strconv.Atoi(s); e == nil && v > 0 {
+				port = v
+			}
+		}
+		sh, err := shareStore.Validate(token, agentID, share.FeatureVNC)
+		if err != nil || store.Get(agentID) == nil || sh.VNCPort != port {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// HandleViewerScoped 会一直阻塞到查看器断开，因此到期收口必须在它之前登记。
+		scheduleShareExpiry(sh, func() { vncMgr.CloseSession(sh.SessionKey) })
+		vncMgr.HandleViewerScoped(w, r, func(tok, agent string, p int) bool {
+			if tok != token || agent != agentID || p != port {
+				return false
+			}
+			cur, verr := shareStore.Validate(tok, agent, share.FeatureVNC)
+			return verr == nil && cur.VNCPort == p && store.Get(agent) != nil
+		})
 	})
 	mux.HandleFunc("/api/command", commandHandler(router, authz))
 	mux.HandleFunc("/api/command/batch", batchCommandHandler(router, authz))
@@ -674,10 +762,20 @@ func main() {
 	// 版本信息（服务端版本 + 各 Agent 在线版本与升级判定）
 	mux.HandleFunc("/api/version", versionHandler(store, geoResolver, authz))
 	mux.HandleFunc("/api/agents/remark", setRemarkHandler(remarks, authz))
-	mux.HandleFunc("/api/agents/delete", deleteAgentHandler(store, remarks, pm, authz, router))
+	mux.HandleFunc("/api/agents/delete", deleteAgentHandler(store, remarks, pm, authz, router, shareStore, hub, vncMgr))
 	mux.HandleFunc("/api/audits", auditsHandler(router, authz))
 	mux.HandleFunc("/api/portmap/rules", portmapRulesHandler(pm, authz))
 	mux.HandleFunc("/api/portmap/op", portmapOpHandler(pm, authz, router))
+	// 邀请远程管理：控制台侧创建/列举/撤销 + 访客侧凭分享 token 的能力入口。
+	// 访客侧不走登录鉴权（没有账号），由各 handler 内的作用域校验把关。
+	mux.HandleFunc("/api/shares", shareSvc.adminHandler())
+	mux.HandleFunc("/api/shares/revoke", shareSvc.revokeHandler())
+	mux.HandleFunc("/api/share/info", shareSvc.infoHandler())
+	mux.HandleFunc("/api/share/command", shareSvc.commandHandler())
+	mux.HandleFunc("/api/share/command/close", shareSvc.commandCloseHandler())
+	mux.HandleFunc("/api/share/portmap/rules", shareSvc.rulesHandler())
+	mux.HandleFunc("/api/share/portmap/op", shareSvc.portmapOpHandler())
+	mux.HandleFunc("/api/share/vnc/password", shareSvc.vncPasswordHandler())
 	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz, *upgradePubKey))
 	mux.HandleFunc("/api/login", loginHandler(userMgr, authz, loginGuard, router))
 	mux.HandleFunc("/api/logout", logoutHandler(authz))
@@ -690,10 +788,11 @@ func main() {
 	})
 	// Agent 接入信息：让运维不必翻服务器终端就能拿到"一条命令"。
 	// 需要登录，但**只含指纹等可公开线索**（密钥明文走下面的轮换接口）。
-	mux.HandleFunc("/api/server-info", serverInfoHandler(authz, identity, verifier, *addr, *dataDir, *requireAgentCert))
+	mux.HandleFunc("/api/server-info", serverInfoHandler(authz, identity, verifier, *addr, *dataDir, *requireAgentCert, *allowAnonAgents, *disableSharedAgentKey, agentChannelTLS.Load))
 	// 一次性注册令牌：签发 / 列举 / 吊销 + 证书 TOFU 绑定重置（均需登录，且全部进审计）。
 	mux.HandleFunc("/api/enroll/tokens", enrollTokensHandler(enrollStore, verifier, authz, router))
 	mux.HandleFunc("/api/enroll/token/revoke", enrollRevokeHandler(enrollStore, authz, router))
+	mux.HandleFunc("/api/enroll/token/delete", enrollDeleteHandler(enrollStore, store, authz, router))
 	mux.HandleFunc("/api/enroll/cert/reset", enrollBindingResetHandler(enrollStore, authz, router))
 	// 轮换部署级共享注册密钥：这是 M-1 之后唯一能拿到该密钥明文的出口。
 	mux.HandleFunc("/api/enroll/shared-key/rotate", sharedKeyRotateHandler(verifier, authz, router, agentKeyPath, agentKeyExplicit))
@@ -758,6 +857,24 @@ func main() {
 		log.Printf("[server] 托管 Web 静态资源: %s", *webDir)
 	}
 
+	// 反代下的真实客户端地址（L-7）：只在最外层做一次归一，让白名单、限速、登录退避、
+	// 审计来源、WS/VNC 握手、公开页并发都用同一个口径。
+	// 未配置 -trusted-proxies 时 proxies 为空，这里直接返回原 handler —— 行为与从前一致。
+	proxies, pxErr := auth.ParseProxyCIDRs(*trustedProxies)
+	if pxErr != nil {
+		log.Fatalf("[server] -trusted-proxies 无法解析: %v（应形如 127.0.0.1,10.0.0.0/8）", pxErr)
+	}
+	webHandler := auth.TrustProxyClients(proxies, securityHeaders(mux))
+	if len(proxies) > 0 {
+		log.Printf("[server] 已按可信代理还原客户端地址（网段: %s）；"+
+			"X-Forwarded-For 只有来自这些网段的连接才会被采信", *trustedProxies)
+	} else if *whitelist != "" {
+		// 白名单 + 反代是最容易配坏的组合：此时所有访客都落在代理那一个 IP 上，
+		// 白名单要么整体放行、要么把后台关死，而现象只表现为"偶发 403"。
+		log.Printf("[server] 提示: 已配置 IP 白名单但未配置 -trusted-proxies；"+
+			"若本站在反向代理之后，白名单/限速只能看到代理地址 %s。请把代理网段填进 -trusted-proxies", *whitelist)
+	}
+
 	// 监听与接收循环封装成函数：被 SCM 拉起时由服务启动回调调用。
 	start := func() {
 		go func() {
@@ -772,7 +889,7 @@ func main() {
 				if err != nil {
 					log.Fatalf("[server] 加载 Web TLS 证书失败: %v", err)
 				}
-				serveAdminTLS(*httpAddr, securityHeaders(mux), cert, true)
+				serveAdminTLS(*httpAddr, webHandler, cert, true)
 				return
 			}
 			if identity != nil && *adminTLSDays > 0 {
@@ -782,7 +899,7 @@ func main() {
 					log.Printf("[server] Web 控制台使用内置 CA 自动签发的临时证书（%d 天，SAN: %v）；"+
 						"浏览器会提示自签名证书，接受即可；如需受信任证书请配置 -web-tls-cert/-web-tls-key",
 						*adminTLSDays, hosts)
-					serveAdminTLS(*httpAddr, securityHeaders(mux), cert, false)
+					serveAdminTLS(*httpAddr, webHandler, cert, false)
 					return
 				}
 				log.Printf("[server] 警告: 生成 Web 控制台临时证书失败: %v", err)
@@ -794,7 +911,7 @@ func main() {
 			}
 			srv := &http.Server{
 				Addr:              *httpAddr,
-				Handler:           securityHeaders(mux),
+				Handler:           webHandler,
 				ReadHeaderTimeout: 10 * time.Second,
 			}
 			if err := srv.ListenAndServe(); err != nil {
@@ -830,8 +947,10 @@ func main() {
 				log.Fatalf("[server] %v", certErr)
 			}
 			tlsLn = ln
+			agentChannelTLS.Store(false)
 			log.Printf("[server] 警告: 自动生成 Agent 通道证书失败（%v），该通道为明文传输", certErr)
 		} else {
+			agentChannelTLS.Store(true)
 			noClientCert := !*requireAgentCert
 			if *caCert != "" {
 				// 手工指定 CA：沿用旧语义（必须携带由该 CA 签发的客户端证书）
@@ -1363,8 +1482,18 @@ func unregisteredHint(conn net.Conn) string {
 }
 
 // validAgentID 校验 AgentID 是否可用。
-// 允许较宽松（兼容中文主机名 / 硬件 UUID），但禁止空白与控制字符，
-// 防止不可控内容进入日志与审计。
+//
+// 允许字母、数字、`.` `-` `_` 与非 ASCII（兼容中文主机名 / 硬件 UUID），
+// 但**显式拒绝 ASCII 元字符**（L-9）。控制字符与空白是旧版就挡的两类；这一层新挡的是
+// shell 与标记语法：`< > " ' \` & ; | $ ( ) { } [ ] / \ : * ? ! # ~ ^ % @ + = ,`。
+//
+// 为什么现在才挡：这个 ID 会流进证书 CN、审计库、CSV 导出、前端界面与运维复制粘贴的
+// shell 命令。今天每条出口都各自做了转义（参数化 SQL、csvCell、logSafe、React 转义、
+// 部署侧另有 agentIDRe），所以它不是可利用漏洞；但"每个下游都要记得转义"正是会失守的
+// 那种约定，而合法主机名从来不需要这些字符 —— 在身份入口收一次，比在每条出口各防一遍稳。
+//
+// 注意：这会拒绝**历史上带过这些字符**的身份重新上线。留空/改名的正确路径是重新签发
+// 一次性令牌（ID 由 UUID 兜底），而不是放宽这里的字符集。
 func validAgentID(s string) bool {
 	s = strings.TrimSpace(s)
 	if s == "" || len(s) > 128 {
@@ -1377,9 +1506,15 @@ func validAgentID(s string) bool {
 		if unicode.IsSpace(r) {
 			return false
 		}
+		if r < 0x80 && strings.IndexRune(agentIDForbiddenASCII, r) >= 0 {
+			return false
+		}
 	}
 	return true
 }
+
+// agentIDForbiddenASCII 是 agent_id 里一律不接受的 ASCII 元字符集合（见 validAgentID）。
+const agentIDForbiddenASCII = "<>\"'&;|(){}[]/\\:*?!#~^%@+,=$`"
 
 // enrollAgentCert 处理 Agent 的"用注册凭据换取客户端证书"请求（"简单模式"的签发端）。
 //
@@ -1424,10 +1559,13 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 	//     没出示 = 匿名意图，两者不是一回事，不能相乘。
 	credentialFree := er.Proof == ""
 	credSource := agentauth.CredAnon
+	// 命中的一次性令牌是否显式绑定到本 agent_id。未绑定令牌只够用于首次接入；
+	// 已有绑定的主机换公钥必须出示绑定令牌（见 CheckOrBind）。
+	credTokenBound := false
 
 	if !credentialFree {
 		// 出示了凭据 → 必须验过，与 allowAnon 无关
-		src, err := verifier.Verify(er.AgentID, er.Nonce, er.Proof, er.TS)
+		src, bound, err := verifier.VerifyEx(er.AgentID, er.Nonce, er.Proof, er.TS)
 		if err != nil {
 			// 凭据校验失败同样要留 auth 审计：这类事件的信号价值与"被绑定拦住"同级 ——
 			// 可能是令牌抄错，也可能是有人在试别人的令牌 / 重放旧报文。
@@ -1437,6 +1575,7 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 			return resp
 		}
 		credSource = src
+		credTokenBound = bound
 	} else {
 		// 完全没带凭据：这是唯一的匿名入口，需**运维显式开启**才放行。
 		// 注意此处不再看 verifier.Enabled()：无论服务端配没配凭据，没带凭据就是匿名，
@@ -1485,7 +1624,7 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 	// 已在启动日志里告警，并被上面的 CredAnon 留痕。
 	if store := verifier.Tokens(); store != nil {
 		if spki := agentauth.SpkiHashOfPEM(certPEM); spki != "" {
-			if berr := store.CheckOrBind(er.AgentID, spki, credSource); berr != nil {
+			if berr := store.CheckOrBind(er.AgentID, spki, credSource, credTokenBound); berr != nil {
 				rejectEnrollment(router, conn, er.AgentID, berr.Error())
 				resp.Message = berr.Error()
 				return resp
@@ -1925,11 +2064,11 @@ func heartbeatSweeper(sess *session.Manager, store *probe.Store, refresh *agentR
 	}
 }
 
-// cleanupSweeper 端口映射超时连接清理 + 上传任务闲置回收。
+// cleanupSweeper 端口映射超时连接清理 + 上传/分发任务闲置回收。
 //
-// 两者都是"有界资源 + 定时清扫"的同一类活儿，放一个协程里跑，
+// 三者都是"有界资源 + 定时清扫"的同一类活儿，放一个协程里跑，
 // 省得将来加新清扫器时又要记一遍"别忘开 goroutine"。
-func cleanupSweeper(pm *portmap.Manager, hub *ws.Hub, ft *filetransfer.Manager) {
+func cleanupSweeper(pm *portmap.Manager, hub *ws.Hub, ft *filetransfer.Manager, pushMgr *filetransfer.PushManager) {
 	t := time.NewTicker(30 * time.Second)
 	for range t.C {
 		expired := pm.CleanupExpired(100)
@@ -1938,6 +2077,7 @@ func cleanupSweeper(pm *portmap.Manager, hub *ws.Hub, ft *filetransfer.Manager) 
 			hub.Broadcast(protocol.TypePortMapState, pm.Tracks())
 		}
 		ft.CleanupStale()
+		pushMgr.CleanupStale()
 	}
 }
 
@@ -1974,18 +2114,27 @@ func broadcastAgents(hub *ws.Hub, store *probe.Store, pub *publicSite) {
 //
 // 注意这里刻意不含任何密钥明文：本接口是控制台页面加载时顺手拉的，把部署级根凭证
 // 放在这里等于让 XSS、浏览器扩展、反向代理日志各替攻击者保管一份（M-1）。
-func serverInfoHandler(authz *auth.Auth, identity *agentauth.Identity, verifier *agentauth.Verifier, listenAddr, dataDir string, requireCert bool) http.HandlerFunc {
+func serverInfoHandler(authz *auth.Auth, identity *agentauth.Identity, verifier *agentauth.Verifier, listenAddr, dataDir string, requireCert, allowAnon, sharedKeyDisabled bool, agentTLS func() bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
 		}
 		sharedKeyOn := verifier.SharedKeyEnabled()
+		tlsOn := true
+		if agentTLS != nil {
+			tlsOn = agentTLS()
+		}
 		resp := map[string]interface{}{
 			"listen":             listenAddr,
 			"require_agent_cert": requireCert,
 			// shared_key_enabled：部署级共享注册密钥当前还能不能用来注册
 			// （false = 只认一次性令牌，此时指纹与密钥路径一律不下发）。
 			"shared_key_enabled": sharedKeyOn,
+			// 三条"身份保障已被削弱"的状态（L-8）。只写启动日志的告警等于没人看，
+			// 而这三项恰恰是运维会一路带着走完整个生命周期的配置。
+			"allow_anon_agents":   allowAnon,
+			"agent_tls_on":        tlsOn,
+			"shared_key_disabled": sharedKeyDisabled,
 		}
 		// public_ip：本机探测到的公网 IP，供「Agent 接入」页面把部署命令里的总控地址
 		// 补全 —— -listen 是 ":9000" / "0.0.0.0:9000" 这类写法时，命令里根本没有可用主机名。
@@ -2355,11 +2504,12 @@ func setRemarkHandler(remarks *remark.Store, authz *auth.Auth) http.HandlerFunc 
 
 // deleteAgentHandler 删除一台离线主机的登记与历史数据。
 //
-// 只清服务端这一侧：主机记录、备注、探针/延迟历史、端口映射规则。
+// 只清服务端这一侧：主机记录、备注、探针/延迟历史、端口映射规则，以及指向它的
+// 分享链接（主机都不在册了，继续可用的邀请没有意义）。
 // 不碰证书 TOFU 绑定与未使用的一次性令牌 —— 那些是"这台机器还能不能换证书"
-// 的信任状态，误清会把一道安全闸门一起删掉；需要时在「Agent 接入」页单独清除。
+// 的信任状态，误清会把一道安全闸门一起删掉；需要时在「Agent 接入」页单独清除/删除。
 // 也不卸载目标机上的 Agent：若它仍在运行，会重新注册并再次出现在列表里。
-func deleteAgentHandler(store *probe.Store, remarks *remark.Store, pm *portmap.Manager, authz *auth.Auth, router *route.Router) http.HandlerFunc {
+func deleteAgentHandler(store *probe.Store, remarks *remark.Store, pm *portmap.Manager, authz *auth.Auth, router *route.Router, shares *share.Store, hub *ws.Hub, vncMgr *vnc.Mgr) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
@@ -2393,6 +2543,7 @@ func deleteAgentHandler(store *probe.Store, remarks *remark.Store, pm *portmap.M
 		if pm != nil {
 			removed = pm.DeleteRulesForAgents(aliases)
 		}
+		revokedShares := revokeSharesForAgents(shares, hub, vncMgr, aliases)
 		router.Audit(&route.AuditLog{
 			Time:       time.Now().Unix(),
 			Operator:   authz.Operator(r.Header.Get("Authorization")),
@@ -2406,6 +2557,7 @@ func deleteAgentHandler(store *probe.Store, remarks *remark.Store, pm *portmap.M
 			"ok":              true,
 			"agent_id":        info.AgentID,
 			"portmap_removed": removed,
+			"shares_revoked":  revokedShares,
 			"msg":             "主机已删除",
 		})
 	}
@@ -3003,7 +3155,13 @@ func loginHandler(um *auth.UserManager, authz *auth.Auth, loginGuard *auth.Login
 			return
 		}
 		loginGuard.Success(body.Username)
-		tok := randHex(32)
+		tok, terr := randHex(32)
+		if terr != nil {
+			// 宁可登录失败，也不发一个可预测的会话 Token
+			log.Printf("[auth] 生成会话 Token 失败（系统熵源不可用）: %v", terr)
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "服务端无法生成安全会话，请稍后重试"})
+			return
+		}
 		authz.RegisterToken(tok, body.Username)
 		router.Audit(&route.AuditLog{
 			Time: time.Now().Unix(), Operator: auditSafeText(body.Username), OperatorIP: opIP,
@@ -3096,11 +3254,16 @@ func changePasswordHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerF
 	}
 }
 
-// randHex 生成随机十六进制字符串（用于 Token）。
-func randHex(n int) string {
+// randHex 生成 n 字节随机值的 hex 串。
+//
+// 熵源失败必须报错而不是返回一串全零：调用方拿它当**会话 Token**，
+// 全零等于把"可预测的管理员凭据"发出去，而失败本身在日志里一个字都不会留。
+func randHex(n int) (string, error) {
 	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // randPassword 生成可读的随机口令（去除易混淆字符，默认 16 位）。
@@ -3642,7 +3805,11 @@ func mimeByExt(ext string) string {
 // handleWebMessage 处理 Web 前端通过 WebSocket 发来的消息。
 // 支持：命令下发、交互输入、端口映射操作。
 // sessionKey 为该连接的会话键，命令要按它登记归属，回执才只回投给发起方。
-func handleWebMessage(sessionKey, operator string, data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr) {
+//
+// 分享访客的连接也走这里（operator = "share:<id>"），但只允许终端输入：
+// 命令下发、端口映射、文件分发全部拒绝 —— 这些能力如果有需要，必须走
+// /api/share/* 的专用端点，那里才有"功能作用域 + 主机绑定"的校验。
+func handleWebMessage(sessionKey, operator string, data []byte, sess *session.Manager, store *probe.Store, router *route.Router, hub *ws.Hub, ft *filetransfer.Manager, pm *portmap.Manager, pushMgr *filetransfer.PushManager, vncMgr *vnc.Mgr, shareStore *share.Store) {
 	// WebSocket 消息中 data 为 JSON 对象，需用 RawMessage 解码（不同于 TCP 的 base64 []byte）
 	var raw struct {
 		Type string          `json:"type"`
@@ -3651,6 +3818,19 @@ func handleWebMessage(sessionKey, operator string, data []byte, sess *session.Ma
 	if err := json.Unmarshal(data, &raw); err != nil {
 		log.Printf("[server] web message decode error: %v", err)
 		return
+	}
+	if shareID, isShare := shareIDFromOperator(operator); isShare {
+		// 分享可能在连接建立后过期/被撤销：每条上行消息都复查一次，
+		// 失效就把这条连接断开，避免"链接过期了终端还能继续输入"。
+		if shareStore == nil || !shareStore.Active(shareID) {
+			hub.CloseSession(sessionKey)
+			closeShareCommands(router, sess, sessionKey)
+			return
+		}
+		if raw.Type != protocol.TypeInteractiveIn {
+			log.Printf("[server] 丢弃分享 %s 的上行消息 %q（只允许终端输入）", shareID, raw.Type)
+			return
+		}
 	}
 	// 统一转成 Envelope 供 switch 复用
 	env := protocol.Envelope{Type: raw.Type, Data: raw.Data}
@@ -3732,7 +3912,15 @@ func handleWebPushChunk(pushMgr *filetransfer.PushManager, sess *session.Manager
 	if err := json.Unmarshal(data, &req); err != nil {
 		return
 	}
-	task, complete := pushMgr.UploadChunk(&req)
+	task, complete, err := pushMgr.UploadChunk(&req)
+	if err != nil {
+		// 超限拒绝必须让界面看见原因：静默停在半截只会让人以为"还在传"。
+		hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{
+			AgentID: req.AgentID, FilePath: req.FilePath, Action: "push",
+			Status: "failed", Message: "分发已中止：" + err.Error(),
+		})
+		return
+	}
 	if task == nil {
 		// 分发失败/取消
 		hub.Broadcast(protocol.TypeFileTransferState, &protocol.FileTransferState{

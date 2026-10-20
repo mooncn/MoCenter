@@ -60,10 +60,20 @@ type CommandOrigin struct {
 	Session string // 发起方操作员会话键（空表示无法定向）
 }
 
+// CommandRef 一条在途命令的定位信息（用于会话结束时主动收口）。
+type CommandRef struct {
+	AgentID   string
+	CommandID string
+}
+
 // 在途命令映射的容量上下限：超过 cmdAuditCapMax 时驱逐到 cmdAuditCapMin。
 const (
 	cmdAuditCapMax = 20000
 	cmdAuditCapMin = 10000
+
+	// maxCommandIDLen command_id 的最大长度。它会成为 map 键与审计字段，
+	// 不设上限时一个请求就能让一条大字符串驻留到命令结束。
+	maxCommandIDLen = 128
 )
 
 // AuditLog 操作审计日志。
@@ -352,6 +362,14 @@ func normalizeForBlacklist(cmd string) string {
 // interactive 为 true 时进入交互模式（通过 WebSocket 实时转发）。
 // session 为发起方操作员会话键（见 ws.SessionKey）：命令输出只回投给这一会话。
 func (r *Router) Dispatch(req *protocol.CommandReq, operator, operatorIP, session string) (bool, string) {
+	if len(req.CommandID) > maxCommandIDLen {
+		return false, fmt.Sprintf("命令 ID 过长（最多 %d 字节），请重新发起", maxCommandIDLen)
+	}
+	// command_id 由前端生成、可猜；同一键只能属于一个会话。分享访客若能覆盖管理端
+	// 已有的绑定，就能收到对方的终端输出并把输入打进对方的会话 —— 这里先做一次快速拒绝。
+	if r.commandIDTakenByOther(req.CommandID, req.AgentID, session) {
+		return false, "命令 ID 已被其他会话占用，请重新发起"
+	}
 	if blocked, reason := r.IsBlocked(req.Command); blocked {
 		r.Audit(&AuditLog{
 			Time: time.Now().Unix(), Operator: operator, OperatorIP: operatorIP,
@@ -375,6 +393,13 @@ func (r *Router) Dispatch(req *protocol.CommandReq, operator, operatorIP, sessio
 		if r.cmdAudit == nil {
 			r.cmdAudit = make(map[string]*cmdBinding)
 		}
+		// 快速检查与这里之间可能插入另一会话的同 ID 下发；持锁再判一次，
+		// 保证"后写入者"不会把先到者的归属顶掉。
+		if cur := r.cmdAudit[cmdKey(req.CommandID, req.AgentID)]; cur != nil && cur.session != session {
+			r.auditMu.Unlock()
+			r.Complete(id, req.AgentID, "命令 ID 已被其他会话占用", -1, 0)
+			return false, "命令 ID 已被其他会话占用，请重新发起"
+		}
 		r.cmdAudit[cmdKey(req.CommandID, req.AgentID)] = &cmdBinding{
 			auditID: id,
 			agentID: req.AgentID,
@@ -389,6 +414,17 @@ func (r *Router) Dispatch(req *protocol.CommandReq, operator, operatorIP, sessio
 		return false, "下发失败: " + err.Error()
 	}
 	return true, ""
+}
+
+// commandIDTakenByOther 判断 (agentID, commandID) 是否已被**其他会话**占用。
+func (r *Router) commandIDTakenByOther(commandID, agentID, session string) bool {
+	if commandID == "" {
+		return false
+	}
+	r.auditMu.Lock()
+	defer r.auditMu.Unlock()
+	b := r.cmdAudit[cmdKey(commandID, agentID)]
+	return b != nil && b.session != session
 }
 
 // cmdKey 在途命令的索引键。
@@ -441,6 +477,33 @@ func (r *Router) CommandOrigin(commandID, agentID string) (CommandOrigin, bool) 
 	// 交互终端的一条命令可以跑很久：每次被触及就续期，避免被容量驱逐
 	b.last = time.Now()
 	return CommandOrigin{AgentID: b.agentID, Session: b.session}, true
+}
+
+// ReleaseSession 取出并移除某个会话名下的全部在途命令绑定。
+//
+// 分享撤销/过期时调用：只断开 WebSocket 不会结束远端 shell，命令进程会继续在
+// 被管主机上运行（且再也无人能输入）。把绑定一并收口，调用方才能向对应 Agent
+// 下发 InteractiveClose。
+func (r *Router) ReleaseSession(session string) []CommandRef {
+	if session == "" {
+		return nil
+	}
+	r.auditMu.Lock()
+	defer r.auditMu.Unlock()
+	var out []CommandRef
+	prefix := ""
+	for k, b := range r.cmdAudit {
+		if b == nil || b.session != session {
+			continue
+		}
+		prefix = b.agentID + "|"
+		out = append(out, CommandRef{
+			AgentID:   b.agentID,
+			CommandID: strings.TrimPrefix(k, prefix),
+		})
+		delete(r.cmdAudit, k)
+	}
+	return out
 }
 
 // auditIDFor 返回某条命令对应的审计记录 ID（不存在返回 0）。

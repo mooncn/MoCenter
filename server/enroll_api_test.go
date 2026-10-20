@@ -250,7 +250,7 @@ func TestServerInfoWithholdsSharedKeyPlaintext(t *testing.T) {
 	_, authz, _ := newEnrollAPIFixture(t)
 	verifier := agentauth.NewVerifier(plaintext)
 
-	rec := doJSON(t, serverInfoHandler(authz, nil, verifier, ":9000", dataDir, false), http.MethodGet, "", "test-token")
+	rec := doJSON(t, serverInfoHandler(authz, nil, verifier, ":9000", dataDir, false, false, false, func() bool { return true }), http.MethodGet, "", "test-token")
 	body := rec.Body.String()
 	if strings.Contains(body, plaintext) {
 		t.Fatalf("server-info 仍下发密钥明文: %s", body)
@@ -258,6 +258,16 @@ func TestServerInfoWithholdsSharedKeyPlaintext(t *testing.T) {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
+	}
+	// L-8：三条"接入身份保障已降级"的状态必须能在后台读到（前端据此出横幅）。
+	if resp["allow_anon_agents"] != false {
+		t.Fatalf("未开启匿名注册时 allow_anon_agents 应为 false: %+v", resp)
+	}
+	if resp["agent_tls_on"] != true {
+		t.Fatalf("Agent 通道 TLS 状态应如实回传: %+v", resp)
+	}
+	if _, ok := resp["shared_key_disabled"]; !ok {
+		t.Fatalf("server-info 应回传共享密钥收口状态: %+v", resp)
 	}
 	if _, ok := resp["agent_key"]; ok {
 		t.Fatalf("响应里不该再有 agent_key 字段: %+v", resp)
@@ -268,6 +278,29 @@ func TestServerInfoWithholdsSharedKeyPlaintext(t *testing.T) {
 	}
 	if resp["agent_key_path"] != filepath.Join(dataDir, agentauth.KeyFileName) {
 		t.Fatalf("应下发密钥文件路径: %+v", resp)
+	}
+}
+
+// TestServerInfoReportsDegradedIdentity 三项降级状态必须被如实回传（L-8）：
+// 匿名注册开着、Agent 通道退回明文、共享密钥未收口 —— 后台横幅完全依赖这几个字段，
+// 少给或给错就等于"风险存在但界面说一切正常"。
+func TestServerInfoReportsDegradedIdentity(t *testing.T) {
+	_, authz, _ := newEnrollAPIFixture(t)
+	verifier := agentauth.NewVerifier("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	h := serverInfoHandler(authz, nil, verifier, ":9000", t.TempDir(), false, true, false, func() bool { return false })
+	rec := doJSON(t, h, http.MethodGet, "", "test-token")
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["allow_anon_agents"] != true {
+		t.Fatalf("匿名注册已开启却未上报: %+v", resp)
+	}
+	if resp["agent_tls_on"] != false {
+		t.Fatalf("通道已明文却未上报: %+v", resp)
+	}
+	if resp["shared_key_disabled"] != false {
+		t.Fatalf("共享密钥未收口却报成已收口: %+v", resp)
 	}
 }
 

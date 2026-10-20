@@ -265,6 +265,16 @@ func (v *Verifier) sharedKeySnapshot() (string, bool) {
 // 未通过时返回错误；错误串刻意保持模糊（不区分"令牌不存在"与"证明不对"），
 // 免得把这条通道变成探测某个 agent_id 是否配过令牌的 oracle。
 func (v *Verifier) Verify(agentID, nonce, proof string, ts int64) (string, error) {
+	src, _, err := v.VerifyEx(agentID, nonce, proof, ts)
+	return src, err
+}
+
+// VerifyEx 同 Verify，并额外报告"这次命中的一次性令牌是否与该 agent_id 绑定"。
+//
+// 换证时需要这个区别：未绑定令牌的设计语义是"任意主机用一次"，它可以让一台
+// **新机器**完成首次绑定，但不能成为接管已有身份（换掉公钥）的授权 ——
+// 否则一枚泄露的未绑定令牌就能顶替任意一台离线主机。判定交给 CheckOrBind。
+func (v *Verifier) VerifyEx(agentID, nonce, proof string, ts int64) (string, bool, error) {
 	// 未启用任何凭据路径时**必须报错**，不能返回 ("", nil)。
 	//
 	// 这里曾经是 `return "", nil` —— 把"没配凭据"当成"校验通过"，调用方
@@ -273,13 +283,13 @@ func (v *Verifier) Verify(agentID, nonce, proof string, ts int64) (string, error
 	// 静默通过这种语义没有任何调用方需要：要放行匿名注册的地方应当**显式**放行
 	// （见 main.go 的 CredAnon），而不是靠"忘了配密钥"这条路径顺出来。
 	if !v.Enabled() {
-		return "", fmt.Errorf("服务端未配置注册凭据（一次性注册令牌或共享注册密钥）")
+		return "", false, fmt.Errorf("服务端未配置注册凭据（一次性注册令牌或共享注册密钥）")
 	}
 	if agentID == "" {
-		return "", fmt.Errorf("缺少 agent_id")
+		return "", false, fmt.Errorf("缺少 agent_id")
 	}
 	if nonce == "" || proof == "" || ts <= 0 {
-		return "", fmt.Errorf("缺少注册凭证（agent-key / 注册令牌未配置？）")
+		return "", false, fmt.Errorf("缺少注册凭证（agent-key / 注册令牌未配置？）")
 	}
 	now := v.now()
 	skew := now.Sub(time.Unix(ts, 0))
@@ -287,7 +297,7 @@ func (v *Verifier) Verify(agentID, nonce, proof string, ts int64) (string, error
 		skew = -skew
 	}
 	if skew > MaxClockSkew {
-		return "", fmt.Errorf("注册报文时间戳偏差过大（%v，请检查两端时钟）", skew.Truncate(time.Second))
+		return "", false, fmt.Errorf("注册报文时间戳偏差过大（%v，请检查两端时钟）", skew.Truncate(time.Second))
 	}
 
 	if store := v.Tokens(); store != nil {
@@ -295,18 +305,20 @@ func (v *Verifier) Verify(agentID, nonce, proof string, ts int64) (string, error
 			if err := v.claimNonce(nonce, now); err != nil {
 				// 令牌已在 matchConsume 里作废：重放者最多把这台机器的机会用掉一次，
 				// 运维重新生成即可，不存在"重复注册成功"。
-				return "", err
+				return "", false, err
 			}
-			return CredToken, nil
+			// 未绑定令牌（AgentID 为空）不构成"这台主机的新授权"：
+			// 首次绑定可以用它，已有身份换公钥不行（见 CheckOrBind）。
+			return CredToken, tok.AgentID != "", nil
 		}
 	}
 	if key, ok := v.sharedKeySnapshot(); ok {
 		want := Proof(key, agentID, nonce, ts)
 		if want != "" && subtle.ConstantTimeCompare([]byte(want), []byte(strings.ToLower(proof))) == 1 {
 			if err := v.claimNonce(nonce, now); err != nil {
-				return "", err
+				return "", false, err
 			}
-			return CredSharedKey, nil
+			return CredSharedKey, false, nil
 		}
 	}
 	// 错误串仍不区分「令牌不存在 / 证明不对 / 共享密钥不对」——避免把这条
@@ -314,7 +326,7 @@ func (v *Verifier) Verify(agentID, nonce, proof string, ts int64) (string, error
 	// 且运维自己能修的原因写出来：令牌与 agent_id 是绑定关系，而被控机未显式
 	// 指定 agent_id 时会回退成机器 UUID/主机名（实测踩过：为 "test" 签发令牌，
 	// Agent 却以机器 UUID 注册，日志只报一句"注册凭证校验失败"，无从下手）。
-	return "", fmt.Errorf("注册凭证校验失败：请确认被控机的 agent_id 与签发令牌时填写的完全一致" +
+	return "", false, fmt.Errorf("注册凭证校验失败：请确认被控机的 agent_id 与签发令牌时填写的完全一致" +
 		"（未指定 -agentid 时会回退为机器 UUID/主机名），且令牌未过期、未被使用；" +
 		"使用共享注册密钥时请确认与服务端 agent.key 一致")
 }

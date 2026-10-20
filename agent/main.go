@@ -50,6 +50,10 @@ func main() {
 	credsDir := flag.String("creds-dir", "", "客户端证书落盘目录（默认 <配置目录>/creds）")
 	upgradePubKey := flag.String("upgrade-pubkey", os.Getenv("MOCENTER_UPGRADE_PUBKEY"), "升级包 Ed25519 公钥（hex 或文件路径）；未配置则拒绝一切远程升级")
 	fileRoots := flag.String("file-roots", os.Getenv("MOCENTER_FILE_ROOTS"), "允许服务端下发读写的目录（逗号分隔），默认仅 <配置目录>/files")
+	tunnelHosts := flag.String("tunnel-hosts", os.Getenv("MOCENTER_TUNNEL_HOSTS"),
+		"端口映射/VNC 隧道允许指向的非回环目标（逗号分隔 IP/主机名）。"+
+			"留空=只允许本机回环（默认）：隧道连的是这台机器所在的网络，放开任意目标等于把本机变成总控的内网代理跳板。"+
+			"该白名单只认本机配置，服务端指令无法打开")
 	latencyTargets := flag.String("latency-targets", "", "延迟探测目标，逗号分隔（如 icmp:1.1.1.1,tcp:1.1.1.1:443,http:https://example.com ）")
 	showVersion := flag.Bool("version", false, "打印版本号并退出")
 	flag.Parse()
@@ -92,6 +96,7 @@ func main() {
 			EnrollmentSecret:           firstNonEmpty(*enrollSecret, *agentKey),
 			UpgradePubKey:              *upgradePubKey,
 			FileRoots:                  splitList(*fileRoots),
+			TunnelHosts:                splitList(*tunnelHosts),
 			LatencyTargets:             splitList(*latencyTargets),
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
@@ -152,6 +157,9 @@ func main() {
 		if len(cfg.FileRoots) > 0 && strings.TrimSpace(*fileRoots) == "" {
 			*fileRoots = strings.Join(cfg.FileRoots, ",")
 		}
+		if len(cfg.TunnelHosts) > 0 && strings.TrimSpace(*tunnelHosts) == "" {
+			*tunnelHosts = strings.Join(cfg.TunnelHosts, ",")
+		}
 		// 注意 flagWasSet 判断：显式传 -allow-public-package-download=false 必须能关掉，
 		// 不能被配置里的 true 顶回去 —— 收紧用的开关不能 fail-open。
 		if cfg.AllowPublicPackageDownload && !*allowPublicPkg && !flagWasSet("allow-public-package-download") {
@@ -203,10 +211,11 @@ func main() {
 			"server-fingerprint":            func() { cfg.ServerFingerprint = *serverFingerprint },
 			"upgrade-pubkey":                func() { cfg.UpgradePubKey = *upgradePubKey },
 			"file-roots":                    func() { cfg.FileRoots = splitList(*fileRoots) },
+			"tunnel-hosts":                  func() { cfg.TunnelHosts = splitList(*tunnelHosts) },
 			"latency-targets":               func() { cfg.LatencyTargets = splitList(*latencyTargets) },
 		}
 		dirty := false
-		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "allow-public-package-download", "agent-key", "enroll-secret", "server-fingerprint", "upgrade-pubkey", "file-roots", "latency-targets"} {
+		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "allow-public-package-download", "agent-key", "enroll-secret", "server-fingerprint", "upgrade-pubkey", "file-roots", "tunnel-hosts", "latency-targets"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -305,6 +314,7 @@ func main() {
 			proxyIP: *proxyIP, agentKey: *agentKey,
 			allowPublicPkg: *allowPublicPkg,
 			upgradePubKey:  *upgradePubKey, fileRoots: splitList(*fileRoots),
+			tunnelHosts:       splitList(*tunnelHosts),
 			latencyTargets:    splitList(*latencyTargets),
 			serverFingerprint: *serverFingerprint,
 			enrollSecret:      firstNonEmpty(*enrollSecret, *agentKey),
@@ -353,6 +363,7 @@ type runOpts struct {
 	// fileRoots 允许服务端读写的本机目录；空 = client.DefaultFileRoot 的沙箱。
 	// 只来自命令行/配置文件，服务端指令无法扩大。
 	fileRoots                       []string
+	tunnelHosts                     []string
 	latencyTargets                  []string
 	serverFingerprint, enrollSecret string
 	configPath, credsDir            string
@@ -360,6 +371,11 @@ type runOpts struct {
 }
 
 func runClient(o runOpts) {
+	// 指纹是 Agent 校验服务端的唯一锚点：格式不对时宁可启动失败，
+	// 也不能"看起来配了 pin、实际按空/弱值处理"。
+	if err := client.ValidateServerFingerprint(o.serverFingerprint); err != nil {
+		log.Fatalf("[agent] 配置错误: %v", err)
+	}
 	c := client.New(client.Config{
 		ServerAddr:          o.server,
 		AgentID:             o.agentID,
@@ -376,6 +392,7 @@ func runClient(o runOpts) {
 		AgentKey:            o.agentKey,
 		UpgradePubKey:       o.upgradePubKey,
 		FileRoots:           o.fileRoots,
+		TunnelHosts:         o.tunnelHosts,
 		LatencyTargets:      o.latencyTargets,
 		ServerFingerprint:   o.serverFingerprint,
 		EnrollmentSecret:    o.enrollSecret,
@@ -390,6 +407,12 @@ func runClient(o runOpts) {
 	// 出问题时第一手证据就是"它到底以为自己的边界在哪"。
 	log.Printf("[agent] 文件读写根目录: %s（用 -file-roots 扩大）",
 		strings.Join(c.FileRoots(), ", "))
+	if len(o.tunnelHosts) == 0 {
+		log.Printf("[agent] 隧道目标仅限本机回环（默认）；如需放行其它地址请用 -tunnel-hosts 在本机配置")
+	} else {
+		log.Printf("[agent] 注意: 隧道目标已放开到 %s —— 本机因此可作为通往这些地址的代理，"+
+			"这是本机显式配置的结果（-tunnel-hosts）", strings.Join(o.tunnelHosts, ", "))
+	}
 	if o.upgradePubKey == "" {
 		log.Printf("[agent] 未配置 -upgrade-pubkey：远程升级已被拒绝（这是默认安全态）")
 	}

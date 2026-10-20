@@ -28,6 +28,15 @@ const PANEL_CSS = [
   "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif",
 ].join(';')
 
+// renderFatal 渲染崩溃兜底面板。
+//
+// 为什么全部走 DOM API 而不是 innerHTML 模板（L-3）：这里的 detail 来自
+// error.message / stack / 失败资源的 URL，而其中一部分内容最终源自被管主机的回传文本
+// （服务端把 Agent 的原因原样带出来）。用 innerHTML 拼就等于把"未经转义的第三方内容"
+// 交给 HTML 解析器 —— 现在只是被 CSP 的 script-src 'self' 兜住不能执行脚本，
+// 但"靠另一层防护来原谅这一层的写法"正是会随某次调整（加白名单、代理吞头）失守的模式。
+// textContent 让这件事根本不可能发生，同时按钮改用 addEventListener：
+// 内联 onclick 在本 CSP 下是被禁止的，旧面板上那两个按钮其实点了没反应。
 function renderFatal(title, detail) {
   if (typeof document === 'undefined') return
   const id = 'mc-fatal-overlay'
@@ -35,16 +44,39 @@ function renderFatal(title, detail) {
   const box = document.createElement('div')
   box.id = id
   box.setAttribute('style', PANEL_CSS)
-  const safe = (v) => String(v == null ? '' : v).slice(0, 2000)
-  box.innerHTML = `
-    <div style="font-size:18px;font-weight:700;color:#ef4444">⚠️ ${safe(title)}</div>
-    <div style="color:#8b98a5">页面未能正常渲染。请把下面这段信息（或本页截图）反馈给管理员，可据此定位问题。</div>
-    <pre style="margin:0;padding:12px;border-radius:8px;background:#1a2129;border:1px solid #2e3a46;white-space:pre-wrap;word-break:break-all;font-size:12px">${safe(detail)}</pre>
-    <div style="color:#8b98a5;font-size:12px">UA：${safe(navigator.userAgent)}<br/>时间：${safe(new Date().toLocaleString())}</div>
-    <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <button style="background:#3b82f6;color:#fff;border:none;padding:9px 16px;border-radius:6px;font-size:14px;cursor:pointer" onclick="location.reload()">重新加载</button>
-      <button style="background:#232c36;color:#e6edf3;border:1px solid #2e3a46;padding:9px 16px;border-radius:6px;font-size:14px;cursor:pointer" onclick="location.href='/'">回到首页</button>
-    </div>`
+  const clip = (v) => String(v == null ? '' : v).slice(0, 2000)
+
+  const add = (text, style) => {
+    const el = document.createElement('div')
+    el.setAttribute('style', style)
+    el.textContent = text
+    box.appendChild(el)
+    return el
+  }
+
+  add(`⚠️ ${clip(title)}`, 'font-size:18px;font-weight:700;color:#ef4444')
+  add('页面未能正常渲染。请把下面这段信息（或本页截图）反馈给管理员，可据此定位问题。', 'color:#8b98a5')
+
+  const pre = document.createElement('pre')
+  pre.setAttribute('style', 'margin:0;padding:12px;border-radius:8px;background:#1a2129;border:1px solid #2e3a46;white-space:pre-wrap;word-break:break-all;font-size:12px')
+  pre.textContent = clip(detail)
+  box.appendChild(pre)
+
+  add(`UA：${clip(navigator.userAgent)}\n时间：${clip(new Date().toLocaleString())}`, 'color:#8b98a5;font-size:12px')
+
+  const actions = document.createElement('div')
+  actions.setAttribute('style', 'display:flex;gap:10px;flex-wrap:wrap')
+  const mkButton = (label, style, onClick) => {
+    const btn = document.createElement('button')
+    btn.setAttribute('style', style)
+    btn.textContent = label
+    btn.addEventListener('click', onClick)
+    actions.appendChild(btn)
+  }
+  mkButton('重新加载', 'background:#3b82f6;color:#fff;border:none;padding:9px 16px;border-radius:6px;font-size:14px;cursor:pointer', () => window.location.reload())
+  mkButton('回到首页', 'background:#232c36;color:#e6edf3;border:1px solid #2e3a46;padding:9px 16px;border-radius:6px;font-size:14px;cursor:pointer', () => { window.location.href = '/' })
+  box.appendChild(actions)
+
   document.body.appendChild(box)
 }
 

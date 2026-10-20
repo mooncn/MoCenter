@@ -84,6 +84,21 @@ func hashPassword(pw string) string {
 		hex.EncodeToString(salt) + "$" + hex.EncodeToString(dk)
 }
 
+// dummyPasswordHash 用于“用户名不存在”时也执行一次同等成本的 PBKDF2。
+//
+// 直接返回 ErrBadLogin 会让未知用户名的响应明显更快，攻击者可据此枚举账号。
+// 这里用固定盐与一段不对应任何账号的口令生成一个合法哈希，校验必然失败，
+// 但耗时与真实账号一致。
+var dummyPasswordHash = func() string {
+	salt := make([]byte, pbkdf2SaltLen)
+	for i := range salt {
+		salt[i] = byte(i*13 + 7)
+	}
+	dk := pbkdf2SHA256([]byte("mocenter-timing-equalizer"), salt, pbkdf2Iterations, pbkdf2KeyLen)
+	return pbkdf2Prefix + strconv.Itoa(pbkdf2Iterations) + "$" +
+		hex.EncodeToString(salt) + "$" + hex.EncodeToString(dk)
+}()
+
 // verifyPassword 校验口令。第二个返回值表示「存储的是旧格式哈希，建议升级」。
 func verifyPassword(stored, pw string) (ok bool, needsUpgrade bool) {
 	if stored == "" {

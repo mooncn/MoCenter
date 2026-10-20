@@ -51,6 +51,10 @@ type Config struct {
 	// FileRoots 允许服务端下发读写的本地目录（文件分发/文件下载）。
 	// 留空则由 New 落到默认沙箱 <配置目录>/files。
 	FileRoots []string
+	// TunnelHosts 端口映射/VNC 隧道允许指向的**非回环**目标（IP 或主机名，逗号分隔）。
+	// 留空 = 只允许回环（默认）。见 openTunnel / tunnelTargetAllowed（L-5）：
+	// 这个开关只从本机配置文件读，服务端指令打不开它。
+	TunnelHosts []string
 	// AllowPublicDownload 解锁「从公网取安装包」（winget / choco / 厂商直连 / https 代理）。
 	// 默认关闭：安装包只从服务端托管目录经长连接下发，除非本机显式解锁。
 	// 该开关**只从本机配置文件读**，服务端指令无法打开它。
@@ -422,7 +426,7 @@ func (c *Client) checkCertAcceptance() error {
 		// 真有问题时后面的正常连接会给出更准确的错误。
 		return nil
 	}
-	if srvFP == issuerFP {
+	if fingerprintMatches(srvFP, issuerFP) {
 		return nil // 同一套总控，证书可用
 	}
 
@@ -1150,14 +1154,45 @@ func (c *Client) runInteractive(req protocol.CommandReq) {
 	sess.Close()
 }
 
+// tunnelTargetAllowed 判断隧道目标是否本机认可（L-5）。
+//
+// 隧道的落点是**这台主机所在的网络**：不限制就等于让总控可以把每台被管机器
+// 当成通往它可达地址（含内网其它机器）的代理。服务端的每个调用点从来只发 127.0.0.1
+// （VNC/探测/端口映射都硬编码回环），所以默认只认回环即可满足全部功能。
+//
+// 确有需要连本机以外地址时，由**本机**配置 tunnel_hosts 放行 —— 不接受服务端下发，
+// 否则这条边界一次 RPC 就能自己关掉，跟没有一样。
+func (c *Client) tunnelTargetAllowed(host string) bool {
+	if h := strings.ToLower(strings.TrimSpace(host)); h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(strings.TrimSpace(host))
+	if ip != nil && ip.IsLoopback() {
+		return true
+	}
+	for _, allowed := range c.cfg.TunnelHosts {
+		if strings.EqualFold(strings.TrimSpace(allowed), strings.TrimSpace(host)) {
+			return true
+		}
+	}
+	return false
+}
+
 // openTunnel 建立到内网服务的隧道连接并桥接双向数据。
 func (c *Client) openTunnel(req protocol.TunnelOpenReq) {
 	localHost := req.LocalHost
 	if localHost == "" {
 		localHost = "127.0.0.1"
 	}
-	lconn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", localHost, req.LocalPort), 10*time.Second)
 	resp := protocol.TunnelOpenResp{TunnelID: req.TunnelID}
+	if !c.tunnelTargetAllowed(localHost) {
+		resp.Message = "tunnel target not allowed by local config: " + localHost
+		_ = c.write(protocol.TypeTunnelOpenResp, resp)
+		log.Printf("[agent] 拒绝隧道 %s：目标 %s 不是回环地址，且不在本机 tunnel_hosts 白名单内"+
+			"（需要放行请把地址写进本机配置的 tunnel_hosts，服务端指令无法打开它）", req.TunnelID, localHost)
+		return
+	}
+	lconn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", localHost, req.LocalPort), 10*time.Second)
 	if err != nil {
 		resp.Message = "dial internal service failed: " + err.Error()
 		_ = c.write(protocol.TypeTunnelOpenResp, resp)

@@ -1,6 +1,7 @@
 package route
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -185,6 +186,83 @@ func TestCommandOriginRejectsOtherAgent(t *testing.T) {
 	}
 	if _, ok := r.CommandOrigin("c-1", ""); ok {
 		t.Fatal("空 agent_id 不应归属")
+	}
+}
+
+// TestReleaseSession 分享撤销/到期时，只收口该会话的命令绑定。
+func TestReleaseSession(t *testing.T) {
+	r := NewRouter(session.NewManager(), nil)
+	now := time.Now()
+	r.auditMu.Lock()
+	r.cmdAudit[cmdKey("it-1", "a1")] = &cmdBinding{agentID: "a1", session: "share:abc", last: now}
+	r.cmdAudit[cmdKey("it-2", "a1")] = &cmdBinding{agentID: "a1", session: "admin", last: now}
+	r.cmdAudit[cmdKey("it-3", "a2")] = &cmdBinding{agentID: "a2", session: "share:abc", last: now}
+	r.auditMu.Unlock()
+
+	refs := r.ReleaseSession("share:abc")
+	if len(refs) != 2 {
+		t.Fatalf("应取出 2 条分享会话的命令，实际 %d: %+v", len(refs), refs)
+	}
+	got := map[string]string{}
+	for _, ref := range refs {
+		got[ref.CommandID] = ref.AgentID
+	}
+	if got["it-1"] != "a1" || got["it-3"] != "a2" {
+		t.Fatalf("agent_id/command_id 配对错误: %+v", got)
+	}
+	// 其它会话的绑定必须原样保留
+	if _, ok := r.CommandOrigin("it-2", "a1"); !ok {
+		t.Fatal("管理端会话的绑定不应被误删")
+	}
+	if _, ok := r.CommandOrigin("it-1", "a1"); ok {
+		t.Fatal("已释放的命令不应再可归属")
+	}
+	if _, ok := r.CommandOrigin("it-3", "a2"); ok {
+		t.Fatal("已释放的命令不应再可归属")
+	}
+}
+
+// TestDispatchRejectsCrossSessionCommandID 回归：分享访客不能用可猜的 command_id
+// 覆盖管理端已有的归属（否则会收到管理端终端输出、并把输入打进对方会话）。
+func TestDispatchRejectsCrossSessionCommandID(t *testing.T) {
+	sess := session.NewManager()
+	p1, p2 := net.Pipe()
+	defer p1.Close()
+	defer p2.Close()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := p2.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	if _, ok := sess.Upsert("a1", session.NewConn(p1)); !ok {
+		t.Fatal("测试前置：会话登记失败")
+	}
+	r := NewRouter(sess, nil)
+	req := func() *protocol.CommandReq {
+		return &protocol.CommandReq{AgentID: "a1", CommandID: "it-1", Command: "echo hi"}
+	}
+
+	if ok, msg := r.Dispatch(req(), "share:abc", "ip", "share:abc"); !ok {
+		t.Fatalf("首个会话应能下发: %s", msg)
+	}
+	if ok, _ := r.Dispatch(req(), "admin", "ip", "admin-session"); ok {
+		t.Fatal("其他会话用同一 command_id 必须被拒绝")
+	}
+	origin, found := r.CommandOrigin("it-1", "a1")
+	if !found || origin.Session != "share:abc" {
+		t.Fatalf("原归属不应被覆盖: %+v", origin)
+	}
+	// 同一会话重复使用自己的 command_id（重连/重发）仍允许
+	if ok, msg := r.Dispatch(req(), "share:abc", "ip", "share:abc"); !ok {
+		t.Fatalf("同会话复用 command_id 应允许: %s", msg)
+	}
+	// 超长 ID 直接拒绝
+	long := &protocol.CommandReq{AgentID: "a1", CommandID: strings.Repeat("x", maxCommandIDLen+1), Command: "echo hi"}
+	if ok, _ := r.Dispatch(long, "share:abc", "ip", "share:abc"); ok {
+		t.Fatal("超长 command_id 必须被拒绝")
 	}
 }
 

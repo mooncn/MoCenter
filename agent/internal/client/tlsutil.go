@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // baseTLSConfig 构造连接服务端用的 TLS 配置。
@@ -53,22 +54,54 @@ func (c *Client) baseTLSConfig() (*tls.Config, error) {
 			if len(rawCerts) == 0 {
 				return fmt.Errorf("服务端未提供证书")
 			}
-			var leafFP string
-			for i, raw := range rawCerts {
+			certs := make([]*x509.Certificate, 0, len(rawCerts))
+			for _, raw := range rawCerts {
 				cert, err := x509.ParseCertificate(raw)
 				if err != nil {
 					return err
 				}
-				if i == 0 {
-					leafFP = spkiFingerprint(cert)
+				certs = append(certs, cert)
+			}
+			// 命中叶子：pin 的是这张证书本身，公钥不可伪造；只需再确认它当前有效。
+			if fingerprintMatches(pin, spkiFingerprint(certs[0])) {
+				now := time.Now()
+				if now.Before(certs[0].NotBefore) || now.After(certs[0].NotAfter) {
+					return fmt.Errorf("服务端证书不在有效期内（%s ~ %s）",
+						certs[0].NotBefore.Format(time.RFC3339), certs[0].NotAfter.Format(time.RFC3339))
 				}
-				if spkiFingerprint(cert) == pin {
-					return nil
+				return nil
+			}
+			// 命中链上的 CA：**必须真的验签叶子**。
+			//
+			// 只遍历 rawCerts 比指纹是不够的：服务端证书链由对端自行给出，攻击者可以把
+			// 公开的 CA 证书附在自己的自签叶子之后 —— CA 公钥是公开信息（本服务端每次
+			// 握手都会下发，换取响应里也会给），指纹一命中就放行等于 pin 完全失效。
+			// 因此这里以命中的证书为信任根，走一次标准的链校验（签名、有效期、ServerAuth 用途），
+			// 不校验 SAN（自签部署换 IP 是常态）。
+			for i := 1; i < len(certs); i++ {
+				if !fingerprintMatches(pin, spkiFingerprint(certs[i])) {
+					continue
 				}
+				roots := x509.NewCertPool()
+				roots.AddCert(certs[i])
+				inter := x509.NewCertPool()
+				for j := 1; j < len(certs); j++ {
+					if j != i {
+						inter.AddCert(certs[j])
+					}
+				}
+				if _, err := certs[0].Verify(x509.VerifyOptions{
+					Roots:         roots,
+					Intermediates: inter,
+					KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+				}); err != nil {
+					return fmt.Errorf("服务端证书链与固定的部署身份不符（链上虽带有该 CA，但叶子并非由其签发）: %w", err)
+				}
+				return nil
 			}
 			return fmt.Errorf("服务端身份指纹不一致：期望 %s（部署身份 CA 指纹），实际服务端证书 %s"+
 				"（服务端换过部署身份？请向管理员索取新指纹，或核对 Agent 配置里的 server_fingerprint）",
-				pin, leafFP)
+				DisplayFingerprint(pin), DisplayFingerprint(spkiFingerprint(certs[0])))
 		}
 		return cfg, nil
 	}
@@ -105,6 +138,26 @@ func (c *Client) baseTLSConfig() (*tls.Config, error) {
 	return cfg, nil
 }
 
+// hasTrustAnchor 本机是否已经持有一个"服务端身份锚"（L-6）。
+//
+// 三个来源任一即算：显式配置的 server_fingerprint、配置指定的 CA 文件、
+// 上一次换取时服务端回传并落盘的 creds/ca.crt。有锚时校验失败意味着"对端不是那套总控"，
+// 换取阶段绝不能再退回去验签；无锚才代表"第一次接入、还没建立过信任"，那才是降级路径的场景。
+func (c *Client) hasTrustAnchor() bool {
+	if normFingerprint(c.cfg.ServerFingerprint) != "" {
+		return true
+	}
+	if strings.TrimSpace(c.cfg.CACert) != "" {
+		return true
+	}
+	if p := filepath.Join(c.credDir(), "ca.crt"); p != "" {
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
 // clientCert 返回当前可用的客户端证书：内存中的换取结果 → 配置指定文件 → 落盘的换取产物。
 func (c *Client) clientCert() *tls.Certificate {
 	if c.cred != nil {
@@ -138,12 +191,15 @@ func certCommonName(cert *tls.Certificate) string {
 	return strings.TrimSpace(leaf.Subject.CommonName)
 }
 
-// spkiFingerprint 取证书公钥指纹（SHA-256 前 16 位 hex）。
+// spkiFingerprint 取证书公钥指纹（完整 SHA-256，64 位 hex）。
 // 用公钥而不是整证书：换签发有效期、换 SAN 都不会改变指纹。
 func spkiFingerprint(cert *x509.Certificate) string {
 	sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
-	return hex.EncodeToString(sum[:])[:16]
+	return hex.EncodeToString(sum[:])
 }
+
+// legacyFingerprintLen 历史版本配置文件里的短指纹长度（只取 SHA-256 前 16 位）。
+const legacyFingerprintLen = 16
 
 // normFingerprint 归一化人工填写的指纹（允许冒号/空格、大小写）。
 func normFingerprint(s string) string {
@@ -155,6 +211,46 @@ func normFingerprint(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// fingerprintMatches 比较预期指纹与实际指纹。
+//
+// 完整 64 位必须完全一致；历史 16 位短指纹按前缀匹配，保证老配置升级后仍能连接。
+func fingerprintMatches(want, got string) bool {
+	w, g := normFingerprint(want), normFingerprint(got)
+	if w == "" || g == "" {
+		return false
+	}
+	if w == g {
+		return true
+	}
+	return len(w) == legacyFingerprintLen && len(g) > legacyFingerprintLen && strings.HasPrefix(g, w)
+}
+
+// ValidateServerFingerprint 校验配置里的 server_fingerprint 格式。
+//
+// 接受完整 64 位十六进制与历史 16 位短指纹（分隔符可为冒号/空格/短横线）；
+// 其它长度（尤其是 8 位）直接拒绝：pin 的强度取决于长度，静默接受短值
+// 会让"填了指纹"看起来比实际更安全。
+func ValidateServerFingerprint(fp string) error {
+	raw := strings.ToLower(strings.TrimSpace(fp))
+	if raw == "" {
+		return nil
+	}
+	for _, r := range raw {
+		switch {
+		case (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f'), r == ':', r == ' ', r == '-':
+			continue
+		default:
+			return fmt.Errorf("server_fingerprint 含非法字符 %q（只允许十六进制、冒号/空格/短横线）", r)
+		}
+	}
+	switch n := len(normFingerprint(raw)); n {
+	case legacyFingerprintLen, 64:
+		return nil
+	default:
+		return fmt.Errorf("server_fingerprint 长度无效（归一化后 %d 位）：应为 64 位完整指纹，或兼容历史 16 位短指纹", n)
+	}
 }
 
 // DisplayFingerprint 格式化指纹便于打印。
@@ -171,8 +267,11 @@ func agentauthDisplay(fp string) string {
 		return fp
 	}
 	var parts []string
-	for i := 0; i+4 <= len(fp) && len(parts) < 4; i += 4 {
+	for i := 0; i+4 <= len(fp); i += 4 {
 		parts = append(parts, fp[i:i+4])
+	}
+	if rem := len(fp) % 4; rem > 0 {
+		parts = append(parts, fp[len(fp)-rem:])
 	}
 	return strings.Join(parts, " ")
 }

@@ -67,6 +67,10 @@ var (
 	mismatchAt = make(map[string]time.Time)
 )
 
+// maxRules 规则总数上限。每条规则都会在服务端占用一个真实监听端口，
+// 不设上限时任何能创建规则的一方都能把进程的 fd/端口资源耗尽。
+const maxRules = 256
+
 // Manager 端口映射管理器，负责隧道建立、连接跟踪与双向转发。
 type Manager struct {
 	mu           sync.RWMutex
@@ -146,10 +150,13 @@ func (m *Manager) TrackConn(t *Track) {
 }
 
 // UpdateTraffic 更新连接流量统计。
+//
+// 必须在持锁状态下改字段：Tracks()/GetTrack() 会把快照交给 API 层并发序列化，
+// 之前的“RLock 取指针、锁外写”是典型的数据竞争（-race 可直接命中）。
 func (m *Manager) UpdateTraffic(tunnelID string, sent, received int64) {
-	m.mu.RLock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	t, ok := m.tracks[tunnelID]
-	m.mu.RUnlock()
 	if !ok {
 		return
 	}
@@ -206,20 +213,27 @@ func (m *Manager) CleanupExpired(max int) []*Track {
 	return expired
 }
 
-// GetTrack 返回指定隧道跟踪记录。
+// GetTrack 返回指定隧道跟踪记录的**快照**。
+// 返回副本而不是内部指针：调用方会直接序列化它，共享指针会把并发写暴露成数据竞争。
 func (m *Manager) GetTrack(tunnelID string) *Track {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.tracks[tunnelID]
+	t, ok := m.tracks[tunnelID]
+	if !ok {
+		return nil
+	}
+	cp := *t
+	return &cp
 }
 
-// Tracks 返回全部活跃连接跟踪。
+// Tracks 返回全部活跃连接跟踪（快照）。
 func (m *Manager) Tracks() []*Track {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	out := make([]*Track, 0, len(m.tracks))
 	for _, t := range m.tracks {
-		out = append(out, t)
+		cp := *t
+		out = append(out, &cp)
 	}
 	return out
 }
@@ -257,6 +271,14 @@ func (m *Manager) CreateRule(r *Rule) error {
 	if r.LocalHost == "" {
 		r.LocalHost = "127.0.0.1"
 	}
+	// 新建规则才有上限；覆盖同一公网端口只是替换，不增加监听数。
+	m.mu.RLock()
+	_, exists := m.rules[r.PublicPort]
+	n := len(m.rules)
+	m.mu.RUnlock()
+	if !exists && n >= maxRules {
+		return fmt.Errorf("端口映射规则数已达上限（%d 条）", maxRules)
+	}
 	r.Enabled = true
 
 	prev := m.GetRule(r.PublicPort)
@@ -272,6 +294,18 @@ func (m *Manager) CreateRule(r *Rule) error {
 		return err
 	}
 	m.mu.Lock()
+	_, exists = m.rules[r.PublicPort]
+	if !exists && len(m.rules) >= maxRules {
+		m.mu.Unlock()
+		// 并发下刚好被别人占满：停掉刚起的监听并把旧规则还原。
+		m.StopRule(r.PublicPort)
+		if prev != nil {
+			if err2 := m.ServeRule(prev); err2 != nil {
+				log.Printf("[portmap] 规则 %d 因达到上限回滚，且旧监听恢复失败: %v", r.PublicPort, err2)
+			}
+		}
+		return fmt.Errorf("端口映射规则数已达上限（%d 条）", maxRules)
+	}
 	m.rules[r.PublicPort] = r
 	m.mu.Unlock()
 	// 持久化到 SQLite

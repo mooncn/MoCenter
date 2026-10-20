@@ -88,6 +88,10 @@ type Client struct {
 	done     chan struct{}
 	operator string // 该连接的操作者（登录用户名），用于审计留痕
 	session  string // 会话键（见 SessionKey），用于把命令输出定向回发起方
+	// guest 标记分享访客连接：只收本会话的定向消息。
+	// 全局广播（主机清单、端口映射状态等）对访客是越权信息面，
+	// 一条只分享 A 机桌面的链接不应该换来整张资产表。
+	guest bool
 }
 
 // publicSubscriber 匿名（公开站点）订阅者。
@@ -190,7 +194,25 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request, tokenValidat
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	session := SessionKey(token)
+	operator := "unknown"
+	if resolveOperator != nil {
+		if op := resolveOperator(token); op != "" {
+			operator = op
+		}
+	}
+	h.upgrade(w, r, SessionKey(token), operator, false)
+}
+
+// HandleUpgradeShare 为分享链接的访客建立连接。
+//
+// 访客没有登录 Token，凭据已在调用方（main.go 的 /ws 路由）校验过；
+// 这里只负责绑定该分享的会话键，并把 operator 标成 "share:<id>"，
+// 上层据此把访客的上行消息限制为终端输入。
+func (h *Hub) HandleUpgradeShare(w http.ResponseWriter, r *http.Request, session, operator string) {
+	h.upgrade(w, r, session, operator, true)
+}
+
+func (h *Hub) upgrade(w http.ResponseWriter, r *http.Request, session, operator string, guest bool) {
 	// 并发上限必须在 Upgrade **之前**判：升级成功后响应已是 101，再写 429 只是
 	// 一行 "response.WriteHeader on hijacked response" 的服务端日志，浏览器什
 	// 么也看不出。判定与登记之间有极小的窗口（同一会话同时握够 8 次会略微超额），
@@ -205,22 +227,40 @@ func (h *Hub) HandleUpgrade(w http.ResponseWriter, r *http.Request, tokenValidat
 		log.Printf("[ws] upgrade error: %v", err)
 		return
 	}
-	operator := "unknown"
-	if resolveOperator != nil {
-		if op := resolveOperator(token); op != "" {
-			operator = op
-		}
-	}
 	c := &Client{
 		conn:     conn,
 		send:     make(chan []byte, 256),
 		done:     make(chan struct{}),
 		operator: operator,
 		session:  session,
+		guest:    guest,
 	}
 	h.register(c)
 	go h.writePump(c)
 	go h.readPump(c)
+}
+
+// CloseSession 关闭某会话的全部连接（分享撤销/过期时使用）。
+// 返回被关闭的连接数。连接对象从表中摘除后由各自的泵收尾，避免重复关闭通道。
+func (h *Hub) CloseSession(session string) int {
+	if session == "" {
+		return 0
+	}
+	h.mu.Lock()
+	var victims []*Client
+	for c := range h.clients {
+		if c.session != session {
+			continue
+		}
+		delete(h.clients, c)
+		close(c.done)
+		victims = append(victims, c)
+	}
+	h.mu.Unlock()
+	for _, c := range victims {
+		_ = c.conn.Close()
+	}
+	return len(victims)
 }
 
 // sessionFull 判断某会话当前连接数是否已达上限。
@@ -289,11 +329,18 @@ func marshalEnv(typ string, payload interface{}) ([]byte, error) {
 
 // deliver 把已序列化的消息投递给客户端；match 为 nil 表示全量投递。
 // 队列满则丢弃该客户端的这帧，避免一个慢连接阻塞广播路径。
+//
+// 全量投递必须排除分享访客：他们只该收到自己会话的定向消息
+// （终端输出），而不是主机清单/端口映射状态这类控制台共享数据。
 func (h *Hub) deliver(env []byte, match func(*Client) bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for c := range h.clients {
-		if match != nil && !match(c) {
+		if match == nil {
+			if c.guest {
+				continue
+			}
+		} else if !match(c) {
 			continue
 		}
 		select {

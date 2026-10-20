@@ -36,8 +36,8 @@ func TestTokenIsSingleUse(t *testing.T) {
 	nonce := NewNonce()
 	ts := time.Now().Unix()
 
-	if src, err := v.Verify("host-01", nonce, enrollProof(secret, "host-01", nonce, ts), ts); err != nil || src != CredToken {
-		t.Fatalf("首次使用应通过且来源为令牌，得到 src=%q err=%v", src, err)
+	if src, bound, err := v.VerifyEx("host-01", nonce, enrollProof(secret, "host-01", nonce, ts), ts); err != nil || src != CredToken || !bound {
+		t.Fatalf("首次使用应通过且报告为已绑定令牌，得到 src=%q bound=%v err=%v", src, bound, err)
 	}
 	nonce2 := NewNonce()
 	if _, err := v.Verify("host-01", nonce2, enrollProof(secret, "host-01", nonce2, ts), ts); err == nil {
@@ -79,8 +79,8 @@ func TestUnboundTokenAcceptsAnyAgentOnce(t *testing.T) {
 	// 客户端未指定 agent_id 时会以机器 UUID 上报，这里直接模拟该形态
 	const uuid = "BF674D56-7E0D-70DB-A9FF-103DE56368D8"
 	nonce := NewNonce()
-	if src, err := v.Verify(uuid, nonce, Proof(secret, uuid, nonce, ts), ts); err != nil || src != CredToken {
-		t.Fatalf("不绑定令牌应接受任意 agent_id，得到 src=%q err=%v", src, err)
+	if src, bound, err := v.VerifyEx(uuid, nonce, Proof(secret, uuid, nonce, ts), ts); err != nil || src != CredToken || bound {
+		t.Fatalf("不绑定令牌应接受任意 agent_id 且 tokenBound=false，得到 src=%q bound=%v err=%v", src, bound, err)
 	}
 
 	// 同一枚令牌不能被第二台主机再用
@@ -410,7 +410,7 @@ func TestStorePersistsAcrossReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s1.CheckOrBind("host-01", "aabbcc", CredToken); err != nil {
+	if err := s1.CheckOrBind("host-01", "aabbcc", CredToken, true); err != nil {
 		t.Fatal(err)
 	}
 	s2, err := NewEnrollStore(path)
@@ -480,20 +480,20 @@ func TestTokenCaps(t *testing.T) {
 // TestCheckOrBindTOFU TOFU：换公钥只有令牌授权才放行。
 func TestCheckOrBindTOFU(t *testing.T) {
 	store := newTestStore(t)
-	if err := store.CheckOrBind("host-01", "key-A", CredSharedKey); err != nil {
+	if err := store.CheckOrBind("host-01", "key-A", CredSharedKey, false); err != nil {
 		t.Fatalf("首次绑定应成功: %v", err)
 	}
-	if err := store.CheckOrBind("host-01", "key-A", CredSharedKey); err != nil {
+	if err := store.CheckOrBind("host-01", "key-A", CredSharedKey, false); err != nil {
 		t.Fatalf("同一公钥重复换取应放行: %v", err)
 	}
 	// 共享密钥泄露后拿同一 ID 换新生成对 → 拒
-	if err := store.CheckOrBind("host-01", "key-B", CredSharedKey); err == nil {
+	if err := store.CheckOrBind("host-01", "key-B", CredSharedKey, false); err == nil {
 		t.Fatal("仅凭共享密钥不得换发新公钥")
 	} else if !strings.Contains(err.Error(), "一次性注册令牌") {
 		t.Fatalf("错误信息应给出恢复路径，实际: %v", err)
 	}
 	// 运维为该主机签了新令牌 = 明确授权 → 放行并更新绑定
-	if err := store.CheckOrBind("host-01", "key-B", CredToken); err != nil {
+	if err := store.CheckOrBind("host-01", "key-B", CredToken, true); err != nil {
 		t.Fatalf("令牌授权的重绑应成功: %v", err)
 	}
 	b := store.Bindings()
@@ -505,6 +505,36 @@ func TestCheckOrBindTOFU(t *testing.T) {
 	}
 	if len(store.Bindings()) != 0 {
 		t.Fatal("绑定未清除")
+	}
+}
+
+// TestUnboundTokenCannotRebindExistingHost 回归：未绑定令牌（任意主机可用一次）
+// 只能用于首次接入，不能把已有主机的证书公钥换掉 —— 否则令牌泄露即等于
+// 任意离线主机的身份可被接管。绑定令牌才是"这台主机换机/重装"的授权。
+func TestUnboundTokenCannotRebindExistingHost(t *testing.T) {
+	store := newTestStore(t)
+	// 首次绑定：未绑定令牌允许（新机器还没有绑定记录）
+	if err := store.CheckOrBind("brand-new", "key-new", CredToken, false); err != nil {
+		t.Fatalf("未绑定令牌用于首次接入应放行: %v", err)
+	}
+	// 已有绑定 → 换公钥：未绑定令牌必须被拒
+	if err := store.CheckOrBind("host-01", "key-A", CredToken, true); err != nil {
+		t.Fatalf("绑定令牌首次绑定应成功: %v", err)
+	}
+	if err := store.CheckOrBind("host-01", "key-B", CredToken, false); err == nil {
+		t.Fatal("未绑定令牌不得重绑已有主机")
+	} else if !strings.Contains(err.Error(), "绑定到该 agent_id") {
+		t.Fatalf("错误信息应给出恢复路径，实际: %v", err)
+	}
+	// 原绑定保持不变
+	b := store.Bindings()
+	if len(b) != 2 {
+		t.Fatalf("绑定数量异常: %+v", b)
+	}
+	for _, item := range b {
+		if item.AgentID == "host-01" && item.SPKIHash != "key-A" {
+			t.Fatalf("被拒的重绑不应修改原绑定: %+v", item)
+		}
 	}
 }
 

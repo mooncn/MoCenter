@@ -285,6 +285,37 @@ func (s *EnrollStore) ListTokens() []map[string]interface{} {
 	return out
 }
 
+// GetToken 返回指定 id 的令牌副本（不含明文），供删除前的归属校验使用。
+func (s *EnrollStore) GetToken(id string) *EnrollToken {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.tokens {
+		if t.ID == id {
+			cp := *t
+			cp.secret = ""
+			return &cp
+		}
+	}
+	return nil
+}
+
+// HasBinding 判断某 agent_id 是否留下过证书绑定（即"曾经真正接入过"）。
+// 删除已注销主机的令牌时用它区分「登记过又删了」与「令牌签了但机器还没来」。
+func (s *EnrollStore) HasBinding(agentID string) bool {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.bindings[agentID]
+	return ok
+}
+
 // RevokeToken 按 id 吊销一条令牌，返回是否存在并被移除。
 func (s *EnrollStore) RevokeToken(id string) bool {
 	s.mu.Lock()
@@ -368,11 +399,15 @@ func (s *EnrollStore) Bindings() []CertBinding {
 
 // CheckOrBind 校验并更新 agent_id 的证书公钥绑定（TOFU）。
 //
-//   - 无历史记录：记下本次公钥（首次信任）；
+//   - 无历史记录：记下本次公钥（首次信任，绑定/未绑定令牌都可）；
 //   - 公钥一致：同一台机器重新换取（证书到期轮换等），放行；
-//   - 公钥变了：只有本次出示了**该主机的新令牌**才放行并更新绑定；否则视为
-//     "拿泄露的共享密钥冒名换机"，拒绝。运维的恢复路径很明确：给该机生成一个新令牌。
-func (s *EnrollStore) CheckOrBind(agentID, spkiHash, source string) error {
+//   - 公钥变了：只有本次出示了**显式绑定到该 agent_id 的一次性令牌**才放行并更新绑定；
+//     共享密钥、匿名、以及"任意主机可用一次"的未绑定令牌都不算 —— 后者一旦泄露，
+//     就等于能把任意一台离线主机的身份换到攻击者手里。运维的恢复路径很明确：
+//     给该机生成一枚绑定到它 agent_id 的新令牌，或先清除绑定。
+//
+// tokenBound 由 Verifier.VerifyEx 给出：命中的令牌创建时是否指定了 agent_id。
+func (s *EnrollStore) CheckOrBind(agentID, spkiHash, source string, tokenBound bool) error {
 	if agentID == "" || spkiHash == "" {
 		return fmt.Errorf("缺少 agent_id 或证书公钥指纹")
 	}
@@ -386,14 +421,18 @@ func (s *EnrollStore) CheckOrBind(agentID, spkiHash, source string) error {
 	if subtle.ConstantTimeCompare([]byte(cur.SPKIHash), []byte(spkiHash)) == 1 {
 		return nil
 	}
-	if source != CredToken {
+	if !tokenBound {
 		old := cur.SPKIHash
 		if len(old) > 16 {
 			old = old[:16]
 		}
-		return fmt.Errorf("该 agent_id 已绑定另一张证书的公钥（首次绑定 %s，指纹 %s…）："+
-			"仅凭共享注册密钥不允许换发。若确为本机重装/换盘，请为该主机生成一次性注册令牌后重试",
-			time.Unix(cur.IssuedAt, 0).Format("2006-01-02 15:04:05"), old)
+		reason := "仅凭共享注册密钥不允许换发"
+		if source == CredToken {
+			reason = "未绑定 agent_id 的一次性令牌只能用于首次接入，不能接管已有主机"
+		}
+		return fmt.Errorf("该 agent_id 已绑定另一张证书的公钥（首次绑定 %s，指纹 %s…）：%s。"+
+			"若确为本机重装/换盘，请为该主机生成一枚**绑定到该 agent_id** 的一次性注册令牌后重试",
+			time.Unix(cur.IssuedAt, 0).Format("2006-01-02 15:04:05"), old, reason)
 	}
 	cur.SPKIHash = spkiHash
 	cur.ReboundAt = s.now().Unix()

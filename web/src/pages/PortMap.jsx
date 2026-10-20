@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Api } from '../api/api.js'
 
 // 端口映射管理界面：配置/查看/管理内网主机端口映射规则
@@ -11,6 +12,18 @@ export default function PortMap({ agents }) {
   const [sourceIp, setSourceIp] = useState('')
   const [notice, setNotice] = useState('')
   const [loading, setLoading] = useState(true)
+  const [params] = useSearchParams()
+
+  // 从仪表盘「操作 → 端口映射」带 ?agent= 过来时预选该主机。
+  // 离线主机也保留在下拉里：规则可以先建好，等它上线自动生效。
+  const wantedAgent = (params.get('agent') || '').trim()
+  const allAgents = agents || []
+  const wantedRec = wantedAgent ? allAgents.find((a) => a.agent_id === wantedAgent) : null
+  const selectable = allAgents.filter((a) => a.online || (wantedRec && a.agent_id === wantedRec.agent_id))
+
+  useEffect(() => {
+    if (wantedRec && !agent) setAgent(wantedRec.agent_id)
+  }, [wantedRec, agent])
 
   // 加载服务端已持久化的映射规则
   const loadRules = () => {
@@ -87,8 +100,10 @@ export default function PortMap({ agents }) {
               <label>目标主机</label>
               <select value={agent} onChange={(e) => setAgent(e.target.value)}>
                 <option value="">选择主机...</option>
-                {(agents || []).filter((a) => a.online).map((a) => (
-                  <option key={a.agent_id} value={a.agent_id}>{a.hostname}</option>
+                {selectable.map((a) => (
+                  <option key={a.agent_id} value={a.agent_id}>
+                    {a.hostname} ({a.agent_id}){a.online ? '' : ' · 离线'}
+                  </option>
                 ))}
               </select>
             </div>
@@ -107,6 +122,11 @@ export default function PortMap({ agents }) {
           </div>
           <button type="submit">添加规则</button>
         </form>
+        {wantedRec && !wantedRec.online && (
+          <div className="notice" style={{ background: 'var(--panel-2)', color: 'var(--muted)', marginTop: 12 }}>
+            该主机当前离线：规则可以保存，公网端口会先监听；待 Agent 上线后隧道自动生效。
+          </div>
+        )}
         {notice && <div className={`notice ${notice.includes('失败') ? 'err' : 'ok'}`} style={{ marginTop: 12 }}>{notice}</div>}
       </div>
 

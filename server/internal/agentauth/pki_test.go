@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -18,8 +19,8 @@ func TestIdentityPersistAndReload(t *testing.T) {
 		t.Fatalf("身份名应为 Acme，得到 %q", id.Name())
 	}
 	fp := id.Fingerprint()
-	if len(fp) != 16 {
-		t.Fatalf("指纹长度应为 16，得到 %d (%q)", len(fp), fp)
+	if len(fp) != 64 {
+		t.Fatalf("指纹应为完整 SHA-256（64 位 hex），得到 %d (%q)", len(fp), fp)
 	}
 	fi, err := os.Stat(filepath.Join(dir, CAKeyFileName))
 	if err != nil {
@@ -102,6 +103,27 @@ func TestLoadIdentityRejectsNonECDSA(t *testing.T) {
 	}
 	if _, err := LoadIdentity(dir); err == nil {
 		t.Fatal("CA 私钥损坏时应报错")
+	}
+}
+
+// 指纹比较：完整值必须全等；历史 16 位短指纹按前缀兼容，更短的值一律不认。
+func TestFingerprintMatching(t *testing.T) {
+	id, _ := NewIdentity("Acme")
+	fp := id.Fingerprint()
+	if !MatchFingerprint(strings.ToUpper(fp), fp) {
+		t.Fatal("大小写不同应视为同一指纹")
+	}
+	if !MatchFingerprint(fp[:legacyFingerprintLen], fp) {
+		t.Fatal("历史 16 位短指纹应按前缀匹配")
+	}
+	if MatchFingerprint(fp[:8], fp) {
+		t.Fatal("8 位短指纹熵不足，不应再被接受")
+	}
+	if MatchFingerprint("0"+fp[1:], fp) {
+		t.Fatal("内容不同不应匹配")
+	}
+	if MatchFingerprint("", fp) || MatchFingerprint(fp, "") {
+		t.Fatal("空指纹不应匹配")
 	}
 }
 

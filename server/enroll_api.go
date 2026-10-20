@@ -12,6 +12,7 @@ import (
 
 	"mocenter/server/internal/agentauth"
 	"mocenter/server/internal/auth"
+	"mocenter/server/internal/probe"
 	"mocenter/server/internal/route"
 )
 
@@ -225,6 +226,60 @@ func sharedKeyRotateHandler(verifier *agentauth.Verifier, authz *auth.Auth, rout
 			"warnings":    warnings,
 			"msg":         "密钥已轮换并写入 " + keyPath,
 		})
+	}
+}
+
+// enrollDeleteHandler 永久删除一枚令牌，仅限**已注销主机**的令牌。
+//
+// 与「吊销」的差别：吊销是"还没用的令牌作废"；删除是清理账本 —— 主机都已经
+// 从服务端注销了，这条令牌不再对应任何可接入对象，留着只会让页面越来越长。
+// 约束（既在界面上体现，也在服务端强制）：
+//   - 必须绑定 agent_id（不绑定令牌不指向任何主机，无从判断"已注销"）；
+//   - 该 agent_id 当前必须不在册；
+//   - 该 agent_id 必须留下过证书绑定（= 确实接入过，而不是"令牌签了、机器还没来"）。
+func enrollDeleteHandler(store *agentauth.EnrollStore, probes *probe.Store, authz *auth.Auth, router *route.Router) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if store == nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "注册令牌存储不可用（详见服务端启动日志）"})
+			return
+		}
+		var body struct {
+			ID string `json:"id"`
+		}
+		if !decodeJSON(w, r, maxJSONBody, &body) {
+			return
+		}
+		id := strings.TrimSpace(body.ID)
+		rec := store.GetToken(id)
+		if rec == nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未找到该令牌（可能已过期被清理）"})
+			return
+		}
+		if rec.AgentID == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "不绑定令牌不对应任何主机，无法按「已注销」删除；请使用吊销"})
+			return
+		}
+		if probes != nil && probes.Get(rec.AgentID) != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "该主机仍在册，只能吊销令牌，不能删除记录"})
+			return
+		}
+		if !store.HasBinding(rec.AgentID) {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "该主机从未完成过证书换取（没有绑定记录），令牌请使用吊销"})
+			return
+		}
+		if !store.RevokeToken(id) {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "删除失败（令牌可能已被清理）"})
+			return
+		}
+		auditEnrollOp(r, authz, router, rec.AgentID, "删除已注销主机的注册令牌", "令牌 "+id)
+		writeJSON(w, map[string]interface{}{"ok": true, "msg": "令牌记录已删除"})
 	}
 }
 

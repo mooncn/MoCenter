@@ -205,3 +205,59 @@ func TestPinAcceptsCAInChain(t *testing.T) {
 		t.Fatal("非本套 CA 的链必须被拒绝")
 	}
 }
+
+// TestPinRejectsInjectedCA 回归：只比较"链中任一证书的指纹"是不够的。
+//
+// 服务端证书链由对端自行给出，攻击者可以把**公开的 CA 证书**附在自己的自签叶子后面：
+// 指纹会命中 CA，但叶子与 CA 毫无签名关系。pin 的语义是"我信任这套部署身份"，
+// 所以命中 CA 之后必须再验签叶子，否则 pin 对主动中间人完全无效。
+func TestPinRejectsInjectedCA(t *testing.T) {
+	served, _ := makeCATestPair(t, "victim")
+	caDER := served.chainDER[1] // 公开的 CA 证书
+	c := &Client{cfg: Config{CredDir: t.TempDir(), ServerFingerprint: served.caFP}}
+	cfg, err := c.baseTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.VerifyPeerCertificate(served.chainDER, nil); err != nil {
+		t.Fatalf("合法链应通过: %v", err)
+	}
+
+	// 攻击者自签叶子 + 附带公开 CA 证书
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "attacker"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	atkDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.VerifyPeerCertificate([][]byte{atkDER, caDER}, nil); err == nil {
+		t.Fatal("附带公开 CA 证书的自签叶子必须被拒绝（pin 不能被未验签的链骗过）")
+	}
+}
+
+// TestPinMatchesLeaf 回归：直接 pin 叶子公钥仍是合法用法（需要同时满足有效期）。
+func TestPinMatchesLeaf(t *testing.T) {
+	served, _ := makeCATestPair(t, "leafpin")
+	leaf, err := x509.ParseCertificate(served.chainDER[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{cfg: Config{CredDir: t.TempDir(), ServerFingerprint: spkiFingerprint(leaf)}}
+	cfg, err := c.baseTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.VerifyPeerCertificate(served.chainDER, nil); err != nil {
+		t.Fatalf("pin 叶子指纹时应通过: %v", err)
+	}
+}

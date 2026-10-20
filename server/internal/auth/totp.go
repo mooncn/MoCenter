@@ -4,6 +4,7 @@ package auth
 import (
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/base32"
 	"fmt"
 	"strings"
@@ -14,22 +15,30 @@ import (
 // secret 为 base32 编码（不带填充的常见形式，兼容 Google Authenticator）。
 // window 表示允许向前/向后偏移的步长数量（容忍时钟偏差）。
 func validateTOTP(secret, code string, window int) bool {
+	_, ok := validateTOTPStep(secret, code, window)
+	return ok
+}
+
+// validateTOTPStep 与 validateTOTP 相同，但返回命中的时间步（用于重放保护）。
+// 比较使用常量时间，避免通过响应时间逐位试探验证码。
+func validateTOTPStep(secret, code string, window int) (int64, bool) {
 	code = strings.TrimSpace(code)
 	if code == "" {
-		return false
+		return 0, false
 	}
 	secret = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(secret), " ", ""))
 	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(secret)
 	if err != nil {
-		return false
+		return 0, false
 	}
 	counter := time.Now().Unix() / 30
 	for w := -window; w <= window; w++ {
-		if totpAt(key, counter+int64(w)) == code {
-			return true
+		step := counter + int64(w)
+		if subtle.ConstantTimeCompare([]byte(totpAt(key, step)), []byte(code)) == 1 {
+			return step, true
 		}
 	}
-	return false
+	return 0, false
 }
 
 // totpAt 计算某一时间步长的 HOTP 值（RFC 4226）并格式化为 6 位数字。

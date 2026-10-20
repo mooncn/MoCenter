@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react'
 import { Api } from '../api/api.js'
+import Pagination from '../components/Pagination.jsx'
 
 // maskedKey 只露出首尾各 6 位：既能让运维确认"是不是这一把"，
 // 又避免密钥长时间明摆在屏幕上（截图/投屏会泄露）。
@@ -38,6 +39,15 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
   // 已登记主机的 agent_id：给签发表单做候选。重装/重接入时直接选原名称，
   // 避免"看起来像"的手填值把令牌签给另一台主机。
   const [knownIDs, setKnownIDs] = useState([])
+  // 令牌会随接入/重装不断累积，列表分页显示，避免整页被历史记录撑长。
+  const [tokenPage, setTokenPage] = useState(1)
+  const [tokenPageSize, setTokenPageSize] = useState(10)
+
+  const loadKnown = useCallback(() => {
+    Api.agents()
+      .then((d) => setKnownIDs((Array.isArray(d) ? d : []).map((a) => a.agent_id).filter(Boolean)))
+      .catch(() => {})
+  }, [])
 
   const reload = useCallback(() => {
     Api.enrollTokens()
@@ -45,15 +55,17 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
         if (d?.ok) { setData(d); setErr('') } else { setErr(d?.msg || '获取注册令牌列表失败') }
       })
       .catch((e) => setErr(e?.response?.data?.msg || e.message || '获取注册令牌列表失败'))
-  }, [])
+    // 主机是否在册决定"删除已注销令牌"按钮是否出现，和令牌列表一起刷新
+    loadKnown()
+  }, [loadKnown])
 
   useEffect(() => { reload() }, [reload])
 
+  // 仪表盘删除主机后会派发该事件（同页打开时也能即时更新）
   useEffect(() => {
-    Api.agents()
-      .then((d) => setKnownIDs((Array.isArray(d) ? d : []).map((a) => a.agent_id).filter(Boolean)))
-      .catch(() => {})
-  }, [])
+    window.addEventListener('mc-agents-refresh', loadKnown)
+    return () => window.removeEventListener('mc-agents-refresh', loadKnown)
+  }, [loadKnown])
 
   const issue = async (e) => {
     e.preventDefault()
@@ -103,8 +115,35 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
     }
   }
 
+  // 永久删除"已注销主机"的令牌记录：与吊销不同，这是清理账本 ——
+  // 主机已经不在册，这条令牌不再对应任何可接入对象。
+  const removeToken = async (t) => {
+    if (!window.confirm(
+      `永久删除 ${t.agent_id} 的这条令牌记录？\n\n` +
+      '仅适用于已从服务端注销、且曾经完成过证书换取的主机。删除后无法恢复；' +
+      '若该机以后还要接入，需重新签发令牌。'
+    )) return
+    try {
+      const d = await Api.deleteEnrollToken(t.id)
+      if (!d?.ok) { setErr(d?.msg || '删除失败'); return }
+      setErr('')
+      reload()
+    } catch (e) {
+      setErr(e?.response?.data?.msg || e.message || '删除失败')
+    }
+  }
+
   const tokens = data?.tokens || []
   const bindings = data?.bindings || []
+  // 主机已注销（不在当前登记列表里）但留下过证书绑定 = 确实接入过、后来被删了。
+  // 这类令牌才允许删除；从未接入过的令牌只能吊销（避免误删还等着用的凭据）。
+  const boundIDs = new Set(bindings.map((b) => b.agent_id))
+  const goneHost = (t) => !t.unbound && !!t.agent_id && !knownIDs.includes(t.agent_id) && boundIDs.has(t.agent_id)
+
+  // 页码收敛在渲染期算：删除/吊销后令牌变少时不会先渲染一屏空白
+  const tokenTotalPages = Math.max(1, Math.ceil(tokens.length / tokenPageSize))
+  const tokenCurPage = Math.min(Math.max(1, tokenPage), tokenTotalPages)
+  const pagedTokens = tokens.slice((tokenCurPage - 1) * tokenPageSize, tokenCurPage * tokenPageSize)
 
   return (
     <div className="card">
@@ -164,7 +203,7 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
           </thead>
           <tbody>
             {tokens.length === 0 && <tr><td colSpan={6} className="table-empty">尚无注册令牌</td></tr>}
-            {tokens.map((t) => {
+            {pagedTokens.map((t) => {
               const st = tokenState(t)
               return (
                 <tr key={t.id}>
@@ -174,12 +213,21 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
                   <td className="cell-sub">{fmtTime(t.created_at)}</td>
                   <td className="cell-sub">{t.used_at ? fmtTime(t.used_at) : fmtTime(t.expires_at)}</td>
                   <td>
-                    {!t.used_at && (
-                      <button className="btn-mini"
-                        onClick={() => revoke({ id: t.id }, `吊销这枚 ${t.unbound ? '不绑定' : t.agent_id} 的令牌？`)}>
-                        吊销
-                      </button>
-                    )}
+                    <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap' }}>
+                      {!t.used_at && (
+                        <button className="btn-mini"
+                          onClick={() => revoke({ id: t.id }, `吊销这枚 ${t.unbound ? '不绑定' : t.agent_id} 的令牌？`)}>
+                          吊销
+                        </button>
+                      )}
+                      {goneHost(t) && (
+                        <button className="secondary danger btn-mini"
+                          title="该主机已注销且曾完成证书换取：永久删除这条令牌记录"
+                          onClick={() => removeToken(t)}>
+                          删除记录
+                        </button>
+                      )}
+                    </span>
                   </td>
                 </tr>
               )
@@ -187,6 +235,19 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
           </tbody>
         </table>
       </div>
+      <Pagination
+        total={tokens.length}
+        page={tokenCurPage}
+        pageSize={tokenPageSize}
+        onPage={setTokenPage}
+        onPageSize={(n) => { setTokenPageSize(n); setTokenPage(1) }}
+      />
+      {tokens.some(goneHost) && (
+        <p className="muted" style={{ fontSize: 12 }}>
+          「删除记录」只出现在<strong>已注销主机</strong>的令牌上（该主机曾被删除，且留下过证书绑定）。
+          主机仍在册、或令牌签发后从未接入过时，请用「吊销」。
+        </p>
+      )}
       {form.agentId.trim() && tokens.some((t) => !t.used_at && !t.expired && !t.unbound && t.agent_id === form.agentId.trim()) && (
         <p className="muted" style={{ fontSize: 12 }}>
           某台机器不再允许接入时，可一次清掉它全部未使用的令牌：

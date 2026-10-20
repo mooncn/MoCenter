@@ -48,6 +48,12 @@ type Config struct {
 	// 与 AllowPublicPackageDownload 同类：**只认本机命令行/配置文件**，服务端指令打不开它。
 	// 扩大范围是运维决定，不该由被攻击的那条通道代劳。
 	FileRoots []string `json:"file_roots"`
+	// TunnelHosts 端口映射/VNC 隧道允许指向的**非回环**目标（IP 或主机名，逗号分隔）。
+	// 留空 = 只允许回环（默认）—— 隧道连的是"这台机器所在的网络"，
+	// 放开任意目标就等于把本机变成总控的内网代理跳板。
+	//
+	// 与 FileRoots 同一性质：**只认本机配置文件/命令行**，服务端指令打不开它。
+	TunnelHosts []string `json:"tunnel_hosts"`
 	// LatencyTargets 延迟探测目标（ICMP/TCP/HTTP）。
 	// 规格形如 "icmp:1.1.1.1" / "tcp:1.1.1.1:443" / "http:https://example.com"，
 	// 省略 kind 前缀时按 icmp 处理。留空 = 不探测（不影响任何其它功能）。

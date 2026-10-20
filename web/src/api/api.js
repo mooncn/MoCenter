@@ -59,6 +59,11 @@ export const Api = {
     const { data } = await api.post('/enroll/cert/reset', { agent_id: agentId })
     return data
   },
+  // 永久删除一枚"已注销主机"的令牌记录（主机仍在册 / 从未接入过时服务端会拒绝）
+  async deleteEnrollToken(id) {
+    const { data } = await api.post('/enroll/token/delete', { id })
+    return data
+  },
   // 轮换部署级共享注册密钥：新明文只在这次响应里出现一次
   async rotateSharedKey() {
     const { data } = await api.post('/enroll/shared-key/rotate', { confirm: true })
@@ -72,6 +77,20 @@ export const Api = {
   // 删除一台离线主机的登记与历史数据（不会卸载目标机上的 Agent）
   async deleteAgent(agentId) {
     const { data } = await api.post('/agents/delete', { agent_id: agentId })
+    return data
+  },
+  // --- 邀请远程管理：控制台侧创建/列举/撤销分享链接 ---
+  // 链接 token 明文只在创建响应里出现一次，列表接口只返回元数据。
+  async listShares(agentId) {
+    const { data } = await api.get('/shares', { params: { agent: agentId } })
+    return data
+  },
+  async createShare(payload) {
+    const { data } = await api.post('/shares', payload)
+    return data
+  },
+  async revokeShare(id) {
+    const { data } = await api.post('/shares/revoke', { id })
     return data
   },
   // 获取主机历史探针趋势；max 控制返回采样点上限（服务端按需降采样）
@@ -375,6 +394,42 @@ export class PublicSocket {
     this.alive = false
     this.ws && this.ws.close()
   }
+}
+
+// 分享访客 API（免登录）：凭链接 token 走 X-Share-Token 头。
+// 刻意不复用上面的 admin 实例 —— 它带 Authorization 且 401 时会跳登录页，
+// 而访客既没有账号，也不该因为链接过期被带去控制台登录。
+const shareClient = axios.create({ baseURL: '/api/share', timeout: 10000 })
+const shareHeaders = (token) => ({ 'X-Share-Token': token || '' })
+
+export const ShareApi = {
+  // 分享范围与目标主机信息（主机名/在线状态/功能/有效期）
+  async info(token) {
+    const { data } = await shareClient.get('/info', { headers: shareHeaders(token) })
+    return data
+  },
+  // 开一个交互终端（服务端只允许开给分享绑定的那台主机）
+  async command(token, payload) {
+    const { data } = await shareClient.post('/command', payload, { headers: shareHeaders(token) })
+    return data
+  },
+  async commandClose(token, commandId) {
+    const { data } = await shareClient.post('/command/close', { command_id: commandId }, { headers: shareHeaders(token) })
+    return data
+  },
+  async rules(token) {
+    const { data } = await shareClient.get('/portmap/rules', { headers: shareHeaders(token) })
+    return data
+  },
+  async portmapOp(token, op) {
+    const { data } = await shareClient.post('/portmap/op', op, { headers: shareHeaders(token) })
+    return data
+  },
+  // 读取该主机当前生效的 VNC 口令（访客没有别的途径知道口令）
+  async vncPassword(token) {
+    const { data } = await shareClient.post('/vnc/password', null, { headers: shareHeaders(token) })
+    return data
+  },
 }
 
 // WebSocket 客户端：用于接收服务端实时推送（主机状态、命令输出等）。

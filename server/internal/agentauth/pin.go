@@ -56,7 +56,7 @@ func buildPinTLSConfig(caPEM []byte, pin, caFile string, insecure bool) (*tls.Co
 			return err
 		}
 		got := certFingerprint(leaf)
-		if got != want {
+		if !fingerprintMatches(want, got) {
 			return FingerprintError(pin, got)
 		}
 		// 有 CA 时再做一次链校验（防中间人拿 CA 之外的证书 + 撑大证书链）
