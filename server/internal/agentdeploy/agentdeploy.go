@@ -76,6 +76,9 @@ type Options struct {
 	// ServerAddr 服务端监听地址（写入 Agent 配置）。
 	// 形如 ":9000" 或 "0.0.0.0:9000" 时，会尝试用本次请求的 Host 推导可路由地址。
 	ServerAddr string
+	// ServerAddrFunc 运行期实时取服务端监听地址；监听配置可热切换，启动快照会过期。
+	// 非空时优先于 ServerAddr（请求里显式覆盖仍然最优先）。
+	ServerAddrFunc func() string
 	// AgentKeyFunc 实时取当前共享注册密钥（写入目标机的 Agent 配置）。
 	//
 	// 必须是"取"而不是启动时"抄一份"：密钥现在能在运行期轮换（M-1），
@@ -491,6 +494,9 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 
 	// --- 4. 生成并写入配置 ---
 	serverAddr := strings.TrimSpace(req.ServerAddr)
+	if serverAddr == "" && d.opts.ServerAddrFunc != nil {
+		serverAddr = strings.TrimSpace(d.opts.ServerAddrFunc())
+	}
 	if serverAddr == "" {
 		serverAddr = d.opts.ServerAddr
 	}

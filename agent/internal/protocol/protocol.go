@@ -31,6 +31,10 @@ const (
 	TypeEnrollReq        = "EnrollReq"        // Agent->Server 注册凭证交换请求（换取客户端证书）
 	TypeEnrollResp       = "EnrollResp"       // Server->Agent 注册凭证交换结果
 	TypeEnrollRequired   = "EnrollRequired"   // Server->Agent 需重新换取证书（现有证书不被认可）
+	// TypeServerAddrUpdate 服务端通知新的连接地址；落盘成功后回 Ack 并主动重连。
+	// 旧版 Agent 忽略未知类型，继续使用本机配置里的旧地址。
+	TypeServerAddrUpdate    = "ServerAddrUpdate"
+	TypeServerAddrUpdateAck = "ServerAddrUpdateAck"
 )
 
 // Envelope 通用消息信封。
@@ -363,3 +367,20 @@ const (
 	CredSourceSharedKey = "shared-key"
 	CredSourceAnonymous = "anonymous"
 )
+
+// ServerAddrUpdate 服务端新监听就绪后通知新地址；Agent 落盘后回 Ack 并重连。
+type ServerAddrUpdate struct {
+	// ServerAddr 完整的新地址；为空时只改端口（Port），主机部分沿用本机配置。
+	ServerAddr string `json:"server_addr,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	// ApplyAfterSec 收到后延迟多少秒再断开重连；0 使用默认 2 秒。
+	ApplyAfterSec int `json:"apply_after_sec,omitempty"`
+}
+
+// ServerAddrUpdateAck 新地址落盘结果。
+type ServerAddrUpdateAck struct {
+	AgentID    string `json:"agent_id"`
+	ServerAddr string `json:"server_addr"`
+	OK         bool   `json:"ok"`
+	Message    string `json:"message,omitempty"`
+}

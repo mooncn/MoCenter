@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -131,7 +132,13 @@ func (c *Client) Run() {
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
 	for {
+		started := time.Now()
 		err := c.connectAndServe()
+		// 连接稳定存活过一段时间后重置退避：否则网络抖动/服务端换监听地址
+		// 次数一多，退避会一直涨到 30 秒，表现为"配置改完主机很久才上线"。
+		if time.Since(started) >= 30*time.Second {
+			backoff = time.Second
+		}
 		switch {
 		case err == nil:
 		case isReenroll(err):
@@ -685,6 +692,97 @@ func (c *Client) write(typ string, payload interface{}) error {
 	return c.enc.Encode(protocol.Envelope{Type: typ, Data: data})
 }
 
+// applyServerAddrUpdate 落盘新的服务端地址并主动重连。
+//
+// 服务端在切换监听前下发这条消息；只有落盘成功才回 OK 并断开，服务端也只踢
+// 收到 OK 的连接。写盘用临时文件 + rename，避免断电留下半截配置。
+func (c *Client) applyServerAddrUpdate(u protocol.ServerAddrUpdate) {
+	addr := strings.TrimSpace(u.ServerAddr)
+	ack := protocol.ServerAddrUpdateAck{AgentID: c.cfg.AgentID, ServerAddr: addr}
+	if addr == "" && u.Port > 0 {
+		// 服务端监听全部网卡：只换端口，主机沿用本机当前配置，
+		// 避免把走内网/域名的 Agent 强行改到服务端以为的公网 IP。
+		host, _, err := net.SplitHostPort(c.cfg.ServerAddr)
+		if err != nil {
+			ack.Message = "本机当前服务端地址无法解析: " + err.Error()
+			_ = c.write(protocol.TypeServerAddrUpdateAck, ack)
+			return
+		}
+		addr = net.JoinHostPort(host, strconv.Itoa(u.Port))
+	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		ack.Message = "地址格式无效: " + err.Error()
+		_ = c.write(protocol.TypeServerAddrUpdateAck, ack)
+		return
+	}
+	ack.ServerAddr = addr
+	old := c.cfg.ServerAddr
+	if err := c.persistServerAddr(addr); err != nil {
+		ack.Message = err.Error()
+		_ = c.write(protocol.TypeServerAddrUpdateAck, ack)
+		log.Printf("[agent] 服务端下发新地址 %s 落盘失败，继续使用 %s: %v", addr, old, err)
+		return
+	}
+	c.mu.Lock()
+	c.cfg.ServerAddr = addr
+	c.mu.Unlock()
+	ack.OK = true
+	_ = c.write(protocol.TypeServerAddrUpdateAck, ack)
+	log.Printf("[agent] 服务端地址已更新为 %s，即将用新地址重连", addr)
+	// 服务端会在收到 Ack 后切换监听；默认等 2 秒，避免 Agent 比新监听先到。
+	delay := u.ApplyAfterSec
+	if delay <= 0 {
+		delay = 2
+	}
+	if delay > 30 {
+		delay = 30
+	}
+	// 只关"收到消息时的那条连接"：服务端可能已经先断开旧连接并让 Agent 连上新监听，
+	// 若定时器按 c.conn 取当前值，会把刚建立的新连接再关一次，造成反复重连。
+	c.mu.Lock()
+	oldConn := c.conn
+	c.mu.Unlock()
+	time.AfterFunc(time.Duration(delay)*time.Second, func() {
+		if oldConn != nil {
+			_ = oldConn.Close()
+		}
+	})
+}
+
+// persistServerAddr 只改配置里的 server 字段，保留安装器写入的其它键。
+func (c *Client) persistServerAddr(addr string) error {
+	path := strings.TrimSpace(c.cfg.ConfigPath)
+	if path == "" {
+		return nil
+	}
+	raw := map[string]json.RawMessage{}
+	if b, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(b, &raw); err != nil {
+			return fmt.Errorf("解析配置失败: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("读取配置失败: %w", err)
+	}
+	v, err := json.Marshal(addr)
+	if err != nil {
+		return err
+	}
+	raw["server"] = v
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0600); err != nil {
+		return fmt.Errorf("写入配置失败: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("替换配置失败: %w", err)
+	}
+	return nil
+}
+
 // heartbeatLoop 定时发送心跳。
 func (c *Client) heartbeatLoop(stop chan struct{}) {
 	t := time.NewTicker(c.hb)
@@ -828,6 +926,12 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 			return
 		}
 		go c.handleVncPassword(req)
+	case protocol.TypeServerAddrUpdate:
+		var u protocol.ServerAddrUpdate
+		if json.Unmarshal(env.Data, &u) != nil {
+			return
+		}
+		c.applyServerAddrUpdate(u)
 	case protocol.TypePkgFetchResp:
 		var resp protocol.PackageFetchResp
 		if json.Unmarshal(env.Data, &resp) != nil {

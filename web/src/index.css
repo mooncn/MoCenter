@@ -140,7 +140,11 @@ label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px
 /* 登录 */
 .login-wrap {
   min-height: 100vh; min-height: 100dvh;
-  display: flex; align-items: center; justify-content: center;
+  /* 必须纵向排列：登录框与站点页脚是同一容器里的两个子元素，
+     横向 flex 会把页脚摆到登录框右侧（窄屏直接挤出视口）。 */
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 16px; padding: 24px;
   background: var(--bg);
 }
 .login-box {
@@ -190,6 +194,7 @@ body { -webkit-text-size-adjust: 100%; }
   position: sticky; top: 0; height: 100vh;
   background: linear-gradient(180deg, #1b232c 0%, #161d25 100%);
   box-shadow: 1px 0 0 var(--border);
+  overflow-y: auto; /* 菜单项多于视口高度时可滚动，底部退出入口不会被挤丢 */
 }
 .sidebar .logo {
   display: flex; align-items: center; justify-content: space-between;
@@ -207,6 +212,13 @@ body { -webkit-text-size-adjust: 100%; }
 
 /* 顶部移动端栏（桌面隐藏） */
 .mobile-topbar { display: none; }
+/* 桌面端常驻退出入口：始终在内容区右上角，不依赖侧边栏是否滚到底部 */
+.content-actions { display: flex; justify-content: flex-end; margin-bottom: 10px; }
+.topbar-logout {
+  margin-left: auto; padding: 6px 10px; font-size: 13px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+}
+.topbar-logout:hover { border-color: var(--accent); color: #fff; }
 
 /* 卡片视觉增强 */
 .card { border-radius: var(--radius); box-shadow: var(--shadow); }
@@ -357,6 +369,8 @@ button.primary { background: var(--accent); }
 /* ============ 移动端自适应 ============ */
 @media (max-width: 900px) {
   .content { padding: 12px 12px 32px; }
+  /* 移动端退出入口已放进顶部栏，内容区不再重复占一行 */
+  .content-actions { display: none; }
 
   /* 顶部栏 */
   .mobile-topbar {
@@ -882,8 +896,8 @@ button.primary { background: var(--accent); }
   font-size: 12px; opacity: .78;
 }
 .public-foot-sub a { color: inherit; }
-/* 后台页脚（登录页）：登录框下方的页脚只需要一点上边距 */
-.login-wrap .site-foot { margin-top: 18px; opacity: .85; }
+/* 后台页脚（登录页）：登录框下方，间距由 .login-wrap 的 gap 统一控制 */
+.login-wrap .site-foot { margin-top: 0; opacity: .85; max-width: 520px; }
 /* 多行代码/HTML 输入框：等宽字体便于核对标签 */
 .code-input {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -1339,3 +1353,48 @@ tr.row-offline > td:last-child .cell-dot { display: inline-block; }
 .share-tabs button.active { color: var(--text); border-color: var(--accent); background: var(--panel-2); }
 .share-empty { text-align: center; padding: 44px 20px; }
 .share-empty h2 { margin: 10px 0; font-size: 18px; }
+
+/* ============ Agent 页签 / 系统配置折叠分区 ============ */
+.tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.tab-btn {
+  padding: 8px 14px; font-size: 13px; border-radius: 8px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+}
+.tab-btn:hover { color: var(--text); border-color: rgba(100, 116, 139, .7); }
+.tab-btn.active { color: #fff; border-color: var(--accent); background: var(--panel-2); }
+
+.cfg-section { padding: 0; overflow: hidden; }
+.cfg-section > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 16px 20px;
+}
+.cfg-section > summary::-webkit-details-marker { display: none; }
+.cfg-section[open] > summary { border-bottom: 1px solid var(--border); }
+.cfg-summary-text { display: flex; flex-direction: column; gap: 2px; }
+.cfg-summary-text strong { font-size: 15px; }
+.cfg-chevron { color: var(--muted); font-size: 12px; transition: transform .15s; }
+.cfg-section[open] .cfg-chevron { transform: rotate(180deg); }
+.cfg-body { padding: 18px 20px 20px; }
+.cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; margin-bottom: 12px; }
+.cfg-note { align-self: end; line-height: 1.6; }
+.cfg-inline { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+.cfg-check {
+  display: flex; align-items: flex-start; gap: 8px; margin: 10px 0 14px;
+  font-size: 12px; color: var(--muted); line-height: 1.5;
+}
+.cfg-check input { width: auto; margin-top: 2px; }
+.cfg-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+
+@media (max-width: 700px) {
+  .cfg-grid { grid-template-columns: 1fr; }
+  .cfg-body { padding: 14px; }
+}
+
+/* 账号与安全：大屏左右两栏，窄屏自动回落为上下 */
+.account-cards { display: grid; grid-template-columns: 1fr; gap: 16px; align-items: start; }
+.account-cards > .card { max-width: 520px; margin-bottom: 0; }
+@media (min-width: 1200px) {
+  .account-cards.embedded { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .account-cards.embedded > .card { max-width: none; }
+}

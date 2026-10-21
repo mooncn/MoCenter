@@ -68,7 +68,7 @@ func TestTokenBoundToAgentID(t *testing.T) {
 // 任何主机都能用它换取一次证书，身份以它上报的 agent_id 为准；用掉即焚。
 func TestUnboundTokenAcceptsAnyAgentOnce(t *testing.T) {
 	store := newTestStore(t)
-	secret, _, err := store.CreateToken("", "any-host", time.Hour)
+	secret, token, err := store.CreateToken("", "any-host", time.Hour)
 	if err != nil {
 		t.Fatalf("签发不绑定令牌失败: %v", err)
 	}
@@ -90,14 +90,50 @@ func TestUnboundTokenAcceptsAnyAgentOnce(t *testing.T) {
 		t.Fatal("不绑定令牌也只能用一次")
 	}
 
-	// 列表里要能看出它不绑定、且已被使用
+	// 使用后应把实际上报的身份回填到令牌记录，便于列表显示与后续清理。
+	got := store.GetToken(token.ID)
+	if got == nil {
+		t.Fatal("令牌记录不应消失")
+	}
+	if got.AgentID != uuid {
+		t.Fatalf("不绑定令牌使用后应回填实际 agent_id，期望 %q，实际 %q", uuid, got.AgentID)
+	}
+	if got.UsedAt == 0 {
+		t.Fatal("使用后 used_at 应更新")
+	}
 	for _, rec := range store.ListTokens() {
-		if rec["unbound"] != true {
-			t.Fatalf("列表应标记 unbound: %+v", rec)
+		if rec["id"] == token.ID && rec["unbound"] != false {
+			t.Fatalf("回填身份后列表不应再标记 unbound: %+v", rec)
 		}
-		if rec["used_at"] == int64(0) {
-			t.Fatalf("使用后 used_at 应更新: %+v", rec)
-		}
+	}
+}
+
+// TestUnboundTokenBackfillKeepsTokenBoundSemantics 回归：账本回填不能改变
+// "签发时是否绑定"的语义，否则未绑定令牌会被 CheckOrBind 当成显式授权，
+// 从而可以接管一台已有主机（换掉它的公钥）。
+func TestUnboundTokenBackfillKeepsTokenBoundSemantics(t *testing.T) {
+	store := newTestStore(t)
+	secret, token, err := store.CreateToken("", "", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := NewVerifier("")
+	v.SetEnrollStore(store)
+	ts := time.Now().Unix()
+	nonce := NewNonce()
+	if _, bound, err := v.VerifyEx("host-new", nonce, Proof(secret, "host-new", nonce, ts), ts); err != nil || bound {
+		t.Fatalf("首次使用应成功且 tokenBound=false，得到 bound=%v err=%v", bound, err)
+	}
+	if got := store.GetToken(token.ID); got == nil || got.AgentID != "host-new" {
+		t.Fatalf("身份应回填到记录: %+v", got)
+	}
+
+	// 已有主机换公钥：未绑定令牌（即使已回填身份）也不能授权。
+	if err := store.CheckOrBind("host-existing", "old-spki", CredSharedKey, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CheckOrBind("host-existing", "new-spki", CredToken, false); err == nil {
+		t.Fatal("未绑定令牌不得接管已有主机")
 	}
 }
 

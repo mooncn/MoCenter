@@ -297,6 +297,23 @@ func TestBindTOTPRoundTrip(t *testing.T) {
 	}
 }
 
+// VerifyPassword 用于 OTP 重新生成/关闭前的二次确认，只认当前密码。
+func TestVerifyPassword(t *testing.T) {
+	m := NewUserManager(filepath.Join(t.TempDir(), "u.json"))
+	if err := m.InitFromFlags("admin", "pass123", ""); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := m.VerifyPassword("admin", "pass123"); err != nil {
+		t.Fatalf("正确密码应通过: %v", err)
+	}
+	if err := m.VerifyPassword("admin", "wrong"); err != ErrBadOldPassword {
+		t.Fatalf("错误密码应返回 ErrBadOldPassword，实得 %v", err)
+	}
+	if err := m.VerifyPassword("ghost", "pass123"); err != ErrBadUsername {
+		t.Fatalf("未知用户应返回 ErrBadUsername，实得 %v", err)
+	}
+}
+
 // UnbindTOTP 需密码校验；已启用 OTP 时还需验证码。
 func TestUnbindTOTP(t *testing.T) {
 	m := NewUserManager(filepath.Join(t.TempDir(), "u.json"))

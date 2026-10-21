@@ -18,6 +18,7 @@ import (
 // DB 全局 SQLite 数据库句柄。
 type DB struct {
 	*sql.DB
+	path string // 数据库文件路径（归档目录与它同级的 history-archive）
 }
 
 // Open 打开（或创建）SQLite 数据库文件，并执行所有建表迁移。
@@ -27,7 +28,13 @@ func Open(dbPath string) (*DB, error) {
 			return nil, fmt.Errorf("创建数据目录失败: %w", err)
 		}
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", dbPath)
+	// cache_size / temp_store 是这次"历史表爆炸"的直接止血点：
+	//   - cache_size 固定 8 MiB，避免页缓存随库文件无界增长；
+	//   - temp_store=FILE 让大范围 GROUP BY / 排序落盘，不再把百万行塞进内存；
+	//   - soft_heap_limit 给 SQLite 一个软上限，超限时它主动收缩缓存。
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"+
+		"&_pragma=foreign_keys(ON)&_pragma=cache_size(-8192)&_pragma=temp_store(FILE)"+
+		"&_pragma=soft_heap_limit(67108864)", dbPath)
 	sdb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite 失败: %w", err)
@@ -38,13 +45,22 @@ func Open(dbPath string) (*DB, error) {
 		sdb.Close()
 		return nil, fmt.Errorf("连接 SQLite 失败: %w", err)
 	}
-	db := &DB{DB: sdb}
+	db := &DB{DB: sdb, path: dbPath}
 	if err := db.migrate(); err != nil {
 		sdb.Close()
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
 	log.Printf("[storage] SQLite 数据库已就绪: %s", dbPath)
 	return db, nil
+}
+
+// ArchiveDir 历史归档目录：与数据库同级的 history-archive。
+// 归档文件含主机名/IP 等运维数据，目录权限收紧到 0700，文件 0600。
+func (db *DB) ArchiveDir() string {
+	if db.path == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(db.path), "history-archive")
 }
 
 // migrate 执行建表迁移（幂等）。
@@ -109,6 +125,9 @@ func (db *DB) migrate() error {
 			load15          REAL    NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_probe_agent_time ON probe_history(agent_id, timestamp)`,
+		// 按时间清理/压缩的专用索引：没有它时每次保留期清理都要全表扫描，
+		// 百万行库会把一次清理拖成数秒并放大 IO。
+		`CREATE INDEX IF NOT EXISTS idx_probe_time ON probe_history(timestamp)`,
 		// 主机信息
 		`CREATE TABLE IF NOT EXISTS agents (
 			agent_id        TEXT    PRIMARY KEY,
@@ -163,6 +182,7 @@ func (db *DB) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_latency_agent_time ON latency_history(agent_id, timestamp)`,
 		`CREATE INDEX IF NOT EXISTS idx_latency_target_time ON latency_history(agent_id, target, timestamp)`,
+		`CREATE INDEX IF NOT EXISTS idx_latency_time ON latency_history(timestamp)`,
 		// 命令黑名单
 		`CREATE TABLE IF NOT EXISTS blacklist (
 			id      INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -5,7 +5,7 @@ import { createQrSvg } from '../utils/qrcode.js'
 // 账号设置：修改登录密码 + OTP 动态验证码（扫码绑定/关闭）
 //
 // 身份一律以登录会话为准（服务端从 Token 解出用户名），页面不再收集用户名。
-export default function Account() {
+export default function Account({ embedded = false }) {
   const [oldPassword, setOldPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
   const [confirm, setConfirm] = useState('')
@@ -20,7 +20,13 @@ export default function Account() {
   const [otpCode, setOtpCode] = useState('')
   const [otpNotice, setOtpNotice] = useState('')
   const [otpOk, setOtpOk] = useState(false)
-  const [otpPassword, setOtpPassword] = useState('')
+  // 重新生成/关闭 OTP 都需要验证当前密码：
+  // - setupPassword 是用户在"重新生成"表单里输入的密码
+  // - rebindPassword 是生成成功后暂存给 enable 步骤的同一份密码（服务端会再验一次）
+  // - disablePassword 只用于关闭流程
+  const [otpSetupPassword, setOtpSetupPassword] = useState('')
+  const [otpRebindPassword, setOtpRebindPassword] = useState('')
+  const [otpDisablePassword, setOtpDisablePassword] = useState('')
   const [otpDisableCode, setOtpDisableCode] = useState('')
 
   // 初始化
@@ -66,12 +72,16 @@ export default function Account() {
   }
 
   // 生成新密钥与二维码（此时尚未启用，需输入验证码确认）
-  // 服务端以当前会话身份为准，无需传用户名
+  // 服务端以当前会话身份为准，无需传用户名；已启用时重新生成必须带当前密码。
   const startOtpSetup = async () => {
     setOtpNotice('')
     setOtpOk(false)
+    if (otpEnabled && !otpSetupPassword) {
+      setOtpNotice('重新生成动态验证码需要先填写当前密码')
+      return
+    }
     try {
-      const res = await Api.otpSetup()
+      const res = await Api.otpSetup(otpEnabled ? { password: otpSetupPassword } : {})
       if (!res || !res.ok) {
         setOtpNotice((res && res.msg) || '生成密钥失败')
         return
@@ -79,6 +89,9 @@ export default function Account() {
       setOtpSecret(res.secret)
       setOtpUri(res.uri)
       setOtpEnabled(!!res.enabled)
+      // enable 步骤还要再验一次密码（服务端不信任前端只验过一次），
+      // 这里把刚验证通过的密码快照下来，避免用户改了输入框导致两边不一致。
+      setOtpRebindPassword(otpEnabled ? otpSetupPassword : '')
       setOtpCode('')
     } catch (ex) {
       setOtpNotice(ex.response?.data?.msg || ex.message)
@@ -101,6 +114,7 @@ export default function Account() {
       const res = await Api.otpEnable({
         secret: otpSecret,
         code: otpCode.trim(),
+        password: otpRebindPassword,
       })
       if (res && res.ok) {
         setOtpNotice(res.msg || 'OTP 已启用')
@@ -109,6 +123,8 @@ export default function Account() {
         setOtpSecret('')
         setOtpUri('')
         setOtpCode('')
+        setOtpSetupPassword('')
+        setOtpRebindPassword('')
       } else {
         setOtpNotice((res && res.msg) || '验证码不正确')
       }
@@ -121,13 +137,17 @@ export default function Account() {
   const disableOtp = async () => {
     setOtpNotice('')
     setOtpOk(false)
-    if (!otpPassword) {
+    if (!otpDisablePassword) {
       setOtpNotice('请填写当前密码')
+      return
+    }
+    if (otpEnabled && !/^\d{6}$/.test(otpDisableCode.trim())) {
+      setOtpNotice('请输入 6 位动态验证码')
       return
     }
     try {
       const res = await Api.otpDisable({
-        password: otpPassword,
+        password: otpDisablePassword,
         otp: otpDisableCode.trim(),
       })
       if (res && res.ok) {
@@ -136,7 +156,9 @@ export default function Account() {
         setOtpEnabled(false)
         setOtpSecret('')
         setOtpUri('')
-        setOtpPassword('')
+        setOtpSetupPassword('')
+        setOtpRebindPassword('')
+        setOtpDisablePassword('')
         setOtpDisableCode('')
       } else {
         setOtpNotice((res && res.msg) || '关闭失败')
@@ -150,14 +172,18 @@ export default function Account() {
 
   return (
     <div>
-      <div className="page-head">
-        <div>
-          <h2>账号设置</h2>
-          <div className="sub">修改 Web 后台登录密码，并配置 OTP 动态验证码二次校验</div>
+      {!embedded && (
+        <div className="page-head">
+          <div>
+            <h2>账号设置</h2>
+            <div className="sub">修改 Web 后台登录密码，并配置 OTP 动态验证码二次校验</div>
+          </div>
         </div>
-      </div>
+      )}
 
-      <div className="card" style={{ maxWidth: 520 }}>
+      {/* 大屏下两张卡片左右排列；窄屏由 CSS 自动回落为上下排列。 */}
+      <div className={`account-cards${embedded ? ' embedded' : ''}`}>
+      <div className="card">
         <h3>修改密码</h3>
         <form onSubmit={submit}>
           <div className="sub" style={{ marginBottom: 8, color: 'var(--muted)', fontSize: 12 }}>
@@ -184,11 +210,12 @@ export default function Account() {
         {notice && <div className={`notice ${ok ? 'ok' : 'err'}`} style={{ marginTop: 12 }}>{notice}</div>}
       </div>
 
-      <div className="card" style={{ maxWidth: 520, marginTop: 16 }}>
+      <div className="card">
         <h3>OTP 动态验证码</h3>
         <div className="desc">
           启用后登录需额外输入一次动态验证码（兼容 Google Authenticator / Microsoft Authenticator / 1Password 等）。
           点击「生成二维码」后用验证器扫码，再输入验证器当前显示的 6 位验证码完成绑定。
+          已启用时，重新生成或关闭都需要验证当前密码。
         </div>
 
         <div className="sub" style={{ marginBottom: 8, color: 'var(--muted)', fontSize: 12 }}>
@@ -202,13 +229,24 @@ export default function Account() {
         )}
 
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <button type="button" onClick={startOtpSetup}>生成二维码</button>
-          {otpEnabled && (
-            <button type="button" className="secondary danger" onClick={() => { setOtpUri(''); setOtpSecret(''); setOtpNotice('') }}>
-              重新绑定
-            </button>
-          )}
+          <button type="button" onClick={startOtpSetup}>{otpEnabled ? '重新生成二维码' : '生成二维码'}</button>
         </div>
+
+        {otpEnabled && (
+          <div className="form-row" style={{ marginTop: 12 }}>
+            <label>当前密码</label>
+            <input
+              type="password"
+              value={otpSetupPassword}
+              onChange={(e) => setOtpSetupPassword(e.target.value)}
+              placeholder="重新生成动态验证码需验证当前密码"
+              autoComplete="current-password"
+            />
+            <div className="sub" style={{ color: 'var(--muted)', fontSize: 12 }}>
+              重新生成后，旧验证器中的密钥会立即失效；未填写密码无法生成新二维码。
+            </div>
+          </div>
+        )}
 
         {otpUri && (
           <div style={{ marginTop: 16 }}>
@@ -242,7 +280,9 @@ export default function Account() {
                     inputMode="numeric"
                   />
                 </div>
-                <button type="button" className="primary" onClick={confirmOtp}>比对并启用</button>
+                <button type="button" className="primary" onClick={confirmOtp}>
+                  {otpEnabled ? '比对并替换' : '比对并启用'}
+                </button>
               </div>
             </div>
           </div>
@@ -255,7 +295,7 @@ export default function Account() {
             </div>
             <div className="form-row">
               <label>当前密码</label>
-              <input type="password" value={otpPassword} onChange={(e) => setOtpPassword(e.target.value)} placeholder="当前登录密码" />
+              <input type="password" value={otpDisablePassword} onChange={(e) => setOtpDisablePassword(e.target.value)} placeholder="当前登录密码" autoComplete="current-password" />
             </div>
             <div className="form-row">
               <label>动态验证码</label>
@@ -276,6 +316,7 @@ export default function Account() {
         <div className="sub" style={{ marginTop: 12, color: '#8b98a5', fontSize: 13 }}>
           密码与 OTP 密钥均以哈希/密文形式存储于服务端 users.json，不会明文落盘。
         </div>
+      </div>
       </div>
     </div>
   )

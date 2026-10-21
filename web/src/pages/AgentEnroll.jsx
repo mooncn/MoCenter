@@ -118,10 +118,11 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
   // 永久删除"已注销主机"的令牌记录：与吊销不同，这是清理账本 ——
   // 主机已经不在册，这条令牌不再对应任何可接入对象。
   const removeToken = async (t) => {
+    const who = t.agent_id ? `${t.agent_id} 的` : '这条已使用的不绑定'
     if (!window.confirm(
-      `永久删除 ${t.agent_id} 的这条令牌记录？\n\n` +
-      '仅适用于已从服务端注销、且曾经完成过证书换取的主机。删除后无法恢复；' +
-      '若该机以后还要接入，需重新签发令牌。'
+      `永久删除 ${who}令牌记录？\n\n` +
+      '仅适用于已使用、且对应主机已不在册（被删除/手动清理，或绑定记录已清除）的令牌。' +
+      '删除后无法恢复；若该机以后还要接入，需重新签发令牌。'
     )) return
     try {
       const d = await Api.deleteEnrollToken(t.id)
@@ -135,10 +136,9 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
 
   const tokens = data?.tokens || []
   const bindings = data?.bindings || []
-  // 主机已注销（不在当前登记列表里）但留下过证书绑定 = 确实接入过、后来被删了。
-  // 这类令牌才允许删除；从未接入过的令牌只能吊销（避免误删还等着用的凭据）。
-  const boundIDs = new Set(bindings.map((b) => b.agent_id))
-  const goneHost = (t) => !t.unbound && !!t.agent_id && !knownIDs.includes(t.agent_id) && boundIDs.has(t.agent_id)
+  // 删除条件与后端一致：令牌已使用，且（记录了 agent_id 时）该主机不在册。
+  // 历史上"不绑定、已使用"的令牌没有 agent_id，已消耗且不指向任何主机，也允许清理。
+  const goneHost = (t) => !!t.used_at && (!t.agent_id || !knownIDs.includes(t.agent_id))
 
   // 页码收敛在渲染期算：删除/吊销后令牌变少时不会先渲染一屏空白
   const tokenTotalPages = Math.max(1, Math.ceil(tokens.length / tokenPageSize))
@@ -160,7 +160,8 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
         Agent 启动时若没有指定 <code>-agentid</code>（Linux）或安装向导里的「Agent 名称/ID」（Windows），
         会回退成<strong>机器硬件 UUID</strong>（探测不到才用主机名）。绑定令牌与名称不一致时，服务端只会报
         「注册凭证校验失败」—— 名称不匹配<strong>不会消耗令牌</strong>，改成一致的名称后可直接重试。
-        不绑定令牌没有这个限制，但它是一次性通行证，请只通过可信渠道交付。
+        不绑定令牌没有这个限制，但它是一次性通行证，请只通过可信渠道交付；
+        首次使用后服务端会把实际上报的 <code>agent_id</code> 回填到该令牌记录，便于事后按主机清理。
         {knownIDs.length > 0 && ' 下方输入框会提示已登记主机的名称。'}
       </div>
       {err && <div className="notice err">{err}</div>}
@@ -207,7 +208,11 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
               const st = tokenState(t)
               return (
                 <tr key={t.id}>
-                  <td>{t.unbound ? <span className="muted">不绑定（按该机上报身份）</span> : <code>{t.agent_id}</code>}</td>
+                  <td>
+                    {t.unbound
+                      ? <span className="muted">{t.used_at ? '不绑定（已使用，身份未回填）' : '不绑定（按该机上报身份）'}</span>
+                      : <code>{t.agent_id}</code>}
+                  </td>
                   <td><span className={`badge ${st.cls}`}>{st.text}</span></td>
                   <td className="cell-sub">{t.label || '—'}</td>
                   <td className="cell-sub">{fmtTime(t.created_at)}</td>
@@ -222,7 +227,7 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
                       )}
                       {goneHost(t) && (
                         <button className="secondary danger btn-mini"
-                          title="该主机已注销且曾完成证书换取：永久删除这条令牌记录"
+                          title="该令牌已使用且对应主机已不在册：永久删除这条令牌记录"
                           onClick={() => removeToken(t)}>
                           删除记录
                         </button>
@@ -244,8 +249,9 @@ function EnrollTokens({ issued, setIssued, copied, copy }) {
       />
       {tokens.some(goneHost) && (
         <p className="muted" style={{ fontSize: 12 }}>
-          「删除记录」只出现在<strong>已注销主机</strong>的令牌上（该主机曾被删除，且留下过证书绑定）。
-          主机仍在册、或令牌签发后从未接入过时，请用「吊销」。
+          「删除记录」只出现在<strong>已使用</strong>令牌上，且对应主机已不在册（被删除/手动清理，
+          或绑定记录已清除）；历史上未回填身份的不绑定令牌也按此处理。
+          主机仍在册、或令牌尚未使用时，请用「吊销」。
         </p>
       )}
       {form.agentId.trim() && tokens.some((t) => !t.used_at && !t.expired && !t.unbound && t.agent_id === form.agentId.trim()) && (

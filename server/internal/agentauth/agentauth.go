@@ -301,15 +301,15 @@ func (v *Verifier) VerifyEx(agentID, nonce, proof string, ts int64) (string, boo
 	}
 
 	if store := v.Tokens(); store != nil {
-		if tok := store.matchConsume(agentID, nonce, proof, ts); tok != nil {
+		if tok, bound := store.matchConsume(agentID, nonce, proof, ts); tok != nil {
 			if err := v.claimNonce(nonce, now); err != nil {
 				// 令牌已在 matchConsume 里作废：重放者最多把这台机器的机会用掉一次，
 				// 运维重新生成即可，不存在"重复注册成功"。
 				return "", false, err
 			}
-			// 未绑定令牌（AgentID 为空）不构成"这台主机的新授权"：
+			// bound 是"签发时是否绑定"：未绑定令牌不构成"这台主机的新授权"，
 			// 首次绑定可以用它，已有身份换公钥不行（见 CheckOrBind）。
-			return CredToken, tok.AgentID != "", nil
+			return CredToken, bound, nil
 		}
 	}
 	if key, ok := v.sharedKeySnapshot(); ok {

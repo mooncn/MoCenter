@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, Suspense, lazy } from 'react'
-import { Routes, Route, NavLink, Navigate, useLocation, Link } from 'react-router-dom'
+import { Routes, Route, NavLink, Navigate, useLocation, useSearchParams, Link } from 'react-router-dom'
 import Dashboard from './pages/Dashboard.jsx'
 import Terminal from './pages/Terminal.jsx'
 import Vnc from './pages/Vnc.jsx'
@@ -7,12 +7,11 @@ import PortMap from './pages/PortMap.jsx'
 import Offline from './pages/Offline.jsx'
 import Audit from './pages/Audit.jsx'
 import Ops from './pages/Ops.jsx'
-import Account from './pages/Account.jsx'
 import SiteConfig from './pages/SiteConfig.jsx'
 import Latency from './pages/Latency.jsx'
-import Deploy from './pages/Deploy.jsx'
+import Agent from './pages/Agent.jsx'
 import Backup from './pages/Backup.jsx'
-import AgentEnroll from './pages/AgentEnroll.jsx'
+import SystemConfig from './pages/SystemConfig.jsx'
 import Login from './pages/Login.jsx'
 import ShareConsole from './pages/ShareConsole.jsx'
 import PublicStatus, { PublicNode } from './pages/PublicStatus.jsx'
@@ -36,10 +35,9 @@ export const NAV_ITEMS = [
   { to: `${ADMIN}/offline`, label: '离线机器', icon: '📴' },
   { to: `${ADMIN}/audit`, label: '操作审计', icon: '📋' },
   { to: `${ADMIN}/site-config`, label: '展示配置', icon: '🪧' },
-  { to: `${ADMIN}/deploy`, label: '部署 Agent', icon: '🚀' },
-  { to: `${ADMIN}/enroll`, label: 'Agent 接入', icon: '🔐' },
+  { to: `${ADMIN}/agent`, label: 'Agent', icon: '🚀' },
   { to: `${ADMIN}/backup`, label: '备份恢复', icon: '💾' },
-  { to: `${ADMIN}/account`, label: '账号设置', icon: '⚙️' },
+  { to: `${ADMIN}/system`, label: '系统配置', icon: '⚙️' },
 ]
 // 后台入口：登录成功后的默认落地页。
 export const ADMIN_HOME = ADMIN
@@ -97,6 +95,9 @@ function Layout() {
     location.href = '/admin/login'
   }
 
+  // 当前页面标题：移动端顶部栏与桌面端都从这里取，避免两处判断走偏
+  const pageTitle = NAV_ITEMS.find((i) => (i.end ? location.pathname === i.to : location.pathname.startsWith(i.to)))?.label || 'MoCenter'
+
   return (
     <SocketContext.Provider value={socketRef.current}>
       <div className={`layout ${navOpen ? 'nav-open' : ''}`}>
@@ -122,12 +123,15 @@ function Layout() {
         </aside>
 
         <div className="content">
-          {/* 移动端顶部栏：菜单按钮 + 当前页面标题 */}
+          {/* 移动端顶部栏：菜单按钮 + 当前页面标题 + 退出登录 */}
           <div className="mobile-topbar">
             <button className="menu-btn" onClick={() => setNavOpen(true)} aria-label="打开菜单">☰</button>
-            <span className="mobile-title">
-              {NAV_ITEMS.find((i) => (i.end ? location.pathname === i.to : location.pathname.startsWith(i.to)))?.label || 'MoCenter'}
-            </span>
+            <span className="mobile-title">{pageTitle}</span>
+            <button type="button" className="topbar-logout" onClick={logout}>退出登录</button>
+          </div>
+          {/* 桌面端常驻右上角退出入口：侧边栏底部那条在长菜单/矮屏下容易被挤出视口 */}
+          <div className="content-actions">
+            <button type="button" className="secondary btn-sm" onClick={logout}>🚪 退出登录</button>
           </div>
           {/* fallback 给懒加载期间一个明确反馈，避免弱网下"点了没反应" */}
           <SecurityBanner />
@@ -142,10 +146,13 @@ function Layout() {
               <Route path="/audit" element={<Audit />} />
               <Route path="/site-config" element={<SiteConfig />} />
               <Route path="/latency" element={<Latency agents={agents} />} />
-              <Route path="/deploy" element={<Deploy />} />
-              <Route path="/enroll" element={<AgentEnroll />} />
+              {/* Agent 部署/接入合并为一个页面；旧地址保留重定向，书签不失效 */}
+              <Route path="/agent" element={<Agent />} />
+              <Route path="/deploy" element={<Navigate to={`${ADMIN}/agent?tab=ssh`} replace />} />
+              <Route path="/enroll" element={<Navigate to={`${ADMIN}/agent?tab=universal`} replace />} />
               <Route path="/backup" element={<Backup />} />
-              <Route path="/account" element={<Account />} />
+              <Route path="/system" element={<SystemConfig />} />
+              <Route path="/account" element={<Navigate to={`${ADMIN}/system?section=account`} replace />} />
               {/* 兜底：未知后台路径回到仪表盘，而不是空白页 */}
               <Route path="*" element={<Navigate to={ADMIN} replace />} />
             </Routes>
@@ -203,12 +210,50 @@ function SecurityBanner() {
 
 function Guard({ children }) {
   const location = useLocation()
-  const token = localStorage.getItem('mc_token')
-  if (!token) {
-    // 未登录访问后台：回登录页并记住原地址，登录后回到原地址（而不是公开页）
-    return <Navigate to={`/admin/login?redirect=${encodeURIComponent(location.pathname + location.search)}`} replace />
+  const [params] = useSearchParams()
+  const [token, setToken] = useState(() => localStorage.getItem('mc_token'))
+  const [handoffFailed, setHandoffFailed] = useState(false)
+  const handoff = params.get('handoff')
+
+  // 修改 Web 监听端口会换 origin，localStorage 里的 Token 不会跟过去。
+  // 旧地址在保存前申请一次性交接码，这里在新地址兑换并恢复会话。
+  useEffect(() => {
+    if (token || !handoff) return
+    let alive = true
+    Api.consumeHandoff(handoff)
+      .then((d) => {
+        if (!alive) return
+        if (d?.ok && d.token) {
+          localStorage.setItem('mc_token', d.token)
+          const url = new URL(window.location.href)
+          url.searchParams.delete('handoff')
+          window.history.replaceState(null, '', url.toString())
+          setToken(d.token)
+          return
+        }
+        setHandoffFailed(true)
+      })
+      .catch(() => { if (alive) setHandoffFailed(true) })
+    return () => { alive = false }
+  }, [token, handoff])
+
+  if (token) return children
+  if (handoff && !handoffFailed) {
+    return (
+      <div className="login-wrap">
+        <div className="login-box">
+          <h1>🖥 MoCenter</h1>
+          <div className="sub">正在恢复登录会话…</div>
+        </div>
+      </div>
+    )
   }
-  return children
+  // 未登录访问后台：回登录页并记住原地址（去掉一次性的 handoff 参数）
+  const clean = new URLSearchParams(location.search)
+  clean.delete('handoff')
+  const q = clean.toString()
+  const redirect = location.pathname + (q ? `?${q}` : '')
+  return <Navigate to={`/admin/login?redirect=${encodeURIComponent(redirect)}`} replace />
 }
 
 export default function App() {

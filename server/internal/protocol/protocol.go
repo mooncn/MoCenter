@@ -42,6 +42,10 @@ const (
 	TypeEnrollReq         = "EnrollReq"        // Agent->Server 注册凭证交换请求（换取客户端证书）
 	TypeEnrollResp        = "EnrollResp"       // Server->Agent 注册凭证交换结果
 	TypeEnrollRequired    = "EnrollRequired"   // Server->Agent 需重新换取证书（现有证书不被认可）
+	// TypeServerAddrUpdate Server->Agent 通知新的服务端地址（监听配置变更前下发）。
+	// Agent 落盘成功后回 Ack 并主动重连；旧版 Agent 不认识该消息，会继续用旧地址。
+	TypeServerAddrUpdate    = "ServerAddrUpdate"
+	TypeServerAddrUpdateAck = "ServerAddrUpdateAck"
 )
 
 // Envelope 是所有消息的通用信封：Type 用于路由，Data 为具体负载。
@@ -495,4 +499,27 @@ type EnrollResp struct {
 	// CredSource 本次换取所凭的凭证类型：token（一次性令牌）/ shared-key / anonymous。
 	// 供 Agent 在成功后清理"被误填进长期字段的一次性令牌"（见 Agent 侧说明）。
 	CredSource string `json:"cred_source,omitempty"`
+}
+
+// ServerAddrUpdate Server->Agent：通知服务端监听地址即将变更。
+//
+// 在服务端新监听绑定成功之后、断开现有连接之前下发，让 Agent 把新地址落盘；
+// 随后服务端会主动断开已确认的主机，促使其用新地址重连。旧版 Agent 不认识该类型，会继续用旧地址，
+// 因此服务端只在**收到 Ack** 后断开对应连接，避免把未升级的主机直接踢掉。
+type ServerAddrUpdate struct {
+	// ServerAddr 完整的新地址；为空时只改端口（Port），主机部分沿用 Agent 本机配置。
+	// "只改端口"用于服务端监听全部网卡的情况：各 Agent 可能走内网/域名/公网不同路径，
+	// 服务端不该替它们猜一个主机名。
+	ServerAddr string `json:"server_addr,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	// ApplyAfterSec 收到后延迟多少秒再断开重连；0 使用默认 2 秒。
+	ApplyAfterSec int `json:"apply_after_sec,omitempty"`
+}
+
+// ServerAddrUpdateAck Agent->Server：新地址落盘结果。
+type ServerAddrUpdateAck struct {
+	AgentID    string `json:"agent_id"`
+	ServerAddr string `json:"server_addr"`
+	OK         bool   `json:"ok"`
+	Message    string `json:"message,omitempty"`
 }

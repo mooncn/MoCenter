@@ -229,14 +229,15 @@ func sharedKeyRotateHandler(verifier *agentauth.Verifier, authz *auth.Auth, rout
 	}
 }
 
-// enrollDeleteHandler 永久删除一枚令牌，仅限**已注销主机**的令牌。
+// enrollDeleteHandler 永久删除一枚**已使用**令牌。
 //
-// 与「吊销」的差别：吊销是"还没用的令牌作废"；删除是清理账本 —— 主机都已经
-// 从服务端注销了，这条令牌不再对应任何可接入对象，留着只会让页面越来越长。
+// 与「吊销」的差别：吊销是"还没用的令牌作废"；删除是清理账本 —— 令牌已经用过，
+// 且它对应的主机已不在册（被删除/手动清理，或绑定记录已清除），这条记录不再
+// 对应任何可接入对象，留着只会让页面越来越长。
 // 约束（既在界面上体现，也在服务端强制）：
-//   - 必须绑定 agent_id（不绑定令牌不指向任何主机，无从判断"已注销"）；
-//   - 该 agent_id 当前必须不在册；
-//   - 该 agent_id 必须留下过证书绑定（= 确实接入过，而不是"令牌签了、机器还没来"）。
+//   - 令牌必须已被使用（未使用的请吊销，避免误删还等着用的凭据）；
+//   - 若记录了 agent_id，该主机当前必须不在册；主机仍在册时保留账本。
+//     历史上"不绑定、已使用"的令牌没有 agent_id，已消耗且不指向任何主机，允许清理。
 func enrollDeleteHandler(store *agentauth.EnrollStore, probes *probe.Store, authz *auth.Auth, router *route.Router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
@@ -262,16 +263,12 @@ func enrollDeleteHandler(store *agentauth.EnrollStore, probes *probe.Store, auth
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未找到该令牌（可能已过期被清理）"})
 			return
 		}
-		if rec.AgentID == "" {
-			writeJSON(w, map[string]interface{}{"ok": false, "msg": "不绑定令牌不对应任何主机，无法按「已注销」删除；请使用吊销"})
+		if rec.UsedAt == 0 {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "该令牌尚未使用：请使用吊销（吊销即作废），不能删除记录"})
 			return
 		}
-		if probes != nil && probes.Get(rec.AgentID) != nil {
+		if rec.AgentID != "" && probes != nil && probes.Get(rec.AgentID) != nil {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "该主机仍在册，只能吊销令牌，不能删除记录"})
-			return
-		}
-		if !store.HasBinding(rec.AgentID) {
-			writeJSON(w, map[string]interface{}{"ok": false, "msg": "该主机从未完成过证书换取（没有绑定记录），令牌请使用吊销"})
 			return
 		}
 		if !store.RevokeToken(id) {

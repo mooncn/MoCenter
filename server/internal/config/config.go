@@ -17,10 +17,17 @@ import (
 // 所有字段**不带 omitempty**：首次生成的配置文件必须完整列出全部参数，
 // 让用户一眼看到有哪些可调项（值为空/默认即表示未启用或使用内置默认）。
 type Config struct {
-	Listen    string `json:"listen"`    // Agent TCP 长连接监听地址，默认 :9000
-	HTTP      string `json:"http"`      // REST API / WebSocket 监听地址，默认 :8080
-	Whitelist string `json:"whitelist"` // IP 白名单（逗号分隔，留空不限制）
-	WebDir    string `json:"web_dir"`   // Web 静态资源目录，留空则不托管前端
+	Listen string `json:"listen"` // Agent TCP 长连接监听地址，默认 :9000
+	HTTP   string `json:"http"`   // REST API / WebSocket 监听地址，默认 :8080
+	// ListenManaged / HTTPManaged 表示监听地址已被控制台「系统配置」接管。
+	//
+	// 安装器会把初始地址写进服务命令（binPath / systemd ExecStart），而命令行原本
+	// 优先于配置文件 —— 不记这个标记的话，控制台改完地址、服务一重启就被改回旧值。
+	// 为 true 时启动阶段配置文件优先；想交还命令行管理，把它改成 false 即可。
+	ListenManaged bool   `json:"listen_managed"`
+	HTTPManaged   bool   `json:"http_managed"`
+	Whitelist     string `json:"whitelist"` // IP 白名单（逗号分隔，留空不限制）
+	WebDir        string `json:"web_dir"`   // Web 静态资源目录，留空则不托管前端
 	// TrustedProxies 自有反向代理的可信网段（逗号分隔 CIDR 或裸 IP），留空 = 不信任任何代理。
 	//
 	// 只有 TCP 对端落在这些网段里时，服务端才按 X-Forwarded-For 还原客户端地址，

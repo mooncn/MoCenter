@@ -69,6 +69,32 @@ export const Api = {
     const { data } = await api.post('/enroll/shared-key/rotate', { confirm: true })
     return data
   },
+  // 会话交接：修改监听端口后在新 origin 恢复登录（一次性、60 秒有效）
+  async createHandoff() {
+    const { data } = await api.post('/session/handoff')
+    return data
+  },
+  async consumeHandoff(code) {
+    const { data } = await api.post('/session/handoff/consume', { code })
+    return data
+  },
+  // 系统配置：会话保持时长 + Agent/后台监听地址
+  async systemConfig() {
+    const { data } = await api.get('/system/config')
+    return data
+  },
+  async setSessionTTL(ttl) {
+    const { data } = await api.post('/system/session', { ttl })
+    return data
+  },
+  async setAgentListen(payload) {
+    const { data } = await api.post('/system/agent-listen', payload)
+    return data
+  },
+  async setHTTPListen(payload) {
+    const { data } = await api.post('/system/http-listen', payload)
+    return data
+  },
   // 获取全部主机（含离线）
   async agents() {
     const { data } = await api.get('/agents')
@@ -158,9 +184,10 @@ export const Api = {
     return data
   },
   // 生成 OTP 绑定密钥与 otpauth URI（返回 { secret, uri, enabled }）
-  // 服务端以当前会话身份为准，无需再传 username
-  async otpSetup() {
-    const { data } = await api.get('/otp/setup')
+  // 服务端以当前会话身份为准，无需再传 username；OTP 已启用时必须带当前密码，
+  // 否则任何持有会话 Token 的人都能把验证器换掉。
+  async otpSetup(payload = {}) {
+    const { data } = await api.post('/otp/setup', payload)
     return data
   },
   // 校验动态验证码并启用 OTP

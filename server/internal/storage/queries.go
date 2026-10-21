@@ -427,17 +427,6 @@ func (db *DB) QueryProbeHistory(agentID string, since int64, limit int) ([]*Prob
 	return out, rows.Err()
 }
 
-// CleanupOldProbeHistory 清理超过指定天数的探针历史数据。
-func (db *DB) CleanupOldProbeHistory(maxDays int) (int64, error) {
-	cutoff := time.Now().AddDate(0, 0, -maxDays).Unix()
-	res, err := db.Exec(`DELETE FROM probe_history WHERE timestamp < ?`, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("清理探针历史失败: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	return n, nil
-}
-
 // AgentRow 主机信息持久化行。
 type AgentRow struct {
 	AgentID       string
@@ -871,18 +860,4 @@ func (db *DB) QueryLatencyHistory(agentID string, since int64, target string, li
 		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
-}
-
-// CleanupOldLatencyHistory 清理超过 maxDays 天的延迟历史，返回删除行数。
-func (db *DB) CleanupOldLatencyHistory(maxDays int) (int64, error) {
-	if maxDays <= 0 {
-		return 0, nil
-	}
-	cutoff := time.Now().Add(-time.Duration(maxDays) * 24 * time.Hour).Unix()
-	res, err := db.Exec(`DELETE FROM latency_history WHERE timestamp < ?`, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("清理延迟历史失败: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	return n, nil
 }

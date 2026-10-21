@@ -172,10 +172,12 @@ func main() {
 		}
 	} else {
 		// 已有配置：命令行显式参数（非默认值）覆盖配置文件
-		if cfg.Listen != "" && *addr == ":9000" {
+		// 控制台接管过监听地址时，配置文件优先于服务命令里的 -listen/-http；
+		// 否则服务重启会把界面上改过的地址又覆盖回安装时的旧值。
+		if cfg.Listen != "" && (cfg.ListenManaged || *addr == ":9000") {
 			*addr = cfg.Listen
 		}
-		if cfg.HTTP != "" && *httpAddr == ":8080" {
+		if cfg.HTTP != "" && (cfg.HTTPManaged || *httpAddr == ":8080") {
 			*httpAddr = cfg.HTTP
 		}
 		if cfg.Whitelist != "" && *whitelist == os.Getenv("MOCENTER_WHITELIST") {
@@ -277,8 +279,16 @@ func main() {
 		explicit := givenFlags
 		// flag 名 -> (配置字段指针, 命令行变量值)
 		field := map[string]func(){
-			"listen":                   func() { cfg.Listen = *addr },
-			"http":                     func() { cfg.HTTP = *httpAddr },
+			"listen": func() {
+				if !cfg.ListenManaged {
+					cfg.Listen = *addr
+				}
+			},
+			"http": func() {
+				if !cfg.HTTPManaged {
+					cfg.HTTP = *httpAddr
+				}
+			},
 			"whitelist":                func() { cfg.Whitelist = *whitelist },
 			"trusted-proxies":          func() { cfg.TrustedProxies = *trustedProxies },
 			"web":                      func() { cfg.WebDir = *webDir },
@@ -678,6 +688,12 @@ func main() {
 	go auditRetentionCleaner(db)
 	go memStatsLogger()
 
+	// 运行期可变的系统配置（会话时长、两个监听地址）：
+	// 所有修改都经由同一把锁落盘，避免并发保存互相覆盖。
+	settings := &settingsStore{path: *configPath, cfg: cfg}
+	// listeners 在 start() 里赋值；HTTP 处理协程开始运行时它必然已就绪。
+	var listeners *listenerHub
+
 	// 启动 HTTP 服务（REST + WebSocket）
 	mux := http.NewServeMux()
 	// Agent 通道最终是否真的加密，要到 start() 里签证书时才知道（自动签发可能失败退回明文），
@@ -780,6 +796,9 @@ func main() {
 	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz, *upgradePubKey))
 	mux.HandleFunc("/api/login", loginHandler(userMgr, authz, loginGuard, router))
 	mux.HandleFunc("/api/logout", logoutHandler(authz))
+	// 修改 Web 监听端口后跨 origin 保持登录：一次性、短时效、绑定 IP 的交接码。
+	mux.HandleFunc("/api/session/handoff", sessionHandoffCreateHandler(authz))
+	mux.HandleFunc("/api/session/handoff/consume", sessionHandoffConsumeHandler(authz))
 	mux.HandleFunc("/api/password", changePasswordHandler(userMgr, authz))
 	mux.HandleFunc("/api/otp/setup", otpSetupHandler(userMgr, authz))
 	mux.HandleFunc("/api/otp/enable", otpEnableHandler(userMgr, authz))
@@ -789,7 +808,12 @@ func main() {
 	})
 	// Agent 接入信息：让运维不必翻服务器终端就能拿到"一条命令"。
 	// 需要登录，但**只含指纹等可公开线索**（密钥明文走下面的轮换接口）。
-	mux.HandleFunc("/api/server-info", serverInfoHandler(authz, identity, verifier, *addr, *dataDir, *requireAgentCert, *allowAnonAgents, *disableSharedAgentKey, agentChannelTLS.Load))
+	mux.HandleFunc("/api/server-info", serverInfoHandler(authz, identity, verifier, func() string {
+		if listeners != nil {
+			return listeners.AgentAddr()
+		}
+		return *addr
+	}, *dataDir, *requireAgentCert, *allowAnonAgents, *disableSharedAgentKey, agentChannelTLS.Load))
 	// 一次性注册令牌：签发 / 列举 / 吊销 + 证书 TOFU 绑定重置（均需登录，且全部进审计）。
 	mux.HandleFunc("/api/enroll/tokens", enrollTokensHandler(enrollStore, verifier, authz, router))
 	mux.HandleFunc("/api/enroll/token/revoke", enrollRevokeHandler(enrollStore, authz, router))
@@ -825,6 +849,19 @@ func main() {
 	mux.HandleFunc("/api/site/config/reset", siteConfigResetHandler(siteCfg, authz, siteAudit))
 	mux.HandleFunc("/api/site/hosts", siteHostOptionsHandler(store, authz))
 
+	// 系统配置：会话保持时长 + 两个监听地址（均需登录；监听变更还要二次验密）。
+	mux.HandleFunc("/api/system/config", systemConfigHandler(authz, settings, func() (string, string) {
+		if listeners == nil {
+			return "", ""
+		}
+		return listeners.AgentAddr(), listeners.HTTPAddr()
+	}))
+	mux.HandleFunc("/api/system/session", systemSessionHandler(authz, settings, siteAudit))
+	mux.HandleFunc("/api/system/agent-listen", systemAgentListenHandler(authz, userMgr, settings,
+		func() *listenerHub { return listeners }, sess, siteAudit))
+	mux.HandleFunc("/api/system/http-listen", systemHTTPListenHandler(authz, userMgr, settings,
+		func() *listenerHub { return listeners }, siteAudit))
+
 	// 备份 / 恢复（P1）：导出数据目录为 zip、查看包内清单、从包恢复
 	mux.HandleFunc("/api/backup", backupHandler(*dataDir, authz, siteAudit))
 	// 一键部署 Agent：SSH 登录目标机并安装 Agent、写入对应配置（Linux）
@@ -832,6 +869,12 @@ func main() {
 		DataDir:    *dataDir,
 		PkgDir:     *pkgDir,
 		ServerAddr: *addr,
+		ServerAddrFunc: func() string {
+			if listeners != nil {
+				return listeners.AgentAddr()
+			}
+			return *addr
+		},
 		// 注册密钥取"当前值"而不是启动时的快照：控制台轮换共享密钥后，
 		// 一键部署必须跟着写新密钥，否则装好的 Agent 会因旧密钥被拒注册，
 		// 现象是"部署成功但主机永远不上线"。
@@ -878,90 +921,105 @@ func main() {
 
 	// 监听与接收循环封装成函数：被 SCM 拉起时由服务启动回调调用。
 	start := func() {
-		go func() {
-			// Web 控制台（Admin：登录口令 + 会话 Token + 远程终端/VNC）**默认走 HTTPS/WSS**：
-			//   - 显式给了 -web-tls-cert/-web-tls-key：用运维提供的证书；
-			//   - 否则用内置 CA 现场签发一张"当前部署临时证书"（内存态、重启即换、不落盘）。
-			// 自签证书会让浏览器提示"不安全"，这不是安全问题而是信任展示问题：
-			// 首次访问点一次"继续"即可，或用 -web-tls-cert 换正式证书 / 前面挂 TLS 反代。
-			// 这样默认部署下口令与 Token 不再明文上网，也就能连带启用 HSTS。
+		// Web 控制台监听（Admin：登录口令 + 会话 Token + 远程终端/VNC）**默认走 HTTPS/WSS**：
+		//   - 显式给了 -web-tls-cert/-web-tls-key：用运维提供的证书；
+		//   - 否则用内置 CA 现场签发一张"当前部署临时证书"（内存态、重启即换、不落盘）。
+		// 自签证书会让浏览器提示"不安全"，这不是安全问题而是信任展示问题：
+		// 首次访问点一次"继续"即可，或用 -web-tls-cert 换正式证书 / 前面挂 TLS 反代。
+		buildWebTLS := func(addr string) (*tls.Config, bool, error) {
 			if *webTLSCert != "" && *webTLSKey != "" {
 				cert, err := tls.LoadX509KeyPair(*webTLSCert, *webTLSKey)
 				if err != nil {
-					log.Fatalf("[server] 加载 Web TLS 证书失败: %v", err)
+					return nil, false, fmt.Errorf("加载 Web TLS 证书失败: %w", err)
 				}
-				serveAdminTLS(*httpAddr, webHandler, cert, true)
-				return
+				return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, true, nil
 			}
 			if identity != nil && *adminTLSDays > 0 {
-				hosts := adminCertHosts(*httpAddr, *serverName)
+				hosts := adminCertHosts(addr, *serverName)
 				cert, err := identity.NewAdminCert(hosts)
 				if err == nil {
 					log.Printf("[server] Web 控制台使用内置 CA 自动签发的临时证书（%d 天，SAN: %v）；"+
 						"浏览器会提示自签名证书，接受即可；如需受信任证书请配置 -web-tls-cert/-web-tls-key",
 						*adminTLSDays, hosts)
-					serveAdminTLS(*httpAddr, webHandler, cert, false)
-					return
+					return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, false, nil
 				}
 				log.Printf("[server] 警告: 生成 Web 控制台临时证书失败: %v", err)
 			}
-			log.Printf("[server] REST API / Web 控制台监听 %s（**明文 HTTP**）", *httpAddr)
-			if !isLoopbackAddr(*httpAddr) {
-				log.Printf("[server] 警告: Web 控制台未启用 TLS，登录口令与 Token 将明文传输。" +
-					"请去掉 -admin-tls-days=0，或配置 -web-tls-cert/-web-tls-key，或确保只通过 TLS 反向代理提供")
-			}
-			srv := &http.Server{
-				Addr:              *httpAddr,
-				Handler:           webHandler,
-				ReadHeaderTimeout: 10 * time.Second,
-			}
-			if err := srv.ListenAndServe(); err != nil {
-				log.Fatalf("[server] http error: %v", err)
-			}
-		}()
-		log.Printf("[server] Agent TCP 监听 %s", *addr)
-		ln, err := net.Listen("tcp", *addr)
-		if err != nil {
-			log.Fatalf("[server] listen error: %v", err)
+			return nil, false, nil
 		}
 
+		// buildHTTP 创建监听器；热切换与首次启动共用同一套 TLS 策略。
+		buildHTTP := func(addr string) (net.Listener, *http.Server, error) {
+			tlsCfg, trusted, err := buildWebTLS(addr)
+			if err != nil {
+				return nil, nil, err
+			}
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return nil, nil, err
+			}
+			if tlsCfg != nil {
+				ln = tls.NewListener(ln, tlsCfg)
+				if trusted {
+					log.Printf("[server] REST API / Web 控制台监听 %s（TLS）", addr)
+				} else {
+					log.Printf("[server] REST API / Web 控制台监听 %s（TLS，自签名证书；浏览器首次访问需确认信任）", addr)
+				}
+			} else {
+				log.Printf("[server] REST API / Web 控制台监听 %s（**明文 HTTP**）", addr)
+				if !isLoopbackAddr(addr) {
+					log.Printf("[server] 警告: Web 控制台未启用 TLS，登录口令与 Token 将明文传输。" +
+						"请去掉 -admin-tls-days=0，或配置 -web-tls-cert/-web-tls-key，或确保只通过 TLS 反向代理提供")
+				}
+			}
+			return ln, &http.Server{Handler: webHandler, ReadHeaderTimeout: 10 * time.Second}, nil
+		}
+
+		// 启动阶段探测一次公网 IP：写进证书 SAN，也作为监听配置的默认主机。
+		if publicIP := detectPublicIP(); publicIP != "" {
+			setPublicIP(publicIP)
+			log.Printf("[server] 探针到本机公网 IP %s，已加入服务端证书 SAN", publicIP)
+		}
+
+		// buildAgent 创建 Agent TCP 监听（含 TLS/mTLS 包装）。
 		// Agent 通道的 TLS 采取"能开就开、开不了才降级"：
 		//   - 显式给了 -tls-cert/-tls-key：用运维提供的证书；
 		//   - 否则用内置 CA 现场签发（CA 首次启动自动生成，无需任何证书文件）；
 		//   - 只有 identity 初始化失败（例如 CA 私钥不可读）才退回明文并告警。
-		// 之所以默认开：明文链路上注册凭证与后续报文都可被嗅探/篡改，
-		// 而"默认不开"正是此前需要手工铺证书、结果大家干脆不铺的原因。
-		var tlsLn net.Listener
-		// 自动签发的服务端证书必须带上「本机真实地址」，否则 Agent 用 -ca-cert 校验时
-		// 会报 x509: certificate is valid for 127.0.0.1, ::1, not <公网IP>。
-		// 这里复用 Web 控制台的地址汇总（监听地址 + 本机所有网卡 + -server-name），
-		// 并把探测到的公网 IP 一并写入 —— 它是 Agent 最常使用的连接地址。
-		agentCertHosts := adminCertHosts(*addr, *serverName)
-		if publicIP := detectPublicIP(); publicIP != "" {
-			agentCertHosts = append(agentCertHosts, publicIP)
-			setPublicIP(publicIP) // 供「Agent 接入」页面拼部署命令用
-			log.Printf("[server] 探针到本机公网 IP %s，已加入服务端证书 SAN", publicIP)
-		}
-		agentCert, usingAutoCert, certErr := identity.ServerCertificate(*tlsCert, *tlsKey, agentCertHosts...)
-		if certErr != nil {
-			if *tlsCert != "" || *tlsKey != "" {
-				log.Fatalf("[server] %v", certErr)
+		buildAgent := func(addr string) (net.Listener, error) {
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return nil, err
 			}
-			tlsLn = ln
-			agentChannelTLS.Store(false)
-			log.Printf("[server] 警告: 自动生成 Agent 通道证书失败（%v），该通道为明文传输", certErr)
-		} else {
+			// 自动签发的服务端证书必须带上「本机真实地址」，否则 Agent 用 -ca-cert 校验时
+			// 会报 x509: certificate is valid for 127.0.0.1, ::1, not <公网IP>。
+			agentCertHosts := adminCertHosts(addr, *serverName)
+			if publicIP := cachedPublicIP(); publicIP != "" {
+				agentCertHosts = append(agentCertHosts, publicIP)
+			}
+			agentCert, usingAutoCert, certErr := identity.ServerCertificate(*tlsCert, *tlsKey, agentCertHosts...)
+			if certErr != nil {
+				if *tlsCert != "" || *tlsKey != "" {
+					_ = ln.Close()
+					return nil, certErr
+				}
+				agentChannelTLS.Store(false)
+				log.Printf("[server] 警告: 自动生成 Agent 通道证书失败（%v），该通道为明文传输", certErr)
+				return ln, nil
+			}
 			agentChannelTLS.Store(true)
 			noClientCert := !*requireAgentCert
 			if *caCert != "" {
 				// 手工指定 CA：沿用旧语义（必须携带由该 CA 签发的客户端证书）
 				caPEM, rerr := os.ReadFile(*caCert)
 				if rerr != nil {
-					log.Fatalf("[server] 读取 CA 证书失败: %v", rerr)
+					_ = ln.Close()
+					return nil, fmt.Errorf("读取 CA 证书失败: %w", rerr)
 				}
 				pool := x509.NewCertPool()
 				if !pool.AppendCertsFromPEM(caPEM) {
-					log.Fatalf("[server] 解析 CA 证书失败")
+					_ = ln.Close()
+					return nil, fmt.Errorf("解析 CA 证书失败")
 				}
 				tlsCfg := &tls.Config{
 					Certificates: []tls.Certificate{agentCert},
@@ -973,16 +1031,15 @@ func main() {
 					// 内置 CA 的证书同样被接受（Agent 换取来的证书由内置 CA 签发）
 					pool.AddCert(identity.Authority())
 				}
-				tlsLn = tls.NewListener(ln, tlsCfg)
 				log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（校验客户端证书，CA: %s）", *caCert)
+				return tls.NewListener(ln, tlsCfg), nil
+			}
+			tlsLn := tls.NewListener(ln, identity.CATLSConfig(&agentCert))
+			if noClientCert {
+				log.Printf("[server] Agent TCP 已启用 TLS；允许无证书的 Agent 用注册密钥现场换取证书（换取后必须携带）")
 			} else {
-				tlsLn = tls.NewListener(ln, identity.CATLSConfig(&agentCert))
-				if noClientCert {
-					log.Printf("[server] Agent TCP 已启用 TLS；允许无证书的 Agent 用注册密钥现场换取证书（换取后必须携带）")
-				} else {
-					log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（内置 CA: %s，指纹 %s）",
-						identity.Name(), agentauth.DisplayFingerprint(identity.Fingerprint()))
-				}
+				log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（内置 CA: %s，指纹 %s）",
+					identity.Name(), agentauth.DisplayFingerprint(identity.Fingerprint()))
 			}
 			if usingAutoCert {
 				log.Printf("[server] Agent 通道使用内置 CA 自动签发的服务端证书（SAN: %v）；无需运维准备证书，换用自有证书可加 -tls-cert/-tls-key",
@@ -991,18 +1048,22 @@ func main() {
 				// 运维用 -tls-cert 提供的证书：其 SAN 决定 Agent 能否用 -ca-cert 校验通过。
 				// 部署后换过公网 IP / 用域名连接是最常见的连不上原因，这里在启动时
 				// 就把"证书里的地址"打出来，免得排障时只能靠 Agent 侧报错反推。
-				logCertSANWarning(agentCert, *addr, agentCertHosts)
+				logCertSANWarning(agentCert, addr, agentCertHosts)
 			}
 			_ = *insecure
+			return tlsLn, nil
 		}
 
-		for {
-			conn, err := tlsLn.Accept()
-			if err != nil {
-				log.Printf("[server] accept error: %v", err)
-				continue
-			}
-			go handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir, verifier, *allowAnonAgents, identity, !*requireAgentCert, refresh)
+		listeners = &listenerHub{
+			onAgent: func(conn net.Conn) {
+				handleAgentConn(conn, sess, store, hub, router, ft, pm, pushMgr, vncMgr, *pkgDir,
+					verifier, *allowAnonAgents, identity, !*requireAgentCert, refresh)
+			},
+			buildAgent: buildAgent,
+			buildHTTP:  buildHTTP,
+		}
+		if err := listeners.Start(*addr, *httpAddr); err != nil {
+			log.Fatalf("[server] %v", err)
 		}
 	}
 
@@ -1022,6 +1083,9 @@ func main() {
 	}
 
 	start()
+	// 监听器在后台协程里 accept，start() 会立即返回：
+	// 普通进程必须在此阻塞，否则 main 返回会让整个服务退出。
+	select {}
 }
 
 // serverServiceName Windows 服务名。必须与安装器注册时使用的名称一致
@@ -1121,28 +1185,6 @@ func uuidSuffix(uuid string) string {
 		return ""
 	}
 	return "，设备 UUID " + logSafe(uuid)
-}
-
-// serveAdminTLS 以 HTTPS 提供 Web 控制台。
-//
-// trusted=false 表示用的是"当前部署临时证书"（自签），此时额外加上 HSTS 之外的说明日志；
-// 两者都加 HSTS：Web 侧默认已经不再有明文入口，HSTS 不会把自己锁死。
-func serveAdminTLS(addr string, handler http.Handler, cert tls.Certificate, trusted bool) {
-	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
-	webSrv := &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		TLSConfig:         cfg,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	if trusted {
-		log.Printf("[server] REST API / Web 控制台监听 %s（TLS）", addr)
-	} else {
-		log.Printf("[server] REST API / Web 控制台监听 %s（TLS，自签名证书；浏览器首次访问需确认信任）", addr)
-	}
-	if err := webSrv.ListenAndServeTLS("", ""); err != nil {
-		log.Fatalf("[server] https error: %v", err)
-	}
 }
 
 // adminCertHosts 汇总 Web 控制台临时证书的 SAN：
@@ -2018,6 +2060,11 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			if json.Unmarshal(env.Data, &pr) == nil {
 				vncMgr.NotifyPassword(sessConn.GetAgentID(), &pr)
 			}
+		case protocol.TypeServerAddrUpdateAck:
+			var ack protocol.ServerAddrUpdateAck
+			if json.Unmarshal(env.Data, &ack) == nil && connOwns(sessConn, ack.AgentID) {
+				serverAddrAcks.deliver(ack)
+			}
 		case protocol.TypePkgFetchReq:
 			var pr protocol.PackageFetchReq
 			if json.Unmarshal(env.Data, &pr) == nil {
@@ -2115,10 +2162,14 @@ func broadcastAgents(hub *ws.Hub, store *probe.Store, pub *publicSite) {
 //
 // 注意这里刻意不含任何密钥明文：本接口是控制台页面加载时顺手拉的，把部署级根凭证
 // 放在这里等于让 XSS、浏览器扩展、反向代理日志各替攻击者保管一份（M-1）。
-func serverInfoHandler(authz *auth.Auth, identity *agentauth.Identity, verifier *agentauth.Verifier, listenAddr, dataDir string, requireCert, allowAnon, sharedKeyDisabled bool, agentTLS func() bool) http.HandlerFunc {
+func serverInfoHandler(authz *auth.Auth, identity *agentauth.Identity, verifier *agentauth.Verifier, listenAddr func() string, dataDir string, requireCert, allowAnon, sharedKeyDisabled bool, agentTLS func() bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
+		}
+		listen := ""
+		if listenAddr != nil {
+			listen = listenAddr()
 		}
 		sharedKeyOn := verifier.SharedKeyEnabled()
 		tlsOn := true
@@ -2126,7 +2177,7 @@ func serverInfoHandler(authz *auth.Auth, identity *agentauth.Identity, verifier 
 			tlsOn = agentTLS()
 		}
 		resp := map[string]interface{}{
-			"listen":             listenAddr,
+			"listen":             listen,
 			"require_agent_cert": requireCert,
 			// shared_key_enabled：部署级共享注册密钥当前还能不能用来注册
 			// （false = 只认一次性令牌，此时指纹与密钥路径一律不下发）。
@@ -3305,6 +3356,27 @@ func otpSetupHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "用户不存在"})
 			return
 		}
+		// 重新生成（OTP 已启用）必须验证当前密码：否则一枚被窃取的会话
+		// Token 就能把二次验证悄悄换成攻击者自己的验证器。
+		// 首次绑定不需要密码 —— 此时还没有可被"换掉"的现有 factor。
+		if enabled {
+			var body struct {
+				Password string `json:"password"`
+			}
+			if r.Method == http.MethodPost {
+				if !decodeJSON(w, r, maxCredBody, &body) {
+					return
+				}
+			}
+			if strings.TrimSpace(body.Password) == "" {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "重新生成动态验证码需要验证当前密码"})
+				return
+			}
+			if err := um.VerifyPassword(username, body.Password); err != nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "当前密码错误"})
+				return
+			}
+		}
 		secret, err := auth.GenerateTOTPSecret()
 		if err != nil {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "生成密钥失败: " + err.Error()})
@@ -3341,8 +3413,9 @@ func otpEnableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			Secret string `json:"secret"`
-			Code   string `json:"code"`
+			Secret   string `json:"secret"`
+			Code     string `json:"code"`
+			Password string `json:"password"`
 		}
 		if !decodeJSON(w, r, maxCredBody, &body) {
 			return
@@ -3350,6 +3423,19 @@ func otpEnableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 		if body.Secret == "" || body.Code == "" {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "密钥与验证码均不能为空"})
 			return
+		}
+		// 已启用 OTP 时再次绑定等于"换掉现有验证器"，必须验证当前密码。
+		// 只在 setup 环节验密码是不够的：enable 是公开的 API 入口，
+		// 绕过前端直接带上一个自选密钥就能完成替换。
+		if enabled, _ := um.TOTPStatus(username); enabled {
+			if strings.TrimSpace(body.Password) == "" {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "重新绑定动态验证码需要验证当前密码"})
+				return
+			}
+			if err := um.VerifyPassword(username, body.Password); err != nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "当前密码错误"})
+				return
+			}
 		}
 		// 扫码绑定前先比对验证码是否正确
 		if !um.VerifyTOTP(username, body.Secret, body.Code) {
@@ -3393,8 +3479,20 @@ func otpDisableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc 
 		if !decodeJSON(w, r, maxCredBody, &body) {
 			return
 		}
+		if strings.TrimSpace(body.Password) == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "关闭动态验证码需要验证当前密码"})
+			return
+		}
+		if enabled, _ := um.TOTPStatus(username); enabled && strings.TrimSpace(body.OTP) == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "请输入当前动态验证码"})
+			return
+		}
 		if err := um.UnbindTOTP(username, body.Password, body.OTP); err != nil {
-			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+			msg := err.Error()
+			if errors.Is(err, auth.ErrBadLogin) {
+				msg = "当前密码错误"
+			}
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": msg})
 			return
 		}
 		log.Printf("[auth] 用户 %s 已关闭 OTP 动态验证码", username)
@@ -3460,7 +3558,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			h.Set("Cache-Control", "no-store")
 		}
-		// Web 控制台默认就是 HTTPS（见 serveAdminTLS），所以可以安全地启用 HSTS：
+		// Web 控制台默认就是 HTTPS（见 start() 的 Web TLS 策略），所以可以安全地启用 HSTS：
 		// 它会阻止后续降级到明文，保护 Bearer Token 与远程终端/远程桌面的会话。
 		// 注意：只在 TLS 请求上加，避免反代外的明文态被浏览器记住。
 		if r.TLS != nil {
@@ -4075,24 +4173,56 @@ func memStatsLogger() {
 	}
 }
 
-// probeHistoryCleaner 定期清理超过 30 天的探针 / 延迟历史数据。
+// probeHistoryCleaner 维护探针 / 延迟历史的分层留存。
+//
+// 10 秒采样直接保留 30 天会把库撑到百万行量级（8 台主机约 7 万行/天），
+// 所以启动后先维护一次存量，之后每 6 小时滚动执行：
+//   - probe_history 只保留最近 7 天原始采样，更早数据导出为 gzip CSV 归档后删除；
+//   - latency_history 仍为 24 小时原始 + 24 小时~30 天 5 分钟聚合。
 func probeHistoryCleaner(db *storage.DB) {
+	// 让监听与首屏先就绪，压缩在后台进行；单连接下它会短暂占用数据库，
+	// 但不影响静态页面与内存态接口。
+	time.Sleep(5 * time.Second)
+	compactHistoryOnce(db, true)
+
 	ticker := time.NewTicker(6 * time.Hour)
 	defer ticker.Stop()
 	for range ticker.C {
-		n, err := db.CleanupOldProbeHistory(30)
-		if err != nil {
-			log.Printf("[server] 清理探针历史失败: %v", err)
-		} else if n > 0 {
-			log.Printf("[server] 清理了 %d 条过期探针历史", n)
-		}
-		// 延迟历史与探针历史同口径（30 天）：都是趋势数据，留存窗口不一致
-		// 会导致"趋势图有数据、延迟曲线却空了一段"这种口径错位。
-		m, lerr := db.CleanupOldLatencyHistory(30)
-		if lerr != nil {
-			log.Printf("[server] 清理延迟历史失败: %v", lerr)
-		} else if m > 0 {
-			log.Printf("[server] 清理了 %d 条过期延迟历史", m)
+		compactHistoryOnce(db, false)
+	}
+}
+
+func compactHistoryOnce(db *storage.DB, first bool) {
+	start := time.Now()
+	if first {
+		log.Printf("[server] 开始维护历史数据（探针保留 7 天原始采样；更早数据先归档再删除）")
+	}
+	st, err := db.CompactHistory()
+	if err != nil {
+		log.Printf("[server] 历史维护失败（下次重试）: %v", err)
+		return
+	}
+	if st.ArchivedProbe > 0 {
+		log.Printf("[server] 已归档 %d 条探针历史到 %s（%s ~ %s）",
+			st.ArchivedProbe, st.ArchivePath,
+			time.Unix(st.ArchiveStart, 0).Format("2006-01-02 15:04:05"),
+			time.Unix(st.ArchiveEnd, 0).Format("2006-01-02 15:04:05"))
+	}
+	if st.RemovedProbe > 0 || st.RemovedLatency > 0 || first {
+		log.Printf("[server] 历史维护完成：探针 %d→%d，延迟 %d→%d（过期 %d），耗时 %s",
+			st.ProbeBefore, st.ProbeAfter,
+			st.LatencyBefore, st.LatencyAfter, st.PrunedLatency,
+			time.Since(start).Round(time.Millisecond))
+	}
+	// 存量库第一次压缩通常删除量很大，做一次 VACUUM 才能真正缩小文件；
+	// 平峰期的小批量清理交给 auto_vacuum 的增量回收。
+	removed := st.RemovedProbe + st.RemovedLatency
+	if (first && (st.ProbeBefore > 100000 || st.LatencyBefore > 100000)) || removed > 50000 {
+		vstart := time.Now()
+		if err := db.CompactStorage(); err != nil {
+			log.Printf("[server] 数据库空间回收失败: %v", err)
+		} else {
+			log.Printf("[server] 数据库空间已回收（VACUUM，耗时 %s）", time.Since(vstart).Round(time.Millisecond))
 		}
 	}
 }

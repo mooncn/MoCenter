@@ -303,19 +303,6 @@ func (s *EnrollStore) GetToken(id string) *EnrollToken {
 	return nil
 }
 
-// HasBinding 判断某 agent_id 是否留下过证书绑定（即"曾经真正接入过"）。
-// 删除已注销主机的令牌时用它区分「登记过又删了」与「令牌签了但机器还没来」。
-func (s *EnrollStore) HasBinding(agentID string) bool {
-	agentID = strings.TrimSpace(agentID)
-	if agentID == "" {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, ok := s.bindings[agentID]
-	return ok
-}
-
 // RevokeToken 按 id 吊销一条令牌，返回是否存在并被移除。
 func (s *EnrollStore) RevokeToken(id string) bool {
 	s.mu.Lock()
@@ -364,9 +351,9 @@ func (s *EnrollStore) RevokeAgentTokens(agentID string) int {
 // 因此客户端无需知道令牌是否绑定。一台主机最多 8 条候选，逐个算 HMAC 的代价可忽略；
 // 比对用常数时间，避免把匹配位置泄露成时序信号。作废与落盘在持锁内一次完成 ——
 // "一次性"必须是硬保证，即使写文件失败也只影响重启后的状态，不影响本次进程内的单次使用。
-func (s *EnrollStore) matchConsume(agentID, nonce, proof string, ts int64) *EnrollToken {
+func (s *EnrollStore) matchConsume(agentID, nonce, proof string, ts int64) (*EnrollToken, bool) {
 	if agentID == "" || proof == "" {
-		return nil
+		return nil, false
 	}
 	want := strings.ToLower(strings.TrimSpace(proof))
 	now := s.now().Unix()
@@ -376,13 +363,22 @@ func (s *EnrollStore) matchConsume(agentID, nonce, proof string, ts int64) *Enro
 		}
 		got := Proof(t.secret, agentID, nonce, ts)
 		if got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1 {
+			// tokenBound 必须是"签发时"的语义，不能看到账本回填后的 AgentID。
+			// 未绑定令牌只允许首次接入；若这里返回 true，CheckOrBind 就会把
+			// 它当成"该主机的显式授权"，从而放行换掉已有公钥（提权）。
+			bound := t.AgentID != ""
+			if !bound {
+				// 不绑定令牌消费时把实际身份写回账本：列表能显示是哪台机器用的，
+				// 主机被删除/手动清理后也能按"已注销"永久删除这条记录。
+				t.AgentID = agentID
+			}
 			t.UsedAt = now
 			t.Source = CredToken
 			_ = s.saveLocked()
-			return t
+			return t, bound
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // Bindings 返回当前的 TOFU 绑定（供控制台展示与审计）。

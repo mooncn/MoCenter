@@ -235,6 +235,23 @@ func (m *UserManager) UnbindTOTP(username, password, otp string) error {
 	return m.Save()
 }
 
+// VerifyPassword 校验当前密码，用于敏感操作（重新生成/关闭 OTP）前的二次确认。
+//
+// 只校验密码本身，不涉及 OTP 与登录态 —— 越是"能改变安全配置"的操作，
+// 越不能只凭一枚可能被窃取的会话 Token 放行。
+func (m *UserManager) VerifyPassword(username, password string) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	u, ok := m.users[username]
+	if !ok {
+		return ErrBadUsername
+	}
+	if ok, _ := verifyPassword(u.PasswordHash, password); !ok {
+		return ErrBadOldPassword
+	}
+	return nil
+}
+
 // VerifyTOTP 校验用户当前 OTP 密钥对应的验证码（用于绑定前的自检）。
 // 若用户尚未设置密钥，返回 false。
 func (m *UserManager) VerifyTOTP(username, secret, code string) bool {

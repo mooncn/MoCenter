@@ -57,6 +57,10 @@ func NewAuth(whitelist []string) *Auth {
 }
 
 // SetTokenTTL 覆盖 Token 有效期（<=0 表示用默认值）。
+//
+// 缩短时同步收紧现有会话：否则把 30 天改成 1 小时之后，旧 Token 仍能用到
+// 原来的 30 天，配置改了却没有任何效果。延长不反向改写现有会话，
+// 下次请求滑动续期时自然采用新值。
 func (a *Auth) SetTokenTTL(d time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -64,6 +68,13 @@ func (a *Auth) SetTokenTTL(d time.Duration) {
 		d = DefaultTokenTTL
 	}
 	a.tokenTTL = d
+	limit := time.Now().Add(d)
+	for tok, e := range a.tokens {
+		if e.expiresAt.After(limit) {
+			e.expiresAt = limit
+			a.tokens[tok] = e
+		}
+	}
 }
 
 // TokenTTL 返回当前 Token 有效期。

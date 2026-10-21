@@ -189,8 +189,9 @@ func TestEnrollAPIIssuesUnboundToken(t *testing.T) {
 	if err := json.Unmarshal(listRec.Body.Bytes(), &list); err != nil {
 		t.Fatal(err)
 	}
-	if len(list.Tokens) != 1 || list.Tokens[0]["unbound"] != true || list.Tokens[0]["used_at"] == int64(0) {
-		t.Fatalf("列表中不绑定令牌的状态异常: %+v", list.Tokens)
+	if len(list.Tokens) != 1 || list.Tokens[0]["unbound"] != false ||
+		list.Tokens[0]["agent_id"] != uuid || list.Tokens[0]["used_at"] == int64(0) {
+		t.Fatalf("不绑定令牌使用后应回填实际 UUID 并标记为已使用: %+v", list.Tokens)
 	}
 	if strings.Contains(listRec.Body.String(), created.Token) {
 		t.Fatal("令牌列表回显了明文")
@@ -250,7 +251,7 @@ func TestServerInfoWithholdsSharedKeyPlaintext(t *testing.T) {
 	_, authz, _ := newEnrollAPIFixture(t)
 	verifier := agentauth.NewVerifier(plaintext)
 
-	rec := doJSON(t, serverInfoHandler(authz, nil, verifier, ":9000", dataDir, false, false, false, func() bool { return true }), http.MethodGet, "", "test-token")
+	rec := doJSON(t, serverInfoHandler(authz, nil, verifier, func() string { return ":9000" }, dataDir, false, false, false, func() bool { return true }), http.MethodGet, "", "test-token")
 	body := rec.Body.String()
 	if strings.Contains(body, plaintext) {
 		t.Fatalf("server-info 仍下发密钥明文: %s", body)
@@ -287,7 +288,7 @@ func TestServerInfoWithholdsSharedKeyPlaintext(t *testing.T) {
 func TestServerInfoReportsDegradedIdentity(t *testing.T) {
 	_, authz, _ := newEnrollAPIFixture(t)
 	verifier := agentauth.NewVerifier("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	h := serverInfoHandler(authz, nil, verifier, ":9000", t.TempDir(), false, true, false, func() bool { return false })
+	h := serverInfoHandler(authz, nil, verifier, func() string { return ":9000" }, t.TempDir(), false, true, false, func() bool { return false })
 	rec := doJSON(t, h, http.MethodGet, "", "test-token")
 	var resp map[string]interface{}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {

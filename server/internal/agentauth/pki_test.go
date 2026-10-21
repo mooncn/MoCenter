@@ -119,7 +119,12 @@ func TestFingerprintMatching(t *testing.T) {
 	if MatchFingerprint(fp[:8], fp) {
 		t.Fatal("8 位短指纹熵不足，不应再被接受")
 	}
-	if MatchFingerprint("0"+fp[1:], fp) {
+	// 首字符可能本来就是 0，换一个确定不同的字符，避免偶发假失败。
+	different := "0" + fp[1:]
+	if different == fp {
+		different = "1" + fp[1:]
+	}
+	if MatchFingerprint(different, fp) {
 		t.Fatal("内容不同不应匹配")
 	}
 	if MatchFingerprint("", fp) || MatchFingerprint(fp, "") {
