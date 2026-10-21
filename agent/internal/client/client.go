@@ -1019,13 +1019,9 @@ func (c *Client) runUpgrade(req *protocol.UpgradeReq) {
 	upgrade.PerformLocal(req, content, report)
 }
 
-// fetchLocalUpgradePackage 通过既有的 PackageFetch 长连接通道把服务端 pkg 目录里的
-// 文件取到本机文件沙箱，再一次性读入内存交给升级模块（上限 256 MiB）。
-func (c *Client) fetchLocalUpgradePackage(name string) ([]byte, error) {
-	safe := filepath.Base(strings.TrimSpace(name))
-	if safe == "" || safe == "." || safe == ".." {
-		return nil, fmt.Errorf("安装包名称不合法")
-	}
+// sandboxSubdir 返回 FileRoots 下的专用子目录。所有"服务端下发文件"都必须落在这里，
+// 否则 handleFilePush 的路径闸门会拒绝（系统临时目录不在默认根目录内）。
+func (c *Client) sandboxSubdir(sub string) string {
 	root := ""
 	if len(c.cfg.FileRoots) > 0 {
 		root = c.cfg.FileRoots[0]
@@ -1033,7 +1029,37 @@ func (c *Client) fetchLocalUpgradePackage(name string) ([]byte, error) {
 	if strings.TrimSpace(root) == "" {
 		root = DefaultFileRoot(c.cfg.ConfigPath)
 	}
-	dir := filepath.Join(root, ".upgrade")
+	return filepath.Join(root, sub)
+}
+
+// fetchServerPackage 从服务端托管目录取一个安装包到本机沙箱，返回本地路径。
+// 供 VNC/虚拟显示驱动等安装流程使用（服务端分片由消息循环写入）。
+func (c *Client) fetchServerPackage(name string) (string, error) {
+	safe := filepath.Base(strings.TrimSpace(name))
+	if safe == "" || safe == "." || safe == ".." {
+		return "", fmt.Errorf("安装包名称不合法")
+	}
+	dir := c.sandboxSubdir(".packages")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("创建安装包临时目录失败: %w", err)
+	}
+	dest := filepath.Join(dir, safe)
+	// 旧版本可能把截断文件留在别处；同名残留会让大小校验误报，先清掉。
+	_ = os.Remove(dest)
+	if _, err := c.fetchPackage(safe, dest); err != nil {
+		return "", err
+	}
+	return dest, nil
+}
+
+// fetchLocalUpgradePackage 通过既有的 PackageFetch 长连接通道把服务端 pkg 目录里的
+// 文件取到本机文件沙箱，再一次性读入内存交给升级模块（上限 256 MiB）。
+func (c *Client) fetchLocalUpgradePackage(name string) ([]byte, error) {
+	safe := filepath.Base(strings.TrimSpace(name))
+	if safe == "" || safe == "." || safe == ".." {
+		return nil, fmt.Errorf("安装包名称不合法")
+	}
+	dir := c.sandboxSubdir(".upgrade")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("创建升级临时目录失败: %w", err)
 	}
@@ -1102,13 +1128,9 @@ func (c *Client) handleVncInstall(req protocol.VncInstallReq) {
 		Proxy:               c.cfg.ProxyIP,
 		Mode:                req.Mode,
 		AllowPublicDownload: c.cfg.AllowPublicDownload,
-		FetchPackage: func(name string) (string, error) {
-			dest := filepath.Join(os.TempDir(), name)
-			if _, err := c.fetchPackage(name, dest); err != nil {
-				return "", err
-			}
-			return dest, nil
-		},
+		// 必须落在本机 FileRoots 内：服务端下发走的是文件分发通道（handleFilePush
+		// 会做路径闸门），写系统临时目录会被逐片拒绝，表现为"每个分片都不在允许根目录内"。
+		FetchPackage: c.fetchServerPackage,
 	})
 	log.Printf("[agent] VNC 安装/启动结果: mode=%s ok=%v msg=%s", resp.Mode, resp.OK, resp.Message)
 	_ = c.write(protocol.TypeVncInstallResp, protocol.VncInstallResp{

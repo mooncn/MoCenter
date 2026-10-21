@@ -1,9 +1,17 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import RFB from '@novnc/novnc'
 import { ShareApi, MCSocket } from '../api/api.js'
+import { createVncPointer, WHEEL_STEP_DELTA } from '../utils/vncPointer.js'
+
+// 远端光标显示尺寸档位（与后台远程桌面同一口径）。
+const CURSOR_SIZES = [
+  { label: '小', factor: 0.6 },
+  { label: '标准', factor: 1 },
+  { label: '大', factor: 1.5 },
+]
 
 // 分享访客页：链接形如 /share#<token>。
 //
@@ -320,11 +328,22 @@ function TerminalPanel({ token, agentId, online }) {
 
 function VncPanel({ token, info }) {
   const viewerRef = useRef(null)
+  const wrapRef = useRef(null)
   const rfbRef = useRef(null)
   const [status, setStatus] = useState('idle') // idle/connecting/connected/disconnected
   const [notice, setNotice] = useState('')
   const [password, setPassword] = useState('')
   const [fetching, setFetching] = useState(false)
+  const [fullscreen, setFullscreen] = useState(false)
+  const [toolsOpen, setToolsOpen] = useState(false)
+  const [cursorIdx, setCursorIdx] = useState(1)
+  const [mouseOpen, setMouseOpen] = useState(false)
+  const [holdLeft, setHoldLeft] = useState(false)
+
+  // 连接成功后默认展开右下角工具条，和后台远程桌面保持一致。
+  useEffect(() => {
+    if (status === 'connected') setToolsOpen(true)
+  }, [status])
 
   useEffect(() => () => {
     if (rfbRef.current) {
@@ -365,6 +384,7 @@ function VncPanel({ token, info }) {
       wsProtocols: ['mocenter', encodeURIComponent(token)],
     })
     rfb.scaleViewport = true
+    rfb.resizeSession = false
     rfb.showDotCursor = true
     rfbRef.current = rfb
     setStatus('connecting')
@@ -388,12 +408,148 @@ function VncPanel({ token, info }) {
   }
 
   const disconnect = () => {
+    try { vp.detach() } catch { /* ignore */ }
     if (rfbRef.current) {
       try { rfbRef.current.disconnect() } catch { /* ignore */ }
       rfbRef.current = null
     }
     setStatus('disconnected')
   }
+
+  // ---- 远端光标显示尺寸（与后台远程桌面同一实现）----
+  const screenCanvas = () => (viewerRef.current ? viewerRef.current.querySelector('canvas') : null)
+  const findCursorCanvas = () => {
+    for (const el of Array.from(document.body.children)) {
+      if (el.tagName === 'CANVAS') return el
+    }
+    return null
+  }
+  const applyCursorScale = () => {
+    const cur = findCursorCanvas()
+    if (!cur) return
+    const screen = screenCanvas()
+    let base = 1
+    if (screen && screen.width > 0 && screen.clientWidth > 0) {
+      base = screen.clientWidth / screen.width
+    }
+    const k = Math.max(0.25, Math.min(4, base * CURSOR_SIZES[cursorIdx].factor))
+    cur.style.transformOrigin = '0 0'
+    cur.style.transform = `scale(${k})`
+  }
+  const cycleCursorSize = () => setCursorIdx((i) => (i + 1) % CURSOR_SIZES.length)
+
+  // ---- 虚拟鼠标（移动端）----
+  const emitMouse = (evt) => {
+    const cv = screenCanvas()
+    if (!cv) return
+    const r = cv.getBoundingClientRect()
+    const clientX = r.left + evt.x
+    const clientY = r.top + evt.y
+    if (evt.type === 'wheel') {
+      cv.dispatchEvent(new WheelEvent('wheel', {
+        clientX, clientY, deltaY: evt.deltaY, deltaMode: 0, bubbles: true, cancelable: true,
+      }))
+      return
+    }
+    cv.dispatchEvent(new MouseEvent(evt.type, {
+      clientX, clientY,
+      buttons: evt.buttons, button: evt.buttons === 2 ? 2 : 0,
+      bubbles: true, cancelable: true,
+    }))
+  }
+  const vp = useMemo(() => createVncPointer({
+    getRect: () => {
+      const cv = screenCanvas()
+      if (!cv) return null
+      const r = cv.getBoundingClientRect()
+      return { width: r.width, height: r.height }
+    },
+    emit: emitMouse,
+    onHoldChange: setHoldLeft,
+  }), [])
+
+  const onTrackDown = (e) => {
+    if (e.currentTarget.setPointerCapture) {
+      try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* ignore */ }
+    }
+    vp.gestureStart(e.clientX, e.clientY)
+  }
+  const onTrackMove = (e) => vp.gestureMove(e.clientX, e.clientY)
+  const onTrackUp = () => vp.gestureEnd()
+  const onTrackCancel = () => vp.gestureCancel()
+
+  useEffect(() => {
+    if (holdLeft && (!mouseOpen || status !== 'connected')) vp.releaseHold()
+  }, [holdLeft, mouseOpen, status, vp])
+  useEffect(() => () => vp.detach(), [vp])
+  useEffect(() => {
+    if (!mouseOpen || status !== 'connected') return
+    vp.syncToCenter()
+  }, [mouseOpen, status, vp])
+  useEffect(() => {
+    if (status !== 'connected') return
+    const id = requestAnimationFrame(applyCursorScale)
+    const onResize = () => applyCursorScale()
+    window.addEventListener('resize', onResize)
+    return () => { cancelAnimationFrame(id); window.removeEventListener('resize', onResize) }
+  }, [status, cursorIdx])
+
+  // ---- 全屏 ----
+  const resizeViewer = (rfb) => {
+    if (!rfb) return
+    try {
+      rfb.scaleViewport = true
+      if (typeof rfb._screenSize === 'object') rfb._screenSize = null
+      window.dispatchEvent(new Event('resize'))
+    } catch { /* ignore */ }
+  }
+  const enterFullscreen = () => {
+    const el = wrapRef.current
+    if (!el) return
+    const isFs = document.fullscreenElement || document.webkitFullscreenElement
+    if (!isFs) {
+      try {
+        const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen
+        const ret = req && req.call(el)
+        if (ret && typeof ret.then === 'function') ret.catch(() => {})
+      } catch { /* 回退沉浸式 */ }
+    }
+    setFullscreen(true)
+    setTimeout(() => resizeViewer(rfbRef.current), 120)
+  }
+  const exitFullscreen = () => {
+    const isFs = document.fullscreenElement || document.webkitFullscreenElement
+    if (isFs) {
+      try {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen
+        exit && exit.call(document)
+      } catch { /* ignore */ }
+    }
+    setFullscreen(false)
+    setTimeout(() => resizeViewer(rfbRef.current), 120)
+  }
+  const toggleFullscreen = () => (fullscreen ? exitFullscreen() : enterFullscreen())
+
+  useEffect(() => {
+    const onChange = () => {
+      const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement)
+      setFullscreen(isFs)
+      setTimeout(() => resizeViewer(rfbRef.current), 120)
+    }
+    document.addEventListener('fullscreenchange', onChange)
+    document.addEventListener('webkitfullscreenchange', onChange)
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange)
+      document.removeEventListener('webkitfullscreenchange', onChange)
+    }
+  }, [])
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape' && fullscreen) exitFullscreen()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
 
   return (
     <div>
@@ -418,8 +574,41 @@ function VncPanel({ token, info }) {
           onChange={(e) => setPassword(e.target.value)}
         />
       </div>
-      <div className="vnc-wrap">
+      <div ref={wrapRef} className={`vnc-wrap ${fullscreen ? 'vnc-fullscreen' : ''}`}>
         <div ref={viewerRef} style={{ width: '100%', height: '100%', minHeight: 360 }} />
+
+        {/* 右下角悬浮工具条：全屏 / 自适应缩放 / 快捷键 / 虚拟鼠标 / 光标大小 */}
+        <div className={`vnc-fab ${toolsOpen ? 'open' : ''}`}>
+          {toolsOpen && (
+            <div className="vnc-fab-menu">
+              <button className="vnc-fab-item" onClick={toggleFullscreen} title="全屏显示桌面（Esc 退出）">
+                {fullscreen ? '⤡ 退出全屏' : '⛶ 全屏'}
+              </button>
+              <button className="vnc-fab-item" onClick={() => { const r = rfbRef.current; if (r) r.scaleViewport = !r.scaleViewport; setTimeout(applyCursorScale, 0) }} title="切换自适应缩放 / 原始分辨率">
+                ⇱ 自适应缩放
+              </button>
+              <button className="vnc-fab-item" onClick={() => { const r = rfbRef.current; if (r) r.sendCtrlAltDel() }} title="发送 Ctrl+Alt+Del">
+                ⌨ Ctrl+Alt+Del
+              </button>
+              <button className="vnc-fab-item" onClick={() => setMouseOpen((v) => !v)} title="移动端虚拟鼠标：触控板移动 + 按键点击">
+                🖱 {mouseOpen ? '隐藏虚拟鼠标' : '虚拟鼠标'}
+              </button>
+              <button className="vnc-fab-item" onClick={cycleCursorSize} title="调整远端光标的显示大小（小 / 标准 / 大）">
+                ◉ 光标大小：{CURSOR_SIZES[cursorIdx].label}
+              </button>
+              <button className="vnc-fab-item" onClick={() => setToolsOpen(false)}>✕ 收起</button>
+            </div>
+          )}
+          <button
+            className="vnc-fab-toggle"
+            onClick={() => setToolsOpen(!toolsOpen)}
+            title={toolsOpen ? '收起工具' : '展开工具（全屏等）'}
+            aria-label="VNC 工具栏"
+          >
+            {toolsOpen ? '✕' : (fullscreen ? '⤡' : '⛶')}
+          </button>
+        </div>
+
         {status !== 'connected' && (
           <div className="vnc-overlay">
             <div>
@@ -431,6 +620,31 @@ function VncPanel({ token, info }) {
           </div>
         )}
       </div>
+
+      {/* 虚拟鼠标面板放在画布下方，避免遮住远端任务栏。 */}
+      {mouseOpen && status === 'connected' && (
+        <div className="vnc-mouse">
+          <div
+            className="vnc-mouse-track"
+            onPointerDown={onTrackDown}
+            onPointerMove={onTrackMove}
+            onPointerUp={onTrackUp}
+            onPointerCancel={onTrackCancel}
+          >
+            <span>触控板：拖动移动指针 · 轻点 = 左键</span>
+          </div>
+          <div className="vnc-mouse-btns">
+            <button onClick={() => vp.click(1)}>左键</button>
+            <button onClick={() => vp.click(2)}>右键</button>
+            <button onClick={() => vp.doubleClick()}>双击</button>
+            <button onClick={() => vp.wheel(-WHEEL_STEP_DELTA)}>滚轮↑</button>
+            <button onClick={() => vp.wheel(WHEEL_STEP_DELTA)}>滚轮↓</button>
+            <button className={holdLeft ? 'on' : ''} onClick={() => vp.toggleHold()}>
+              {holdLeft ? '松开左键' : '按住左键'}
+            </button>
+          </div>
+        </div>
+      )}
       {notice && <div className="notice err" style={{ marginTop: 10 }}>{notice}</div>}
     </div>
   )

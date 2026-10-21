@@ -262,3 +262,24 @@ func TestSendFileChunksRefusesOutsideRoot(t *testing.T) {
 		t.Fatalf("越界取回必须整体失败且不外发内容，实际 %+v", up)
 	}
 }
+
+// TestServerPackageSandboxInsideRoots 服务端托管包（VNC/驱动）必须落在 FileRoots 内，
+// 否则文件分发的路径闸门会逐片拒绝（历史 bug 是写 os.TempDir()）。
+func TestServerPackageSandboxInsideRoots(t *testing.T) {
+	root := t.TempDir()
+	c := &Client{cfg: Config{FileRoots: []string{root}}}
+	dir := c.sandboxSubdir(".packages")
+	if filepath.Dir(dir) != root {
+		t.Fatalf("专用目录应直接位于 FileRoots 下: %s", dir)
+	}
+	if _, err := withinRoots(c.cfg.FileRoots, filepath.Join(dir, "UltraVNC_1824_x64_Setup.exe")); err != nil {
+		t.Fatalf("托管包落点必须在允许根目录内: %v", err)
+	}
+
+	// 未显式配置 FileRoots 时，默认沙箱 <配置目录>/files 同样要成立。
+	c2 := New(Config{AgentID: "a", ConfigPath: filepath.Join(root, "mocenter-agent.json")})
+	dir2 := c2.sandboxSubdir(".packages")
+	if _, err := withinRoots(c2.cfg.FileRoots, filepath.Join(dir2, "pkg.exe")); err != nil {
+		t.Fatalf("默认沙箱内的托管包落点应放行: %v", err)
+	}
+}

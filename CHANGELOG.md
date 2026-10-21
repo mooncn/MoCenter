@@ -24,6 +24,9 @@
   （向 Agent 下发 `InteractiveClose`），不再出现"链接过期但会话还能一直用"。
 - 分享命令 ID 限定 `share-` 命名空间；路由层对同一 `(agent_id, command_id)` 的跨会话
   复用一律拒绝，杜绝访客抢占管理端终端归属。
+- **访客远程桌面补齐悬浮工具条**：与后台一致提供全屏、自适应缩放、Ctrl+Alt+Del、
+  虚拟鼠标（触控板 + 左/右键、双击、滚轮、按住拖拽）与光标大小（小/标准/大）；
+  虚拟鼠标面板放在画布下方，不遮挡远端任务栏。
 
 ### 注册令牌管理
 
@@ -49,6 +52,17 @@
 - 在线链接模式保持原安全模型不变：仅 https、SHA-256 必填、Ed25519 签名必填；
   Agent 未配置公钥时只拒绝在线链接升级，本地 pkg 模式不受影响。
 - 本地直发需要目标 Agent 支持 `PackageName` 升级指令；旧版 Agent 请先用在线链接升级一次。
+
+### 远程桌面 / VNC
+
+- **修复服务端托管安装包落点错误**：VNC / 虚拟显示驱动的取包回调原先写入
+  `os.TempDir()`（SYSTEM 下为 `C:\Windows\SystemTemp`），不在 Agent 的
+  `-file-roots` 内，导致服务端每个分片都被路径闸门拒绝，随后误判为"未托管"
+  并回退公网下载。现在统一落到 `<file-roots>/.packages/`（默认
+  `C:\ProgramData\MoCenter\agent\files\.packages\`），并在取包前清理同名残留，
+  避免旧截断文件触发"大小不符"。
+- `allow_public_package_download` 只控制服务端托管失败后的公网兜底
+  （winget/choco/官方直连），不影响托管包分片落盘；托管链路可用时应保持关闭。
 
 ### Web 控制台
 
