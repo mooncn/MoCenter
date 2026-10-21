@@ -54,7 +54,7 @@ func TestUpgradeHandlerAcceptsVersionDifferentFromServer(t *testing.T) {
 	const token = "test-token"
 	authz.RegisterToken(token, "tester")
 
-	h := upgradeHandler(sess, authz, "")
+	h := upgradeHandler(sess, authz, "", "", nil)
 
 	// 一个明显异于服务端版本的目标版本
 	body := `{"agent_id":"not-online","version":"9.9.9","url":"https://example.com/a.bin",` +

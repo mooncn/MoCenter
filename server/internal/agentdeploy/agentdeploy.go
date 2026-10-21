@@ -741,7 +741,8 @@ func listBinaries(dir string) ([]string, error) {
 		}
 		if strings.HasSuffix(name, ".deb") || strings.HasSuffix(name, ".rpm") ||
 			strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".sha256") ||
-			strings.HasSuffix(name, ".sha1") {
+			strings.HasSuffix(name, ".sha1") || strings.HasSuffix(name, ".bak") ||
+			strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".sig") {
 			continue
 		}
 		out = append(out, filepath.Join(dir, e.Name()))
@@ -1093,7 +1094,8 @@ func humanSize(n int64) string {
 type PackageInfo struct {
 	Name string `json:"name"`
 	Size int64  `json:"size"`
-	// Arch 由文件名推导（mocenter-agent-arm64 -> arm64）
+	// OS / Arch 由文件名推导（mocenter-agent-amd64 / mocenter-agent-amd64.exe）
+	OS   string `json:"os"`
 	Arch string `json:"arch"`
 }
 
@@ -1114,10 +1116,27 @@ func (d *Deployer) PackageCandidates() []PackageInfo {
 		if fi, err := os.Stat(p); err == nil {
 			size = fi.Size()
 		}
-		out = append(out, PackageInfo{Name: name, Size: size, Arch: archFromName(name)})
+		info := PackageInfo{Name: name, Size: size, OS: PackageOS(name), Arch: PackageArch(name)}
+		if info.Arch == "" {
+			continue // 无法判断架构的文件不作为升级候选（避免把普通文件推给 Agent）
+		}
+		out = append(out, info)
 	}
 	return out
 }
+
+// PackageOS 从文件名推导目标系统：Windows 二进制带 .exe（构建脚本命名），
+// 其余按 Linux 处理；显式含 "-windows"/"-linux" 时以标记为准。
+func PackageOS(name string) string {
+	lower := strings.ToLower(name)
+	if strings.Contains(lower, "-windows") || strings.HasSuffix(lower, ".exe") {
+		return "windows"
+	}
+	return "linux"
+}
+
+// PackageArch 导出文件名架构解析（升级模块复用同一口径）。
+func PackageArch(name string) string { return archFromName(name) }
 
 // archFromName 从文件名推导架构（mocenter-agent-arm64.exe -> arm64）。
 func archFromName(name string) string {

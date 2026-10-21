@@ -3,17 +3,23 @@ package main
 import (
 	"bufio"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"mocenter/server/internal/auth"
+	"mocenter/server/internal/probe"
 	"mocenter/server/internal/protocol"
 	"mocenter/server/internal/session"
+	"mocenter/server/internal/version"
 )
 
 // 本文件覆盖升级指令下发口（M-10 的服务端那一半）。
@@ -82,7 +88,7 @@ func TestUpgradeRequiresSignature(t *testing.T) {
 	frames := startFrameReader(agentSide)
 
 	body := `{"agent_id":"live-agent","version":"1.2.3","url":"https://example.com/a.bin","sha256":"` + hex64() + `"}`
-	rec := postUpgrade(t, upgradeHandler(sess, authz, ""), token, body)
+	rec := postUpgrade(t, upgradeHandler(sess, authz, "", "", nil), token, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("应 200 带业务错误，实际 %d %s", rec.Code, rec.Body.String())
 	}
@@ -99,7 +105,7 @@ func TestUpgradeRequiresSignature(t *testing.T) {
 func TestUpgradeSignatureFormat(t *testing.T) {
 	sess := session.NewManager()
 	authz, token := newUpgradeAuthedToken(t)
-	h := upgradeHandler(sess, authz, "")
+	h := upgradeHandler(sess, authz, "", "", nil)
 	for name, sig := range map[string]string{
 		"过短":   strings.Repeat("b", 32),
 		"非hex": strings.Repeat("z", 128),
@@ -118,7 +124,7 @@ func TestUpgradeRejectsUnparsableTargetVersion(t *testing.T) {
 	authz, token := newUpgradeAuthedToken(t)
 	body := `{"agent_id":"a","version":"latest","url":"https://e/x","sha256":"` + hex64() +
 		`","signature":"` + hexSig() + `"}`
-	if out := postUpgrade(t, upgradeHandler(sess, authz, ""), token, body).Body.String(); !strings.Contains(out, "版本号") {
+	if out := postUpgrade(t, upgradeHandler(sess, authz, "", "", nil), token, body).Body.String(); !strings.Contains(out, "版本号") {
 		t.Fatalf("应拒绝无法解析的目标版本，实际 %s", out)
 	}
 }
@@ -138,7 +144,7 @@ func TestUpgradeRequiresTargetVersion(t *testing.T) {
 	for name, ver := range map[string]string{"缺省": `""`, "纯空白": `"   "`} {
 		body := `{"agent_id":"live-agent","version":` + ver + `,"url":"https://e/x","sha256":"` + hex64() +
 			`","signature":"` + hexSig() + `"}`
-		if out := postUpgrade(t, upgradeHandler(sess, authz, ""), token, body).Body.String(); !strings.Contains(out, "版本号") {
+		if out := postUpgrade(t, upgradeHandler(sess, authz, "", "", nil), token, body).Body.String(); !strings.Contains(out, "版本号") {
 			t.Errorf("%s: 应要求填写目标版本号，实际 %s", name, out)
 		}
 	}
@@ -159,7 +165,7 @@ func TestUpgradeForwardsSignatureAndDowngradeFlag(t *testing.T) {
 
 	body := `{"agent_id":"live-agent","version":"0.9.0","url":"https://e/x","sha256":"` + hex64() +
 		`","signature":"` + hexSig() + `","force":true,"allow_downgrade":true}`
-	rec := postUpgrade(t, upgradeHandler(sess, authz, "pubkey-hex"), token, body)
+	rec := postUpgrade(t, upgradeHandler(sess, authz, "pubkey-hex", "", nil), token, body)
 	if out := rec.Body.String(); !strings.Contains(out, `"ok":true`) {
 		t.Fatalf("应下发成功，实际 %s", out)
 	}
@@ -193,7 +199,126 @@ func TestUpgradeHTTPURLStillRejected(t *testing.T) {
 	authz, token := newUpgradeAuthedToken(t)
 	body := `{"agent_id":"a","version":"1.2.3","url":"http://e/x","sha256":"` + hex64() +
 		`","signature":"` + hexSig() + `"}`
-	if out := postUpgrade(t, upgradeHandler(sess, authz, ""), token, body).Body.String(); !strings.Contains(out, "https") {
+	if out := postUpgrade(t, upgradeHandler(sess, authz, "", "", nil), token, body).Body.String(); !strings.Contains(out, "https") {
 		t.Fatalf("http 下载地址应被拒绝，实际 %s", out)
+	}
+}
+
+// TestUpgradeLocalPackage 本地 pkg 模式：无需 URL/签名，摘要由服务端现算，
+// 下发的 UpgradeReq 带 PackageName 且 URL/Signature 为空。
+func TestUpgradeLocalPackage(t *testing.T) {
+	dir := t.TempDir()
+	const pkgName = "mocenter-agent-amd64"
+	content := []byte("fake-agent-binary-content")
+	if err := os.WriteFile(filepath.Join(dir, pkgName), content, 0755); err != nil {
+		t.Fatal(err)
+	}
+	probes := probe.NewStore(nil)
+	probes.UpsertAgent(&protocol.AgentInfo{AgentID: "live-agent", OSType: "linux", Arch: "amd64"})
+
+	agentSide, serverSide := net.Pipe()
+	defer agentSide.Close()
+	sess := session.NewManager()
+	sess.Upsert("live-agent", session.NewConn(serverSide))
+	authz, token := newUpgradeAuthedToken(t)
+	frames := startFrameReader(agentSide)
+
+	h := upgradeHandler(sess, authz, "", dir, probes)
+	body := `{"agent_id":"live-agent","version":"1.2.3","package":"` + pkgName + `"}`
+	rec := postUpgrade(t, h, token, body)
+	if out := rec.Body.String(); !strings.Contains(out, `"ok":true`) {
+		t.Fatalf("本地包应下发成功，实际 %s", out)
+	}
+
+	line, ok := nextFrame(frames)
+	if !ok {
+		t.Fatal("本地升级指令应写到连接上")
+	}
+	var env protocol.Envelope
+	if err := json.Unmarshal([]byte(line), &env); err != nil {
+		t.Fatal(err)
+	}
+	var got protocol.UpgradeReq
+	if err := json.Unmarshal(env.Data, &got); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	if got.PackageName != pkgName || got.URL != "" || got.Signature != "" ||
+		got.SHA256 != hex.EncodeToString(sum[:]) || got.Version != "1.2.3" {
+		t.Fatalf("本地升级指令异常: %+v", got)
+	}
+}
+
+// TestUpgradeLocalDefaultsToServerVersion 本地模式下版本可省略，默认用服务端版本。
+func TestUpgradeLocalDefaultsToServerVersion(t *testing.T) {
+	dir := t.TempDir()
+	const pkgName = "mocenter-agent-amd64"
+	if err := os.WriteFile(filepath.Join(dir, pkgName), []byte("bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	agentSide, serverSide := net.Pipe()
+	defer agentSide.Close()
+	sess := session.NewManager()
+	sess.Upsert("live-agent", session.NewConn(serverSide))
+	authz, token := newUpgradeAuthedToken(t)
+	frames := startFrameReader(agentSide)
+
+	h := upgradeHandler(sess, authz, "", dir, nil)
+	body := `{"agent_id":"live-agent","package":"` + pkgName + `"}`
+	if out := postUpgrade(t, h, token, body).Body.String(); !strings.Contains(out, `"ok":true`) {
+		t.Fatalf("本地包应下发成功，实际 %s", out)
+	}
+	line, ok := nextFrame(frames)
+	if !ok {
+		t.Fatal("应收到升级指令")
+	}
+	var env protocol.Envelope
+	_ = json.Unmarshal([]byte(line), &env)
+	var got protocol.UpgradeReq
+	_ = json.Unmarshal(env.Data, &got)
+	if got.Version != version.Version {
+		t.Fatalf("本地模式未填版本时应使用服务端版本 %s，实际 %q", version.Version, got.Version)
+	}
+}
+
+// TestUpgradeLocalRejectsWrongOS 不能把 Windows 包推给 Linux 主机。
+func TestUpgradeLocalRejectsWrongOS(t *testing.T) {
+	dir := t.TempDir()
+	const pkgName = "mocenter-agent-amd64.exe"
+	if err := os.WriteFile(filepath.Join(dir, pkgName), []byte("bin"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	probes := probe.NewStore(nil)
+	probes.UpsertAgent(&protocol.AgentInfo{AgentID: "live-agent", OSType: "linux", Arch: "amd64"})
+	agentSide, serverSide := net.Pipe()
+	defer agentSide.Close()
+	sess := session.NewManager()
+	sess.Upsert("live-agent", session.NewConn(serverSide))
+	authz, token := newUpgradeAuthedToken(t)
+	frames := startFrameReader(agentSide)
+
+	body := `{"agent_id":"live-agent","version":"1.2.3","package":"` + pkgName + `"}`
+	out := postUpgrade(t, upgradeHandler(sess, authz, "", dir, probes), token, body).Body.String()
+	if !strings.Contains(out, "windows") || !strings.Contains(out, "linux") {
+		t.Fatalf("应拒绝系统不匹配的包，实际 %s", out)
+	}
+	if frame, ok := nextFrame(frames); ok {
+		t.Fatalf("被拒绝的包不应下发，实际 %s", frame)
+	}
+}
+
+// TestUpgradeLocalRejectsTraversal pkg 名称不能带路径。
+func TestUpgradeLocalRejectsTraversal(t *testing.T) {
+	authz, token := newUpgradeAuthedToken(t)
+	sess := session.NewManager()
+	agentSide, serverSide := net.Pipe()
+	defer agentSide.Close()
+	sess.Upsert("live-agent", session.NewConn(serverSide))
+	_ = startFrameReader(agentSide)
+
+	out := postUpgrade(t, upgradeHandler(sess, authz, "", t.TempDir(), nil), token,
+		`{"agent_id":"live-agent","version":"1.2.3","package":"../mocenter-agent-amd64"}`).Body.String()
+	if !strings.Contains(out, "不合法") {
+		t.Fatalf("路径穿越应被拒绝，实际 %s", out)
 	}
 }

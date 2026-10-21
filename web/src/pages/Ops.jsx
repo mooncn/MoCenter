@@ -1,4 +1,4 @@
-import React, { useState, useContext } from 'react'
+import React, { useState, useContext, useEffect } from 'react'
 import { Api } from '../api/api.js'
 import { SocketContext } from '../App.jsx'
 import { hostLabel, hostLabelById } from '../utils/hostName.js'
@@ -16,14 +16,56 @@ export default function Ops({ agents }) {
   const [batchNotice, setBatchNotice] = useState('')
 
   // 远程升级
+  const [upMode, setUpMode] = useState('pkg') // pkg=服务端本地包（免签名），url=在线链接（需签名）
   const [upAgent, setUpAgent] = useState('')
   const [upVersion, setUpVersion] = useState('')
+  const [upPackage, setUpPackage] = useState('')
+  const [upPackages, setUpPackages] = useState([])
   const [upUrl, setUpUrl] = useState('')
   const [upSha256, setUpSha256] = useState('')
   const [upSignature, setUpSignature] = useState('')
-  const [upForce, setUpForce] = useState(false)
+  // 本地 pkg 默认同版本重装：重新构建但版本号未变时也能直接覆盖升级。
+  const [upForce, setUpForce] = useState(true)
   const [upDowngrade, setUpDowngrade] = useState(false)
   const [upNotice, setUpNotice] = useState('')
+  const [upBusy, setUpBusy] = useState(false)
+
+  // 本地 pkg 列表与服务端版本（版本号仅作为默认值，可按实际包修改）
+  const loadUpgradePackages = () => {
+    Api.deployPackages()
+      .then((d) => setUpPackages(Array.isArray(d?.packages) ? d.packages : []))
+      .catch(() => {})
+  }
+  useEffect(() => {
+    loadUpgradePackages()
+    Api.version()
+      .then((v) => {
+        const ver = v?.server_version || ''
+        if (ver) setUpVersion((prev) => prev || ver)
+      })
+      .catch(() => {})
+  }, [])
+
+  const normOS = (s) => (String(s || '').toLowerCase().includes('win') ? 'windows' : 'linux')
+  const normArch = (s) => {
+    const v = String(s || '').toLowerCase().trim()
+    if (v === 'x86_64' || v === 'x64') return 'amd64'
+    if (v === 'aarch64') return 'arm64'
+    if (v === 'i386' || v === 'i686' || v === 'x86') return '386'
+    return v
+  }
+  const upAgentInfo = online.find((a) => a.agent_id === upAgent)
+  const matchPackages = (list) => {
+    if (!upAgentInfo) return list
+    return list.filter((p) => p.os === normOS(upAgentInfo.os_type) && p.arch === normArch(upAgentInfo.arch))
+  }
+  useEffect(() => {
+    if (upMode !== 'pkg') return
+    const matched = matchPackages(upPackages)
+    if (!matched.some((p) => p.name === upPackage)) {
+      setUpPackage(matched[0]?.name || '')
+    }
+  }, [upAgent, upMode, upPackages])
 
   const toggleSelect = (id) => {
     setSelected(selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id])
@@ -63,26 +105,44 @@ export default function Ops({ agents }) {
       return
     }
     if (!upVersion.trim()) {
-      setUpNotice('请填写目标版本：签名覆盖版本号，留空无法验签')
+      setUpNotice('请填写目标版本')
       return
     }
-    if (!upUrl.trim()) {
+    if (upMode === 'pkg' && !upPackage) {
+      setUpNotice('请选择 pkg 目录中的安装包')
+      return
+    }
+    if (upMode === 'url' && !upUrl.trim()) {
       setUpNotice('请填写升级包下载地址（仅支持 https）')
       return
     }
+    setUpBusy(true)
     try {
-      const res = await Api.upgrade({
+      const payload = {
         agent_id: upAgent,
         version: upVersion.trim(),
-        url: upUrl.trim(),
-        sha256: upSha256.trim(),
-        signature: upSignature.trim(),
         force: upForce,
         allow_downgrade: upDowngrade,
-      })
-      setUpNotice(res.ok ? '升级指令已下发，等待 Agent 执行...' : res.msg)
+      }
+      if (upMode === 'pkg') {
+        payload.package = upPackage
+      } else {
+        payload.url = upUrl.trim()
+        payload.sha256 = upSha256.trim()
+        payload.signature = upSignature.trim()
+      }
+      const res = await Api.upgrade(payload)
+      if (res.ok) {
+        setUpNotice(upMode === 'pkg'
+          ? `本地安装包已开始下发（${res.package || upPackage}），等待 Agent 校验并重启...`
+          : '升级指令已下发，等待 Agent 执行...')
+      } else {
+        setUpNotice(res.msg || '下发失败')
+      }
     } catch (ex) {
       setUpNotice('下发失败：' + (ex.response?.data?.msg || ex.message))
+    } finally {
+      setUpBusy(false)
     }
   }
 
@@ -207,6 +267,20 @@ export default function Ops({ agents }) {
         <form onSubmit={runUpgrade}>
           <div className="form-grid">
             <div className="form-row">
+              <label>升级包来源</label>
+              <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', paddingTop: 6 }}>
+                <label className="checkbox-item">
+                  <input type="radio" name="upmode" checked={upMode === 'pkg'}
+                    onChange={() => { setUpMode('pkg'); setUpForce(true) }} />
+                  本地 pkg（免签名）
+                </label>
+                <label className="checkbox-item">
+                  <input type="radio" name="upmode" checked={upMode === 'url'} onChange={() => setUpMode('url')} />
+                  在线链接（需签名）
+                </label>
+              </div>
+            </div>
+            <div className="form-row">
               <label>目标主机</label>
               <select value={upAgent} onChange={(e) => setUpAgent(e.target.value)}>
                 <option value="">选择主机...</option>
@@ -216,21 +290,47 @@ export default function Ops({ agents }) {
               </select>
             </div>
             <div className="form-row">
-              <label>目标版本（必填）</label>
-              <input value={upVersion} onChange={(e) => setUpVersion(e.target.value)} placeholder="如 1.1.0，签名包含此版本号" />
+              <label>目标版本{upMode === 'pkg' ? '（默认服务端版本，可按包修改）' : '（必填）'}</label>
+              <input value={upVersion} onChange={(e) => setUpVersion(e.target.value)} placeholder="如 1.1.0" />
             </div>
-            <div className="form-row">
-              <label>升级包下载地址（仅 https）</label>
-              <input value={upUrl} onChange={(e) => setUpUrl(e.target.value)} placeholder="https://example.com/mocenter-agent" />
-            </div>
-            <div className="form-row">
-              <label>升级包 SHA-256（必填）</label>
-              <input value={upSha256} onChange={(e) => setUpSha256(e.target.value)} placeholder="64 位十六进制摘要，signpkg 可打印" />
-            </div>
-            <div className="form-row">
-              <label>Ed25519 签名（必填）</label>
-              <input value={upSignature} onChange={(e) => setUpSignature(e.target.value)} placeholder="256 位十六进制签名，由 scripts/signpkg -sign 生成" />
-            </div>
+            {upMode === 'pkg' ? (
+              <div className="form-row" style={{ gridColumn: '1 / -1' }}>
+                <label>pkg 目录安装包</label>
+                <div className="row-inline" style={{ gap: 8, alignItems: 'center' }}>
+                  <select value={upPackage} onChange={(e) => setUpPackage(e.target.value)} style={{ flex: 1 }}>
+                    {matchPackages(upPackages).length === 0 && <option value="">没有匹配的安装包</option>}
+                    {matchPackages(upPackages).map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.name}（{p.os}/{p.arch}，{(Number(p.size || 0) / 1048576).toFixed(1)} MiB）
+                      </option>
+                    ))}
+                  </select>
+                  <button type="button" className="btn-mini" onClick={loadUpgradePackages}>刷新</button>
+                </div>
+                {!upAgentInfo && <span className="cell-sub">选择目标主机后自动匹配系统与架构。</span>}
+                {upAgentInfo && matchPackages(upPackages).length === 0 && (
+                  <span className="cell-sub">
+                    pkg 目录中没有匹配 {normOS(upAgentInfo.os_type)}/{normArch(upAgentInfo.arch)} 的
+                    mocenter-agent 二进制，请先构建并放入 pkg 目录。
+                  </span>
+                )}
+              </div>
+            ) : (
+              <>
+                <div className="form-row">
+                  <label>升级包下载地址（仅 https）</label>
+                  <input value={upUrl} onChange={(e) => setUpUrl(e.target.value)} placeholder="https://example.com/mocenter-agent" />
+                </div>
+                <div className="form-row">
+                  <label>升级包 SHA-256（必填）</label>
+                  <input value={upSha256} onChange={(e) => setUpSha256(e.target.value)} placeholder="64 位十六进制摘要，signpkg 可打印" />
+                </div>
+                <div className="form-row">
+                  <label>Ed25519 签名（必填）</label>
+                  <input value={upSignature} onChange={(e) => setUpSignature(e.target.value)} placeholder="256 位十六进制签名，由 scripts/signpkg -sign 生成" />
+                </div>
+              </>
+            )}
             <div className="form-row">
               <label>升级策略</label>
               <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', paddingTop: 6 }}>
@@ -245,14 +345,20 @@ export default function Ops({ agents }) {
               </div>
             </div>
           </div>
-          <button type="submit">下发升级</button>
+          <button type="submit" disabled={upBusy}>{upBusy ? '下发中…' : '下发升级'}</button>
         </form>
         {upNotice && <div className={`notice ${upNotice.includes('失败') ? 'err' : 'ok'}`} style={{ marginTop: 12 }}>{upNotice}</div>}
         <div className="sub" style={{ marginTop: 12 }}>
-          升级流程：Agent 一次读入升级包 → 按 SHA-256 与 Ed25519 签名校验同一份字节 → 落盘复核 → 备份旧版本 → 替换二进制 → 自动重启（失败自动回滚）。
-          摘要与签名都必须由签名工具生成：<code>scripts/signpkg -sign -pkg &lt;升级包&gt; -key &lt;私钥&gt; -version &lt;目标版本&gt;</code>
-          会打印可直接使用的 sha256 / signature；私钥只留在发布机，配置给 Agent 的只有公钥。
-          未配置公钥的 Agent 会直接拒绝升级，这里没有任何跳过验签的开关。
+          <strong>本地 pkg</strong>：服务端从 <code>-pkg-dir</code>（默认 <code>&lt;data&gt;/packages</code>）
+          中选择与目标主机系统/架构匹配的 <code>mocenter-agent*</code> 文件，经已认证的长连接分片直发；
+          Agent 校验 SHA-256 后替换并重启。pkg 目录由运维自行维护，视为可信，因此无需填写签名或摘要。
+          Linux / Windows 包都放在同一目录即可，列表会按主机自动过滤。
+          目标 Agent 需为支持本地包直发的版本；旧版 Agent 请先用在线链接升级一次。
+        </div>
+        <div className="sub" style={{ marginTop: 6 }}>
+          <strong>在线链接</strong>：Agent 一次读入升级包 → 按 SHA-256 与 Ed25519 签名校验同一份字节 → 落盘复核 → 备份旧版本 → 替换二进制 → 自动重启（失败自动回滚）。
+          摘要与签名必须由签名工具生成：<code>scripts/signpkg -sign -pkg &lt;升级包&gt; -key &lt;私钥&gt; -version &lt;目标版本&gt;</code>；
+          未配置公钥的 Agent 会拒绝在线链接升级，这里没有跳过验签的开关。
         </div>
         <div className="sub" style={{ marginTop: 6 }}>
           Agent 版本与服务端版本互相独立：此处填写的版本只表示"本次要升到哪个版本"，与当前服务端版本不同也能下发；

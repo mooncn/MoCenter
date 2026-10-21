@@ -192,6 +192,9 @@ type UpgradeReq struct {
 	UpgradeID string `json:"upgrade_id"`
 	Version   string `json:"version"`
 	URL       string `json:"url"` // 升级包下载地址（必须 https）
+	// PackageName 非空表示"服务端 pkg 目录托管包"模式：
+	// 经已认证长连接拉取，不再要求 URL/签名，但仍校验 SHA256。
+	PackageName string `json:"package_name,omitempty"`
 	// MD5 已废弃：不是安全控制（无密钥、可碰撞），仅为兼容旧服务端保留。
 	MD5 string `json:"md5,omitempty"`
 	// SHA256 升级包摘要，**必填**。为空则拒绝升级。

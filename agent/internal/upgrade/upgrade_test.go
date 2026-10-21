@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"mocenter/agent/internal/protocol"
 )
@@ -303,5 +304,60 @@ func TestLoadPubKey(t *testing.T) {
 	}
 	if _, err := loadPubKey("abcd"); err == nil {
 		t.Fatal("长度不对的公钥应报错")
+	}
+}
+
+// TestPerformLocalVerifiesHashAndInstalls 本地 pkg 模式：不要求公钥/签名，
+// 但必须校验 SHA-256；校验通过后用同一份内存字节安装。
+func TestPerformLocalVerifiesHashAndInstalls(t *testing.T) {
+	content := []byte("local-pkg-binary")
+	goodSum := sumOf(content)
+
+	origExec, origInstall, origRestart := currentExecPathFn, installBinaryFn, restartSelfFn
+	t.Cleanup(func() {
+		currentExecPathFn, installBinaryFn, restartSelfFn = origExec, origInstall, origRestart
+	})
+	currentExecPathFn = func() (string, error) { return filepath.Join(t.TempDir(), "mocenter-agent"), nil }
+	var installed []byte
+	installBinaryFn = func(_ string, c []byte, _ string) error {
+		installed = append([]byte(nil), c...)
+		return nil
+	}
+	restarted := make(chan struct{}, 1)
+	restartSelfFn = func(string) { restarted <- struct{}{} }
+
+	var resp *protocol.UpgradeResp
+	PerformLocal(&protocol.UpgradeReq{
+		UpgradeID: "u-local", Version: "99.0.0", PackageName: "mocenter-agent-amd64", SHA256: goodSum,
+	}, content, func(r *protocol.UpgradeResp) { resp = r })
+	if resp == nil || !resp.OK {
+		t.Fatalf("本地包应升级成功，实际 %+v", resp)
+	}
+	if string(installed) != string(content) {
+		t.Fatalf("安装内容不是校验过的那份字节")
+	}
+	select {
+	case <-restarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("升级成功后应触发重启")
+	}
+}
+
+// TestPerformLocalRejectsBadHash 摘要不符（或缺失）时不得安装。
+func TestPerformLocalRejectsBadHash(t *testing.T) {
+	origInstall := installBinaryFn
+	installed := false
+	installBinaryFn = func(string, []byte, string) error { installed = true; return nil }
+	t.Cleanup(func() { installBinaryFn = origInstall })
+
+	var resp *protocol.UpgradeResp
+	PerformLocal(&protocol.UpgradeReq{
+		UpgradeID: "u", Version: "99.0.0", PackageName: "pkg", SHA256: strings.Repeat("0", 64),
+	}, []byte("content"), func(r *protocol.UpgradeResp) { resp = r })
+	if resp == nil || resp.OK || !strings.Contains(resp.Message, "SHA-256") {
+		t.Fatalf("摘要不符应拒绝，实际 %+v", resp)
+	}
+	if installed {
+		t.Fatal("校验失败不应进入安装")
 	}
 }

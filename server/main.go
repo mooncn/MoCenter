@@ -18,6 +18,7 @@ import (
 	"crypto/ed25519"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/csv"
@@ -793,7 +794,7 @@ func main() {
 	mux.HandleFunc("/api/share/portmap/rules", shareSvc.rulesHandler())
 	mux.HandleFunc("/api/share/portmap/op", shareSvc.portmapOpHandler())
 	mux.HandleFunc("/api/share/vnc/password", shareSvc.vncPasswordHandler())
-	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz, *upgradePubKey))
+	mux.HandleFunc("/api/upgrade", upgradeHandler(sess, authz, *upgradePubKey, *pkgDir, store))
 	mux.HandleFunc("/api/login", loginHandler(userMgr, authz, loginGuard, router))
 	mux.HandleFunc("/api/logout", logoutHandler(authz))
 	// 修改 Web 监听端口后跨 origin 保持登录：一次性、短时效、绑定 IP 的交接码。
@@ -3008,7 +3009,7 @@ func portmapOpHandler(pm *portmap.Manager, authz *auth.Auth, router *route.Route
 	}
 }
 
-func upgradeHandler(sess *session.Manager, authz *auth.Auth, upgradePubKey string) http.HandlerFunc {
+func upgradeHandler(sess *session.Manager, authz *auth.Auth, upgradePubKey, pkgDir string, probes *probe.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
@@ -3021,6 +3022,7 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth, upgradePubKey strin
 			AgentID        string `json:"agent_id"`
 			Version        string `json:"version"`
 			URL            string `json:"url"`
+			Package        string `json:"package"`
 			SHA256         string `json:"sha256"`
 			Signature      string `json:"signature"`
 			MD5            string `json:"md5"` // 已废弃，仅为兼容旧前端
@@ -3032,6 +3034,61 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth, upgradePubKey strin
 		}
 		if body.AgentID == "" {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "未指定目标主机"})
+			return
+		}
+		// 本地 pkg 模式：服务端已托管的安全文件，经认证长连接直接下发。
+		// 不需要 URL/SHA/签名输入；摘要由服务端现算，Agent 侧仍会复核。
+		if pkgName := strings.TrimSpace(body.Package); pkgName != "" {
+			versionArg := strings.TrimSpace(body.Version)
+			if versionArg == "" {
+				versionArg = version.Version
+			}
+			if !isVersionLike(versionArg) {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "目标版本号需形如 1.2.3"})
+				return
+			}
+			var agentInfo *protocol.AgentInfo
+			if probes != nil {
+				agentInfo = probes.Get(body.AgentID)
+			}
+			path, pkgOS, pkgArch, size, err := resolveLocalAgentPackage(pkgDir, pkgName, agentInfo)
+			if err != nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+				return
+			}
+			sum, err := fileSHA256(path)
+			if err != nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "计算安装包摘要失败: " + err.Error()})
+				return
+			}
+			conn := sess.Get(body.AgentID)
+			if conn == nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": "目标主机离线"})
+				return
+			}
+			req := &protocol.UpgradeReq{
+				UpgradeID:      fmt.Sprintf("up-%d", time.Now().UnixNano()),
+				Version:        versionArg,
+				PackageName:    filepath.Base(path),
+				SHA256:         sum,
+				Force:          body.Force,
+				AllowDowngrade: body.AllowDowngrade,
+			}
+			if err := conn.Write(protocol.TypeUpgradeReq, req); err != nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+				return
+			}
+			log.Printf("[upgrade] 向 %s 下发本地 pkg 升级包 %s（%s/%s，%d 字节，版本 %s）",
+				body.AgentID, req.PackageName, pkgOS, pkgArch, size, versionArg)
+			writeJSON(w, map[string]interface{}{
+				"ok":         true,
+				"upgrade_id": req.UpgradeID,
+				"package":    req.PackageName,
+				"os":         pkgOS,
+				"arch":       pkgArch,
+				"size":       size,
+				"sha256":     sum,
+			})
 			return
 		}
 		// Agent 版本与 Server 版本互相独立：这里**不做**"升级包版本必须等于
@@ -3082,7 +3139,7 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth, upgradePubKey strin
 		if strings.TrimSpace(upgradePubKey) == "" {
 			// 不阻断：公钥可以只配在 Agent 侧（本服务端只是转发方）。
 			// 但一键部署生成的 Agent 配置里会是空值，那条链就升级不动了，得留个提示。
-			log.Printf("[upgrade] 提示: 服务端未配置 -upgrade-pubkey，一键部署的 Agent 将因无公钥而拒绝所有升级指令")
+			log.Printf("[upgrade] 提示: 服务端未配置 -upgrade-pubkey，在线链接升级会被 Agent 拒绝；本地 pkg 模式不受影响")
 		}
 		// 下载源协议白名单：http 会被明文传输、易被中间人篡改，等同于给目标机投毒
 		if u, perr := url.Parse(strings.TrimSpace(body.URL)); perr != nil || u.Scheme == "" {
@@ -3118,6 +3175,106 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth, upgradePubKey strin
 		}
 		writeJSON(w, map[string]interface{}{"ok": true, "upgrade_id": req.UpgradeID})
 	}
+}
+
+// maxLocalUpgradePkgBytes 与 Agent 侧升级包内存上限保持一致。
+const maxLocalUpgradePkgBytes = 256 << 20
+
+// resolveLocalAgentPackage 定位 pkg 目录内的 Agent 二进制，并校验目标主机系统/架构。
+//
+// 只接受 pkg 目录顶层的 mocenter-agent* 文件；真实路径（解析软链接后）必须仍在
+// pkg 目录内，避免借软链接读到目录外文件。系统/架构从文件名推导，与在线 Agent
+// 上报值比对，防止把 Windows 包推给 Linux 主机（或反之）。
+func resolveLocalAgentPackage(pkgDir, name string, agent *protocol.AgentInfo) (path, osName, arch string, size int64, err error) {
+	pkgDir = strings.TrimSpace(pkgDir)
+	if pkgDir == "" {
+		return "", "", "", 0, fmt.Errorf("未配置安装包托管目录")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || filepath.Base(name) != name || strings.Contains(name, "..") {
+		return "", "", "", 0, fmt.Errorf("安装包名称不合法")
+	}
+	lower := strings.ToLower(name)
+	if !strings.HasPrefix(lower, "mocenter-agent") {
+		return "", "", "", 0, fmt.Errorf("只允许下发 mocenter-agent* 安装包")
+	}
+	if strings.HasSuffix(lower, ".deb") || strings.HasSuffix(lower, ".rpm") ||
+		strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".sha256") ||
+		strings.HasSuffix(lower, ".sha1") {
+		return "", "", "", 0, fmt.Errorf("该文件不是可执行的 Agent 升级包")
+	}
+
+	realDir, err := filepath.EvalSymlinks(pkgDir)
+	if err != nil {
+		return "", "", "", 0, fmt.Errorf("安装包目录不可用: %w", err)
+	}
+	realPath, err := filepath.EvalSymlinks(filepath.Join(realDir, name))
+	if err != nil {
+		return "", "", "", 0, fmt.Errorf("安装包不存在: %s", name)
+	}
+	rel, err := filepath.Rel(realDir, realPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", "", "", 0, fmt.Errorf("安装包不在 pkg 目录内")
+	}
+	fi, err := os.Stat(realPath)
+	if err != nil || fi.IsDir() || !fi.Mode().IsRegular() {
+		return "", "", "", 0, fmt.Errorf("安装包不是普通文件: %s", name)
+	}
+	if fi.Size() <= 0 || fi.Size() > maxLocalUpgradePkgBytes {
+		return "", "", "", 0, fmt.Errorf("安装包大小异常（%d 字节，上限 %d）", fi.Size(), maxLocalUpgradePkgBytes)
+	}
+
+	osName = agentdeploy.PackageOS(name)
+	arch = agentdeploy.PackageArch(name)
+	if arch == "" {
+		return "", "", "", 0, fmt.Errorf("无法从文件名判断安装包架构: %s", name)
+	}
+	if agent != nil {
+		if got := normalizeAgentOS(agent.OSType); got != "" && got != osName {
+			return "", "", "", 0, fmt.Errorf("安装包是 %s 版本，但目标主机是 %s", osName, got)
+		}
+		if got := normalizeAgentArch(agent.Arch); got != "" && got != arch {
+			return "", "", "", 0, fmt.Errorf("安装包是 %s 架构，但目标主机是 %s", arch, got)
+		}
+	}
+	return realPath, osName, arch, fi.Size(), nil
+}
+
+func normalizeAgentOS(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "win") {
+		return "windows"
+	}
+	return "linux"
+}
+
+func normalizeAgentArch(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "x86_64", "x64":
+		return "amd64"
+	case "aarch64":
+		return "arm64"
+	case "i386", "i686", "x86":
+		return "386"
+	}
+	return s
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // isHex64 判断是否为 64 位十六进制（SHA-256 摘要）。

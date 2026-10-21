@@ -414,7 +414,7 @@ func runClient(o runOpts) {
 			"这是本机显式配置的结果（-tunnel-hosts）", strings.Join(o.tunnelHosts, ", "))
 	}
 	if o.upgradePubKey == "" {
-		log.Printf("[agent] 未配置 -upgrade-pubkey：远程升级已被拒绝（这是默认安全态）")
+		log.Printf("[agent] 未配置 -upgrade-pubkey：在线链接升级会被拒绝（这是默认安全态）；服务端本地 pkg 升级仍可用（认证长连接 + SHA-256）")
 	}
 	c.Run()
 }

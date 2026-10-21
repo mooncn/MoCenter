@@ -65,7 +65,17 @@ const (
 //
 // 用 var 只为测试能便宜地触发这条分支（真塞 256MB 进单测不合理）；
 // 运行期没有任何入口能改它。
-var maxPackageBytes = int64(256 << 20)
+const MaxPackageBytes = 256 << 20
+
+// maxPackageBytes 保留为 var：测试用较小阈值触发上限分支，运行期无入口可改。
+var maxPackageBytes = int64(MaxPackageBytes)
+
+// 可在测试中替换的安装/重启入口，避免单测真的覆盖当前测试二进制。
+var (
+	currentExecPathFn = currentExecPath
+	installBinaryFn   = installBinary
+	restartSelfFn     = restartSelf
+)
 
 // currentExecPath 返回当前可执行文件路径。
 func currentExecPath() (string, error) {
@@ -215,12 +225,12 @@ func Perform(req *protocol.UpgradeReq, pol Policy, report func(*protocol.Upgrade
 		return
 	}
 
-	exe, err := currentExecPath()
+	exe, err := currentExecPathFn()
 	if err != nil {
 		resp.Message = "无法定位可执行文件: " + err.Error()
 		return
 	}
-	if err := installBinary(exe, content, wantSum); err != nil {
+	if err := installBinaryFn(exe, content, wantSum); err != nil {
 		resp.Message = err.Error()
 		return
 	}
@@ -230,7 +240,70 @@ func Perform(req *protocol.UpgradeReq, pol Policy, report func(*protocol.Upgrade
 	resp.Message = "升级成功，正在重启"
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		restartSelf(exe)
+		restartSelfFn(exe)
+	}()
+}
+
+// PerformLocal 安装服务端 pkg 目录直接下发的升级包。
+//
+// 信任模型与 URL 模式不同：包内容由服务端经**已认证的长连接**送达（mTLS/指纹钉扎），
+// 服务端本身已能对 Agent 下发命令，因此这里不再要求 Ed25519 签名；但仍强制校验
+// SHA-256，确保收到的字节与服务端选中的文件一致（防传输损坏/错包）。
+//
+// 只有 PackageName 非空才走本函数；URL 模式仍走 Perform，签名不可省略。
+func PerformLocal(req *protocol.UpgradeReq, content []byte, report func(*protocol.UpgradeResp)) {
+	resp := &protocol.UpgradeResp{UpgradeID: req.UpgradeID, Version: Version()}
+	defer report(resp)
+
+	if strings.TrimSpace(req.PackageName) == "" {
+		resp.Message = "本地升级缺少安装包名称"
+		return
+	}
+	if len(content) == 0 {
+		resp.Message = "升级包为空"
+		return
+	}
+	if int64(len(content)) > maxPackageBytes {
+		resp.Message = fmt.Sprintf("升级包超过 %d 字节上限", maxPackageBytes)
+		return
+	}
+	wantSum := strings.ToLower(strings.TrimSpace(req.SHA256))
+	if wantSum == "" || len(wantSum) != 64 || !isHex(wantSum) {
+		resp.Message = "本地升级包缺少合法的 sha256 摘要"
+		return
+	}
+	sum := sha256.Sum256(content)
+	if hex.EncodeToString(sum[:]) != wantSum {
+		resp.Message = "升级包 SHA-256 校验失败（包可能损坏或被替换）"
+		return
+	}
+
+	skip, derr := decideUpgrade(req.Version, Version(), req.Force, req.AllowDowngrade)
+	if derr != nil {
+		resp.Message = derr.Error()
+		return
+	}
+	if skip {
+		resp.OK = true
+		resp.Message = "已是最新版本 " + Version()
+		return
+	}
+
+	exe, err := currentExecPathFn()
+	if err != nil {
+		resp.Message = "无法定位可执行文件: " + err.Error()
+		return
+	}
+	if err := installBinaryFn(exe, content, wantSum); err != nil {
+		resp.Message = err.Error()
+		return
+	}
+	log.Printf("[upgrade] 本地 pkg 升级包 %s 校验通过，正在替换二进制", req.PackageName)
+	resp.OK = true
+	resp.Message = "升级成功（服务端本地包），正在重启"
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		restartSelfFn(exe)
 	}()
 }
 

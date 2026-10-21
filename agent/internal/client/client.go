@@ -903,11 +903,7 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 		if json.Unmarshal(env.Data, &up) != nil {
 			return
 		}
-		go upgrade.Perform(&up, upgrade.Policy{
-			PubKey: c.cfg.UpgradePubKey,
-		}, func(resp *protocol.UpgradeResp) {
-			_ = c.write(protocol.TypeUpgradeResp, resp)
-		})
+		go c.runUpgrade(&up)
 	case protocol.TypeInteractiveClose:
 		var req protocol.InteractiveCloseReq
 		if json.Unmarshal(env.Data, &req) != nil {
@@ -998,6 +994,65 @@ func (c *Client) fetchPackage(name, destPath string) (int64, error) {
 	case <-time.After(5 * time.Minute):
 		return 0, errors.New("等待服务端下发安装包超时")
 	}
+}
+
+// runUpgrade 按升级包来源分派：URL 模式仍走签名校验；服务端 pkg 托管包
+// 经当前认证长连接拉取，随后交给 PerformLocal（仅校验 SHA-256）。
+func (c *Client) runUpgrade(req *protocol.UpgradeReq) {
+	report := func(resp *protocol.UpgradeResp) {
+		_ = c.write(protocol.TypeUpgradeResp, resp)
+	}
+	if strings.TrimSpace(req.PackageName) == "" {
+		upgrade.Perform(req, upgrade.Policy{PubKey: c.cfg.UpgradePubKey}, report)
+		return
+	}
+	content, err := c.fetchLocalUpgradePackage(req.PackageName)
+	if err != nil {
+		log.Printf("[agent] 获取服务端本地升级包 %s 失败: %v", req.PackageName, err)
+		report(&protocol.UpgradeResp{
+			UpgradeID: req.UpgradeID,
+			Version:   upgrade.Version(),
+			Message:   "获取服务端本地升级包失败: " + err.Error(),
+		})
+		return
+	}
+	upgrade.PerformLocal(req, content, report)
+}
+
+// fetchLocalUpgradePackage 通过既有的 PackageFetch 长连接通道把服务端 pkg 目录里的
+// 文件取到本机文件沙箱，再一次性读入内存交给升级模块（上限 256 MiB）。
+func (c *Client) fetchLocalUpgradePackage(name string) ([]byte, error) {
+	safe := filepath.Base(strings.TrimSpace(name))
+	if safe == "" || safe == "." || safe == ".." {
+		return nil, fmt.Errorf("安装包名称不合法")
+	}
+	root := ""
+	if len(c.cfg.FileRoots) > 0 {
+		root = c.cfg.FileRoots[0]
+	}
+	if strings.TrimSpace(root) == "" {
+		root = DefaultFileRoot(c.cfg.ConfigPath)
+	}
+	dir := filepath.Join(root, ".upgrade")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("创建升级临时目录失败: %w", err)
+	}
+	dest := filepath.Join(dir, fmt.Sprintf("%s-%d.bin", safe, time.Now().UnixNano()))
+	defer os.Remove(dest)
+
+	size, err := c.fetchPackage(safe, dest)
+	if err != nil {
+		return nil, err
+	}
+	if size > upgrade.MaxPackageBytes {
+		return nil, fmt.Errorf("升级包超过 %d 字节上限", upgrade.MaxPackageBytes)
+	}
+	content, err := os.ReadFile(dest)
+	if err != nil {
+		return nil, fmt.Errorf("读取升级包失败: %w", err)
+	}
+	log.Printf("[agent] 已从服务端 pkg 取回升级包 %s（%d 字节）", safe, size)
+	return content, nil
 }
 
 // closeSession 断开终端连接：结束指定会话/命令及其相关进程。
