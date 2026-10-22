@@ -33,8 +33,8 @@
 
 | 模块 | 技术 | 说明 |
 |------|------|------|
-| 后端 | Go 1.26.6+ | 高并发网络通信。三个模块的 `go.mod` 均以 **1.26.6** 为下限：`server` 依赖的 `golang.org/x/crypto v0.56.0` 要求 Go ≥ 1.26，而 1.26.6 起标准库（`crypto/tls`、`crypto/x509`、`net/url`）的已知公告才全部修补 —— 下限即交付二进制内嵌运行时的安全底线，故写到补丁号 |
-| 前端 | React 18 + Vite 5 + xterm.js 5 | 组件化 + 标准终端模拟 |
+| 后端 | Go 1.26.10+ | 高并发网络通信。三个模块的 `go.mod` 均以 **1.26.10** 为下限：1.26.9/1.26.10 修补了本轮披露的标准库公告（`net/http` 的 HTTP/2 崩溃与流控、`net/textproto`、`crypto/tls`、`crypto/x509` 等），下限即交付二进制内嵌运行时的安全底线，故写到补丁号 |
+| 前端 | React 18 + Vite 6 + xterm.js 5 | 组件化 + 标准终端模拟 |
 | 通信 | TCP 长连接 + WebSocket | Agent<->Server 用 TCP，Web<->Server 用 WebSocket |
 | 协议 | JSON（可迁移 Protobuf） | 协议定义见 `proto/` |
 | 鉴权 | Token + IP 白名单 + 速率限制 | `server/internal/auth` |
@@ -93,7 +93,7 @@ MoCenter/
 
 **构建只需要记两个文件**：`scripts/build-linux-all.sh`（Linux/macOS 构建机）与
 `scripts/build-all.bat`（Windows 构建机）。参数同名同义，产物统一落到 `build/`。
-需 **Go 1.26.6+**，Web 需 **Node.js 18+**。
+需 **Go 1.26.10+**，Web 需 **Node.js 18+**。
 
 ```bash
 # 默认：全部类型 + 全部平台 + 全部架构 + 全部安装包
@@ -256,7 +256,7 @@ npm run dev     # 开发模式 (代理到 :8080)
 
 | 工具 | 版本 | 用于 |
 |------|------|------|
-| Go | **1.26.6+** | 编译 `server` / `agent` / `installer`（三者 `go.mod` 下限一致） |
+| Go | **1.26.10+** | 编译 `server` / `agent` / `installer`（三者 `go.mod` 下限一致） |
 | Node.js + npm | 18+ | 构建 Web 前端 |
 | [Inno Setup 6](https://jrsoftware.org/isdl.php) | 6.x | **仅**编译 Windows 图形安装程序 |
 | OpenSSL | — | **仅**生成 TLS/mTLS 证书 |

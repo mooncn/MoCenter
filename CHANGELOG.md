@@ -4,6 +4,27 @@
 `server/internal/version/version.go` 与 `agent/internal/version/version.go` 维护；
 安装包版本由 `installer/setup.iss` 的 `AppVersion` 决定。发布纪律：只在明确发版时修改版本号。
 
+## 未发布
+
+### 依赖安全更新（2026-10-22）
+
+- **Go 工具链下限对齐到 1.26.10**（server / agent / installer 三个模块的 `go` 指令同步）：
+  `govulncheck` 修复前报告 server **11 项、agent 10 项可达**标准库漏洞（HTTP/2 HPACK 竞态与流控、
+  HTTP/1 CONNECT 后的连接反同步、Range/MIME 头解析内存放大、`crypto/tls`、`crypto/x509`
+  中间证书校验绕过等），全部在 Go 1.26.9 / 1.26.10 修复；复扫结果：server 可达 **0**、
+  agent / installer **0**。
+- `agent`、`installer` 的 `golang.org/x/sys` 0.22.0 → **0.47.0**（CVE-2026-39824，
+  `NewNTUnicodeString` 整数溢出；项目未调用该符号，属预防性升级）。
+- 前端 `vite` 5.4.21 → **6.4.5**、`source-map-js` → **1.2.2**：`npm audit` 的 2 项 **high**
+  （Vite 优化依赖路径穿越 / launch-editor NTLM 泄露、source-map-js 事件循环 DoS）清零；
+  已重新构建并对登录页做浏览器冒烟（无 JS 报错）。
+- 残留（非高危，记录备查）：
+  - `react-router-dom` 6.x 的 2 项 **moderate**（`<Link>`/`useNavigate` 反斜杠开放重定向、
+    SSR hydration 反序列化构造注入），上游只在 7.x 修复，属破坏性大版本升级，另行安排；
+    本项目未使用 SSR，第二条不可达。
+  - `golang.org/x/crypto` 的 openpgp 模块级公告（GO-2026-5932）：项目未导入该包，不可达；
+    上游无修复版本（该包已停止维护），无需处理。
+
 ## 1.0.3（2026-10-22）
 
 本轮重点：Agent 部署/接入合并与系统配置、监听地址热切换、探针历史 7 天归档、

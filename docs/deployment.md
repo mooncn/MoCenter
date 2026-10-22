@@ -17,7 +17,7 @@
 | Windows 10 **1809（17763）及以上** | **支持** | 本项目支持口径为 1809+；`installer/setup.iss` 的 `MinVersion=10.0`；既有真机复测已在 Win10 19044 跑通安装、注册与 VNC「服务模式」 |
 | Windows 11（21H2–24H2） | **支持（基础链路已实机验证）** | 2026-10-20 在 Windows 11 24H2（10.0.26100，x64）用当前工作树构建实跑：Server 托管 Web、Agent 注册上线 / 探针 / 离线判定 / 一次性令牌换取证书全链路通过；VNC 与虚拟显示本轮未在 Win11 单独复测（UltraVNC 1.8.2.4 官方支持 Win11） |
 | Windows 10 1809 以下 / Server 2016 | **不在支持范围** | 安装器只校验主版本号，可能能装上，但超出支持口径，未做兼容性验证 |
-| Windows 7 / 8 / 8.1 / Server 2008 R2 | **不支持** | Go 1.21 起已移除对 Win7/8/8.1 的支持（本项目 `go 1.26.6`）；`setup.iss` 的 `MinVersion=10.0` 会直接拒绝安装；绕过安装也不保证运行时可用 |
+| Windows 7 / 8 / 8.1 / Server 2008 R2 | **不支持** | Go 1.21 起已移除对 Win7/8/8.1 的支持（本项目 `go 1.26.10`）；`setup.iss` 的 `MinVersion=10.0` 会直接拒绝安装；绕过安装也不保证运行时可用 |
 | 32 位 Windows | **不支持** | `ArchitecturesAllowed=x64compatible` / `ArchitecturesInstallIn64BitMode=x64compatible`，图形安装器只提供 x64 |
 
 > 本表只讨论 Windows 客户端/被控端。Server 角色推荐部署在 Linux；Windows 上同时装 Server 也能运行，但未纳入上表的长期支持承诺。
