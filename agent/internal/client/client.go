@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"mocenter/agent/internal/logx"
 	"net"
 	"os"
 	"path/filepath"
@@ -67,6 +67,8 @@ type Config struct {
 	ServerFingerprint string
 	// EnrollmentSecret 首次换取客户端证书用的注册密钥；换取成功后由调用方清空配置。
 	EnrollmentSecret string
+	// LogLevel 当前生效的日志级别（服务端下发的值也写回这里）。
+	LogLevel string
 	// ConfigPath Agent 配置文件路径（凭证默认落在同目录的 creds/）。
 	ConfigPath string
 	// CredDir 凭证目录（覆盖默认值；主要便于测试）。
@@ -131,6 +133,9 @@ func (c *Client) Run() {
 	c.logCredentialPlan()
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
+	// 连接失败按"状态跃迁"记：同一轮故障只在第一次用 ERROR，之后降为 WARN。
+	// 全打 WARN 的话默认级别（error）看不到"连不上"；全打 ERROR 又会被重试刷屏。
+	firstFailure := true
 	for {
 		started := time.Now()
 		err := c.connectAndServe()
@@ -138,16 +143,24 @@ func (c *Client) Run() {
 		// 次数一多，退避会一直涨到 30 秒，表现为"配置改完主机很久才上线"。
 		if time.Since(started) >= 30*time.Second {
 			backoff = time.Second
+			firstFailure = true
 		}
 		switch {
 		case err == nil:
+			firstFailure = true
 		case isReenroll(err):
 			// 证书刚换过：这是正常收敛过程，不计入退避，也不打"连接断开"的吓人日志
-			log.Printf("[agent] %v", err)
+			logx.Infof("[agent] %v", err)
 			backoff = time.Second
+			firstFailure = true
 			continue
 		default:
-			log.Printf("[agent] 连接断开: %v，%v 后重连", err, backoff)
+			if firstFailure {
+				logx.Errorf("[agent] 连接服务端失败: %v，%v 后重试（同一轮故障的后续失败降为 WARN）", err, backoff)
+				firstFailure = false
+			} else {
+				logx.Warnf("[agent] 连接仍失败: %v，%v 后重试", err, backoff)
+			}
 		}
 		time.Sleep(backoff)
 		backoff *= 2
@@ -167,9 +180,9 @@ func (c *Client) logCredentialPlan() {
 	cert := c.clientCert()
 	if cert == nil {
 		if c.hasEnrollSecret() {
-			log.Printf("[agent] 本机尚无客户端证书，将用注册凭据换取（agent_id=%q）", c.cfg.AgentID)
+			logx.Infof("[agent] 本机尚无客户端证书，将用注册凭据换取（agent_id=%q）", c.cfg.AgentID)
 		} else {
-			log.Printf("[agent] 警告: 本机无客户端证书且未配置注册凭据，服务端会拒绝接入")
+			logx.Warnf("[agent] 本机无客户端证书且未配置注册凭据，服务端会拒绝接入")
 		}
 		return
 	}
@@ -178,13 +191,13 @@ func (c *Client) logCredentialPlan() {
 		cn = c.cfg.AgentID
 	}
 	if !c.hasEnrollSecret() {
-		log.Printf("[agent] 本机已有客户端证书（身份 %s），直接以证书接入", cn)
+		logx.Infof("[agent] 本机已有客户端证书（身份 %s），直接以证书接入", cn)
 		return
 	}
-	log.Printf("[agent] 本机已有客户端证书（身份 %s），直接以证书接入：配置里的注册凭据本次不会被使用，"+
+	logx.Infof("[agent] 本机已有客户端证书（身份 %s），直接以证书接入：配置里的注册凭据本次不会被使用，"+
 		"控制台的一次性令牌会保持「待使用」", cn)
 	if !c.usesExternalCert() {
-		log.Printf("[agent] 若要改用新令牌重新换取：删除 %s 下的 client.crt 与 ca.crt（保留 client.key）后重启",
+		logx.Infof("[agent] 若要改用新令牌重新换取：删除 %s 下的 client.crt 与 ca.crt（保留 client.key）后重启",
 			c.credDir())
 	}
 }
@@ -216,7 +229,7 @@ func (c *Client) ensureCertIdentity() error {
 			"请删除 %s 下的 client.crt 与 ca.crt（保留 client.key），并配置注册密钥或一次性令牌后重启",
 			cn, want, c.credDir())
 	}
-	log.Printf("[agent] 本机客户端证书身份 %q 与配置 agent_id %q 不一致；丢弃旧证书并用注册凭据重新换取", cn, want)
+	logx.Infof("[agent] 本机客户端证书身份 %q 与配置 agent_id %q 不一致；丢弃旧证书并用注册凭据重新换取", cn, want)
 	if err := c.discardServerIssuedCreds(); err != nil {
 		return fmt.Errorf("清理旧客户端证书失败（请手动删除 %s 下的 client.crt 与 ca.crt）: %w", c.credDir(), err)
 	}
@@ -287,7 +300,7 @@ func (c *Client) connectAndServe() error {
 			}
 			conn, err = tls.Dial("tcp", c.cfg.ServerAddr, tlsCfg)
 			if err == nil {
-				log.Printf("[agent] 服务端 CA 已轮换，已用注册密钥重新换取证书并恢复连接")
+				logx.Infof("[agent] 服务端 CA 已轮换，已用注册密钥重新换取证书并恢复连接")
 			}
 		}
 		if err != nil {
@@ -303,7 +316,7 @@ func (c *Client) connectAndServe() error {
 				return c.tlsFailure(err)
 			}
 			conn = plain
-			log.Printf("[agent] 服务端未提供可信 TLS（%v），本次以明文连接（身份由注册密钥保障）", err)
+			logx.Infof("[agent] 服务端未提供可信 TLS（%v），本次以明文连接（身份由注册密钥保障）", err)
 		}
 	}
 	c.mu.Lock()
@@ -313,7 +326,7 @@ func (c *Client) connectAndServe() error {
 	c.sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	c.mu.Unlock()
 
-	log.Printf("[agent] 已连接服务端 %s，注册上线...", c.cfg.ServerAddr)
+	logx.Infof("[agent] 已连接服务端 %s，注册上线...", c.cfg.ServerAddr)
 	c.register()
 
 	// 启动心跳与探针协程
@@ -385,7 +398,7 @@ func (c *Client) handleEnrollRequired(env protocol.Envelope) error {
 			"server_fingerprint（或删除本机 %s 里的 client.crt 与 ca.crt、保留 client.key 后重启）",
 			where, req.Reason, DisplayFingerprint(old), c.credDir())
 	}
-	log.Printf("[agent] 服务端不认可本机证书%s；已授权，自动丢弃旧证书并重新换取", where)
+	logx.Infof("[agent] 服务端不认可本机证书%s；已授权，自动丢弃旧证书并重新换取", where)
 	if err := c.discardServerIssuedCreds(); err != nil {
 		return fmt.Errorf("清理旧证书失败（请手动删除 %s 后重启）: %w", c.credDir(), err)
 	}
@@ -446,7 +459,7 @@ func (c *Client) checkCertAcceptance() error {
 	if !c.canTrustNewCA() {
 		return trustNewCAError(issuerFP, srvFP, true)
 	}
-	log.Printf("[agent] 服务端部署身份 CA 已变化（本机证书签发者 %s，服务端 %s）；已授权，重新换取证书",
+	logx.Infof("[agent] 服务端部署身份 CA 已变化（本机证书签发者 %s，服务端 %s）；已授权，重新换取证书",
 		DisplayFingerprint(issuerFP), DisplayFingerprint(srvFP))
 	if err := c.discardServerIssuedCreds(); err != nil {
 		return fmt.Errorf("清理旧证书失败（请手动删除 %s 后重启）: %w", c.credDir(), err)
@@ -550,7 +563,7 @@ func (c *Client) recoverFromCAChange(cause error) (bool, error) {
 		old := firstNonEmptyStr(firstOf(pinned), firstOf(known))
 		return true, trustNewCAError(old, "", true)
 	}
-	log.Printf("[agent] TLS 校验失败（%v）；本机持有旧证书且配置了可用注册密钥，尝试丢弃旧证书并重新换取", cause)
+	logx.Errorf("[agent] TLS 校验失败（%v）；本机持有旧证书且配置了可用注册密钥，尝试丢弃旧证书并重新换取", cause)
 	if err := c.discardServerIssuedCreds(); err != nil {
 		return true, fmt.Errorf("清理旧证书失败（请手动删除 %s 后重启）: %w", c.credDir(), err)
 	}
@@ -662,6 +675,8 @@ func (c *Client) register() {
 		"public_ipv6": ips.IPv6,
 		// 版本号：服务端据此判断该主机是否需要升级，前端展示在线版本
 		"agent_version": version.Version,
+		// 当前日志级别：上线即上报，控制台不必等第一次心跳就能显示
+		"log_level": logx.Current().String(),
 	}
 	if c.cfg.AgentKey != "" {
 		nonce := agentauth.NewNonce()
@@ -671,9 +686,9 @@ func (c *Client) register() {
 		info["auth_proof"] = agentauth.Proof(c.cfg.AgentKey, c.cfg.AgentID, nonce, ts)
 	} else if c.clientCert() != nil {
 		// 已持有服务端签发的证书：身份以证书为准，服务端据此放行（无需再传注册密钥）
-		log.Printf("[agent] 已携带客户端证书连接（证书身份即 agent_id）")
+		logx.Infof("[agent] 已携带客户端证书连接（证书身份即 agent_id）")
 	} else {
-		log.Printf("[agent] 警告: 未配置 -agent-key，无法通过服务端的注册鉴权（若服务端已启用校验将被拒绝连接）")
+		logx.Warnf("[agent] 未配置 -agent-key，无法通过服务端的注册鉴权（若服务端已启用校验将被拒绝连接）")
 	}
 	_ = c.write(protocol.TypeOnline, info)
 }
@@ -696,6 +711,36 @@ func (c *Client) write(typ string, payload interface{}) error {
 //
 // 服务端在切换监听前下发这条消息；只有落盘成功才回 OK 并断开，服务端也只踢
 // 收到 OK 的连接。写盘用临时文件 + rename，避免断电留下半截配置。
+// applyLogLevelUpdate 应用服务端下发的日志级别：校验 → 落盘 → 立即生效 → 回 Ack。
+//
+// "先落盘再改内存"：写配置失败时仍让本次生效（否则运维看不到调试日志），
+// 但 Ack 里如实说明"重启后会回退"，避免界面显示成功、重启才发现没生效。
+func (c *Client) applyLogLevelUpdate(u protocol.LogLevelUpdate) {
+	ack := protocol.LogLevelUpdateAck{AgentID: c.cfg.AgentID, Level: logx.Current().String()}
+	lv, ok := logx.ParseLevel(u.Level)
+	if !ok {
+		ack.Message = "无法识别的日志级别: " + u.Level + "（可用 off/error/warn/info）"
+		_ = c.write(protocol.TypeLogLevelUpdateAck, ack)
+		logx.Errorf("[agent] 拒绝服务端下发的日志级别 %q：不是 off/error/warn/info", u.Level)
+		return
+	}
+	persistErr := c.persistConfigString("log_level", lv.String())
+	c.mu.Lock()
+	c.cfg.LogLevel = lv.String()
+	c.mu.Unlock()
+	logx.SetLevel(lv)
+	ack.Level = lv.String()
+	if persistErr != nil {
+		ack.Message = "已即时生效，但写入配置失败（重启后会回退）: " + persistErr.Error()
+		_ = c.write(protocol.TypeLogLevelUpdateAck, ack)
+		logx.Errorf("[agent] 日志级别已临时改为 %s，但落盘失败: %v", lv, persistErr)
+		return
+	}
+	ack.OK = true
+	_ = c.write(protocol.TypeLogLevelUpdateAck, ack)
+	logx.Infof("[agent] 日志级别已按服务端下发更新为 %s", lv)
+}
+
 func (c *Client) applyServerAddrUpdate(u protocol.ServerAddrUpdate) {
 	addr := strings.TrimSpace(u.ServerAddr)
 	ack := protocol.ServerAddrUpdateAck{AgentID: c.cfg.AgentID, ServerAddr: addr}
@@ -720,7 +765,7 @@ func (c *Client) applyServerAddrUpdate(u protocol.ServerAddrUpdate) {
 	if err := c.persistServerAddr(addr); err != nil {
 		ack.Message = err.Error()
 		_ = c.write(protocol.TypeServerAddrUpdateAck, ack)
-		log.Printf("[agent] 服务端下发新地址 %s 落盘失败，继续使用 %s: %v", addr, old, err)
+		logx.Errorf("[agent] 服务端下发新地址 %s 落盘失败，继续使用 %s: %v", addr, old, err)
 		return
 	}
 	c.mu.Lock()
@@ -728,7 +773,7 @@ func (c *Client) applyServerAddrUpdate(u protocol.ServerAddrUpdate) {
 	c.mu.Unlock()
 	ack.OK = true
 	_ = c.write(protocol.TypeServerAddrUpdateAck, ack)
-	log.Printf("[agent] 服务端地址已更新为 %s，即将用新地址重连", addr)
+	logx.Infof("[agent] 服务端地址已更新为 %s，即将用新地址重连", addr)
 	// 服务端会在收到 Ack 后切换监听；默认等 2 秒，避免 Agent 比新监听先到。
 	delay := u.ApplyAfterSec
 	if delay <= 0 {
@@ -751,6 +796,14 @@ func (c *Client) applyServerAddrUpdate(u protocol.ServerAddrUpdate) {
 
 // persistServerAddr 只改配置里的 server 字段，保留安装器写入的其它键。
 func (c *Client) persistServerAddr(addr string) error {
+	return c.persistConfigString("server", addr)
+}
+
+// persistConfigString 只改配置里的单个字符串字段，保留其它键（含安装器写入的）。
+//
+// 用"读原始 JSON → 改一个键 → 临时文件 + rename"而不是 unmarshal 成 Config 再整份写回：
+// 后者会把本版本不认识的键（更老的/更新的配置项）一并抹掉。
+func (c *Client) persistConfigString(key, val string) error {
 	path := strings.TrimSpace(c.cfg.ConfigPath)
 	if path == "" {
 		return nil
@@ -763,11 +816,11 @@ func (c *Client) persistServerAddr(addr string) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("读取配置失败: %w", err)
 	}
-	v, err := json.Marshal(addr)
+	v, err := json.Marshal(val)
 	if err != nil {
 		return err
 	}
-	raw["server"] = v
+	raw[key] = v
 	out, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
 		return err
@@ -797,6 +850,7 @@ func (c *Client) heartbeatLoop(stop chan struct{}) {
 				Hostname:  c.collect.Host(),
 				Timestamp: time.Now().Unix(),
 				RTTMs:     0,
+				LogLevel:  logx.Current().String(),
 			}
 			_ = c.write(protocol.TypeHeartbeatReq, req)
 		}
@@ -883,12 +937,12 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 		conn := c.getTunnel(td.TunnelID)
 		if conn == nil {
 			// 静默丢弃 = 最难查的一类故障：服务端以为画面数据已经送到，本机一个字节都没落地。
-			log.Printf("[agent] 丢弃隧道数据 %s（%d 字节）：本机没有这条隧道", td.TunnelID, len(td.Data))
+			logx.Warnf("[agent] 丢弃隧道数据 %s（%d 字节）：本机没有这条隧道", td.TunnelID, len(td.Data))
 			return
 		}
 		if _, err := conn.Write(td.Data); err != nil {
 			// 写不进去说明本地 VNC 已经不接受输入了；继续留着隧道只会让浏览器对着空气发指令。
-			log.Printf("[agent] 写本地 VNC 失败，关闭隧道 %s: %v", td.TunnelID, err)
+			logx.Errorf("[agent] 写本地 VNC 失败，关闭隧道 %s: %v", td.TunnelID, err)
 			c.closeTunnel(td.TunnelID)
 			_ = c.write(protocol.TypeTunnelClose, &protocol.TunnelClose{TunnelID: td.TunnelID, Reason: "local-write-failed"})
 		}
@@ -922,6 +976,12 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 			return
 		}
 		go c.handleVncPassword(req)
+	case protocol.TypeLogLevelUpdate:
+		var u protocol.LogLevelUpdate
+		if json.Unmarshal(env.Data, &u) != nil {
+			return
+		}
+		c.applyLogLevelUpdate(u)
 	case protocol.TypeServerAddrUpdate:
 		var u protocol.ServerAddrUpdate
 		if json.Unmarshal(env.Data, &u) != nil {
@@ -1008,7 +1068,7 @@ func (c *Client) runUpgrade(req *protocol.UpgradeReq) {
 	}
 	content, err := c.fetchLocalUpgradePackage(req.PackageName)
 	if err != nil {
-		log.Printf("[agent] 获取服务端本地升级包 %s 失败: %v", req.PackageName, err)
+		logx.Errorf("[agent] 获取服务端本地升级包 %s 失败: %v", req.PackageName, err)
 		report(&protocol.UpgradeResp{
 			UpgradeID: req.UpgradeID,
 			Version:   upgrade.Version(),
@@ -1077,7 +1137,7 @@ func (c *Client) fetchLocalUpgradePackage(name string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取升级包失败: %w", err)
 	}
-	log.Printf("[agent] 已从服务端 pkg 取回升级包 %s（%d 字节）", safe, size)
+	logx.Infof("[agent] 已从服务端 pkg 取回升级包 %s（%d 字节）", safe, size)
 	return content, nil
 }
 
@@ -1090,7 +1150,7 @@ func (c *Client) closeSession(req protocol.InteractiveCloseReq) {
 			delete(c.interactive, req.CommandID)
 			s.Close()
 			c.mu.Unlock()
-			log.Printf("[agent] 断开会话 %s 并结束相关进程", req.CommandID)
+			logx.Infof("[agent] 断开会话 %s 并结束相关进程", req.CommandID)
 			return
 		}
 		c.mu.Unlock()
@@ -1115,7 +1175,7 @@ func (c *Client) closeSession(req protocol.InteractiveCloseReq) {
 		c.mu.Unlock()
 		closed += command.KillAll()
 	}
-	log.Printf("[agent] 断开终端连接，已结束 %d 个会话/命令", closed)
+	logx.Infof("[agent] 断开终端连接，已结束 %d 个会话/命令", closed)
 }
 
 // handleVncInstall 处理 VNC 安装/启动指令并回传结果。
@@ -1132,7 +1192,11 @@ func (c *Client) handleVncInstall(req protocol.VncInstallReq) {
 		// 会做路径闸门），写系统临时目录会被逐片拒绝，表现为"每个分片都不在允许根目录内"。
 		FetchPackage: c.fetchServerPackage,
 	})
-	log.Printf("[agent] VNC 安装/启动结果: mode=%s ok=%v msg=%s", resp.Mode, resp.OK, resp.Message)
+	if resp.OK {
+		logx.Infof("[agent] VNC 安装/启动结果: mode=%s msg=%s", resp.Mode, resp.Message)
+	} else {
+		logx.Errorf("[agent] VNC 安装/启动失败: mode=%s msg=%s", resp.Mode, resp.Message)
+	}
 	_ = c.write(protocol.TypeVncInstallResp, protocol.VncInstallResp{
 		OK: resp.OK, Message: resp.Message, Port: resp.Port, Password: resp.Password, Mode: resp.Mode,
 	})
@@ -1145,7 +1209,11 @@ func (c *Client) handleVncInstall(req protocol.VncInstallReq) {
 func (c *Client) handleVncPassword(req protocol.VncPasswordReq) {
 	r := command.VncReadPassword()
 	// 日志只记"读到没有"，绝不把口令本身写进日志（那等于又存了一份明文凭据）
-	log.Printf("[agent] VNC 口令读取结果: ok=%v mode=%s msg=%s", r.OK, r.Mode, r.Message)
+	if r.OK {
+		logx.Infof("[agent] VNC 口令读取结果: mode=%s", r.Mode)
+	} else {
+		logx.Errorf("[agent] VNC 口令读取失败: mode=%s msg=%s", r.Mode, r.Message)
+	}
 	_ = c.write(protocol.TypeVncPasswordResp, protocol.VncPasswordResp{
 		OK: r.OK, Message: r.Message, Password: r.Password, Mode: r.Mode,
 	})
@@ -1153,7 +1221,7 @@ func (c *Client) handleVncPassword(req protocol.VncPasswordReq) {
 
 // handleFilePush 接收服务端下发的文件分片，写入本地目标文件并回传 ACK/NACK。
 func (c *Client) handleFilePush(req protocol.FilePushReq) {
-	log.Printf("[agent] 收到文件分发分片 seq=%d %s", req.ChunkSeq, req.FilePath)
+	logx.Infof("[agent] 收到文件分发分片 seq=%d %s", req.ChunkSeq, req.FilePath)
 	ack := func(ok bool, status, msg string) {
 		_ = c.write(protocol.TypeFilePushAck, protocol.FilePushAck{
 			CommandID: req.CommandID, FilePath: req.FilePath, ChunkSeq: req.ChunkSeq,
@@ -1166,7 +1234,7 @@ func (c *Client) handleFilePush(req protocol.FilePushReq) {
 	// 各开一个句柄互相截断。
 	path, gerr := c.guardPath(req.FilePath)
 	if gerr != nil {
-		log.Printf("[agent] 拒绝文件分发 %q: %v", req.FilePath, gerr)
+		logx.Errorf("[agent] 拒绝文件分发 %q: %v", req.FilePath, gerr)
 		ack(false, "rejected", gerr.Error())
 		return
 	}
@@ -1202,13 +1270,13 @@ func (c *Client) pushWrite(req protocol.FilePushReq) bool {
 	f, ok := c.pushFiles[req.FilePath]
 	if !ok {
 		if err := os.MkdirAll(filepath.Dir(req.FilePath), 0755); err != nil {
-			log.Printf("[agent] 创建目录失败 %s: %v", filepath.Dir(req.FilePath), err)
+			logx.Errorf("[agent] 创建目录失败 %s: %v", filepath.Dir(req.FilePath), err)
 			return false
 		}
 		var err error
 		f, err = os.Create(req.FilePath)
 		if err != nil {
-			log.Printf("[agent] 创建文件失败 %s: %v", req.FilePath, err)
+			logx.Errorf("[agent] 创建文件失败 %s: %v", req.FilePath, err)
 			return false
 		}
 		c.pushFiles[req.FilePath] = f
@@ -1218,7 +1286,7 @@ func (c *Client) pushWrite(req protocol.FilePushReq) bool {
 		// 顺序写入校验：位置不匹配时按期望偏移 Seek 补齐（简化处理）
 	}
 	if _, err := f.Write(req.ChunkData); err != nil {
-		log.Printf("[agent] 写入分片失败 %s: %v", req.FilePath, err)
+		logx.Errorf("[agent] 写入分片失败 %s: %v", req.FilePath, err)
 		return false
 	}
 	return true
@@ -1231,17 +1299,17 @@ func (c *Client) pushClose(filePath string) {
 	if f, ok := c.pushFiles[filePath]; ok {
 		_ = f.Close()
 		delete(c.pushFiles, filePath)
-		log.Printf("[agent] 文件分发完成: %s", filePath)
+		logx.Infof("[agent] 文件分发完成: %s", filePath)
 	}
 }
 
 // sendFileChunks 将本地文件分片回传给服务端（文件下载）。
 func (c *Client) sendFileChunks(req protocol.FileDownloadReq) {
-	log.Printf("[agent] 收到文件下载请求: %s", req.FilePath)
+	logx.Infof("[agent] 收到文件下载请求: %s", req.FilePath)
 	path, gerr := c.guardPath(req.FilePath)
 	if gerr != nil {
 		// 与读失败走同一条上报：否则服务端会一直等到超时
-		log.Printf("[agent] 拒绝文件下载 %q: %v", req.FilePath, gerr)
+		logx.Errorf("[agent] 拒绝文件下载 %q: %v", req.FilePath, gerr)
 		_ = c.write(protocol.TypeFileUploadReq, protocol.FileUploadReq{
 			AgentID: c.cfg.AgentID, FilePath: req.FilePath, FileSize: -1,
 		})
@@ -1273,7 +1341,7 @@ func (c *Client) sendFileChunks(req protocol.FileDownloadReq) {
 				AgentID: c.cfg.AgentID, FilePath: req.FilePath, FileSize: size,
 				ChunkSeq: seq, ChunkData: append([]byte(nil), buf[:n]...), ChunkMD5: md5,
 			}); werr != nil {
-				log.Printf("[agent] 文件回传中断于第 %d 片（%s，共 %d 字节）: %v", seq, req.FilePath, size, werr)
+				logx.Infof("[agent] 文件回传中断于第 %d 片（%s，共 %d 字节）: %v", seq, req.FilePath, size, werr)
 				return
 			}
 			seq++
@@ -1369,7 +1437,7 @@ func (c *Client) openTunnel(req protocol.TunnelOpenReq) {
 	if !c.tunnelTargetAllowed(localHost) {
 		resp.Message = "tunnel target not allowed by local config: " + localHost
 		_ = c.write(protocol.TypeTunnelOpenResp, resp)
-		log.Printf("[agent] 拒绝隧道 %s：目标 %s 不是回环地址，且不在本机 tunnel_hosts 白名单内"+
+		logx.Errorf("[agent] 拒绝隧道 %s：目标 %s 不是回环地址，且不在本机 tunnel_hosts 白名单内"+
 			"（需要放行请把地址写进本机配置的 tunnel_hosts，服务端指令无法打开它）", req.TunnelID, localHost)
 		return
 	}
@@ -1377,7 +1445,7 @@ func (c *Client) openTunnel(req protocol.TunnelOpenReq) {
 	if err != nil {
 		resp.Message = "dial internal service failed: " + err.Error()
 		_ = c.write(protocol.TypeTunnelOpenResp, resp)
-		log.Printf("[agent] 隧道建立失败 %s: %v", req.TunnelID, err)
+		logx.Errorf("[agent] 隧道建立失败 %s: %v", req.TunnelID, err)
 		return
 	}
 	c.tunnelsMu.Lock()
@@ -1388,7 +1456,7 @@ func (c *Client) openTunnel(req protocol.TunnelOpenReq) {
 	c.tunnelsMu.Unlock()
 	resp.OK = true
 	_ = c.write(protocol.TypeTunnelOpenResp, resp)
-	log.Printf("[agent] 隧道建立成功 %s -> %s:%d", req.TunnelID, localHost, req.LocalPort)
+	logx.Infof("[agent] 隧道建立成功 %s -> %s:%d", req.TunnelID, localHost, req.LocalPort)
 	go c.readTunnel(req.TunnelID, lconn)
 }
 
@@ -1408,14 +1476,14 @@ func (c *Client) readTunnel(tunnelID string, conn net.Conn) {
 			// 不带原因的退出会把"内网服务自己关了"和"回写服务端失败"混成同一种现象，
 			// 而这两种情况在控制台上看起来都只是"远程桌面黑屏/断线"。
 			if !errors.Is(err, net.ErrClosed) {
-				log.Printf("[agent] 隧道 %s 读内网服务结束: %v", tunnelID, err)
+				logx.Infof("[agent] 隧道 %s 读内网服务结束: %v", tunnelID, err)
 			}
 			break
 		}
 	}
 	// 字节总数必须留痕：只有"隧道建立成功"而没有它，"连上却黑屏"就无从判断
 	// 是内网服务根本没回数据，还是数据丢在回传服务端的路上。
-	log.Printf("[agent] 隧道 %s 结束：共读内网服务 %d 字节", tunnelID, total)
+	logx.Infof("[agent] 隧道 %s 结束：共读内网服务 %d 字节", tunnelID, total)
 	// 内网服务关闭 -> 通知服务端关闭隧道
 	_ = c.write(protocol.TypeTunnelClose, &protocol.TunnelClose{TunnelID: tunnelID, Reason: "local-closed"})
 	c.closeTunnel(tunnelID)

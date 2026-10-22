@@ -18,7 +18,7 @@ import { Api } from '../api/api.js'
 //     首次信任时显式标黄提示"请核对"，否则这条链就退化成"连上就算对"。
 export default function Deploy() {
   const [form, setForm] = useState({
-    host: '', port: 22, user: 'root', password: '', private_key: '',
+    host: '', port: 22, user: 'root', password: '', sudo_password: '', private_key: '', passphrase: '',
     agent_id: '', server_addr: '', binary: '', latency: '', host_key_fingerprint: '',
   })
   const [authMode, setAuthMode] = useState('password')
@@ -52,7 +52,11 @@ export default function Deploy() {
         latency_targets: form.latency.split('\n').map((s) => s.trim()).filter(Boolean),
       }
       if (authMode === 'password') payload.password = form.password
-      else payload.private_key = form.private_key
+      else {
+        payload.private_key = form.private_key
+        payload.passphrase = form.passphrase
+      }
+      payload.sudo_password = form.sudo_password
 
       const d = await Api.deployAgent(payload)
       setResult(d)
@@ -88,7 +92,10 @@ export default function Deploy() {
           </label>
           <label>
             登录用户
-            <input value={form.user} onChange={set('user')} placeholder="root" />
+            <input value={form.user} onChange={set('user')} placeholder="root / debian / ubuntu" />
+            <span className="cell-sub">
+              Debian/Ubuntu 云镜像通常禁用 root 密码登录：请改用实例默认用户（如 debian/ubuntu）或私钥。
+            </span>
           </label>
           <label>
             认证方式
@@ -103,13 +110,28 @@ export default function Deploy() {
               <input type="password" value={form.password} onChange={set('password')} autoComplete="new-password" />
             </label>
           ) : (
-            <label className="span2">
-              私钥内容（PEM）
-              <textarea rows={5} value={form.private_key} onChange={set('private_key')}
-                placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
-            </label>
+            <>
+              <label className="span2">
+                私钥内容（PEM / OpenSSH）
+                <textarea rows={5} value={form.private_key} onChange={set('private_key')}
+                  placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" />
+              </label>
+              <label>
+                私钥口令（可选）
+                <input type="password" value={form.passphrase} onChange={set('passphrase')}
+                  placeholder="仅加密私钥需要" autoComplete="new-password" />
+              </label>
+            </>
           )}
 
+          <label>
+            sudo 密码（可选）
+            <input type="password" value={form.sudo_password} onChange={set('sudo_password')}
+              placeholder="非 root 且 sudo 需要密码时填写" autoComplete="current-password" />
+            <span className="cell-sub">
+              Debian/Ubuntu 云镜像常用 debian/ubuntu 用户：sudo 需密码时填这里；使用密码登录且留空时会自动复用 SSH 密码。
+            </span>
+          </label>
           <label>
             Agent 名称（留空用主机名）
             <input value={form.agent_id} onChange={set('agent_id')} placeholder="web-01" />
@@ -168,7 +190,8 @@ export default function Deploy() {
             <div className="public-fact"><span className="k">主机名</span><span className="v">{result.target.hostname || '—'}</span></div>
             <div className="public-fact"><span className="k">系统</span><span className="v">{result.target.os_name || '—'}</span></div>
             <div className="public-fact"><span className="k">架构</span><span className="v">{result.target.arch}（{result.target.goarch}）</span></div>
-            <div className="public-fact"><span className="k">root</span><span className="v">{result.target.is_root ? '是' : `否（sudo: ${result.target.sudo_ok ? '可用' : '不可用'}）`}</span></div>
+            <div className="public-fact"><span className="k">root</span><span className="v">{result.target.is_root ? '是' : `否（sudo: ${result.target.sudo_ok ? (result.target.sudo_mode === 'password' ? '密码验证通过' : '免密可用') : '不可用'}）`}</span></div>
+            <div className="public-fact"><span className="k">系统</span><span className="v">{result.target.os_name || '—'}{result.target.distro_id ? `（${result.target.distro_id}${result.target.distro_ver ? ' ' + result.target.distro_ver : ''}）` : ''}</span></div>
             <div className="public-fact"><span className="k">systemd</span><span className="v">{result.target.has_systemd ? '可用' : '不可用（将用进程守护方式）'}</span></div>
           </div>
         </div>

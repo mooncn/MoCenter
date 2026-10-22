@@ -4,7 +4,7 @@ package session
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"net"
 	"strings"
 	"sync"
@@ -35,6 +35,8 @@ type Conn struct {
 	HeartbeatInterval int
 	// AgentVersion Agent 注册时自报的版本号（空串 = 旧版 Agent 未上报）。
 	AgentVersion string
+	// LogLevel Agent 心跳里自报的当前日志级别（off/error/warn/info；旧版为空）。
+	LogLevel string
 }
 
 // SetAgentVersion 记录 Agent 自报的版本号（注册时写入）。
@@ -221,7 +223,7 @@ func (m *Manager) Upsert(agentID string, c *Conn) (*Conn, bool) {
 		if !m.isStaleLocked(old, time.Now()) {
 			return old, false // 拒绝：该 ID 已有活跃连接
 		}
-		log.Printf("[session] Agent %s 的旧连接已超时未心跳，允许新连接替换（旧来自 %s，新来自 %s）",
+		logx.Errorf("[session] Agent %s 的旧连接已超时未心跳，允许新连接替换（旧来自 %s，新来自 %s）",
 			agentID, old.RemoteAddr, c.RemoteAddr)
 		if old.NetConn != nil {
 			_ = old.NetConn.Close()
@@ -339,7 +341,7 @@ func (m *Manager) SendTo(agentID, typ string, payload interface{}) error {
 func (m *Manager) Broadcast(typ string, payload interface{}) {
 	for _, c := range m.All() {
 		if err := c.Write(typ, payload); err != nil {
-			log.Printf("[session] broadcast to %s error: %v", c.AgentID, err)
+			logx.Infof("[session] broadcast to %s error: %v", c.AgentID, err)
 		}
 	}
 }
@@ -367,4 +369,18 @@ func (m *Manager) Tick(offlineAfter time.Duration) []string {
 		m.Remove(id)
 	}
 	return offline
+}
+
+// SetLogLevel 记录 Agent 自报的日志级别（心跳时刷新）。
+func (c *Conn) SetLogLevel(v string) {
+	c.mu.Lock()
+	c.LogLevel = strings.TrimSpace(v)
+	c.mu.Unlock()
+}
+
+// GetLogLevel 线程安全地读取 Agent 自报的日志级别。
+func (c *Conn) GetLogLevel() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.LogLevel
 }

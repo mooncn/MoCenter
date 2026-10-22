@@ -7,7 +7,7 @@
 | 组件 | 环境 |
 |------|------|
 | 服务端 | Linux x86_64，2 核 4G（压测 4 核 8G），公网 IP，开放 TCP 端口（默认 9000）与 HTTP 端口（默认 8080） |
-| Agent | Linux（CentOS/RHEL 7/8、Ubuntu 18.04~22.04、Debian 10/11）、Windows 10 1809+ / Server 2019+，x86_64 为主 |
+| Agent | Linux（CentOS/RHEL 7/8、Ubuntu 18.04~22.04、Debian 10/11/12）、Windows 10 1809+ / Server 2019+，x86_64 为主 |
 | Web | 浏览器 Chrome/Edge/Firefox 最新两个大版本 |
 
 ### Windows 版本兼容性（2026-10-20 评估）
@@ -27,6 +27,8 @@
 - **按角色分页**：只选 Agent 时，向导只显示服务端地址、Agent 名称/ID（选填；绑定令牌须与签发时一致，留空则用机器 UUID）与注册凭据，
   不出现 Server 的后台账号和监听端口；只选 Server 时反之；两者都选才显示全部页面。
 - **升级不重填**：检测到既有配置即按升级处理，只替换二进制与服务，连接参数与账号沿用原配置。
+- **日志级别页**：向导新增「运行期日志级别」（OFF / ERROR / WARN / INFO，默认 ERROR），
+  写入 `log_level` 字段；升级时预选既有值，只改这一个键。详见「十六、日志级别与日志文件」。
 - **卸载可选清数据**：卸载时会弹窗询问「是否同时删除配置与数据」，默认**保留**
   （`%ProgramData%\MoCenter\<角色>`）；安装时已把数据目录记入
   `HKLM\Software\MoCenter\DataDir`，自定义目录也能删对地方。
@@ -915,7 +917,12 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN"   "http://127.0.0.1:8080/api/ba
 
 ### 前置条件
 
-- 目标机可 SSH 登录，且具备 **root 权限或免密 sudo**（`sudo -n true` 可用）；
+- 目标机可 SSH 登录，且具备 **root 权限，或可用的 sudo**：
+  - root 直接登录最省事；
+  - 非 root 用户可用免密 sudo（`sudo -n true`），也可在部署表单填写 **sudo 密码**
+    （使用密码登录时留空会自动复用 SSH 密码）；
+  - **Debian/Ubuntu 云镜像通常禁用 root 密码登录**：请改用实例默认用户
+    （`debian` / `ubuntu`）或私钥，并确认该用户有 sudo 权限；
 - 服务端数据目录的 `packages/` 下有**匹配目标架构**的 Agent 二进制
   （`mocenter-agent-amd64` / `-arm64` / `-arm` / `-386`；也可用 `?binary=` 指定，支持 `.exe` 后缀）；
 - 没有 systemd 的环境（容器）会退化为"后台进程 + 进程守护"，**不提供开机自启**，步骤里会明确告知。
@@ -930,11 +937,16 @@ systemd 可用性探测，**不做任何改动**。建议先探测确认，再�
 每一步都会回传状态与原始输出（前端按顺序展示，失败时能直接看到卡在哪一步）：
 
 1. SSH 连接与认证（密码 / 键盘交互 / 私钥 / 私钥+passphrase）
-2. 探测目标机环境（`uname -m` → GOARCH、`/etc/os-release`、`id -u`、`sudo -n`、是否 systemd）
-3. 上传 Agent 二进制（走 stdin 的 `cat > file`，不依赖目标机是否启用 sftp 子系统）
-4. 写入 Agent 配置（服务端地址、Agent 名称、注册凭据、代理、延迟目标，权限 0600）
-5. 安装为 systemd 服务并启动（配置与二进制分离：`/etc/mocenter/mocenter-agent.json` + `/usr/local/bin/mocenter-agent`）
-6. 回读状态确认（`is-active` / `is-enabled` / `-version`）
+2. 探测目标机环境（`uname -m` → GOARCH，缺失时回退 `dpkg --print-architecture`；
+   `/etc/os-release` 的 PRETTY_NAME/ID/VERSION_ID；`id -u`；sudo 免密/密码/不可用；是否 systemd）。
+   脚本末尾带一个结束标记，回显不含标记就自动重跑（最多 3 次）——
+   零回显会被明确报成"exec 通道输出丢失"，不再误报成"架构不支持"
+3. 上传 Agent 二进制（走 stdin 的 `cat > file`，不依赖目标机是否启用 sftp 子系统；
+   写完回读远端字节数核对，不符自动重传一次）
+4. 写入 Agent 配置（服务端地址、Agent 名称、注册凭据、代理、延迟目标，权限 0600，同样核对字节数）
+5. 安装为 systemd 服务并启动（配置与二进制分离：`/etc/mocenter/mocenter-agent.json` + `/usr/local/bin/mocenter-agent`；
+   非 root 登录时整段脚本经 sudo 提权执行，**既有配置不会被覆盖**）
+6. 回读状态确认（`is-active` / `is-enabled` / `-version`；同样要求回显里出现 `active=` 才算有效）
 
 ### 安全约束
 
@@ -1145,7 +1157,9 @@ Agent 与 Server **同一份配置只允许一个实例**。跨平台实现不�
 | 端口映射不通 | 确认映射规则已启用、Agent 在线、目标内网服务可达 |
 | 节点地区/国旗不显示 | ① 是否有外网出口；无外网请配 `-mmdb` 离线库。② 看日志里的 `[geo]` 行（会区分"限流 / 网络不通 / 不支持该地址族 / 该 IP 无数据"）。③ 后台「展示配置」总开关是否开、地区字段是否勾选。④ 直连 ip-api.com 不稳时配 `-proxy-ip` |
 | 延迟目标一直显示"超时" | ICMP 依赖目标机的 `ping` 命令（极简容器可能没有），换 `tcp:` 目标验证链路；`http:` 目标缺 scheme 时按 https 处理，自签证书不受影响（探测忽略证书校验） |
-| 一键部署报 `sudo: not found` | 已修复：当前用户是 root 时不再使用 sudo。若版本较旧请升级服务端 |
+| 一键部署报 `sudo: not found` | 已修复：当前用户是 root 时不再使用 sudo；非 root 且系统没有 sudo 时请改用 root。若版本较旧请升级服务端 |
+| Debian 12 云服务器 SSH 认证失败 / 提示 root 权限不足 | 云镜像通常禁用 root 密码登录：改用 `debian` 用户 + 私钥（或密码），并在「sudo 密码」填写该用户 sudo 密码（密码登录留空会复用 SSH 密码）；探测结果会显示 `sudo=密码验证通过` |
+| 一键部署报 `不支持的目标架构: ""`，或报「探测脚本没有完整回显」 | 这不是目标机的问题：是服务端读取 SSH 回显时丢了输出（1.0.3 之前把 `Session.Stdout` 与 `Stderr` 挂到同一个 buffer，两个拷贝 goroutine 并发写会整段丢回显）。现版本已加锁并重跑最多 3 次，同时在错误里附上最后一次原始输出。若仍然零回显，多半是目标机给 SSH 配了 `ForceCommand` / shell 钩子或 PAM 模块吞掉了会话，可在该机手工 `ssh root@host sh -s < 脚本` 复现 |
 | 一键部署报服务启动成功但 Agent 不上线 | 检查写入的注册凭据是否有效（`/etc/mocenter/mocenter-agent.json` 的 `agent_key`：一次性令牌要用对应该 `agent_id` 且未过期未使用的）、服务端地址是否从目标机可达；`systemctl status mocenter-agent` 看日志 |
 | 恢复备份后数据没变 | 恢复后需**重启服务端**；被覆盖的旧文件在 `<文件名>.before-restore` |
 | 日志出现「已有一个使用同一配置的 Agent 在运行，本次启动终止」 | **这是保护生效，不是故障**：已有实例持有单实例锁。用 `systemctl status mocenter-agent` / `ps -ef \| grep mocenter-agent` 确认。若确实是上次断电遗留（日志会提示锁文件多久没被刷新、PID 是否来自上一次开机），删掉锁文件后重启即可，**不要**去杀那个 PID（可能已被复用）。详见「单实例保护」 |
@@ -1200,3 +1214,52 @@ systemctl restart mocenter-server
 - **落地**：一次性读入内存 → 校验 → 0600 临时文件落盘并复核摘要 → 备份旧二进制 →
   替换 → 以分离进程重新拉起 → 旧进程退出；替换失败会回滚备份。
 - **不支持**：差分升级（未实现，走整包替换）。
+
+## 十六、日志级别与日志文件
+
+Agent 与 Server 的运行期日志统一为四个级别，可在**配置文件 / 命令行 / 安装向导 / 控制台远程下发**四处调整。
+
+| 级别 | 含义 | 默认 |
+|---|---|---|
+| `off` | 关闭运行期日志（启动期致命错误仍输出一行并退出） | — |
+| `error` | 只记录失败（含安全不变量被破坏的 CRITICAL） | **Agent** |
+| `warn` | 失败 + 重试/降级/回退等可恢复情况 | — |
+| `info` | 生命周期与事实（启动、注册上线、监听地址、部署各步…） | **Server** |
+
+默认值刻意不同：Agent 部署量大、日常无需噪声，默认 `error`；Server 只有一台且日志量小，
+启动信息（监听地址、数据目录、证书路径）是排障的第一手材料，默认 `info`。
+
+### 配置方式（优先级：命令行 > 配置文件 > 默认值）
+
+- **配置文件**：`mocenter-agent.json` / `mocenter-server.json` 的 `log_level` 字段；
+- **命令行**：`-log-level off|error|warn|info`；
+- **Windows 安装向导**：第 6 页「运行期日志级别」，默认 ERROR；升级时预选既有的值，
+  且只改 `log_level` 这一个键（其余配置仍保持"升级不动配置"）；
+- **控制台远程下发**：「仪表盘 → 操作 → 日志级别」，可选单台或**全部在线主机**。
+  下发后会写回该 Agent 的配置文件并**立即生效**（无需重启），回执里给出实际生效级别；
+  旧版 Agent 不识别该指令，界面会明确提示"未回执"。
+
+### off 的边界
+
+`off` 关闭的是运行期日志。进程启动阶段的致命错误（配置解析失败、端口占用、凭据缺失等）
+仍会打印一行 `[CRITICAL]` 并以退出码 1 结束 —— 这类事件每个进程最多发生一次，
+是"服务起不来"的唯一线索，静默掉只会让排障无从下手。
+
+### 日志文件在哪
+
+| 环境 | 位置 | 轮转 |
+|---|---|---|
+| Windows 服务 | `<data>\logs\<服务名>.log`（如 `C:\ProgramData\MoCenter\agent\logs\MoCenterAgent.log`） | 单份 8MB，超过即切到 `.log.1`（只保留一份旧文件） |
+| Linux systemd | journald：`journalctl -u mocenter-agent -f` | 由 journald 管理 |
+| Linux 无 systemd（SSH 部署的兜底形态） | `/var/log/mocenter-agent.log` | 无自动轮转，建议配 logrotate |
+
+Windows 服务模式以前只在启动时按 8MB 截断，运行期可无限增长；现在改为运行期按大小轮转，
+把 `info` 常开也不会写满磁盘。
+
+### 排障建议
+
+1. 默认 `error` 下看不到"连接重试"的过程：首次连接失败会记一条 `[ERROR]`，后续重试降为
+   `[WARN]`（默认级别下不显示），恢复后继续正常上报。要观察重连细节，临时调到 `warn`。
+2. 需要完整过程（注册、证书换取、探针、文件分发每片）时临时调到 `info`，排完调回 `error`。
+3. `info` 下文件分发会按分片记录（一个 10MB 文件约 160 行），长时间开 `info` 前先确认磁盘余量。
+4. 修改级别**不需要重启**（远程下发路径）；改配置文件或命令行参数则需重启对应服务。

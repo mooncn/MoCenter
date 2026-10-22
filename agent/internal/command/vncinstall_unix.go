@@ -13,7 +13,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"mocenter/agent/internal/logx"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,7 +66,7 @@ func installX11VNCInteractive(port int, cfg VncConfig) VncInstallResult {
 	if len(missing) > 0 {
 		if msg, ok := installLinuxPkgs(missing); !ok {
 			pkgErr = msg
-			log.Printf("[vnc-install] 依赖安装未完全成功: %s", msg)
+			logx.Infof("[vnc-install] 依赖安装未完全成功: %s", msg)
 		}
 	}
 	if !x11vncAvailable() {
@@ -129,7 +129,7 @@ func installX11VNCService(port int, cfg VncConfig) VncInstallResult {
 	if !x11vncAvailable() {
 		if msg, ok := installLinuxPkgs([]string{"x11vnc"}); !ok {
 			pkgErr = msg
-			log.Printf("[vnc-install] 包管理器安装 x11vnc 失败: %s", msg)
+			logx.Errorf("[vnc-install] 包管理器安装 x11vnc 失败: %s", msg)
 		}
 	}
 	if !x11vncAvailable() {
@@ -447,7 +447,7 @@ func installX11VNCBinary(src string) bool {
 		return false
 	}
 	if !isELFExecutable(src) {
-		log.Printf("[vnc-install] %s 不是 ELF 可执行文件（可能架构不匹配或内容被替换），已拒绝安装", src)
+		logx.Errorf("[vnc-install] %s 不是 ELF 可执行文件（可能架构不匹配或内容被替换），已拒绝安装", src)
 		return false
 	}
 	dst := filepath.Join(homeDir(), ".local", "bin", "x11vnc")
@@ -455,11 +455,11 @@ func installX11VNCBinary(src string) bool {
 	// 单引号包裹只在"路径里没有单引号"时成立，而 HOME 是本机可控变量。
 	// 这里是纯文件操作，本来就不需要 shell。
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		log.Printf("[vnc-install] 创建 %s 失败: %v", filepath.Dir(dst), err)
+		logx.Errorf("[vnc-install] 创建 %s 失败: %v", filepath.Dir(dst), err)
 		return false
 	}
 	if err := copyExecutable(src, dst); err != nil {
-		log.Printf("[vnc-install] 安装 x11vnc 二进制失败: %v", err)
+		logx.Errorf("[vnc-install] 安装 x11vnc 二进制失败: %v", err)
 		return false
 	}
 	_ = os.Remove(src)

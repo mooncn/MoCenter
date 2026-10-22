@@ -3,7 +3,7 @@
 package daemon
 
 import (
-	"log"
+	"mocenter/agent/internal/logx"
 	"os"
 	"os/signal"
 	"sync"
@@ -15,7 +15,7 @@ import (
 // 当 fn 返回（异常退出）时，在短暂延迟后重新调用，实现崩溃自启。
 // 仅当收到 SIGTERM/SIGINT 信号时才真正退出。
 func Supervise(fn func()) {
-	log.Printf("[daemon] 守护进程启动，监视 Agent 主循环")
+	logx.Infof("[daemon] 守护进程启动，监视 Agent 主循环")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
@@ -32,7 +32,7 @@ func Supervise(fn func()) {
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
-							log.Printf("[daemon] Agent 主循环 panic: %v，准备重启", r)
+							logx.Criticalf("[daemon] Agent 主循环 panic: %v，准备重启", r)
 						}
 					}()
 					fn()
@@ -42,7 +42,7 @@ func Supervise(fn func()) {
 				case <-stop:
 					return
 				case <-time.After(3 * time.Second):
-					log.Printf("[daemon] Agent 进程退出，3 秒后自动重启")
+					logx.Infof("[daemon] Agent 进程退出，3 秒后自动重启")
 				}
 			}
 		}
@@ -52,7 +52,7 @@ func Supervise(fn func()) {
 	go func() {
 		defer wg.Done()
 		sig := <-stop
-		log.Printf("[daemon] 收到信号 %v，退出守护进程", sig)
+		logx.Infof("[daemon] 收到信号 %v，退出守护进程", sig)
 		os.Exit(0)
 	}()
 	wg.Wait()

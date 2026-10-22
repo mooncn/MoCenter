@@ -15,7 +15,7 @@ package command
 import (
 	"context"
 	"fmt"
-	"log"
+	"mocenter/agent/internal/logx"
 	"os"
 	"os/exec"
 	"strings"
@@ -40,7 +40,7 @@ func vncInstallWindows(port int, cfg VncConfig) VncInstallResult {
 		if failMsg == "" {
 			failMsg = "服务模式未能就绪"
 		}
-		log.Printf("[vnc-install] 服务模式失败，降级为交互会话模式: %s", failMsg)
+		logx.Warnf("[vnc-install] 服务模式失败，降级为交互会话模式: %s", failMsg)
 		fallback := installInteractiveWindows(port, cfg)
 		if fallback.OK {
 			fallback.Message = "服务模式失败（" + failMsg + "），已降级为交互会话模式（锁屏/登录界面不可见）：" + fallback.Message
@@ -86,7 +86,7 @@ func startInUserSession(exe string) {
 		taskName, quotedExe, taskName, taskName,
 	)
 	if err := exec.Command("cmd.exe", "/c", cmdStr).Run(); err != nil {
-		log.Printf("[vnc-install] schtasks 用户会话启动失败: %v", err)
+		logx.Errorf("[vnc-install] schtasks 用户会话启动失败: %v", err)
 	}
 }
 
@@ -107,10 +107,10 @@ func ensureVncLogonTask(exe string) {
 		taskName, quotedExe,
 	)
 	if err := exec.Command("cmd.exe", "/c", cmdStr).Run(); err != nil {
-		log.Printf("[vnc-install] 创建登录自启任务失败: %v", err)
+		logx.Errorf("[vnc-install] 创建登录自启任务失败: %v", err)
 		return
 	}
-	log.Printf("[vnc-install] 已创建登录自启任务 %s", taskName)
+	logx.Infof("[vnc-install] 已创建登录自启任务 %s", taskName)
 }
 
 // downloadFile 下载文件到目标路径（PowerShell Invoke-WebRequest）。

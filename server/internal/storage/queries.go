@@ -4,7 +4,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"strings"
 	"time"
 )
@@ -563,7 +563,7 @@ func (db *DB) mergeAgentByUUID(agentID, uuid string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交主机合并事务失败: %w", err)
 	}
-	log.Printf("[storage] UUID %s 的 agent_id 由 %s 变更为 %s，已合并为一条记录", uuid, oldID, agentID)
+	logx.Infof("[storage] UUID %s 的 agent_id 由 %s 变更为 %s，已合并为一条记录", uuid, oldID, agentID)
 	return nil
 }
 

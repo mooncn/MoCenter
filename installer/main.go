@@ -28,32 +28,35 @@ import (
 
 // options 安装/卸载参数。
 type options struct {
-	role          string // agent | server | all
-	server        string // Agent 连接的服务端地址
-	agentID       string
-	agentUUID     string // 设备硬件 UUID（设备身份；留空由 Agent 自动探测并持久化）
-	proxyIP       string
-	agentKey      string // Agent 注册预共享密钥（与服务端 agent.key 相同）
-	agentKeyFile  string // 注册凭据所在文件（优先于 agentKey；读后立即删除，见 doInstall）
+	role           string // agent | server | all
+	server         string // Agent 连接的服务端地址
+	agentID        string
+	agentUUID      string // 设备硬件 UUID（设备身份；留空由 Agent 自动探测并持久化）
+	proxyIP        string
+	agentKey       string // Agent 注册预共享密钥（与服务端 agent.key 相同）
+	agentKeyFile   string // 注册凭据所在文件（优先于 agentKey；读后立即删除，见 doInstall）
 	adminUser      string // Server 的登录用户名
 	adminPass      string // Server 的登录密码（已退役：只保留旗标用于给出明确报错，见 resolveAdminPass）
 	adminPassFile  string // Server 登录密码所在文件
 	adminPassStdin bool   // Server 登录密码改从标准输入读一行
-	listen        string // Server 的 Agent TCP 监听
-	httpAddr      string // Server 的 HTTP 监听
-	webDir        string // Server 托管的 Web 静态资源目录
-	installDir    string // 二进制目录
-	dataRoot      string // 数据根目录
-	extra         string // 追加到服务命令行的额外参数
+	listen         string // Server 的 Agent TCP 监听
+	httpAddr       string // Server 的 HTTP 监听
+	webDir         string // Server 托管的 Web 静态资源目录
+	installDir     string // 二进制目录
+	dataRoot       string // 数据根目录
+	extra          string // 追加到服务命令行的额外参数
 	// serverFingerprint 服务端身份公钥指纹（免 CA 文件校验服务端；可选）。
 	serverFingerprint string
 	// serverName 部署身份名（写入服务端 CA，便于区分多套总控；可选）。
 	serverName string
-	force      bool   // 安装/卸载时强制清理既有配置与数据后重来（默认升级模式，保留配置）
-	runExe     string // run 子命令：要拉起的可执行文件（默认按角色推导）
-	runConfig  string // run 子命令：目标进程的配置文件路径
-	purge      bool   // 卸载时是否删除数据
-	keepBins   bool   // 卸载时保留二进制（由外部安装器负责删除时用）
+	// logLevel 运行期日志级别 off/error/warn/info（写入配置 log_level；留空则不写，
+	// Agent 侧按 error、Server 侧按 info 的默认值运行）。不塞进服务命令行。
+	logLevel  string
+	force     bool   // 安装/卸载时强制清理既有配置与数据后重来（默认升级模式，保留配置）
+	runExe    string // run 子命令：要拉起的可执行文件（默认按角色推导）
+	runConfig string // run 子命令：目标进程的配置文件路径
+	purge     bool   // 卸载时是否删除数据
+	keepBins  bool   // 卸载时保留二进制（由外部安装器负责删除时用）
 }
 
 func main() {
@@ -79,6 +82,7 @@ func main() {
 	flag.StringVar(&o.extra, "extra", "", "追加到服务命令行的额外参数")
 	flag.StringVar(&o.serverFingerprint, "server-fingerprint", "", "服务端身份公钥指纹（可选；填了就不需要 CA 文件，也不受服务端换 IP/证书影响）")
 	flag.StringVar(&o.serverName, "server-name", "", "部署身份名（可选；写入服务端 CA，用于区分多套总控）")
+	flag.StringVar(&o.logLevel, "log-level", "", "运行期日志级别 off|error|warn|info（写入配置；留空用默认值：Agent=error、Server=info）")
 	flag.BoolVar(&o.force, "force", false, "安装/卸载时强制清理既有配置与数据后重装（默认升级模式：保留配置）")
 	flag.StringVar(&o.runExe, "exe", "", "run 子命令内部使用：要拉起的可执行文件路径")
 	flag.StringVar(&o.runConfig, "config", "", "run 子命令内部使用：目标进程的配置文件路径")

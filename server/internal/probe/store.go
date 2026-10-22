@@ -16,7 +16,7 @@ package probe
 
 import (
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"strings"
 	"sync"
 	"time"
@@ -98,7 +98,7 @@ func NewStore(db *storage.DB) *Store {
 func (s *Store) loadAgentsFromDB() {
 	rows, err := s.db.LoadAgents()
 	if err != nil {
-		log.Printf("[probe] 从数据库加载主机信息失败: %v", err)
+		logx.Errorf("[probe] 从数据库加载主机信息失败: %v", err)
 		return
 	}
 	merged := 0
@@ -155,9 +155,9 @@ func (s *Store) loadAgentsFromDB() {
 		s.byAgent[row.AgentID] = key
 	}
 	if merged > 0 {
-		log.Printf("[probe] 检测到 %d 条按 agent_id 重复的主机记录，已按 UUID 归并", merged)
+		logx.Infof("[probe] 检测到 %d 条按 agent_id 重复的主机记录，已按 UUID 归并", merged)
 	}
-	log.Printf("[probe] 从数据库恢复了 %d 台主机信息", len(s.devices))
+	logx.Infof("[probe] 从数据库恢复了 %d 台主机信息", len(s.devices))
 }
 
 // SetRemarkFn 注入备注获取函数。
@@ -281,7 +281,7 @@ func (s *Store) UpsertAgent(info *protocol.AgentInfo) {
 				info.LastOfflineAt = adopt.LastOfflineAt
 			}
 			delete(s.devices, k)
-			log.Printf("[probe] 主机 %q 首次上报 UUID %s，已把旧记录（agent_id=%s）归并到该设备",
+			logx.Infof("[probe] 主机 %q 首次上报 UUID %s，已把旧记录（agent_id=%s）归并到该设备",
 				info.Hostname, info.UUID, adopt.AgentID)
 		}
 	}
@@ -301,7 +301,7 @@ func (s *Store) UpsertAgent(info *protocol.AgentInfo) {
 		// agent_id 变更（配置变更 / 重装）：沿用旧 agent_id 的历史指标兜底，
 		// 保证「一台机器一条记录」且趋势图连续。
 		if info.AgentID != old.AgentID {
-			log.Printf("[probe] 设备 %s 的 agent_id 由 %q 变更为 %q，按同一台机器归并",
+			logx.Infof("[probe] 设备 %s 的 agent_id 由 %q 变更为 %q，按同一台机器归并",
 				displayDevice(info), old.AgentID, info.AgentID)
 		}
 	}
@@ -321,7 +321,7 @@ func (s *Store) UpsertAgent(info *protocol.AgentInfo) {
 	if renamedFrom != "" {
 		if err := s.renameRemark(renamedFrom, info.AgentID); err != nil {
 			s.mu.Unlock()
-			log.Printf("[probe] 设备 %s 的 agent_id 改名 %s -> %s 失败，本次改名已放弃（备注未迁移）: %v",
+			logx.Errorf("[probe] 设备 %s 的 agent_id 改名 %s -> %s 失败，本次改名已放弃（备注未迁移）: %v",
 				displayDevice(info), renamedFrom, info.AgentID, err)
 			return
 		}
@@ -352,7 +352,7 @@ func (s *Store) UpsertAgent(info *protocol.AgentInfo) {
 			// 仍在它名下）与新行，下次加载按 UUID 归并时才补救，期间用户看到两台机器。
 			if renamedFrom != "" {
 				if err := s.db.UpdateAgentIdentity(renamedFrom, info.AgentID, info.UUID); err != nil {
-					log.Printf("[probe] 迁移主机身份 (%s -> %s) 失败，跳过本次落库以免产生孤儿记录: %v",
+					logx.Errorf("[probe] 迁移主机身份 (%s -> %s) 失败，跳过本次落库以免产生孤儿记录: %v",
 						renamedFrom, info.AgentID, err)
 					return
 				}
@@ -599,7 +599,7 @@ func (s *Store) persistLatency(p *protocol.ProbeDataReq) {
 		})
 	}
 	if err := s.db.InsertLatencyHistory(rows); err != nil {
-		log.Printf("[probe] 持久化延迟历史失败: %v", err)
+		logx.Errorf("[probe] 持久化延迟历史失败: %v", err)
 	}
 }
 
@@ -649,7 +649,7 @@ func (s *Store) LatencyHistory(agentID string, since time.Time, target string, l
 		if err == nil {
 			return rows
 		}
-		log.Printf("[probe] 查询延迟历史失败，回退内存: %v", err)
+		logx.Errorf("[probe] 查询延迟历史失败，回退内存: %v", err)
 	}
 	// 无数据库（内存模式）：只能给出当前一个点，避免前端完全空白
 	s.mu.RLock()
@@ -712,7 +712,7 @@ func (s *Store) MarkOffline(agentID string) {
 	if s.db != nil {
 		go func() {
 			if err := s.db.UpdateAgentOnline(dbID, false, now); err != nil {
-				log.Printf("[probe] 更新主机离线状态到数据库失败: %v", err)
+				logx.Errorf("[probe] 更新主机离线状态到数据库失败: %v", err)
 			}
 		}()
 	}
@@ -904,7 +904,7 @@ func (s *Store) NetTotalsSince(agentID string, since time.Time) (in, out int64, 
 		if err == nil {
 			return i, o, true
 		}
-		log.Printf("[probe] 统计窗口流量失败，回退内存: %v", err)
+		logx.Errorf("[probe] 统计窗口流量失败，回退内存: %v", err)
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -968,7 +968,7 @@ func (s *Store) HistoryDownsampled(agentID string, since time.Time, maxPoints in
 				}
 				return out
 			}
-			log.Printf("[probe] 降采样查询失败，回退常规查询: %v", qerr)
+			logx.Errorf("[probe] 降采样查询失败，回退常规查询: %v", qerr)
 		}
 	}
 	// 内存回退：直接切片抽稀
@@ -1020,7 +1020,7 @@ func (s *Store) History(agentID string, since time.Time) []*protocol.ProbeDataRe
 			}
 			return out
 		}
-		log.Printf("[probe] 从数据库查询探针历史失败，回退内存: %v", err)
+		logx.Errorf("[probe] 从数据库查询探针历史失败，回退内存: %v", err)
 	}
 
 	s.mu.RLock()
@@ -1074,7 +1074,7 @@ func (s *Store) persistAgent(info *protocol.AgentInfo) {
 		AgentVersion:  info.AgentVersion,
 	}
 	if err := s.db.UpsertAgent(row); err != nil {
-		log.Printf("[probe] 持久化主机信息失败: %v", err)
+		logx.Errorf("[probe] 持久化主机信息失败: %v", err)
 	}
 }
 
@@ -1106,6 +1106,6 @@ func (s *Store) persistProbeHistory(p *protocol.ProbeDataReq) {
 		Load15:        derefFloat(p.Load15),
 	}
 	if err := s.db.InsertProbeHistory(row); err != nil {
-		log.Printf("[probe] 持久化探针历史失败: %v", err)
+		logx.Errorf("[probe] 持久化探针历史失败: %v", err)
 	}
 }

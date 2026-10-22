@@ -13,7 +13,7 @@ package portmap
 
 import (
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"net"
 	"strings"
 	"sync"
@@ -109,7 +109,7 @@ func NewManager(sess *session.Manager, db *storage.DB) *Manager {
 func (m *Manager) loadRulesFromDB() {
 	rows, err := m.db.LoadPortmapRules()
 	if err != nil {
-		log.Printf("[portmap] 从数据库加载规则失败: %v", err)
+		logx.Errorf("[portmap] 从数据库加载规则失败: %v", err)
 		return
 	}
 	for _, row := range rows {
@@ -126,10 +126,10 @@ func (m *Manager) loadRulesFromDB() {
 		m.rules[r.PublicPort] = r
 		if r.Enabled {
 			if err := m.ServeRule(r); err != nil {
-				log.Printf("[portmap] 恢复规则 %d 监听失败: %v", r.PublicPort, err)
+				logx.Errorf("[portmap] 恢复规则 %d 监听失败: %v", r.PublicPort, err)
 				r.Enabled = false
 			} else {
-				log.Printf("[portmap] 恢复规则 %d -> agent=%s:%d", r.PublicPort, r.AgentID, r.LocalPort)
+				logx.Infof("[portmap] 恢复规则 %d -> agent=%s:%d", r.PublicPort, r.AgentID, r.LocalPort)
 			}
 		}
 	}
@@ -287,7 +287,7 @@ func (m *Manager) CreateRule(r *Rule) error {
 		// 起不来就把旧监听还原：否则这次失败的修改会把原本在跑的端口一起弄没
 		if prev != nil {
 			if err2 := m.ServeRule(prev); err2 != nil {
-				log.Printf("[portmap] 规则 %d 修改失败（%v）且旧监听恢复失败，端口已停止对外服务: %v",
+				logx.Errorf("[portmap] 规则 %d 修改失败（%v）且旧监听恢复失败，端口已停止对外服务: %v",
 					r.PublicPort, err, err2)
 			}
 		}
@@ -301,7 +301,7 @@ func (m *Manager) CreateRule(r *Rule) error {
 		m.StopRule(r.PublicPort)
 		if prev != nil {
 			if err2 := m.ServeRule(prev); err2 != nil {
-				log.Printf("[portmap] 规则 %d 因达到上限回滚，且旧监听恢复失败: %v", r.PublicPort, err2)
+				logx.Errorf("[portmap] 规则 %d 因达到上限回滚，且旧监听恢复失败: %v", r.PublicPort, err2)
 			}
 		}
 		return fmt.Errorf("端口映射规则数已达上限（%d 条）", maxRules)
@@ -320,7 +320,7 @@ func (m *Manager) CreateRule(r *Rule) error {
 			SourceIP:   r.SourceIP,
 			CreatedAt:  r.CreatedAt,
 		}); err != nil {
-			log.Printf("[portmap] 规则 %d 持久化失败: %v", r.PublicPort, err)
+			logx.Errorf("[portmap] 规则 %d 持久化失败: %v", r.PublicPort, err)
 		}
 	}
 	return nil
@@ -335,7 +335,7 @@ func (m *Manager) DeleteRule(publicPort int) {
 	// 从 SQLite 删除
 	if m.db != nil {
 		if err := m.db.DeletePortmapRule(publicPort); err != nil {
-			log.Printf("[portmap] 删除规则 %d 持久化失败: %v", publicPort, err)
+			logx.Errorf("[portmap] 删除规则 %d 持久化失败: %v", publicPort, err)
 		}
 	}
 }
@@ -383,7 +383,7 @@ func (m *Manager) DisableRule(publicPort int) {
 	// 更新 SQLite 中的启用状态
 	if m.db != nil {
 		if err := m.db.UpdatePortmapRuleEnabled(publicPort, false); err != nil {
-			log.Printf("[portmap] 停用规则 %d 持久化失败: %v", publicPort, err)
+			logx.Errorf("[portmap] 停用规则 %d 持久化失败: %v", publicPort, err)
 		}
 	}
 }
@@ -414,7 +414,7 @@ func (m *Manager) EnableRule(publicPort int) error {
 	// 更新 SQLite 中的启用状态
 	if m.db != nil {
 		if err := m.db.UpdatePortmapRuleEnabled(publicPort, true); err != nil {
-			log.Printf("[portmap] 启用规则 %d 持久化失败: %v", publicPort, err)
+			logx.Errorf("[portmap] 启用规则 %d 持久化失败: %v", publicPort, err)
 		}
 	}
 	return nil
@@ -442,7 +442,7 @@ func (m *Manager) ServeRule(r *Rule) error {
 		return err
 	}
 	if len(parseSourceIPList(r.SourceIP)) == 0 {
-		log.Printf("[portmap] 警告: 规则 %d (%s:%d) 未设置源 IP 白名单，将对全网开放",
+		logx.Warnf("[portmap] 规则 %d (%s:%d) 未设置源 IP 白名单，将对全网开放",
 			publicPort, r.AgentID, r.LocalPort)
 	}
 	m.mu.Lock()
@@ -479,7 +479,7 @@ func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, r *Rule)
 
 	// 源 IP 白名单：逗号分隔的 IP / CIDR；为空表示不限制
 	if list := parseSourceIPList(r.SourceIP); len(list) > 0 && !auth.AddrAllowed(list, clientConn.RemoteAddr()) {
-		log.Printf("[portmap] 拒绝来自 %s 的连接（不在端口 %d 的源 IP 白名单内）",
+		logx.Errorf("[portmap] 拒绝来自 %s 的连接（不在端口 %d 的源 IP 白名单内）",
 			clientConn.RemoteAddr(), publicPort)
 		return
 	}
@@ -489,7 +489,7 @@ func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, r *Rule)
 		agent = m.sessions.Get(r.AgentID)
 	}
 	if agent == nil {
-		log.Printf("[portmap] 目标 Agent %s 离线，拒绝公网端口 %d", r.AgentID, publicPort)
+		logx.Errorf("[portmap] 目标 Agent %s 离线，拒绝公网端口 %d", r.AgentID, publicPort)
 		return
 	}
 
@@ -520,7 +520,7 @@ func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, r *Rule)
 	if err := agent.Write(protocol.TypeTunnelOpen, open); err != nil {
 		m.removePublic(tunnelID)
 		m.CloseTrack(tunnelID)
-		log.Printf("[portmap] 发送隧道建立请求失败: %v", err)
+		logx.Errorf("[portmap] 发送隧道建立请求失败: %v", err)
 		return
 	}
 
@@ -591,7 +591,7 @@ const mismatchLogInterval = time.Minute
 
 // logMismatch 记录一次"用别人的隧道 ID 回传"，按伪造方 agentID 限频。
 func (m *Manager) logMismatch(from, owner, tunnelID, kind string) {
-	log.Printf("[portmap] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）", from, kind, tunnelID, owner)
+	logx.Infof("[portmap] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）", from, kind, tunnelID, owner)
 	mismatchMu.Lock()
 	defer mismatchMu.Unlock()
 	now := time.Now()

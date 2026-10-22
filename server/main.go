@@ -29,7 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"mocenter/server/internal/logx"
 	"net"
 	"net/http"
 	"net/url"
@@ -69,6 +69,9 @@ import (
 )
 
 func main() {
+	// 服务端默认 info：日志量小，启动信息是排障的第一手材料（Agent 默认 error）。
+	// 显式 -log-level / 配置文件里的 log_level 会覆盖它，见 applyLogLevel。
+	logx.SetLevel(logx.Info)
 	addr := flag.String("listen", ":9000", "Agent TCP 长连接监听地址")
 	httpAddr := flag.String("http", ":8080", "REST API / WebSocket 监听地址")
 	whitelist := flag.String("whitelist", os.Getenv("MOCENTER_WHITELIST"), "IP 白名单，逗号分隔")
@@ -116,6 +119,7 @@ func main() {
 	upgradePubKey := flag.String("upgrade-pubkey", os.Getenv("MOCENTER_UPGRADE_PUBKEY"),
 		"升级包 Ed25519 公钥（hex 或公钥文件路径）：一键部署时写进 Agent 配置，"+
 			"并在下发升级时拦下缺签名的请求。私钥**不**在本机，签包是离线动作")
+	logLevel := flag.String("log-level", os.Getenv("MOCENTER_LOG_LEVEL"), "运行期日志级别：off / error / warn / info（服务端默认 info）")
 	flag.Parse()
 
 	// 空串参数归一（原因见 flags.go）。-vnc-ports 排除在外：它的帮助文本明写
@@ -132,8 +136,10 @@ func main() {
 	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
+		logx.Fatalf("加载配置失败: %v", err)
 	}
+	// 级别在拿到配置后立刻生效：命令行 > 配置文件 > 服务端默认 info。
+	applyLogLevel(*logLevel, cfg)
 	if cfg == nil {
 		cfg = &config.Config{
 			Listen:         *addr,
@@ -165,11 +171,12 @@ func main() {
 			ServerName:            *serverName,
 			VncPorts:              *vncPorts,
 			UpgradePubKey:         *upgradePubKey,
+			LogLevel:              normalizeLogLevel(*logLevel, logx.Info),
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
-			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
+			logx.Warnf("写入配置文件 %s 失败: %v", *configPath, err)
 		} else {
-			log.Printf("已生成配置文件: %s（后续可直接运行 %s）", *configPath, os.Args[0])
+			logx.Infof("已生成配置文件: %s（后续可直接运行 %s）", *configPath, os.Args[0])
 		}
 	} else {
 		// 已有配置：命令行显式参数（非默认值）覆盖配置文件
@@ -313,9 +320,10 @@ func main() {
 			"server-name":              func() { cfg.ServerName = *serverName },
 			"vnc-ports":                func() { cfg.VncPorts = *vncPorts },
 			"upgrade-pubkey":           func() { cfg.UpgradePubKey = *upgradePubKey },
+			"log-level":                func() { cfg.LogLevel = logx.Current().String() },
 		}
 		dirty := false
-		for _, name := range []string{"listen", "http", "whitelist", "trusted-proxies", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "password-file", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl", "require-agent-cert", "disable-shared-agent-key", "admin-tls-days", "server-name", "vnc-ports", "upgrade-pubkey"} {
+		for _, name := range []string{"listen", "http", "whitelist", "trusted-proxies", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "password-file", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl", "require-agent-cert", "disable-shared-agent-key", "admin-tls-days", "server-name", "vnc-ports", "upgrade-pubkey", "log-level"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -323,9 +331,9 @@ func main() {
 		}
 		if dirty {
 			if err := config.Save(*configPath, cfg); err != nil {
-				log.Printf("警告: 更新配置文件 %s 失败: %v", *configPath, err)
+				logx.Warnf("更新配置文件 %s 失败: %v", *configPath, err)
 			} else {
-				log.Printf("已把命令行参数保存到配置文件: %s", *configPath)
+				logx.Infof("已把命令行参数保存到配置文件: %s", *configPath)
 			}
 		}
 	}
@@ -340,13 +348,13 @@ func main() {
 		for _, c := range candidates {
 			if _, err := os.Stat(filepath.Join(c, "index.html")); err == nil {
 				*webDir = c
-				log.Printf("[server] 自动探测到 Web 前端目录: %s", c)
+				logx.Infof("[server] 自动探测到 Web 前端目录: %s", c)
 				break
 			}
 		}
 	}
 
-	log.Printf("[server] %s 启动中（数据目录 %s）", version.Full(), *dataDir)
+	logx.Infof("[server] %s 启动中（数据目录 %s）", version.Full(), *dataDir)
 
 	// 安装包托管目录：默认 <data>/packages。
 	// Agent 一键安装 VNC 时会优先通过既有长连接从这里拉取安装包，
@@ -355,7 +363,7 @@ func main() {
 		*pkgDir = filepath.Join(*dataDir, "packages")
 	}
 	if err := os.MkdirAll(*pkgDir, 0755); err != nil {
-		log.Printf("[server] 创建安装包目录失败 %s: %v", *pkgDir, err)
+		logx.Warnf("[server] 创建安装包目录失败 %s: %v（pkg 下发不可用，其余功能不受影响）", *pkgDir, err)
 	}
 	logAvailablePackages(*pkgDir)
 
@@ -371,13 +379,13 @@ func main() {
 	if agentKeyVal == "" {
 		k, created, err := agentauth.LoadOrCreateKey(agentKeyPath)
 		if err != nil {
-			log.Fatalf("[server] 读取/生成 Agent 注册密钥失败: %v", err)
+			logx.Fatalf("[server] 读取/生成 Agent 注册密钥失败: %v", err)
 		}
 		agentKeyVal, agentKeyCreated = k, created
 	} else if err := os.MkdirAll(*dataDir, 0700); err != nil {
-		log.Printf("[server] 警告: 创建数据目录失败: %v", err)
+		logx.Warnf("[server] 创建数据目录失败: %v", err)
 	} else if err := os.WriteFile(agentKeyPath, []byte(agentKeyVal+"\n"), 0600); err != nil {
-		log.Printf("[server] 警告: 保存 Agent 注册密钥失败: %v", err)
+		logx.Warnf("[server] 保存 Agent 注册密钥失败: %v", err)
 	}
 	verifier := agentauth.NewVerifier(agentKeyVal)
 
@@ -388,7 +396,7 @@ func main() {
 	// "一台一份、一次一用"，TOFU 绑定再挡住"用泄露的共享密钥给别人的 ID 换新生证书"。
 	enrollStore, ensErr := agentauth.NewEnrollStore(filepath.Join(*dataDir, agentauth.EnrollStoreFileName))
 	if ensErr != nil {
-		log.Printf("[server] 警告: 注册令牌存储不可用（%v）—— 本次启动只接受共享注册密钥，"+
+		logx.Warnf("[server] 注册令牌存储不可用（%v）—— 本次启动只接受共享注册密钥，"+
 			"「Agent 接入」页的令牌签发功能将返回错误", ensErr)
 	} else {
 		verifier.SetEnrollStore(enrollStore)
@@ -406,36 +414,36 @@ func main() {
 	}
 	identity, identityCreated, idErr := agentauth.LoadOrCreateIdentity(*dataDir, identityName)
 	if idErr != nil {
-		log.Printf("[server] 警告: 初始化内置 CA 失败: %v（将退回手工证书/明文）", idErr)
+		logx.Warnf("[server] 初始化内置 CA 失败: %v（将退回手工证书/明文）", idErr)
 	} else if identityCreated {
-		log.Printf("[server] 已生成部署身份 CA 并写入 %s（权限 0600）；身份名 %q，指纹 %s",
+		logx.Infof("[server] 已生成部署身份 CA 并写入 %s（权限 0600）；身份名 %q，指纹 %s",
 			filepath.Join(*dataDir, agentauth.CACertFileName), identity.Name(),
 			agentauth.DisplayFingerprint(identity.Fingerprint()))
 	} else {
 		// 身份名以已存在的 CA 为准（改动它会让指纹变化，进而让所有 Agent 需要更新 pin）
 		_ = identityName
-		log.Printf("[server] 部署身份 CA: %s（身份名 %q，指纹 %s）",
+		logx.Infof("[server] 部署身份 CA: %s（身份名 %q，指纹 %s）",
 			filepath.Join(*dataDir, agentauth.CACertFileName), identity.Name(),
 			agentauth.DisplayFingerprint(identity.Fingerprint()))
 	}
 
 	if agentKeyCreated {
-		log.Printf("[server] 已生成 Agent 注册密钥并写入 %s（权限 0600）", agentKeyPath)
+		logx.Infof("[server] 已生成 Agent 注册密钥并写入 %s（权限 0600）", agentKeyPath)
 	}
 	switch {
 	case !verifier.Enabled():
 		if *disableSharedAgentKey {
-			log.Fatalf("[server] 已要求「只接受一次性注册令牌」，但令牌存储不可用（见上方警告），" +
+			logx.Fatalf("[server] 已要求「只接受一次性注册令牌」，但令牌存储不可用（见上方警告），" +
 				"且共享密钥路径已关闭 —— 没有任何可用的注册凭据，拒绝启动")
 		}
-		log.Printf("[server] 警告: Agent 注册鉴权已关闭（-allow-unauthenticated-agents）——"+
+		logx.Warnf("[server] Agent 注册鉴权已关闭（-allow-unauthenticated-agents）——"+
 			"任何能连通 %s 的主机都可注册为 Agent 或冒用他人 AgentID", *addr)
 	case !verifier.SharedKeyEnabled():
-		log.Printf("[server] Agent 注册鉴权已启用：**仅接受 per-agent 一次性注册令牌**" +
+		logx.Infof("[server] Agent 注册鉴权已启用：**仅接受 per-agent 一次性注册令牌**" +
 			"（共享注册密钥路径已由 -disable-shared-agent-key 关闭）。在「Agent 接入」页为每台主机签发令牌，" +
 			"或调用 POST /api/enroll/tokens")
 	default:
-		log.Printf("[server] Agent 注册鉴权已启用。推荐做法：在 Web 控制台「Agent 接入」页为每台主机签发"+
+		logx.Infof("[server] Agent 注册鉴权已启用。推荐做法：在 Web 控制台「Agent 接入」页为每台主机签发"+
 			"**一次性注册令牌**（一台一份、用后即废），填进该机的 agent_key / enrollment_secret；"+
 			"当前仍同时接受部署级共享注册密钥（指纹 %s，来自 %s 或 -agent-key），"+
 			"它是一把钥匙认全网 —— 泄露任一台即可冒名注册任意主机，"+
@@ -458,24 +466,24 @@ func main() {
 	singleKey := winapp.SingletonKey("Server", *configPath)
 	release, ok := winapp.AcquireSingleton(singleKey, *configPath)
 	if !ok {
-		log.Fatalf("已有一个使用同一配置(%s)的 Server 在运行，本次启动终止（%s）",
+		logx.Fatalf("已有一个使用同一配置(%s)的 Server 在运行，本次启动终止（%s）",
 			*configPath, winapp.DescribeSingleton(singleKey, *configPath))
 	}
 	defer release()
-	log.Printf("[server] 已取得单实例锁：%s", winapp.DescribeSingleton(singleKey, *configPath))
+	logx.Infof("[server] 已取得单实例锁：%s", winapp.DescribeSingleton(singleKey, *configPath))
 
 	// 打开 SQLite 持久化存储
 	dbPath := filepath.Join(*dataDir, "mocenter.db")
 	db, err := storage.Open(dbPath)
 	if err != nil {
-		log.Fatalf("[server] 打开 SQLite 数据库失败: %v", err)
+		logx.Fatalf("[server] 打开 SQLite 数据库失败: %v", err)
 	}
 	defer db.Close()
-	log.Printf("[server] SQLite 数据库: %s", dbPath)
+	logx.Infof("[server] SQLite 数据库: %s", dbPath)
 
 	// 初始化内置黑名单规则（幂等）
 	if err := db.InitDefaultBlacklist(route.DefaultBlacklistPatterns); err != nil {
-		log.Printf("[server] 初始化内置黑名单失败: %v", err)
+		logx.Warnf("[server] 初始化内置黑名单失败: %v（黑名单功能本次不可用）", err)
 	}
 
 	sess := session.NewManager()
@@ -485,12 +493,12 @@ func main() {
 	// 无外网部署下的"地区全空"问题。加载失败只告警并降级，不影响启动。
 	if strings.TrimSpace(*mmdbPath) != "" {
 		if err := geoResolver.SetMMDB(*mmdbPath); err != nil {
-			log.Printf("[geo] 离线 GeoIP 库加载失败（将降级使用外部接口）: %v", err)
+			logx.Warnf("[geo] 离线 GeoIP 库加载失败（将降级使用外部接口）: %v", err)
 		} else if geoResolver.MMDBLoaded() {
-			log.Printf("[geo] 离线 GeoIP 已启用: %s（本地解析优先，未命中才走外部接口）", geoResolver.MMDBPath())
+			logx.Infof("[geo] 离线 GeoIP 已启用: %s（本地解析优先，未命中才走外部接口）", geoResolver.MMDBPath())
 		}
 	} else {
-		log.Printf("[geo] 未配置离线 GeoIP 库（-mmdb / 配置项 mmdb_path）；地区解析走外部接口，" +
+		logx.Warnf("[geo] 未配置离线 GeoIP 库（-mmdb / 配置项 mmdb_path）；地区解析走外部接口，" +
 			"无外网或接口限流时可能出现「地区不显示」。可下载 GeoLite2-Country.mmdb 后配置该项")
 	}
 	store.SetGeoResolver(geoResolver)
@@ -502,7 +510,7 @@ func main() {
 	// 公开站点展示配置（Issue #5）：默认**关闭**，升级安装不会因本功能对外暴露主机信息。
 	siteCfg := siteconfig.NewStore(filepath.Join(*dataDir, "public-site.json"))
 	if err := siteCfg.Load(); err != nil {
-		log.Printf("警告: 加载公开站点配置失败（按默认=关闭处理）: %v", err)
+		logx.Warnf("加载公开站点配置失败（按默认=关闭处理）: %v", err)
 	}
 	authz := auth.NewAuth(wl)
 	authz.SetTokenTTL(*tokenTTL)
@@ -524,7 +532,7 @@ func main() {
 	// —— 结果是启动时读口令文件（文件已删/权限变化就启动失败），
 	// 而且看起来像"账号没被记住"。
 	if err := userMgr.Load(); err != nil {
-		log.Fatalf("加载账号文件 %s 失败: %v", filepath.Join(*dataDir, "users.json"), err)
+		logx.Fatalf("加载账号文件 %s 失败: %v", filepath.Join(*dataDir, "users.json"), err)
 	}
 
 	if pf := strings.TrimSpace(*passwordFile); pf != "" {
@@ -532,23 +540,23 @@ func main() {
 			// 已有账号：**不读、也不校验**口令文件。读取会因权限/内容问题
 			// 在"其实用不到它"的机器上导致启动失败；而即使读到也不会生效 ——
 			// 账号以 users.json 里的哈希为准，这里只提示可以删掉这个文件了。
-			log.Printf("已存在账号，忽略初始口令文件 %s（该文件仅在首次创建账号时使用，可安全删除）", pf)
+			logx.Warnf("已存在账号，忽略初始口令文件 %s（该文件仅在首次创建账号时使用，可安全删除）", pf)
 		} else {
 			pw, ferr := readPasswordFile(pf)
 			if ferr != nil {
-				log.Fatalf("读取初始口令文件 %s 失败: %v（该文件应为仅 root 可读的 0600 文件）", pf, ferr)
+				logx.Fatalf("读取初始口令文件 %s 失败: %v（该文件应为仅 root 可读的 0600 文件）", pf, ferr)
 			}
 			*password = pw
-			log.Printf("已从口令文件 %s 读取初始口令（仅本次创建账号使用，登录后请立即修改并删除该文件）", pf)
+			logx.Infof("已从口令文件 %s 读取初始口令（仅本次创建账号使用，登录后请立即修改并删除该文件）", pf)
 		}
 	}
 
 	if err := userMgr.InitFromFlags(*user, *password, *totpSecret); err != nil {
 		if errors.Is(err, auth.ErrInitPasswordRequired) {
 			// 提供了 -user 但缺少 -password：给出明确提示，避免静默生成空密码坏账号
-			log.Printf("警告: 已指定 -user %q 但未提供 -password，未创建账号。请补充 -password 后重启。", *user)
+			logx.Warnf("已指定 -user %q 但未提供 -password，未创建账号。请补充 -password 后重启。", *user)
 		} else {
-			log.Printf("警告: 初始化用户失败: %v", err)
+			logx.Warnf("初始化用户失败: %v", err)
 		}
 	}
 	// 若尚无任何账号，则创建初始账号（**不再使用固定弱口令** admin/123456 ——
@@ -564,22 +572,22 @@ func main() {
 			defPass = randPassword(16)
 		}
 		if err := userMgr.UpsertUser(defUser, defPass, *totpSecret); err != nil {
-			log.Printf("警告: 创建默认账号失败: %v", err)
+			logx.Warnf("创建默认账号失败: %v", err)
 		} else if strings.TrimSpace(*password) == "" {
 			pwFile := filepath.Join(*dataDir, "initial-password.txt")
 			_ = os.MkdirAll(*dataDir, 0700)
 			body := fmt.Sprintf("账号: %s\n初始密码: %s\n生成时间: %s\n\n请登录后立即在「账号设置」修改密码，随后删除本文件。\n",
 				defUser, defPass, time.Now().Format("2006-01-02 15:04:05"))
 			if werr := os.WriteFile(pwFile, []byte(body), 0600); werr != nil {
-				log.Printf("已创建初始账号 %s，但初始密码写入 %s 失败: %v", defUser, pwFile, werr)
+				logx.Errorf("已创建初始账号 %s，但初始密码写入 %s 失败: %v", defUser, pwFile, werr)
 			} else {
-				log.Printf("已创建初始账号 %s，初始密码已写入 %s（权限 0600，请查看后删除）", defUser, pwFile)
+				logx.Infof("已创建初始账号 %s，初始密码已写入 %s（权限 0600，请查看后删除）", defUser, pwFile)
 			}
 			if !winapp.IsWindowsService() {
-				log.Printf(">>> 初始账号 %s / %s （请登录后立即修改密码） <<<", defUser, defPass)
+				logx.Infof(">>> 初始账号 %s / %s （请登录后立即修改密码） <<<", defUser, defPass)
 			}
 		} else {
-			log.Printf("已创建默认账号 %s", defUser)
+			logx.Infof("已创建默认账号 %s", defUser)
 		}
 	}
 	// 修复历史版本因缺少 -password 而误建的空密码账号：改用**随机口令**（不再固定 123456）。
@@ -587,13 +595,13 @@ func main() {
 		for _, name := range broken {
 			pw := randPassword(16)
 			if err := userMgr.SetPassword(name, pw); err != nil {
-				log.Printf("警告: 修复账号 %s 失败: %v", name, err)
+				logx.Warnf("修复账号 %s 失败: %v", name, err)
 				continue
 			}
 			if !winapp.IsWindowsService() {
-				log.Printf("已修复历史空密码账号 %s，临时密码：%s（请登录后立即修改）", name, pw)
+				logx.Infof("已修复历史空密码账号 %s，临时密码：%s（请登录后立即修改）", name, pw)
 			} else {
-				log.Printf("已修复历史空密码账号 %s，临时密码见 %s", name,
+				logx.Infof("已修复历史空密码账号 %s，临时密码见 %s", name,
 					filepath.Join(*dataDir, "initial-password.txt"))
 			}
 		}
@@ -608,14 +616,14 @@ func main() {
 	vncMgr := vnc.NewMgr(sess)
 	// 端口闸门在启动时生效：配置写错应当是"起不来"，而不是"以为已收紧、实际还在放行"。
 	if err := vncMgr.SetAllowedPorts(*vncPorts); err != nil {
-		log.Fatalf("VNC 端口配置无效: %v", err)
+		logx.Fatalf("VNC 端口配置无效: %v", err)
 	}
 	// 生效范围要在启动日志里看得见：闸门放开后如果只体现在"某个端口连得上"，
 	// 运维很难察觉它已经不在默认状态了。
 	if spec := strings.TrimSpace(*vncPorts); spec != "" {
-		log.Printf("[vnc] 隧道目标端口闸门: %s", spec)
+		logx.Infof("[vnc] 隧道目标端口闸门: %s", spec)
 	} else {
-		log.Printf("[vnc] 隧道目标端口闸门已放开（任意端口），建议用 -vnc-ports 收回 RFB 区间")
+		logx.Infof("[vnc] 隧道目标端口闸门已放开（任意端口），建议用 -vnc-ports 收回 RFB 区间")
 	}
 
 	hub := ws.NewHub()
@@ -624,7 +632,7 @@ func main() {
 	// 加载失败只降级本功能：主机监控/命令/桌面等既有能力不应因一份分享文件损坏而停服。
 	shareStore, shareErr := share.NewStore(filepath.Join(*dataDir, share.StoreFileName))
 	if shareErr != nil {
-		log.Printf("[server] 警告: 分享存储不可用（%v）—— 本次启动「分享控制」将返回错误", shareErr)
+		logx.Warnf("[server] 分享存储不可用（%v）—— 本次启动「分享控制」将返回错误", shareErr)
 		shareStore = nil
 	}
 	shareSvc := &shareAPI{
@@ -646,10 +654,10 @@ func main() {
 	// 候选主机名离线算编号、再用 samples 接口的 404/200 反查"哪些机器在册"。
 	nodeKeys, nodeKeysCreated, nkErr := publicview.LoadNodeKeys(filepath.Join(*dataDir, publicview.NodeKeyFileName))
 	if nkErr != nil {
-		log.Fatalf("[server] 读取/生成公开节点编号密钥失败: %v", nkErr)
+		logx.Fatalf("[server] 读取/生成公开节点编号密钥失败: %v", nkErr)
 	}
 	if nodeKeysCreated {
-		log.Printf("[server] 已生成公开节点编号密钥 %s（0600）。删除它即可整体更换 node 编号：公开页的历史数据不受影响（内部仍按 agent_id 存），但已分享的 /public/node/… 链接会全部失效",
+		logx.Infof("[server] 已生成公开节点编号密钥 %s（0600）。删除它即可整体更换 node 编号：公开页的历史数据不受影响（内部仍按 agent_id 存），但已分享的 /public/node/… 链接会全部失效",
 			filepath.Join(*dataDir, publicview.NodeKeyFileName))
 	}
 	pub := &publicSite{
@@ -772,7 +780,7 @@ func main() {
 	mux.HandleFunc("/api/vnc/install", vncInstallHandler(vncMgr, authz, router))
 	mux.HandleFunc("/api/vnc/status", vncStatusHandler(vncMgr, authz))
 	mux.HandleFunc("/api/vnc/password", vncPasswordHandler(vncMgr.ReadPassword, authz, router))
-	mux.HandleFunc("/api/agents", agentsHandler(store, authz))
+	mux.HandleFunc("/api/agents", agentsHandler(store, sess, authz))
 	mux.HandleFunc("/api/agents/history", historyHandler(store, authz))
 	// 延迟监测（ICMP/TCP/HTTP）：查询历史曲线 + 下发/查看探测目标
 	mux.HandleFunc("/api/latency", latencyHandler(store, authz))
@@ -846,6 +854,7 @@ func main() {
 			Command:    summary, Result: "ok", Category: "op",
 		})
 	}
+	mux.HandleFunc("/api/agents/log-level", agentLogLevelHandler(sess, authz, siteAudit))
 	mux.HandleFunc("/api/site/config", siteConfigHandler(siteCfg, authz, siteAudit))
 	mux.HandleFunc("/api/site/config/reset", siteConfigResetHandler(siteCfg, authz, siteAudit))
 	mux.HandleFunc("/api/site/hosts", siteHostOptionsHandler(store, authz))
@@ -891,15 +900,15 @@ func main() {
 	}), authz, siteAudit))
 
 	if siteCfg.Get().Enabled {
-		log.Printf("[server] 公开站点已启用：%s（字段开关见 后台 → 展示配置）", publicAPIBase)
+		logx.Infof("[server] 公开站点已启用：%s（字段开关见 后台 → 展示配置）", publicAPIBase)
 	} else {
-		log.Printf("[server] 公开站点未启用（默认关闭）；如需对外展示运行指标，请在 Web 后台「展示配置」中开启")
+		logx.Warnf("[server] 公开站点未启用（默认关闭）；如需对外展示运行指标，请在 Web 后台「展示配置」中开启")
 	}
 
 	// 可选：托管 Web 前端静态资源（SPA 回退到 index.html）
 	if *webDir != "" {
 		serveSPA(mux, *webDir)
-		log.Printf("[server] 托管 Web 静态资源: %s", *webDir)
+		logx.Infof("[server] 托管 Web 静态资源: %s", *webDir)
 	}
 
 	// 反代下的真实客户端地址（L-7）：只在最外层做一次归一，让白名单、限速、登录退避、
@@ -907,16 +916,16 @@ func main() {
 	// 未配置 -trusted-proxies 时 proxies 为空，这里直接返回原 handler —— 行为与从前一致。
 	proxies, pxErr := auth.ParseProxyCIDRs(*trustedProxies)
 	if pxErr != nil {
-		log.Fatalf("[server] -trusted-proxies 无法解析: %v（应形如 127.0.0.1,10.0.0.0/8）", pxErr)
+		logx.Fatalf("[server] -trusted-proxies 无法解析: %v（应形如 127.0.0.1,10.0.0.0/8）", pxErr)
 	}
 	webHandler := auth.TrustProxyClients(proxies, securityHeaders(mux))
 	if len(proxies) > 0 {
-		log.Printf("[server] 已按可信代理还原客户端地址（网段: %s）；"+
+		logx.Infof("[server] 已按可信代理还原客户端地址（网段: %s）；"+
 			"X-Forwarded-For 只有来自这些网段的连接才会被采信", *trustedProxies)
 	} else if *whitelist != "" {
 		// 白名单 + 反代是最容易配坏的组合：此时所有访客都落在代理那一个 IP 上，
 		// 白名单要么整体放行、要么把后台关死，而现象只表现为"偶发 403"。
-		log.Printf("[server] 提示: 已配置 IP 白名单但未配置 -trusted-proxies；"+
+		logx.Warnf("[server] 已配置 IP 白名单但未配置 -trusted-proxies；"+
 			"若本站在反向代理之后，白名单/限速只能看到代理地址 %s。请把代理网段填进 -trusted-proxies", *whitelist)
 	}
 
@@ -939,12 +948,12 @@ func main() {
 				hosts := adminCertHosts(addr, *serverName)
 				cert, err := identity.NewAdminCert(hosts)
 				if err == nil {
-					log.Printf("[server] Web 控制台使用内置 CA 自动签发的临时证书（%d 天，SAN: %v）；"+
+					logx.Infof("[server] Web 控制台使用内置 CA 自动签发的临时证书（%d 天，SAN: %v）；"+
 						"浏览器会提示自签名证书，接受即可；如需受信任证书请配置 -web-tls-cert/-web-tls-key",
 						*adminTLSDays, hosts)
 					return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, false, nil
 				}
-				log.Printf("[server] 警告: 生成 Web 控制台临时证书失败: %v", err)
+				logx.Warnf("[server] 生成 Web 控制台临时证书失败: %v", err)
 			}
 			return nil, false, nil
 		}
@@ -962,14 +971,14 @@ func main() {
 			if tlsCfg != nil {
 				ln = tls.NewListener(ln, tlsCfg)
 				if trusted {
-					log.Printf("[server] REST API / Web 控制台监听 %s（TLS）", addr)
+					logx.Infof("[server] REST API / Web 控制台监听 %s（TLS）", addr)
 				} else {
-					log.Printf("[server] REST API / Web 控制台监听 %s（TLS，自签名证书；浏览器首次访问需确认信任）", addr)
+					logx.Infof("[server] REST API / Web 控制台监听 %s（TLS，自签名证书；浏览器首次访问需确认信任）", addr)
 				}
 			} else {
-				log.Printf("[server] REST API / Web 控制台监听 %s（**明文 HTTP**）", addr)
+				logx.Infof("[server] REST API / Web 控制台监听 %s（**明文 HTTP**）", addr)
 				if !isLoopbackAddr(addr) {
-					log.Printf("[server] 警告: Web 控制台未启用 TLS，登录口令与 Token 将明文传输。" +
+					logx.Warnf("[server] Web 控制台未启用 TLS，登录口令与 Token 将明文传输。" +
 						"请去掉 -admin-tls-days=0，或配置 -web-tls-cert/-web-tls-key，或确保只通过 TLS 反向代理提供")
 				}
 			}
@@ -979,7 +988,7 @@ func main() {
 		// 启动阶段探测一次公网 IP：写进证书 SAN，也作为监听配置的默认主机。
 		if publicIP := detectPublicIP(); publicIP != "" {
 			setPublicIP(publicIP)
-			log.Printf("[server] 探针到本机公网 IP %s，已加入服务端证书 SAN", publicIP)
+			logx.Infof("[server] 探针到本机公网 IP %s，已加入服务端证书 SAN", publicIP)
 		}
 
 		// buildAgent 创建 Agent TCP 监听（含 TLS/mTLS 包装）。
@@ -1005,7 +1014,7 @@ func main() {
 					return nil, certErr
 				}
 				agentChannelTLS.Store(false)
-				log.Printf("[server] 警告: 自动生成 Agent 通道证书失败（%v），该通道为明文传输", certErr)
+				logx.Warnf("[server] 自动生成 Agent 通道证书失败（%v），该通道为明文传输", certErr)
 				return ln, nil
 			}
 			agentChannelTLS.Store(true)
@@ -1032,18 +1041,18 @@ func main() {
 					// 内置 CA 的证书同样被接受（Agent 换取来的证书由内置 CA 签发）
 					pool.AddCert(identity.Authority())
 				}
-				log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（校验客户端证书，CA: %s）", *caCert)
+				logx.Infof("[server] Agent TCP 已启用 mTLS 双向认证（校验客户端证书，CA: %s）", *caCert)
 				return tls.NewListener(ln, tlsCfg), nil
 			}
 			tlsLn := tls.NewListener(ln, identity.CATLSConfig(&agentCert))
 			if noClientCert {
-				log.Printf("[server] Agent TCP 已启用 TLS；允许无证书的 Agent 用注册密钥现场换取证书（换取后必须携带）")
+				logx.Infof("[server] Agent TCP 已启用 TLS；允许无证书的 Agent 用注册密钥现场换取证书（换取后必须携带）")
 			} else {
-				log.Printf("[server] Agent TCP 已启用 mTLS 双向认证（内置 CA: %s，指纹 %s）",
+				logx.Infof("[server] Agent TCP 已启用 mTLS 双向认证（内置 CA: %s，指纹 %s）",
 					identity.Name(), agentauth.DisplayFingerprint(identity.Fingerprint()))
 			}
 			if usingAutoCert {
-				log.Printf("[server] Agent 通道使用内置 CA 自动签发的服务端证书（SAN: %v）；无需运维准备证书，换用自有证书可加 -tls-cert/-tls-key",
+				logx.Infof("[server] Agent 通道使用内置 CA 自动签发的服务端证书（SAN: %v）；无需运维准备证书，换用自有证书可加 -tls-cert/-tls-key",
 					agentCertHosts)
 			} else {
 				// 运维用 -tls-cert 提供的证书：其 SAN 决定 Agent 能否用 -ca-cert 校验通过。
@@ -1064,7 +1073,7 @@ func main() {
 			buildHTTP:  buildHTTP,
 		}
 		if err := listeners.Start(*addr, *httpAddr); err != nil {
-			log.Fatalf("[server] %v", err)
+			logx.Fatalf("[server] %v", err)
 		}
 	}
 
@@ -1073,12 +1082,12 @@ func main() {
 	if winapp.IsWindowsService() {
 		logPath := filepath.Join(filepath.Dir(*configPath), "logs", serverServiceName+".log")
 		if err := winapp.RedirectLogToFile(logPath); err != nil {
-			log.Printf("警告: 重定向服务日志到 %s 失败: %v", logPath, err)
+			logx.Warnf("重定向服务日志到 %s 失败: %v", logPath, err)
 		} else {
-			log.Printf("[server] 服务模式启动，日志输出到 %s", logPath)
+			logx.Infof("[server] 服务模式启动，日志输出到 %s", logPath)
 		}
 		if err := winapp.RunAsService(serverServiceName, start, func() { os.Exit(0) }); err != nil {
-			log.Fatalf("以 Windows 服务方式运行失败: %v", err)
+			logx.Fatalf("以 Windows 服务方式运行失败: %v", err)
 		}
 		return
 	}
@@ -1120,7 +1129,7 @@ func rejectUnownedCommand(router *route.Router, c *session.Conn, commandID, kind
 	if c != nil {
 		agentID = c.GetAgentID()
 	}
-	log.Printf("[server] 丢弃来自 %s 的%s：command_id=%q 从未下发给该连接（身份与归属不符）",
+	logx.Infof("[server] 丢弃来自 %s 的%s：command_id=%q 从未下发给该连接（身份与归属不符）",
 		agentID, kind, commandID)
 
 	cmdRejectMu.Lock()
@@ -1250,7 +1259,7 @@ func logCertSANWarning(cert tls.Certificate, listenAddr string, hosts []string) 
 	for _, ip := range leaf.IPAddresses {
 		san = append(san, ip.String())
 	}
-	log.Printf("[server] Agent 通道使用手工指定的证书（SAN: %v）", san)
+	logx.Infof("[server] Agent 通道使用手工指定的证书（SAN: %v）", san)
 
 	// 只在"证书里的地址"完全覆盖不到本机实际地址"时告警：说明 Agent 用这些地址
 	// 连接（含 -ca-cert 校验）必然失败。
@@ -1273,7 +1282,7 @@ func logCertSANWarning(cert tls.Certificate, listenAddr string, hosts []string) 
 		return
 	}
 	sort.Strings(missing)
-	log.Printf("[server] 警告: 该证书的 SAN 不含本机地址 %v。"+
+	logx.Warnf("[server] 该证书的 SAN 不含本机地址 %v。"+
 		"Agent 若用这些地址连接并用 -ca-cert 校验服务端证书，会报 "+
 		"\"x509: certificate is valid for ..., not <地址>\"。重签方式（自动按本机公网 IP 写入 SAN）: "+
 		"cd scripts/signcert && go run . -ip %s -server-config <服务端配置文件>；或给 Agent 配 server_fingerprint 免 CA 校验",
@@ -1440,7 +1449,7 @@ func sendEnrollRequired(conn net.Conn, identity *agentauth.Identity) {
 	if err := json.NewEncoder(conn).Encode(protocol.Envelope{
 		Type: protocol.TypeEnrollRequired, Data: mustJSON(resp),
 	}); err != nil {
-		log.Printf("[server] 通知 %s 重新换取证书失败: %v", conn.RemoteAddr(), err)
+		logx.Errorf("[server] 通知 %s 重新换取证书失败: %v", conn.RemoteAddr(), err)
 	}
 }
 
@@ -1644,7 +1653,7 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 	}
 	if credSource == agentauth.CredAnon {
 		// 显式匿名接入必须留痕：事后排查看得出"这台主机的身份是没有凭据支撑的"。
-		log.Printf("[server] 警告: 以**无凭据**方式为 Agent %q 签发证书（服务端开启了 "+
+		logx.Warnf("[server] 以**无凭据**方式为 Agent %q 签发证书（服务端开启了 "+
 			"-allow-unauthenticated-agents，来自 %s）；该身份不可作为信任依据，"+
 			"请为该主机签发一次性注册令牌后重新接入", er.AgentID, tlsInfo(conn))
 	}
@@ -1682,10 +1691,10 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 	resp.ServerFingerprint = identity.Fingerprint()
 	resp.Identity = identity.Name()
 	resp.CredSource = credSource
-	log.Printf("[server] 已为 Agent %q 签发客户端证书（凭证类型 %s，来自 %s）", er.AgentID, credSource, tlsInfo(conn))
+	logx.Infof("[server] 已为 Agent %q 签发客户端证书（凭证类型 %s，来自 %s）", er.AgentID, credSource, tlsInfo(conn))
 	if credSource == agentauth.CredSharedKey {
 		// 双轨过渡期的提醒：还靠"一把密钥认全网"上来的主机，是 C-1 未收口的部分。
-		log.Printf("[server] 注意: Agent %q 用**部署级共享注册密钥**换取了证书。"+
+		logx.Infof("[server] 注意: Agent %q 用**部署级共享注册密钥**换取了证书。"+
 			"该密钥泄露一台即等于全网身份泄露；请为每台主机改用一次性注册令牌"+
 			"（Web 控制台「Agent 接入」页签发，或 POST /api/enroll/tokens），"+
 			"全部迁移完成后加 -disable-shared-agent-key 彻底关闭此路径", er.AgentID)
@@ -1713,7 +1722,7 @@ func verifyOnlineRegistration(verifier *agentauth.Verifier, info protocol.AgentI
 
 // rejectEnrollment 记录一次被拒的证书换发（日志 + 审计）。
 func rejectEnrollment(router *route.Router, conn net.Conn, agentID, reason string) {
-	log.Printf("[server] 拒绝为 Agent %q 换发证书: %s（来自 %s）", agentID, reason, conn.RemoteAddr())
+	logx.Errorf("[server] 拒绝为 Agent %q 换发证书: %s（来自 %s）", agentID, reason, conn.RemoteAddr())
 	if router == nil {
 		return
 	}
@@ -1748,7 +1757,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 	for sc.Scan() {
 		var env protocol.Envelope
 		if err := json.Unmarshal(sc.Bytes(), &env); err != nil {
-			log.Printf("[server] decode error from %s: %v", conn.RemoteAddr(), err)
+			logx.Infof("[server] decode error from %s: %v", conn.RemoteAddr(), err)
 			continue
 		}
 		// 换取客户端证书：允许在**尚无证书**的 TLS 连接上发起（这正是它的用途）。
@@ -1778,7 +1787,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			if identity != nil && identity.CertSignedByThisCA(peer) {
 				sessConn.CertCN = peer.Subject.CommonName
 			} else {
-				log.Printf("[server] 拒绝来自 %s 的连接：客户端证书 CN=%q 不是本套 CA（%s）签发的"+
+				logx.Infof("[server] 拒绝来自 %s 的连接：客户端证书 CN=%q 不是本套 CA（%s）签发的"+
 					"（服务端换过 CA？请让该 Agent 删除 creds/ 后用注册密钥重新换取，"+
 					"或把新指纹填进它的 server_fingerprint）",
 					conn.RemoteAddr(), peer.Subject.CommonName, identityNameOf(identity))
@@ -1791,7 +1800,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			}
 		}
 		if !allowNoCert && sessConn.CertCN == "" {
-			log.Printf("[server] 拒绝未携带有效客户端证书的连接（-require-agent-cert）：%s（来自: %s）。"+
+			logx.Errorf("[server] 拒绝未携带有效客户端证书的连接（-require-agent-cert）：%s（来自: %s）。"+
 				"新装 Agent 请先在不带该开关的情况下完成一次证书换取，或为其预置 -client-cert/-client-key",
 				"该 Agent 尚未持有证书", tlsInfo(conn))
 			return
@@ -1805,13 +1814,13 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			continue
 		}
 		if !validAgentID(info.AgentID) {
-			log.Printf("[server] 拒绝注册（agent_id 非法或为空）: %s", conn.RemoteAddr())
+			logx.Errorf("[server] 拒绝注册（agent_id 非法或为空）: %s", conn.RemoteAddr())
 			return
 		}
 		// 身份来自连接的客户端证书（若携带）时，以证书为准；
 		// 否则要求报文里的 HMAC 证明（自报身份 + 持有注册密钥）。
 		if sessConn.CertCN != "" && sessConn.CertCN != info.AgentID {
-			log.Printf("[server] 拒绝 Agent %q 注册: 客户端证书身份为 %q，与自报身份不符（来自 %s）",
+			logx.Errorf("[server] 拒绝 Agent %q 注册: 客户端证书身份为 %q，与自报身份不符（来自 %s）",
 				info.AgentID, sessConn.CertCN, tlsInfo(conn))
 			return
 		}
@@ -1824,7 +1833,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		if sessConn.CertCN == "" {
 			if err := verifyOnlineRegistration(verifier, info, allowAnon); err != nil {
 				// 只写日志、不写审计库：这里的内容来自未认证方，写库会被灌垃圾
-				log.Printf("[server] 拒绝 Agent %q 注册: %v（来自 %s）", info.AgentID, err, conn.RemoteAddr())
+				logx.Errorf("[server] 拒绝 Agent %q 注册: %v（来自 %s）", info.AgentID, err, conn.RemoteAddr())
 				return
 			}
 		}
@@ -1836,7 +1845,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			// 只写日志、不写审计库：内容与来源都由未可信的一方给出。
 			// 成因有两种：① 别台机器冒用了这个身份；② 本机换了硬件后 UUID 变了。
 			// 两者都按"已绑定值"处理，运维可从日志里的两个值判断是哪一种。
-			log.Printf("[server] Agent %s 上报的设备身份与已绑定值不符：自报 %q，按已绑定的 %q 处理"+
+			logx.Infof("[server] Agent %s 上报的设备身份与已绑定值不符：自报 %q，按已绑定的 %q 处理"+
 				"（若确为该机换了 UUID，请在主机列表删除该记录后让 Agent 重新上线）",
 				info.AgentID, logSafe(info.UUID), logSafe(trustedUUID))
 		}
@@ -1855,18 +1864,18 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		// 反过来会在「新连接被拒绝」时误杀仍在服务的旧连接。
 		old, accepted := sess.Upsert(info.AgentID, sessConn)
 		if !accepted {
-			log.Printf("[server] 拒绝 Agent %s 重复注册：该 ID 已有活跃连接（正在被 %s 使用）",
+			logx.Errorf("[server] 拒绝 Agent %s 重复注册：该 ID 已有活跃连接（正在被 %s 使用）",
 				info.AgentID, old.RemoteAddr)
 			return
 		}
 		// 新连接已接入，再顶掉同一设备（UUID）下的旧会话：此时旧连接是被"自己"
 		// 替换的，无需标离线（否则会把刚上线的新连接状态冲掉）。
 		for _, oldID := range sess.ReplaceByUUID(info.UUID, sessConn) {
-			log.Printf("[server] 设备 %s 的旧会话 %s 已被本次连接顶替（同机 agent_id 变更或重复上线）",
+			logx.Infof("[server] 设备 %s 的旧会话 %s 已被本次连接顶替（同机 agent_id 变更或重复上线）",
 				logSafe(info.UUID), oldID)
 		}
 		store.UpsertAgent(&info)
-		log.Printf("[server] Agent %s 上线（来自 %s%s）", info.AgentID, conn.RemoteAddr(),
+		logx.Infof("[server] Agent %s 上线（来自 %s%s）", info.AgentID, conn.RemoteAddr(),
 			uuidSuffix(info.UUID))
 		refresh.now() // 上线是状态跃迁，不能等节流窗口
 		registered = true
@@ -1878,7 +1887,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		// 客户端证书**：TLS 握手失败的那一侧只有客户端有明确报错，服务端这边
 		// 往往只剩"连接建立又断开"，于是双方日志对不上、只能人肉猜。
 		// 这里补上"对端证书是谁签的/有没有握手失败痕迹"，让一行日志就能定性。
-		log.Printf("[server] Agent 连接未完成注册，关闭: %s%s", conn.RemoteAddr(), unregisteredHint(conn))
+		logx.Warnf("[server] Agent 连接未完成注册，关闭: %s%s", conn.RemoteAddr(), unregisteredHint(conn))
 		return
 	}
 
@@ -1895,6 +1904,8 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		case protocol.TypeHeartbeatReq:
 			var hb protocol.HeartbeatReq
 			_ = json.Unmarshal(env.Data, &hb)
+			// 顺带刷新"当前日志级别"，控制台据此显示（旧版 Agent 带空串）。
+			sessConn.SetLogLevel(hb.LogLevel)
 			// 动态心跳：RTT 优则保持 30s，弱网拉长
 			interval := 30
 			if hb.RTTMs > 200 {
@@ -1912,7 +1923,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			// 身份以连接为准：报文里的 agent_id 不可信，
 			// 否则一条连接可以伪造其它主机的探针数据 / 凭空造出假主机。
 			if !connOwns(sessConn, p.AgentID) {
-				log.Printf("[server] 丢弃 %s 的探针报文（自报身份 %q 与连接身份不符）",
+				logx.Infof("[server] 丢弃 %s 的探针报文（自报身份 %q 与连接身份不符）",
 					sessConn.GetAgentID(), logSafe(p.AgentID))
 				continue
 			}
@@ -1972,7 +1983,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			_ = json.Unmarshal(env.Data, &fu)
 			// 身份以连接为准：防止一条连接伪造他人身份把文件写到服务端
 			if !connOwns(sessConn, fu.AgentID) {
-				log.Printf("[server] 丢弃 %s 的上传分片（自报身份 %q 与连接身份不符）", sessConn.GetAgentID(), fu.AgentID)
+				logx.Infof("[server] 丢弃 %s 的上传分片（自报身份 %q 与连接身份不符）", sessConn.GetAgentID(), fu.AgentID)
 				continue
 			}
 			// 分片接收：MD5 校验 + 断点续传 + 容量闸门
@@ -2011,7 +2022,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			_ = json.Unmarshal(env.Data, &ur)
 			hub.Broadcast(protocol.TypeUpgradeResp, ur)
 			// L-2：ur.Message 是 Agent 自报字段，原样进日志能被用来伪造 "[server] ..." 行
-			log.Printf("[server] Agent %s 升级结果: %v %s", sessConn.GetAgentID(), ur.OK, logSafe(ur.Message))
+			logx.Infof("[server] Agent %s 升级结果: %v %s", sessConn.GetAgentID(), ur.OK, logSafe(ur.Message))
 		case protocol.TypeTunnelOpenResp:
 			var tr protocol.TunnelOpenResp
 			if json.Unmarshal(env.Data, &tr) != nil {
@@ -2023,11 +2034,11 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			if isVNCTunnel(tr.TunnelID) {
 				vncMgr.DeliverOpenResp(tr.TunnelID, sessConn.GetAgentID(), tr.OK, tr.Message)
 				if !tr.OK {
-					log.Printf("[server] VNC 隧道建立失败 %s: %s", logSafe(tr.TunnelID), logSafe(tr.Message))
+					logx.Errorf("[server] VNC 隧道建立失败 %s: %s", logSafe(tr.TunnelID), logSafe(tr.Message))
 				}
 			} else if !tr.OK {
 				// 端口映射隧道建立失败：关闭对应的公网侧连接
-				log.Printf("[server] 隧道建立失败 %s: %s", logSafe(tr.TunnelID), logSafe(tr.Message))
+				logx.Errorf("[server] 隧道建立失败 %s: %s", logSafe(tr.TunnelID), logSafe(tr.Message))
 				pm.NotifyTunnelClosed(tr.TunnelID, sessConn.GetAgentID(), tr.Message)
 			}
 		case protocol.TypeTunnelData:
@@ -2066,6 +2077,13 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 			if json.Unmarshal(env.Data, &ack) == nil && connOwns(sessConn, ack.AgentID) {
 				serverAddrAcks.deliver(ack)
 			}
+		case protocol.TypeLogLevelUpdateAck:
+			var ack protocol.LogLevelUpdateAck
+			if json.Unmarshal(env.Data, &ack) == nil {
+				// 身份以连接为准，不信报文里自报的 agent_id（与其它回执同一口径）。
+				ack.AgentID = sessConn.GetAgentID()
+				logLevelAcks.deliver(ack)
+			}
 		case protocol.TypePkgFetchReq:
 			var pr protocol.PackageFetchReq
 			if json.Unmarshal(env.Data, &pr) == nil {
@@ -2079,7 +2097,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 						servePackage(sessConn, pkgDir, &pr)
 					}()
 				default:
-					log.Printf("[server] %s 的安装包下发并发已满（%d 路），本次请求忽略，等 Agent 重试",
+					logx.Warnf("[server] %s 的安装包下发并发已满（%d 路），本次请求忽略，等 Agent 重试",
 						sessConn.GetAgentID(), cap(pkgSlots))
 				}
 			}
@@ -2090,12 +2108,12 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 	// 注意：设备身份是 UUID。旧连接被同 UUID 的新连接顶替后也会走到这里
 	// （或被顶替时已从会话池移除），此时不能把同一台机器标成离线。
 	if !sess.RemoveIfCurrent(sessConn.GetAgentID(), sessConn) {
-		log.Printf("[server] Agent %s 的旧连接已断开（该设备已有新会话），跳过离线标记", sessConn.GetAgentID())
+		logx.Warnf("[server] Agent %s 的旧连接已断开（该设备已有新会话），跳过离线标记", sessConn.GetAgentID())
 		return
 	}
 	store.MarkOffline(sessConn.GetAgentID())
 	refresh.now() // 离线是状态跃迁，必须立刻反映到界面
-	log.Printf("[server] Agent %s 离线", sessConn.GetAgentID())
+	logx.Infof("[server] Agent %s 离线", sessConn.GetAgentID())
 }
 
 // heartbeatSweeper 心跳清扫：超过 3 个心跳周期（默认 90s）视为离线。
@@ -2105,7 +2123,7 @@ func heartbeatSweeper(sess *session.Manager, store *probe.Store, refresh *agentR
 		offline := sess.Tick(90 * time.Second)
 		for _, id := range offline {
 			store.MarkOffline(id)
-			log.Printf("[server] Agent %s 心跳超时离线", id)
+			logx.Infof("[server] Agent %s 心跳超时离线", id)
 		}
 		if len(offline) > 0 {
 			refresh.now()
@@ -2122,7 +2140,7 @@ func cleanupSweeper(pm *portmap.Manager, hub *ws.Hub, ft *filetransfer.Manager, 
 	for range t.C {
 		expired := pm.CleanupExpired(100)
 		if len(expired) > 0 {
-			log.Printf("[server] 清理 %d 条超时映射连接", len(expired))
+			logx.Infof("[server] 清理 %d 条超时映射连接", len(expired))
 			hub.Broadcast(protocol.TypePortMapState, pm.Tracks())
 		}
 		ft.CleanupStale()
@@ -2215,12 +2233,24 @@ func serverInfoHandler(authz *auth.Auth, identity *agentauth.Identity, verifier 
 	}
 }
 
-func agentsHandler(store *probe.Store, authz *auth.Auth) http.HandlerFunc {
+func agentsHandler(store *probe.Store, sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
 		}
-		writeJSON(w, store.All())
+		list := store.All()
+		// 日志级别只存在于在线会话（来自心跳），叠加到主机列表上供控制台展示。
+		if sess != nil {
+			for _, a := range list {
+				// 会话里的值来自心跳（最新）；会话还没心跳过时保留注册报文里的值。
+				if c := sess.Get(a.AgentID); c != nil {
+					if lv := c.GetLogLevel(); lv != "" {
+						a.LogLevel = lv
+					}
+				}
+			}
+		}
+		writeJSON(w, list)
 	}
 }
 
@@ -2589,7 +2619,7 @@ func deleteAgentHandler(store *probe.Store, remarks *remark.Store, pm *portmap.M
 		}
 		for _, id := range aliases {
 			if err := remarks.Set(id, ""); err != nil {
-				log.Printf("[server] 删除主机 %q 的备注失败: %v", id, err)
+				logx.Errorf("[server] 删除主机 %q 的备注失败: %v", id, err)
 			}
 		}
 		removed := 0
@@ -2709,7 +2739,7 @@ func commandCloseHandler(sess *session.Manager, authz *auth.Auth) http.HandlerFu
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "下发失败: " + err.Error()})
 			return
 		}
-		log.Printf("[server] 终端断开请求 agent=%s command_id=%q kill_all=%v", req.AgentID, req.CommandID, req.KillAll)
+		logx.Infof("[server] 终端断开请求 agent=%s command_id=%q kill_all=%v", req.AgentID, req.CommandID, req.KillAll)
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "已下发断开/结束指令"})
 	}
 }
@@ -3078,7 +3108,7 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth, upgradePubKey, pkgD
 				writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 				return
 			}
-			log.Printf("[upgrade] 向 %s 下发本地 pkg 升级包 %s（%s/%s，%d 字节，版本 %s）",
+			logx.Infof("[upgrade] 向 %s 下发本地 pkg 升级包 %s（%s/%s，%d 字节，版本 %s）",
 				body.AgentID, req.PackageName, pkgOS, pkgArch, size, versionArg)
 			writeJSON(w, map[string]interface{}{
 				"ok":         true,
@@ -3139,7 +3169,7 @@ func upgradeHandler(sess *session.Manager, authz *auth.Auth, upgradePubKey, pkgD
 		if strings.TrimSpace(upgradePubKey) == "" {
 			// 不阻断：公钥可以只配在 Agent 侧（本服务端只是转发方）。
 			// 但一键部署生成的 Agent 配置里会是空值，那条链就升级不动了，得留个提示。
-			log.Printf("[upgrade] 提示: 服务端未配置 -upgrade-pubkey，在线链接升级会被 Agent 拒绝；本地 pkg 模式不受影响")
+			logx.Warnf("[upgrade] 服务端未配置 -upgrade-pubkey，在线链接升级会被 Agent 拒绝；本地 pkg 模式不受影响")
 		}
 		// 下载源协议白名单：http 会被明文传输、易被中间人篡改，等同于给目标机投毒
 		if u, perr := url.Parse(strings.TrimSpace(body.URL)); perr != nil || u.Scheme == "" {
@@ -3367,7 +3397,7 @@ func loginHandler(um *auth.UserManager, authz *auth.Auth, loginGuard *auth.Login
 		tok, terr := randHex(32)
 		if terr != nil {
 			// 宁可登录失败，也不发一个可预测的会话 Token
-			log.Printf("[auth] 生成会话 Token 失败（系统熵源不可用）: %v", terr)
+			logx.Errorf("[auth] 生成会话 Token 失败（系统熵源不可用）: %v", terr)
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "服务端无法生成安全会话，请稍后重试"})
 			return
 		}
@@ -3376,7 +3406,7 @@ func loginHandler(um *auth.UserManager, authz *auth.Auth, loginGuard *auth.Login
 			Time: time.Now().Unix(), Operator: auditSafeText(body.Username), OperatorIP: opIP,
 			Command: "登录成功", Result: "ok", Category: "auth",
 		})
-		log.Printf("[auth] 用户 %s 登录成功（来自 %s）", body.Username, opIP)
+		logx.Infof("[auth] 用户 %s 登录成功（来自 %s）", body.Username, opIP)
 		writeJSON(w, map[string]interface{}{"ok": true, "token": tok})
 	}
 }
@@ -3455,9 +3485,9 @@ func changePasswordHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerF
 		}
 		// 吊销该用户的其它会话：被盗 Token 即使不知道新密码也会立即失效
 		if n := authz.RevokeUserTokens(username, token); n > 0 {
-			log.Printf("[auth] 用户 %s 修改密码成功，已吊销 %d 个其它会话", username, n)
+			logx.Infof("[auth] 用户 %s 修改密码成功，已吊销 %d 个其它会话", username, n)
 		} else {
-			log.Printf("[auth] 用户 %s 修改密码成功", username)
+			logx.Infof("[auth] 用户 %s 修改密码成功", username)
 		}
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "密码修改成功"})
 	}
@@ -3486,7 +3516,7 @@ func randPassword(n int) string {
 	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
 		// 熵源故障时不应生成可预测口令：直接退出，让运维看到原因
-		log.Fatalf("生成随机口令失败（系统熵源不可用）: %v", err)
+		logx.Fatalf("生成随机口令失败（系统熵源不可用）: %v", err)
 	}
 	for i := range out {
 		out[i] = charset[int(buf[i])%len(charset)]
@@ -3605,9 +3635,9 @@ func otpEnableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 		}
 		// 绑定 OTP 属于安全状态变更：吊销其它会话
 		if n := authz.RevokeUserTokens(username, token); n > 0 {
-			log.Printf("[auth] 用户 %s 启用 OTP，吊销 %d 个其它会话", username, n)
+			logx.Infof("[auth] 用户 %s 启用 OTP，吊销 %d 个其它会话", username, n)
 		} else {
-			log.Printf("[auth] 用户 %s 已启用 OTP 动态验证码", username)
+			logx.Infof("[auth] 用户 %s 已启用 OTP 动态验证码", username)
 		}
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已启用"})
 	}
@@ -3652,7 +3682,7 @@ func otpDisableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc 
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": msg})
 			return
 		}
-		log.Printf("[auth] 用户 %s 已关闭 OTP 动态验证码", username)
+		logx.Infof("[auth] 用户 %s 已关闭 OTP 动态验证码", username)
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已关闭"})
 	}
 }
@@ -4072,7 +4102,7 @@ func handleWebMessage(sessionKey, operator string, data []byte, sess *session.Ma
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
-		log.Printf("[server] web message decode error: %v", err)
+		logx.Infof("[server] web message decode error: %v", err)
 		return
 	}
 	if shareID, isShare := shareIDFromOperator(operator); isShare {
@@ -4084,7 +4114,7 @@ func handleWebMessage(sessionKey, operator string, data []byte, sess *session.Ma
 			return
 		}
 		if raw.Type != protocol.TypeInteractiveIn {
-			log.Printf("[server] 丢弃分享 %s 的上行消息 %q（只允许终端输入）", shareID, raw.Type)
+			logx.Infof("[server] 丢弃分享 %s 的上行消息 %q（只允许终端输入）", shareID, raw.Type)
 			return
 		}
 	}
@@ -4112,7 +4142,7 @@ func handleWebMessage(sessionKey, operator string, data []byte, sess *session.Ma
 		// 不校验的话任一登录者都能往别人正开着的远程终端里打字，
 		// 等于借用他人已授权的 shell（比读别人输出更严重）。
 		if origin, ok := router.CommandOrigin(inp.CommandID, inp.AgentID); !ok || origin.Session != sessionKey {
-			log.Printf("[server] 丢弃操作员 %s 对 %s 的交互输入：会话 %q 不属于该连接",
+			logx.Infof("[server] 丢弃操作员 %s 对 %s 的交互输入：会话 %q 不属于该连接",
 				operator, inp.AgentID, inp.CommandID)
 			return
 		}
@@ -4149,7 +4179,7 @@ func handleWebMessage(sessionKey, operator string, data []byte, sess *session.Ma
 		}
 		handlePortMapOp(pm, sess, &op)
 		hub.Broadcast(protocol.TypePortMapState, pm.Tracks())
-		log.Printf("[server] 端口映射操作: %+v", op)
+		logx.Infof("[server] 端口映射操作: %+v", op)
 	case protocol.TypeFileTransferOp:
 		var op protocol.FileTransferOp
 		if err := json.Unmarshal(env.Data, &op); err != nil {
@@ -4274,7 +4304,7 @@ func handlePortMapOp(pm *portmap.Manager, sess *session.Manager, op *protocol.Po
 			CreatedAt:  time.Now().Unix(),
 		}
 		if err := pm.CreateRule(r); err != nil {
-			log.Printf("[portmap] 创建映射 %d 失败: %v", op.PublicPort, err)
+			logx.Errorf("[portmap] 创建映射 %d 失败: %v", op.PublicPort, err)
 		}
 	case "enable":
 		if op.PublicPort <= 0 {
@@ -4282,7 +4312,7 @@ func handlePortMapOp(pm *portmap.Manager, sess *session.Manager, op *protocol.Po
 		}
 		// 规则已存在则恢复监听；否则（规则曾被删除或不存在）按新建处理
 		if err := pm.EnableRule(op.PublicPort); err != nil {
-			log.Printf("[portmap] 启用映射 %d 失败: %v", op.PublicPort, err)
+			logx.Errorf("[portmap] 启用映射 %d 失败: %v", op.PublicPort, err)
 		}
 	case "disable":
 		if op.PublicPort > 0 {
@@ -4304,9 +4334,9 @@ func auditRetentionCleaner(db *storage.DB) {
 	for range ticker.C {
 		n, err := db.CleanupOldAuditLogs(keepDays)
 		if err != nil {
-			log.Printf("[server] 清理审计日志失败: %v", err)
+			logx.Errorf("[server] 清理审计日志失败: %v", err)
 		} else if n > 0 {
-			log.Printf("[server] 清理了 %d 条超出 %d 天留存期的审计日志", n, keepDays)
+			logx.Infof("[server] 清理了 %d 条超出 %d 天留存期的审计日志", n, keepDays)
 		}
 	}
 }
@@ -4325,7 +4355,7 @@ func memStatsLogger() {
 		if m.HeapAlloc < threshold {
 			continue
 		}
-		log.Printf("[mem] heap=%dMiB heap_sys=%dMiB sys=%dMiB goroutines=%d",
+		logx.Infof("[mem] heap=%dMiB heap_sys=%dMiB sys=%dMiB goroutines=%d",
 			m.HeapAlloc>>20, m.HeapSys>>20, m.Sys>>20, runtime.NumGoroutine())
 	}
 }
@@ -4352,21 +4382,21 @@ func probeHistoryCleaner(db *storage.DB) {
 func compactHistoryOnce(db *storage.DB, first bool) {
 	start := time.Now()
 	if first {
-		log.Printf("[server] 开始维护历史数据（探针保留 7 天原始采样；更早数据先归档再删除）")
+		logx.Infof("[server] 开始维护历史数据（探针保留 7 天原始采样；更早数据先归档再删除）")
 	}
 	st, err := db.CompactHistory()
 	if err != nil {
-		log.Printf("[server] 历史维护失败（下次重试）: %v", err)
+		logx.Errorf("[server] 历史维护失败（下次重试）: %v", err)
 		return
 	}
 	if st.ArchivedProbe > 0 {
-		log.Printf("[server] 已归档 %d 条探针历史到 %s（%s ~ %s）",
+		logx.Infof("[server] 已归档 %d 条探针历史到 %s（%s ~ %s）",
 			st.ArchivedProbe, st.ArchivePath,
 			time.Unix(st.ArchiveStart, 0).Format("2006-01-02 15:04:05"),
 			time.Unix(st.ArchiveEnd, 0).Format("2006-01-02 15:04:05"))
 	}
 	if st.RemovedProbe > 0 || st.RemovedLatency > 0 || first {
-		log.Printf("[server] 历史维护完成：探针 %d→%d，延迟 %d→%d（过期 %d），耗时 %s",
+		logx.Infof("[server] 历史维护完成：探针 %d→%d，延迟 %d→%d（过期 %d），耗时 %s",
 			st.ProbeBefore, st.ProbeAfter,
 			st.LatencyBefore, st.LatencyAfter, st.PrunedLatency,
 			time.Since(start).Round(time.Millisecond))
@@ -4377,9 +4407,9 @@ func compactHistoryOnce(db *storage.DB, first bool) {
 	if (first && (st.ProbeBefore > 100000 || st.LatencyBefore > 100000)) || removed > 50000 {
 		vstart := time.Now()
 		if err := db.CompactStorage(); err != nil {
-			log.Printf("[server] 数据库空间回收失败: %v", err)
+			logx.Errorf("[server] 数据库空间回收失败: %v", err)
 		} else {
-			log.Printf("[server] 数据库空间已回收（VACUUM，耗时 %s）", time.Since(vstart).Round(time.Millisecond))
+			logx.Infof("[server] 数据库空间已回收（VACUUM，耗时 %s）", time.Since(vstart).Round(time.Millisecond))
 		}
 	}
 }
@@ -4394,7 +4424,7 @@ var pkgFetchCmds sync.Map
 func logAvailablePackages(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		log.Printf("[pkg] 读取安装包目录失败 %s: %v", dir, err)
+		logx.Errorf("[pkg] 读取安装包目录失败 %s: %v", dir, err)
 		return
 	}
 	var names []string
@@ -4407,10 +4437,10 @@ func logAvailablePackages(dir string) {
 		}
 	}
 	if len(names) == 0 {
-		log.Printf("[pkg] 安装包目录 %s 为空；如需让 Agent 从服务端取包（避免公网下载），把安装包放进去即可", dir)
+		logx.Warnf("[pkg] 安装包目录 %s 为空；如需让 Agent 从服务端取包（避免公网下载），把安装包放进去即可", dir)
 		return
 	}
-	log.Printf("[pkg] 安装包目录 %s 已托管: %s", dir, strings.Join(names, ", "))
+	logx.Infof("[pkg] 安装包目录 %s 已托管: %s", dir, strings.Join(names, ", "))
 }
 
 // servePackage 将服务端托管的安装包以分片形式下发给 Agent。
@@ -4426,7 +4456,7 @@ func servePackage(conn *session.Conn, pkgDir string, req *protocol.PackageFetchR
 		resp.OK = false
 		resp.Message = msg
 		_ = conn.Write(protocol.TypePkgFetchResp, resp)
-		log.Printf("[pkg] 向 %s 下发 %s 失败: %s", conn.AgentID, name, msg)
+		logx.Errorf("[pkg] 向 %s 下发 %s 失败: %s", conn.AgentID, name, msg)
 	}
 	if name == "" || name == "." || name == ".." || name == string(filepath.Separator) {
 		fail("未指定有效的安装包名称")
@@ -4474,7 +4504,7 @@ func servePackage(conn *session.Conn, pkgDir string, req *protocol.PackageFetchR
 				ChunkMD5:  fmt.Sprintf("%x", sum),
 				Done:      last,
 			}); werr != nil {
-				log.Printf("[pkg] 向 %s 下发 %s 中断: %v", conn.AgentID, name, werr)
+				logx.Infof("[pkg] 向 %s 下发 %s 中断: %v", conn.AgentID, name, werr)
 				return
 			}
 			seq++
@@ -4484,7 +4514,7 @@ func servePackage(conn *session.Conn, pkgDir string, req *protocol.PackageFetchR
 		}
 		if rerr != nil {
 			if rerr != io.EOF {
-				log.Printf("[pkg] 读取安装包 %s 失败: %v", name, rerr)
+				logx.Errorf("[pkg] 读取安装包 %s 失败: %v", name, rerr)
 			}
 			break
 		}
@@ -4493,5 +4523,34 @@ func servePackage(conn *session.Conn, pkgDir string, req *protocol.PackageFetchR
 	resp.Size = total
 	resp.Message = "安装包下发完成"
 	_ = conn.Write(protocol.TypePkgFetchResp, resp)
-	log.Printf("[pkg] 已向 %s 下发安装包 %s（%d 字节，%d 分片）", conn.AgentID, name, total, seq)
+	logx.Infof("[pkg] 已向 %s 下发安装包 %s（%d 字节，%d 分片）", conn.AgentID, name, total, seq)
+}
+
+// applyLogLevel 解析并应用日志级别：命令行 > 配置文件 > 默认值。
+func applyLogLevel(flagVal string, cfg *config.Config) {
+	text := strings.TrimSpace(flagVal)
+	if text == "" && cfg != nil {
+		text = strings.TrimSpace(cfg.LogLevel)
+	}
+	lv, ok := logx.ParseLevel(text)
+	if !ok {
+		logx.SetLevel(logx.Info)
+		logx.Errorf("无法识别的日志级别 %q，按 info 处理（可用 off / error / warn / info）", text)
+		return
+	}
+	if text == "" {
+		lv = logx.Info // 服务端默认
+	}
+	logx.SetLevel(lv)
+}
+
+// normalizeLogLevel 返回写进配置文件的规范级别字符串。
+func normalizeLogLevel(s string, def logx.Level) string {
+	if strings.TrimSpace(s) == "" {
+		return def.String()
+	}
+	if lv, ok := logx.ParseLevel(s); ok {
+		return lv.String()
+	}
+	return def.String()
 }

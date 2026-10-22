@@ -23,7 +23,7 @@ package geo
 
 import (
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"net"
 	"os"
 	"strings"
@@ -124,7 +124,7 @@ func (p *MMDBProvider) Reopen(path string) error {
 	if old != nil {
 		_ = old.Close()
 	}
-	log.Printf("[geo] 已加载离线 GeoIP 库: %s（数据库类型 %s）", path, r.Metadata.DatabaseType)
+	logx.Infof("[geo] 已加载离线 GeoIP 库: %s（数据库类型 %s）", path, r.Metadata.DatabaseType)
 	return nil
 }
 
@@ -181,7 +181,7 @@ func (p *MMDBProvider) Lookup(ip string) *protocol.GeoInfo {
 	if err := reader.Lookup(addr, &rec); err != nil {
 		// 单条记录解析失败（库版本与结构不匹配、IP 不在库中）不该影响整批查询，
 		// 记一次日志后按"未命中"处理，让链路继续降级到下一个源。
-		log.Printf("[geo] MMDB 查询 %s 失败: %v", ip, err)
+		logx.Errorf("[geo] MMDB 查询 %s 失败: %v", ip, err)
 		return nil
 	}
 	code := strings.ToUpper(strings.TrimSpace(rec.Country.ISOCode))

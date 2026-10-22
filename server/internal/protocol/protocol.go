@@ -46,6 +46,10 @@ const (
 	// Agent 落盘成功后回 Ack 并主动重连；旧版 Agent 不认识该消息，会继续用旧地址。
 	TypeServerAddrUpdate    = "ServerAddrUpdate"
 	TypeServerAddrUpdateAck = "ServerAddrUpdateAck"
+	// TypeLogLevelUpdate 服务端下发运行期日志级别（off/error/warn/info）。
+	// Agent 校验后写回配置 log_level 并立即生效，再回 Ack；旧版 Agent 忽略该消息。
+	TypeLogLevelUpdate    = "LogLevelUpdate"
+	TypeLogLevelUpdateAck = "LogLevelUpdateAck"
 )
 
 // Envelope 是所有消息的通用信封：Type 用于路由，Data 为具体负载。
@@ -61,6 +65,9 @@ type HeartbeatReq struct {
 	Timestamp int64  `json:"timestamp"`
 	Uptime    int64  `json:"uptime"`
 	RTTMs     int64  `json:"rtt_ms"`
+	// LogLevel Agent 当前生效的日志级别（off/error/warn/info）。
+	// 旧版 Agent 不上报，服务端显示为空 —— 控制台据此展示"当前级别"。
+	LogLevel string `json:"log_level,omitempty"`
 }
 
 // HeartbeatResp Server -> Agent 心跳响应
@@ -146,7 +153,9 @@ type ProbeDataReq struct {
 
 // AgentInfo Server 保存/向 Web 推送的主机信息
 type AgentInfo struct {
-	AgentID       string   `json:"agent_id"`
+	AgentID string `json:"agent_id"`
+	// LogLevel 该主机当前生效的日志级别（来自心跳；旧版 Agent 为空）。
+	LogLevel      string   `json:"log_level,omitempty"`
 	UUID          string   `json:"uuid,omitempty"` // 硬件唯一标识（如 wmic csproduct get UUID）
 	Hostname      string   `json:"hostname"`
 	OSType        string   `json:"os_type"`
@@ -526,4 +535,17 @@ type ServerAddrUpdateAck struct {
 	ServerAddr string `json:"server_addr"`
 	OK         bool   `json:"ok"`
 	Message    string `json:"message,omitempty"`
+}
+
+// LogLevelUpdate 服务端要求 Agent 修改运行期日志级别。
+type LogLevelUpdate struct {
+	Level string `json:"level"` // off / error / warn / info
+}
+
+// LogLevelUpdateAck 级别应用与落盘结果。Level 是**实际生效**的级别（非法值会被拒绝）。
+type LogLevelUpdateAck struct {
+	AgentID string `json:"agent_id"`
+	Level   string `json:"level"`
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
 }

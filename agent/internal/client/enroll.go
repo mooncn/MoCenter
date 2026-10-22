@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"mocenter/agent/internal/agentauth"
+	"mocenter/agent/internal/logx"
 	"mocenter/agent/internal/protocol"
 )
 
@@ -276,7 +277,7 @@ func dialForEnroll(addr string, tlsCfg *tls.Config, allowUnverified bool) (net.C
 		loose.VerifyPeerCertificate = nil
 		loose.VerifyConnection = nil
 		if c2, e2 := tls.Dial("tcp", addr, loose); e2 == nil {
-			logf("[agent] 警告: 换取证书前本机没有可用身份锚（未配 server_fingerprint / ca_cert），"+
+			logx.Errorf("[agent] 换取证书前本机没有可用身份锚（未配 server_fingerprint / ca_cert），"+
 				"本次 TLS 未校验服务端身份；请把服务端「Agent 接入」页的部署身份指纹填进配置，"+
 				"或在 %s 落好 ca.crt 后重新接入", "creds/ca.crt")
 			return c2, nil

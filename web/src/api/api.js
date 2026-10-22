@@ -95,6 +95,11 @@ export const Api = {
     const { data } = await api.post('/system/http-listen', payload)
     return data
   },
+  // 远程设置 Agent 日志级别：{agent_id, level} 或 {all:true, level}
+  async setAgentLogLevel(payload) {
+    const { data } = await api.post('/agents/log-level', payload)
+    return data
+  },
   // 获取全部主机（含离线）
   async agents() {
     const { data } = await api.get('/agents')

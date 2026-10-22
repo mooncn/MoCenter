@@ -22,7 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"mocenter/agent/internal/logx"
 	"net/http"
 	"net/url"
 	"os"
@@ -211,7 +211,7 @@ func Perform(req *protocol.UpgradeReq, pol Policy, report func(*protocol.Upgrade
 		return
 	}
 	if req.MD5 != "" {
-		log.Printf("[upgrade] 提示: 指令携带的 md5 字段已废弃，不参与校验")
+		logx.Infof("[upgrade] 提示: 指令携带的 md5 字段已废弃，不参与校验")
 	}
 
 	// 5) 取包：一次读入内存，摘要与验签共用这份字节
@@ -298,7 +298,7 @@ func PerformLocal(req *protocol.UpgradeReq, content []byte, report func(*protoco
 		resp.Message = err.Error()
 		return
 	}
-	log.Printf("[upgrade] 本地 pkg 升级包 %s 校验通过，正在替换二进制", req.PackageName)
+	logx.Infof("[upgrade] 本地 pkg 升级包 %s 校验通过，正在替换二进制", req.PackageName)
 	resp.OK = true
 	resp.Message = "升级成功（服务端本地包），正在重启"
 	go func() {
@@ -446,7 +446,7 @@ func renameWithRetry(from, to string, attempts int, wait time.Duration) error {
 		if err = os.Rename(from, to); err == nil {
 			return nil
 		}
-		log.Printf("[upgrade] rename 重试 %d/%d: %v", i+1, attempts, err)
+		logx.Warnf("[upgrade] rename 重试 %d/%d: %v", i+1, attempts, err)
 	}
 	return err
 }
@@ -460,7 +460,7 @@ func renameWithRetry(from, to string, attempts int, wait time.Duration) error {
 // 新版本最终只是靠 systemd 的 Restart=always 才回来。
 func restartSelf(exe string) {
 	if err := platformRelaunch(exe); err != nil {
-		log.Printf("[upgrade] 换入新版本失败: %v（退出交给守护方按新二进制重新拉起）", err)
+		logx.Errorf("[upgrade] 换入新版本失败: %v（退出交给守护方按新二进制重新拉起）", err)
 	}
 	os.Exit(0)
 }

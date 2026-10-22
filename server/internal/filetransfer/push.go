@@ -8,7 +8,7 @@ package filetransfer
 import (
 	"crypto/md5"
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"os"
 	"path/filepath"
 	"sync"
@@ -151,7 +151,7 @@ func (m *PushManager) logRejectLocked(reason string) {
 		return
 	}
 	m.lastRejectLog = now
-	log.Printf("[filetransfer] %s", reason)
+	logx.Infof("[filetransfer] %s", reason)
 }
 
 // deleteLocked 从表中摘除任务并释放其暂存额度（调用方须持有 m.mu）。
@@ -183,7 +183,7 @@ func (m *PushManager) CleanupStale() int {
 		}
 	}
 	if n > 0 {
-		log.Printf("[filetransfer] 回收 %d 个超过 %v 未完成的分发任务", n, pushTaskTTL)
+		logx.Infof("[filetransfer] 回收 %d 个超过 %v 未完成的分发任务", n, pushTaskTTL)
 	}
 	return n
 }
@@ -256,6 +256,6 @@ func (m *PushManager) SaveToTemp(commandID string, baseDir string) (string, erro
 			return "", err
 		}
 	}
-	log.Printf("[filetransfer] 文件分发 %s 已缓存到 %s", t.CommandID, path)
+	logx.Infof("[filetransfer] 文件分发 %s 已缓存到 %s", t.CommandID, path)
 	return path, nil
 }

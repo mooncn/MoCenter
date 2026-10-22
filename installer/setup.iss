@@ -87,6 +87,7 @@ var
   PageServer: TInputQueryWizardPage;     // Server 专用：后台用户名 / 口令
   PageAdv: TInputQueryWizardPage;        // 公共：数据目录 / 代理 / 额外 TLS 参数
   PageAdvServer: TInputQueryWizardPage;  // Server 专用：Agent 与 HTTP 监听
+  PageLog: TInputOptionWizardPage;       // 公共：运行期日志级别（Agent/Server 各写各的配置）
   PurgeData: Boolean;                    // 卸载时是否删除配置与数据
 
 // SafeVal 清掉值里的双引号并去空白 —— 这些值要拼进命令行，带引号会破坏参数边界。
@@ -216,6 +217,19 @@ begin
   Result := p;
 end;
 
+// GetLogLevelStr 返回向导选择的级别字符串。
+function GetLogLevelStr(Param: String): String;
+begin
+  if PageLog.Values[0] then
+    Result := 'off'
+  else if PageLog.Values[1] then
+    Result := 'error'
+  else if PageLog.Values[2] then
+    Result := 'warn'
+  else
+    Result := 'info';
+end;
+
 // BuildInstallParams 把向导收集的参数拼成 mocenter-deploy.exe 的命令行。
 function BuildInstallParams(Param: String): String;
 var
@@ -256,12 +270,91 @@ begin
       s := s + ' -web "' + ExpandConstant('{app}\web') + '"';
   end;
 
+  // 日志级别只写进配置文件（不塞服务命令行），升级时引擎也只改这一个键。
+  s := s + ' -log-level "' + GetLogLevelStr('') + '"';
+
   if SafeVal(PageAdv.Values[1]) <> '' then
     s := s + ' -proxy-ip "' + SafeVal(PageAdv.Values[1]) + '"';
   if SafeVal(PageAdv.Values[2]) <> '' then
     s := s + ' -extra "' + SafeVal(PageAdv.Values[2]) + '"';
 
   Result := s;
+end;
+
+// ExtractJsonStringValue 从 JSON 文本里取一个字符串字段（不引入 JSON 库，够用即可）。
+// Inno 的 Pascal Script 没有正规 JSON 解析，这里只处理本项目自己写出的缩进格式。
+// 注意：循环一律写成显式边界判断，Pascal 的 and 不保证短路，
+// 写成 (i <= n) and (rest[i] <> ...) 在 i 越界后仍可能去取 rest[i] 而报错。
+function ExtractJsonStringValue(const content: String; const key: String): String;
+var
+  p, i, n: Integer;
+  rest: String;
+begin
+  Result := '';
+  p := Pos(key, content);
+  if p = 0 then Exit;
+  rest := Copy(content, p + Length(key), Length(content));
+  n := Length(rest);
+  i := 1;
+  while i <= n do
+  begin
+    if rest[i] = ':' then Break;
+    Inc(i);
+  end;
+  if i > n then Exit;
+  while i <= n do
+  begin
+    if rest[i] = '"' then Break;
+    Inc(i);
+  end;
+  if i > n then Exit;
+  Inc(i);
+  p := i;
+  while i <= n do
+  begin
+    if rest[i] = '"' then Break;
+    Inc(i);
+  end;
+  if i <= n then
+    Result := Lowercase(Copy(rest, p, i - p));
+end;
+
+// ReadCfgLogLevel 读取某角色既有配置里的 log_level；没有则返回空串。
+function ReadCfgLogLevel(const role, dataRoot: String): String;
+var
+  cfgPath: String;
+  // Inno 6 的 LoadStringFromFile 第二个参数是 AnsiString（传 String 会 Type mismatch）；
+  // 配置里的 log_level 是纯 ASCII，用 AnsiString 读取没有编码问题。
+  cfgText: AnsiString;
+begin
+  Result := '';
+  cfgPath := AddBackslash(dataRoot) + role + '\mocenter-' + role + '.json';
+  if not FileExists(cfgPath) then Exit;
+  if LoadStringFromFile(cfgPath, cfgText) = False then Exit;
+  Result := ExtractJsonStringValue(cfgText, '"log_level"');
+end;
+
+// DetectExistingLogLevel 升级时优先沿用 Agent 的级别，其次 Server 的。
+function DetectExistingLogLevel(const dataRoot: String): String;
+begin
+  Result := '';
+  if Pos('agent', GetRoleStr('')) > 0 then
+    Result := ReadCfgLogLevel('agent', dataRoot);
+  if (Result = '') and (Pos('server', GetRoleStr('')) > 0) then
+    Result := ReadCfgLogLevel('server', dataRoot);
+end;
+
+// SelectLogLevel 把级别字符串映射到单选索引；空/未知时落到 ERROR。
+procedure SelectLogLevel(const lv: String);
+begin
+  if lv = 'off' then
+    PageLog.Values[0] := True
+  else if lv = 'warn' then
+    PageLog.Values[2] := True
+  else if lv = 'info' then
+    PageLog.Values[3] := True
+  else
+    PageLog.Values[1] := True;
 end;
 
 procedure InitializeWizard;
@@ -323,6 +416,19 @@ begin
   PageAdvServer.Add('Server 的 Agent 监听地址：', False);
   PageAdvServer.Add('Server 的 HTTP 监听地址：', False);
 
+  // 第 6 页：日志级别（Agent/Server 通用；升级时预选既有配置里的值）
+  PageLog := CreateInputOptionPage(PageAdvServer.ID,
+    '运行期日志级别',
+    '日志写到什么详细程度',
+    'Agent 默认 error（只记失败），Server 默认 info（日志量小，启动信息更利于排障）。' + #13#10 +
+    'OFF 关闭运行期日志，但启动致命错误仍会输出一行（否则服务起不来时零线索）。' + #13#10 +
+    '装好后可在控制台「仪表盘 → 操作 → 日志级别」随时远程调整。',
+    True, False);
+  PageLog.Add('OFF —— 关闭运行期日志');
+  PageLog.Add('ERROR —— 只记录失败（推荐，默认）');
+  PageLog.Add('WARN —— 失败 + 重试/降级');
+  PageLog.Add('INFO —— 完整生命周期（排障用，日志量最大）');
+
   // 重装/升级沿用上次记录的数据目录，避免自定义目录被默认值顶掉；
   // 全新安装时注册表没有该值，仍用 ProgramData 默认路径。
   if RegQueryStringValue(HKLM, 'Software\MoCenter', 'DataDir', prevDataDir) then
@@ -333,6 +439,8 @@ begin
   PageAdv.Values[2] := '';
   PageAdvServer.Values[0] := ':9000';
   PageAdvServer.Values[1] := ':8080';
+  // 升级：预选既有配置里的级别，避免把运维调好的 info 悄悄改回 error。
+  SelectLogLevel(DetectExistingLogLevel(PageAdv.Values[0]));
 end;
 
 // ShouldSkipPage 按角色选择跳过专有页：

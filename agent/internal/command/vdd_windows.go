@@ -22,7 +22,7 @@ package command
 import (
 	"context"
 	"fmt"
-	"log"
+	"mocenter/agent/internal/logx"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,7 +56,7 @@ if ($monitors) { $monitors.Count } else { 0 }
 	if err == nil {
 		n := strings.TrimSpace(string(out))
 		if n != "" && n != "0" {
-			log.Printf("[vdd] 检测到 %s 个活动监视器设备", n)
+			logx.Infof("[vdd] 检测到 %s 个活动监视器设备", n)
 			return true
 		}
 	}
@@ -80,7 +80,7 @@ public class DisplayConfig {
 	if err == nil {
 		n := strings.TrimSpace(string(out2))
 		if n != "" && n != "0" {
-			log.Printf("[vdd] GetSystemMetrics(SM_CMONITORS)=%s，判定有活动显示器", n)
+			logx.Infof("[vdd] GetSystemMetrics(SM_CMONITORS)=%s，判定有活动显示器", n)
 			return true
 		}
 	}
@@ -91,12 +91,12 @@ public class DisplayConfig {
 		content := string(out3)
 		// 检查是否有 Scaling 值（表示有活动的显示配置）
 		if strings.Contains(content, "Scaling") && !strings.Contains(content, "0x0") {
-			log.Printf("[vdd] 注册表中检测到活动显示配置")
+			logx.Infof("[vdd] 注册表中检测到活动显示配置")
 			return true
 		}
 	}
 
-	log.Printf("[vdd] 未检测到活动显示器，判定为无头系统")
+	logx.Infof("[vdd] 未检测到活动显示器，判定为无头系统")
 	return false
 }
 
@@ -108,7 +108,7 @@ public class DisplayConfig {
 func installVirtualDisplayDriver(cfg VncConfig) bool {
 	// 先检查是否已安装 Virtual Display Driver
 	if isVDDInstalled() {
-		log.Printf("[vdd] Virtual Display Driver 已安装，跳过下载")
+		logx.Warnf("[vdd] Virtual Display Driver 已安装，跳过下载")
 		return true
 	}
 
@@ -119,24 +119,24 @@ func installVirtualDisplayDriver(cfg VncConfig) bool {
 
 	zipPath, err := fetchVDDPackage(cfg)
 	if err != nil {
-		log.Printf("[vdd] 获取 VDD 驱动包失败: %v", err)
+		logx.Errorf("[vdd] 获取 VDD 驱动包失败: %v", err)
 		return false
 	}
 	defer os.Remove(zipPath)
 
 	if err := os.MkdirAll(extractDir, 0700); err != nil {
-		log.Printf("[vdd] 创建解压目录失败: %v", err)
+		logx.Errorf("[vdd] 创建解压目录失败: %v", err)
 		return false
 	}
 	if err := extractZip(zipPath, extractDir); err != nil {
-		log.Printf("[vdd] 解压 VDD 驱动失败: %v", err)
+		logx.Errorf("[vdd] 解压 VDD 驱动失败: %v", err)
 		return false
 	}
 
 	// 在解压目录中查找 .inf 驱动文件
 	infFile := findDriverINF(extractDir)
 	if infFile == "" {
-		log.Printf("[vdd] 未找到 VDD 驱动 INF 文件")
+		logx.Infof("[vdd] 未找到 VDD 驱动 INF 文件")
 		return false
 	}
 
@@ -147,17 +147,17 @@ func installVirtualDisplayDriver(cfg VncConfig) bool {
 	installCmd := exec.CommandContext(ctx, "pnputil.exe", "/add-driver", infFile, "/install")
 	out, err := installCmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[vdd] pnputil 安装驱动失败: %v, 输出: %s", err, string(out))
+		logx.Errorf("[vdd] pnputil 安装驱动失败: %v, 输出: %s", err, string(out))
 		return false
 	}
-	log.Printf("[vdd] pnputil 安装驱动成功: %s", strings.TrimSpace(string(out)))
+	logx.Infof("[vdd] pnputil 安装驱动成功: %s", strings.TrimSpace(string(out)))
 
 	// 等待驱动安装生效
 	time.Sleep(3 * time.Second)
 
 	// 验证驱动安装成功
 	if !isVDDInstalled() {
-		log.Printf("[vdd] 驱动已执行 pnputil 安装但未检测到 VDD 设备")
+		logx.Infof("[vdd] 驱动已执行 pnputil 安装但未检测到 VDD 设备")
 		// 可能需要重启才能生效，返回 false 让调用方决定
 		return false
 	}
@@ -175,7 +175,7 @@ func fetchVDDPackage(cfg VncConfig) (string, error) {
 	if cfg.FetchPackage != nil {
 		path, err := cfg.FetchPackage(vddZipName)
 		if err != nil {
-			log.Printf("[vdd] 服务端未托管 %s（%v）", vddZipName, err)
+			logx.Infof("[vdd] 服务端未托管 %s（%v）", vddZipName, err)
 		} else {
 			if verr := verifyDigest(path, want, vddZipName); verr != nil {
 				_ = os.Remove(path)
@@ -209,7 +209,7 @@ func fetchVDDPackage(cfg VncConfig) (string, error) {
 	var lastErr error
 	for _, u := range urls {
 		tmp := filepath.Join(os.TempDir(), vddZipName)
-		log.Printf("[vdd] 尝试下载 Virtual Display Driver: %s", u)
+		logx.Infof("[vdd] 尝试下载 Virtual Display Driver: %s", u)
 		if err := downloadPlain(u, tmp); err != nil {
 			lastErr = err
 			_ = os.Remove(tmp)
@@ -256,7 +256,7 @@ func isVDDInstalled() bool {
 func createVirtualDisplay() (bool, string) {
 	// 先检查是否已有虚拟显示器
 	if virtualDisplayCount() > 0 {
-		log.Printf("[vdd] 已存在虚拟显示器，跳过创建")
+		logx.Warnf("[vdd] 已存在虚拟显示器，跳过创建")
 		return true, "虚拟显示器已就绪"
 	}
 
@@ -288,7 +288,7 @@ Start-Sleep -Seconds 2
 	}
 	n := strings.TrimSpace(string(out))
 	if n != "" && n != "0" {
-		log.Printf("[vdd] 虚拟显示设备已激活，设备数: %s", n)
+		logx.Infof("[vdd] 虚拟显示设备已激活，设备数: %s", n)
 		return true, "虚拟显示器已激活"
 	}
 
@@ -305,7 +305,7 @@ if (Test-Path $devConPath) {
 Get-PnpDevice -Class Display | Format-List FriendlyName, InstanceId, Status
 `
 	out2, _ := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript2).Output()
-	log.Printf("[vdd] 显示设备枚举: %s", strings.TrimSpace(string(out2)))
+	logx.Infof("[vdd] 显示设备枚举: %s", strings.TrimSpace(string(out2)))
 
 	return false, "虚拟显示驱动已安装但未检测到活动显示输出"
 }
@@ -332,25 +332,25 @@ func virtualDisplayCount() int {
 func ensureVirtualDisplay(cfg VncConfig) (bool, string) {
 	// 1. 检查是否已有活动显示器（物理或已配置的虚拟）
 	if hasActiveDisplay() {
-		log.Printf("[vdd] 系统已有活动显示器，无需安装虚拟显示驱动")
+		logx.Infof("[vdd] 系统已有活动显示器，无需安装虚拟显示驱动")
 		return true, "系统已有活动显示器"
 	}
 
 	// 2. 尝试安装虚拟显示驱动
-	log.Printf("[vdd] 检测到无头系统，开始安装虚拟显示驱动...")
+	logx.Infof("[vdd] 检测到无头系统，开始安装虚拟显示驱动...")
 	if !installVirtualDisplayDriver(cfg) {
 		msg := "无头系统且虚拟显示驱动安装失败。请连接物理显示器或在 VM 设置中添加虚拟显示器后重试。"
-		log.Printf("[vdd] %s", msg)
+		logx.Infof("[vdd] %s", msg)
 		return false, msg
 	}
 
 	// 3. 创建/激活虚拟显示器
 	ok, msg := createVirtualDisplay()
 	if !ok {
-		log.Printf("[vdd] 创建虚拟显示器失败: %s", msg)
+		logx.Errorf("[vdd] 创建虚拟显示器失败: %s", msg)
 		return false, "虚拟显示驱动已安装但无法创建虚拟显示器: " + msg
 	}
-	log.Printf("[vdd] 虚拟显示器就绪: %s", msg)
+	logx.Infof("[vdd] 虚拟显示器就绪: %s", msg)
 	return true, "已创建虚拟显示器，VNC 可正常捕获画面"
 }
 

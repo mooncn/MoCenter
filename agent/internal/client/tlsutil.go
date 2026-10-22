@@ -6,7 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"mocenter/agent/internal/logx"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,7 +168,7 @@ func (c *Client) clientCert() *tls.Certificate {
 		if err == nil {
 			return &cert
 		}
-		log.Printf("[agent] 加载配置中的客户端证书失败: %v", err)
+		logx.Errorf("[agent] 加载配置中的客户端证书失败: %v", err)
 	}
 	dir := c.credDir()
 	cert, err := tls.LoadX509KeyPair(dir+"/client.crt", dir+"/client.key")
@@ -259,7 +259,7 @@ func DisplayFingerprint(fp string) string {
 }
 
 // logf 统一日志前缀。
-func logf(format string, args ...interface{}) { log.Printf(format, args...) }
+func logf(format string, args ...interface{}) { logx.Infof(format, args...) }
 
 // agentauthDisplay 把指纹格式化成 4 位一组（与服务端日志口径一致）。
 func agentauthDisplay(fp string) string {

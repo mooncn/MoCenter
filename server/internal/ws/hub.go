@@ -11,7 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"log"
+	"mocenter/server/internal/logx"
 	"net/http"
 	"strings"
 	"sync"
@@ -170,7 +170,7 @@ func (h *Hub) PublicSubscribers() int {
 func (h *Hub) BroadcastPublic(payload interface{}) {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("[ws] public marshal error: %v", err)
+		logx.Infof("[ws] public marshal error: %v", err)
 		return
 	}
 	h.mu.RLock()
@@ -227,13 +227,13 @@ func (h *Hub) upgrade(w http.ResponseWriter, r *http.Request, session, operator 
 	// 么也看不出。判定与登记之间有极小的窗口（同一会话同时握够 8 次会略微超额），
 	// 换来的是拒绝路径干净，这个取舍可以接受。
 	if h.sessionFull(session) {
-		log.Printf("[ws] 会话 %s… 连接数已达上限 %d，拒绝握手（来自 %s）", SessionPrefix(session), maxConnsPerSession, r.RemoteAddr)
+		logx.Errorf("[ws] 会话 %s… 连接数已达上限 %d，拒绝握手（来自 %s）", SessionPrefix(session), maxConnsPerSession, r.RemoteAddr)
 		http.Error(w, "too many connections", http.StatusTooManyRequests)
 		return
 	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[ws] upgrade error: %v", err)
+		logx.Infof("[ws] upgrade error: %v", err)
 		return
 	}
 	c := &Client{
@@ -302,7 +302,7 @@ func SessionPrefix(session string) string {
 func (h *Hub) Broadcast(typ string, payload interface{}) {
 	env, err := marshalEnv(typ, payload)
 	if err != nil {
-		log.Printf("[ws] marshal error: %v", err)
+		logx.Infof("[ws] marshal error: %v", err)
 		return
 	}
 	h.deliver(env, nil)
@@ -317,7 +317,7 @@ func (h *Hub) Broadcast(typ string, payload interface{}) {
 func (h *Hub) BroadcastToSession(session, typ string, payload interface{}) {
 	env, err := marshalEnv(typ, payload)
 	if err != nil {
-		log.Printf("[ws] marshal error: %v", err)
+		logx.Infof("[ws] marshal error: %v", err)
 		return
 	}
 	if session == "" {

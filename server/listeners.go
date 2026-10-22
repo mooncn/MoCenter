@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"net"
 	"net/http"
 	"strconv"
@@ -85,7 +85,7 @@ func (l *listenerHub) acceptAgents(ln net.Listener) {
 			}
 			// 瞬时错误（句柄耗尽等）不应把监听协程永久打死；
 			// 但也不能空转：退避 100ms 再继续。
-			log.Printf("[server] Agent accept error: %v", err)
+			logx.Infof("[server] Agent accept error: %v", err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -96,7 +96,7 @@ func (l *listenerHub) acceptAgents(ln net.Listener) {
 func serveWeb(srv *http.Server, ln net.Listener) {
 	if err := srv.Serve(ln); err != nil &&
 		!errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
-		log.Printf("[server] Web 控制台监听结束: %v", err)
+		logx.Infof("[server] Web 控制台监听结束: %v", err)
 	}
 }
 
@@ -150,7 +150,7 @@ func (l *listenerHub) RebindAgent(addr string) error {
 	if oldLn != nil && !closedOld {
 		_ = oldLn.Close()
 	}
-	log.Printf("[server] Agent TCP 监听已切换: %s → %s", oldAddr, addr)
+	logx.Infof("[server] Agent TCP 监听已切换: %s → %s", oldAddr, addr)
 	return nil
 }
 
@@ -192,7 +192,7 @@ func (l *listenerHub) RebindHTTP(addr string, persist func(string) error) (pendi
 		// 给当前请求留出写响应的时间，再优雅关闭旧监听。
 		time.AfterFunc(time.Second, func() { shutdownWeb(oldSrv) })
 	}
-	log.Printf("[server] Web 控制台监听已切换: %s → %s", oldAddr, addr)
+	logx.Infof("[server] Web 控制台监听已切换: %s → %s", oldAddr, addr)
 	return false, nil
 }
 
@@ -218,7 +218,7 @@ func (l *listenerHub) applySamePortHTTP(addr, oldAddr string, oldSrv *http.Serve
 			l.mu.Lock()
 			l.httpSrv = nil
 			l.mu.Unlock()
-			log.Printf("[server] 警告: Web 监听切换失败且无法恢复 %s: %v", oldAddr, rerr)
+			logx.Errorf("[server] Web 监听切换失败且无法恢复 %s: %v", oldAddr, rerr)
 			return
 		}
 		l.mu.Lock()
@@ -226,9 +226,9 @@ func (l *listenerHub) applySamePortHTTP(addr, oldAddr string, oldSrv *http.Serve
 		l.httpSrv = restoreSrv
 		l.mu.Unlock()
 		go serveWeb(restoreSrv, restoreLn)
-		log.Printf("[server] Web 监听切换失败，已恢复旧地址 %s: %v", oldAddr, err)
+		logx.Errorf("[server] Web 监听切换失败，已恢复旧地址 %s: %v", oldAddr, err)
 		if perr := persist(oldAddr); perr != nil {
-			log.Printf("[server] 警告: 恢复旧地址后写回配置失败: %v", perr)
+			logx.Errorf("[server] 恢复旧地址后写回配置失败: %v", perr)
 		}
 		return
 	}
@@ -239,9 +239,9 @@ func (l *listenerHub) applySamePortHTTP(addr, oldAddr string, oldSrv *http.Serve
 	l.mu.Unlock()
 	go serveWeb(srv, ln)
 	if err := persist(addr); err != nil {
-		log.Printf("[server] 警告: 新监听已生效，但写入配置失败（重启后将回到旧地址）: %v", err)
+		logx.Errorf("[server] 新监听已生效，但写入配置失败（重启后将回到旧地址）: %v", err)
 	}
-	log.Printf("[server] Web 控制台监听已切换: %s → %s", oldAddr, addr)
+	logx.Infof("[server] Web 控制台监听已切换: %s → %s", oldAddr, addr)
 }
 
 func shutdownWeb(srv *http.Server) {

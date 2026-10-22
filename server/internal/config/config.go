@@ -63,6 +63,11 @@ type Config struct {
 	ProxyIP string `json:"proxy_ip"`
 	// TokenTTL 会话 Token 有效期（Go duration 字符串，如 12h / 30m）；留空用内置默认 12h。
 	TokenTTL string `json:"token_ttl"`
+	// LogLevel 运行期日志级别：off / error / warn / info，**服务端默认 info**。
+	//
+	// 服务端日志量小、启动信息（监听地址、数据目录、证书路径）排障价值高，
+	// 所以与 Agent（默认 error）取不同的默认值。留空即按 info 处理。
+	LogLevel string `json:"log_level"`
 	// WebTLSCert / WebTLSKey Web 控制台 TLS 证书与私钥。
 	// 不配置则 :8080 为明文 HTTP —— 登录口令与 Token 将明文上网，
 	// 仅在前面有 TLS 反向代理时才可接受。

@@ -15,7 +15,7 @@ package vnc
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"net/http"
 	"strconv"
 	"strings"
@@ -287,7 +287,7 @@ const mismatchLogInterval = time.Minute
 
 // logMismatch 记录一次"用别人的隧道 ID 回传"，按 agentID 限频。
 func (m *Mgr) logMismatch(from, owner, tunnelID, kind string) {
-	log.Printf("[vnc] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）", from, kind, tunnelID, owner)
+	logx.Infof("[vnc] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）", from, kind, tunnelID, owner)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.mismatchAt == nil {
@@ -331,7 +331,7 @@ func (m *Mgr) closeViewer(tunnelID string, reason ...string) {
 	relayed := vw.relayed
 	_ = vw.ws.Close()
 	vw.wmu.Unlock()
-	log.Printf("[vnc] 关闭隧道 %s agent=%s 原因=%s 已转发=%dB", tunnelID, vw.agentID, r, relayed)
+	logx.Infof("[vnc] 关闭隧道 %s agent=%s 原因=%s 已转发=%dB", tunnelID, vw.agentID, r, relayed)
 	m.sendTunnelClose(tunnelID, vw.agentID, r)
 }
 
@@ -650,7 +650,7 @@ func (m *Mgr) handleViewer(w http.ResponseWriter, r *http.Request, validate func
 	// 目标端口闸门：放在握手与名额之前。VNC 隧道连的是被管主机的回环，
 	// 放开任意端口就等于给每个登录会话一台内网端口代理（Redis/SSH/调试端口）。
 	if err := m.CheckPort(port); err != nil {
-		log.Printf("[vnc] 拒绝隧道请求 agent=%s port=%d: %s", agentID, port, err.Error())
+		logx.Errorf("[vnc] 拒绝隧道请求 agent=%s port=%d: %s", agentID, port, err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -659,7 +659,7 @@ func (m *Mgr) handleViewer(w http.ResponseWriter, r *http.Request, validate func
 	// 瞬时多开一条——窗口毫秒级，不足以防住刷隧道。
 	session := ws.SessionKey(token)
 	if !m.acquireViewer(session) {
-		log.Printf("[vnc] 会话 %s… 远程桌面并发数已达上限 %d，拒绝握手（来自 %s）",
+		logx.Errorf("[vnc] 会话 %s… 远程桌面并发数已达上限 %d，拒绝握手（来自 %s）",
 			ws.SessionPrefix(session), maxViewersPerSession, r.RemoteAddr)
 		http.Error(w, "too many viewers", http.StatusTooManyRequests)
 		return
@@ -674,7 +674,7 @@ func (m *Mgr) handleViewer(w http.ResponseWriter, r *http.Request, validate func
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[vnc] upgrade error: %v", err)
+		logx.Infof("[vnc] upgrade error: %v", err)
 		return
 	}
 	conn.SetReadLimit(viewerReadLimit)
@@ -713,7 +713,7 @@ func (m *Mgr) handleViewer(w http.ResponseWriter, r *http.Request, validate func
 		ready := v.ready
 		v.wmu.Unlock()
 		if !ready {
-			log.Printf("[vnc] 隧道建立超时 %s，关闭查看器", tid)
+			logx.Errorf("[vnc] 隧道建立超时 %s，关闭查看器", tid)
 			m.closeViewer(tid, "隧道建立超时（Agent 未回 openResp）")
 		}
 	}(tunnelID)
@@ -744,7 +744,7 @@ func (m *Mgr) handleViewer(w http.ResponseWriter, r *http.Request, validate func
 			vw.pending = append(vw.pending, data)
 			vw.wmu.Unlock()
 			if over {
-				log.Printf("[vnc] 隧道 %s 建立前缓冲超过 %d 字节，关闭查看器", tunnelID, viewerPendingLimit)
+				logx.Infof("[vnc] 隧道 %s 建立前缓冲超过 %d 字节，关闭查看器", tunnelID, viewerPendingLimit)
 				break
 			}
 		}

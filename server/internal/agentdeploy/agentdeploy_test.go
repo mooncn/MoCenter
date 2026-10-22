@@ -1,11 +1,13 @@
 package agentdeploy
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -414,6 +416,109 @@ func TestParseKeyVals(t *testing.T) {
 	}
 	if v, ok := m["OS"]; !ok || v != "" {
 		t.Fatalf("空值应存在且为空串，实际 %q ok=%v", v, ok)
+	}
+}
+
+// TestProbeSentinelWellFormed 守护探测脚本的完整性标记。
+//
+// runProbe 只接受含 probeSentinel 的回显，并据此判定"exec 通道被拦截"。
+// 标记一旦写坏（改了常量却没同步脚本、或脚本正文里出现了同样的字面量），
+// 每一次部署都会白重试三轮然后报"无有效回显"——而目标机其实完全正常。
+func TestProbeSentinelWellFormed(t *testing.T) {
+	if strings.Contains(probeScriptSrc, probeSentinel) {
+		t.Fatal("探测脚本正文里不应出现结束标记字面量，否则无法区分完整回显与截断回显")
+	}
+	full := probeScriptSrc + "\necho " + probeSentinel + "\n"
+	lines := strings.Split(strings.TrimRight(full, "\n"), "\n")
+	tail := lines[len(lines)-1]
+	if tail != "echo "+probeSentinel {
+		t.Fatalf("结束标记应是脚本最后一条命令，实际尾行 %q", tail)
+	}
+	if strings.Contains(tail, "\r") {
+		t.Fatal("脚本含 CR，sh/dash 会把标记解析成带 \\r 的行")
+	}
+}
+
+// TestProbeFactsAreParsed 守护探测字段清单与解析端的一致性。
+//
+// 脚本用 `echo "KEY=..."` 打印，Go 侧按字符串字面量取值；把 DISTRO_ID 改名
+// 或删掉一行，编译不会报错，表现是发行版/权限判断静默变成"未知"。
+func TestProbeFactsAreParsed(t *testing.T) {
+	for _, key := range []string{"ARCH", "UID", "HOST", "OS", "DISTRO_ID", "DISTRO_VER", "SYSTEMD", "HAS_SUDO", "SUDO_NOPASS"} {
+		if !strings.Contains(probeScriptSrc, `"`+key+`=`) {
+			t.Errorf("探测脚本不再输出 %s，probeTarget 的取值会永远是空", key)
+		}
+	}
+}
+
+// TestProbeScriptRunsOnPOSIXShell 在真实 sh 上跑一遍探测脚本。
+//
+// 这是"识别不出 Debian 12 x86_64"的直接复现点：脚本必须能被 /bin/sh=dash 解析，
+// 任何 bash 专属写法（[[ ]]、数组）都会让整段脚本零回显，
+// 而零回显在旧实现里被报成"不支持的目标架构"。
+func TestProbeScriptRunsOnPOSIXShell(t *testing.T) {
+	ran := false
+	for _, sh := range []string{"sh", "dash"} {
+		path, err := exec.LookPath(sh)
+		if err != nil {
+			continue
+		}
+		ran = true
+		t.Run(sh, func(t *testing.T) {
+			cmd := exec.Command(path, "-s")
+			cmd.Stdin = strings.NewReader(probeScriptSrc + "\necho " + probeSentinel + "\n")
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%s 执行探测脚本失败: %v（输出 %q）", sh, err, out)
+			}
+			s := string(out)
+			if !strings.Contains(s, probeSentinel) {
+				t.Fatalf("%s 下回显不完整: %q", sh, s)
+			}
+			vals := parseKeyVals(s)
+			if strings.TrimSpace(vals["ARCH"]) == "" {
+				t.Fatalf("%s 下没有解析出 ARCH: %q", sh, s)
+			}
+			if vals["UID"] == "" {
+				t.Fatalf("%s 下没有解析出 UID: %q", sh, s)
+			}
+		})
+	}
+	if !ran {
+		t.Skip("本机没有 sh/dash 可执行文件（Windows CI）")
+	}
+}
+
+// TestSafeBufferKeepsConcurrentWrites 守护部署输出的合并缓冲。
+//
+// ssh 库会为 Stdout 与 Stderr 各起一个拷贝 goroutine；换成裸 bytes.Buffer
+// 时实测（Debian 12 云机）8 次里 7 次回显被整段丢掉，运维看到的是一句
+// "不支持的目标架构"，而目标机其实完全正常。
+func TestSafeBufferKeepsConcurrentWrites(t *testing.T) {
+	var b safeBuffer
+	const writers, chunk = 16, 64
+	payload := bytes.Repeat([]byte("x"), chunk)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 32; j++ {
+				if n, err := b.Write(payload); err != nil || n != chunk {
+					t.Errorf("写入结果异常: n=%d err=%v", n, err)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := b.String(); len(got) != writers*chunk*32 {
+		t.Fatalf("并发写入丢数据: 期望 %d 字节，实际 %d 字节", writers*chunk*32, len(got))
 	}
 }
 

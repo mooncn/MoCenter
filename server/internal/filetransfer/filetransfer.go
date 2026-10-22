@@ -9,7 +9,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"io"
-	"log"
+	"mocenter/server/internal/logx"
 	"os"
 	"path/filepath"
 	"strings"
@@ -158,7 +158,7 @@ func (m *Manager) HandleUploadChunk(req *protocol.FileUploadReq) *protocol.Chunk
 
 	if req.FileSize < 0 {
 		// 文件打开失败通知
-		log.Printf("[filetransfer] Agent %s 上传文件 %s 失败", req.AgentID, req.FilePath)
+		logx.Errorf("[filetransfer] Agent %s 上传文件 %s 失败", req.AgentID, req.FilePath)
 		return ack
 	}
 
@@ -167,7 +167,7 @@ func (m *Manager) HandleUploadChunk(req *protocol.FileUploadReq) *protocol.Chunk
 	if !ok {
 		if len(m.uploads) >= maxActiveUploadTasks {
 			if m.shouldLogReject() {
-				log.Printf("[filetransfer] 拒绝 %s 的新任务 %s：在途上传任务已达上限 %d（可能有主机在异常刷上传）",
+				logx.Errorf("[filetransfer] 拒绝 %s 的新任务 %s：在途上传任务已达上限 %d（可能有主机在异常刷上传）",
 					req.AgentID, req.FilePath, maxActiveUploadTasks)
 			}
 			m.mu.Unlock()
@@ -175,7 +175,7 @@ func (m *Manager) HandleUploadChunk(req *protocol.FileUploadReq) *protocol.Chunk
 		}
 		if req.FileSize > maxUploadTaskBytes {
 			if m.shouldLogReject() {
-				log.Printf("[filetransfer] 拒绝 %s 的上传 %s：声明大小 %d 超过单任务上限 %d",
+				logx.Errorf("[filetransfer] 拒绝 %s 的上传 %s：声明大小 %d 超过单任务上限 %d",
 					req.AgentID, req.FilePath, req.FileSize, maxUploadTaskBytes)
 			}
 			m.mu.Unlock()
@@ -184,7 +184,7 @@ func (m *Manager) HandleUploadChunk(req *protocol.FileUploadReq) *protocol.Chunk
 		lp := m.localPath(req.AgentID, req.FilePath)
 		if lp == "" {
 			m.mu.Unlock()
-			log.Printf("[filetransfer] 拒绝上传：AgentID/FilePath 非法 agent=%q file=%q", req.AgentID, req.FilePath)
+			logx.Errorf("[filetransfer] 拒绝上传：AgentID/FilePath 非法 agent=%q file=%q", req.AgentID, req.FilePath)
 			return ack // NACK
 		}
 		t = &uploadTask{
@@ -215,7 +215,7 @@ func (m *Manager) HandleUploadChunk(req *protocol.FileUploadReq) *protocol.Chunk
 		// 单任务上限挡住一路灌到底，总量上限挡住多条任务合力吃满内存。
 		if t.received+n > maxUploadTaskBytes || m.stored+n > maxStoredBytes {
 			if m.shouldLogReject() {
-				log.Printf("[filetransfer] 拒绝 %s 的续传分片 %s#%d：本任务已存 %d、全部在途已存 %d，超过上限（%d/%d）",
+				logx.Errorf("[filetransfer] 拒绝 %s 的续传分片 %s#%d：本任务已存 %d、全部在途已存 %d，超过上限（%d/%d）",
 					req.AgentID, req.FilePath, req.ChunkSeq, t.received, m.stored, maxUploadTaskBytes, maxStoredBytes)
 			}
 			m.mu.Unlock()
@@ -267,7 +267,7 @@ func (m *Manager) CleanupStale() int {
 		}
 	}
 	if n > 0 {
-		log.Printf("[filetransfer] 回收 %d 个超过 %v 未完成的上传任务", n, uploadTaskTTL)
+		logx.Infof("[filetransfer] 回收 %d 个超过 %v 未完成的上传任务", n, uploadTaskTTL)
 	}
 	return n
 }
@@ -306,17 +306,17 @@ func (m *Manager) tryAssemble(t *uploadTask) {
 	// 合并写盘
 	f, err := os.OpenFile(t.localPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Printf("[filetransfer] 打开 %s 失败: %v", t.localPath, err)
+		logx.Errorf("[filetransfer] 打开 %s 失败: %v", t.localPath, err)
 		return
 	}
 	defer f.Close()
 	for _, c := range chunks {
 		if _, err := f.Write(c); err != nil {
-			log.Printf("[filetransfer] 写入 %s 失败: %v", t.localPath, err)
+			logx.Errorf("[filetransfer] 写入 %s 失败: %v", t.localPath, err)
 			return
 		}
 	}
-	log.Printf("[filetransfer] 文件上传完成: %s -> %s (%d bytes)", t.filePath, t.localPath, t.fileSize)
+	logx.Infof("[filetransfer] 文件上传完成: %s -> %s (%d bytes)", t.filePath, t.localPath, t.fileSize)
 }
 
 // HandleFileDownload 处理 Agent 下载回传的分片（复用上传逻辑）。

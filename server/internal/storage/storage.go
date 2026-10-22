@@ -7,7 +7,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -50,7 +50,7 @@ func Open(dbPath string) (*DB, error) {
 		sdb.Close()
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
-	log.Printf("[storage] SQLite 数据库已就绪: %s", dbPath)
+	logx.Infof("[storage] SQLite 数据库已就绪: %s", dbPath)
 	return db, nil
 }
 
@@ -324,7 +324,7 @@ func (db *DB) dedupAgentsByUUID() error {
 			d.uuid, d.keep); err != nil {
 			return fmt.Errorf("删除 UUID %s 的冗余主机记录失败: %w", d.uuid, err)
 		}
-		log.Printf("[storage] 已按 UUID %s 合并重复主机记录，保留 agent_id=%s", d.uuid, d.keep)
+		logx.Infof("[storage] 已按 UUID %s 合并重复主机记录，保留 agent_id=%s", d.uuid, d.keep)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交重复主机合并事务失败: %w", err)

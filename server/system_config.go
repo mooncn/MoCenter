@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"net"
 	"net/http"
 	"strings"
@@ -135,7 +135,7 @@ func systemSessionHandler(authz *auth.Auth, settings *settingsStore, audit func(
 		if audit != nil {
 			audit(r, "修改会话保持时长为 "+ttl)
 		}
-		log.Printf("[server] 会话保持时长已更新为 %s（新有效期同时收紧现有会话）", ttl)
+		logx.Infof("[server] 会话保持时长已更新为 %s（新有效期同时收紧现有会话）", ttl)
 		writeJSON(w, map[string]interface{}{
 			"ok":  true,
 			"ttl": ttl,
@@ -305,7 +305,7 @@ func systemAgentListenHandler(authz *auth.Auth, um *auth.UserManager, settings *
 		firewallMsg := "端口未变化，无需新增防火墙规则"
 		if port != oldPort {
 			firewallMsg = ensureFirewallPort(port, "Agent")
-			log.Printf("[server] Agent 监听防火墙处理: %s", firewallMsg)
+			logx.Infof("[server] Agent 监听防火墙处理: %s", firewallMsg)
 		}
 		warn := ""
 		if err := settings.Update(func(c *config.Config) {
@@ -313,7 +313,7 @@ func systemAgentListenHandler(authz *auth.Auth, um *auth.UserManager, settings *
 			c.ListenManaged = true
 		}); err != nil {
 			warn = "（新监听已生效，但写入配置失败：重启后将回到旧地址）"
-			log.Printf("[server] 警告: Agent 监听已切换，但写配置失败: %v", err)
+			logx.Errorf("[server] Agent 监听已切换，但写配置失败: %v", err)
 		}
 		// 新监听已就绪，再下发地址；确认后的主机直接断开让它们立刻重连，
 		// 未确认（旧版 Agent）保持原连接，不做无差别踢下线。
@@ -326,7 +326,7 @@ func systemAgentListenHandler(authz *auth.Auth, um *auth.UserManager, settings *
 		if audit != nil {
 			audit(r, fmt.Sprintf("修改 Agent 监听地址 %s → %s（通知 %d 台，确认 %d 台）", oldAddr, addr, notified, len(acked)))
 		}
-		log.Printf("[server] Agent 监听已切换 %s → %s（通知 %d 台，确认 %d 台）", oldAddr, addr, notified, len(acked))
+		logx.Infof("[server] Agent 监听已切换 %s → %s（通知 %d 台，确认 %d 台）", oldAddr, addr, notified, len(acked))
 		writeJSON(w, map[string]interface{}{
 			"ok":         true,
 			"addr":       addr,
@@ -410,7 +410,7 @@ func systemHTTPListenHandler(authz *auth.Auth, um *auth.UserManager, settings *s
 		firewallMsg := "端口未变化，无需新增防火墙规则"
 		if newPort != oldPort {
 			firewallMsg = ensureFirewallPort(newPort, "Web")
-			log.Printf("[server] Web 控制台防火墙处理: %s", firewallMsg)
+			logx.Infof("[server] Web 控制台防火墙处理: %s", firewallMsg)
 		}
 		if audit != nil {
 			audit(r, fmt.Sprintf("修改后台监听地址 %s → %s", oldAddr, addr))
@@ -420,7 +420,7 @@ func systemHTTPListenHandler(authz *auth.Auth, um *auth.UserManager, settings *s
 			msg = fmt.Sprintf("已保存并开始切换为 %s：当前连接会断开，请用新地址访问；防火墙：%s"+
 				"（若同端口换主机，切换失败会自动恢复旧地址）", addr, firewallMsg)
 		}
-		log.Printf("[server] 后台监听配置请求: %s → %s（pending=%v）", oldAddr, addr, pending)
+		logx.Infof("[server] 后台监听配置请求: %s → %s（pending=%v）", oldAddr, addr, pending)
 		writeJSON(w, map[string]interface{}{
 			"ok":       true,
 			"addr":     addr,

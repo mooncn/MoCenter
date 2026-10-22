@@ -16,7 +16,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"net/http"
 	"strconv"
 	"strings"
@@ -296,7 +296,7 @@ func (p *publicSite) publicWSHandler() http.HandlerFunc {
 		defer p.releaseWS(ip)
 		conn, err := p.upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Printf("[public] ws upgrade error: %v", err)
+			logx.Infof("[public] ws upgrade error: %v", err)
 			return
 		}
 		defer conn.Close()

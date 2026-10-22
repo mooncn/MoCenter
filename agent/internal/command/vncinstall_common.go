@@ -10,7 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
+	"mocenter/agent/internal/logx"
 	"os"
 	"strings"
 	"time"
@@ -55,7 +55,7 @@ func httpsProxyOrEmpty(proxy, reason string) string {
 		return ""
 	}
 	if !strings.HasPrefix(strings.ToLower(p), "https://") {
-		log.Printf("[vnc-install] 忽略非 https 的加速代理（%s）：明文代理可被中间人替换安装包，等同于放弃完整性校验", reason)
+		logx.Warnf("[vnc-install] 忽略非 https 的加速代理（%s）：明文代理可被中间人替换安装包，等同于放弃完整性校验", reason)
 		return ""
 	}
 	return p

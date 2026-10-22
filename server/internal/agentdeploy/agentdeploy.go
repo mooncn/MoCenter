@@ -43,6 +43,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +112,9 @@ type Request struct {
 	PrivateKey string `json:"private_key"`
 	// Passphrase 私钥口令（私钥加密时提供）
 	Passphrase string `json:"passphrase"`
+	// SudoPassword 非 root 用户执行 sudo 所需密码（SSH 使用私钥登录时单独提供）。
+	// 使用密码登录时留空即默认复用 SSH 密码；只在本次请求内存中使用，不落盘、不写审计。
+	SudoPassword string `json:"sudo_password"`
 	// AgentID 目标机上的 Agent 名称（留空用主机名）。
 	// 必须通过白名单校验（只允许 [A-Za-z0-9._-]，最长 64）。
 	AgentID string `json:"agent_id"`
@@ -161,10 +165,13 @@ type Result struct {
 
 // TargetInfo 目标机探测结果。
 type TargetInfo struct {
-	Arch       string `json:"arch"`        // uname -m
+	Arch       string `json:"arch"`        // uname -m（缺失时回退 dpkg --print-architecture）
 	OSName     string `json:"os_name"`     // /etc/os-release 的 PRETTY_NAME
+	DistroID   string `json:"distro_id"`   // /etc/os-release 的 ID（debian/ubuntu/rocky…）
+	DistroVer  string `json:"distro_ver"`  // /etc/os-release 的 VERSION_ID
 	IsRoot     bool   `json:"is_root"`     // id -u == 0
-	SudoOK     bool   `json:"sudo_ok"`     // 非 root 时 sudo -n 是否可用
+	SudoOK     bool   `json:"sudo_ok"`     // 提权是否可用
+	SudoMode   string `json:"sudo_mode"`   // root / nopass / password / none
 	HasSystemd bool   `json:"has_systemd"` // 是否存在 systemctl
 	Hostname   string `json:"hostname"`
 	// GOARCH 由 Arch 推导（amd64 / arm64 / arm / 386）
@@ -398,6 +405,11 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 		// 因此把原始错误保留在步骤里（不含凭证内容）。
 		addStep(StepResult{Name: "SSH 连接与认证", OK: false, Error: err.Error()})
 		res.Message = "SSH 连接失败"
+		if strings.Contains(strings.ToLower(err.Error()), "unable to authenticate") ||
+			strings.Contains(strings.ToLower(err.Error()), "no supported methods") {
+			res.Message = "SSH 认证失败：请核对用户名/密码或私钥。Debian/Ubuntu 云镜像通常禁用 root 密码登录，" +
+				"请改用实例默认用户（debian/ubuntu）或私钥；非 root 用户需要可用的 sudo"
+		}
 		d.auditf(operator, operatorIP, "一键部署 Agent 失败（SSH 连接）: %s@%s:%d 主机密钥=%s",
 			req.User, host, port, hostKeyForAudit(trust))
 		return res, nil
@@ -420,10 +432,17 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 		}
 	}()
 
+	// 非 root 用户提权密码：私钥登录时用单独填写的 sudo_password；
+	// 密码登录时留空则复用 SSH 密码（Debian 云镜像常见 debian 用户 + sudo 密码）。
+	sudoPw := strings.TrimSpace(req.SudoPassword)
+	if sudoPw == "" {
+		sudoPw = req.Password
+	}
+
 	// --- 2. 环境探测 ---
 	var info *TargetInfo
 	if err := step("探测目标机环境", func() (string, error) {
-		ti, out, err := probeTarget(client)
+		ti, out, err := probeTarget(client, sudoPw)
 		if err != nil {
 			return out, err
 		}
@@ -438,8 +457,9 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 
 	if !info.IsRoot && !info.SudoOK {
 		addStep(StepResult{Name: "权限检查", OK: false,
-			Error: "需要 root 权限（或免密 sudo）才能安装为系统服务"})
-		res.Message = "目标机缺少 root 权限"
+			Error: "需要 root 或可用的 sudo。当前用户不是 root，且免密 sudo / sudo 密码均不可用；" +
+				"Debian/Ubuntu 云镜像请改用 root 登录，或在表单填写该用户的 sudo 密码"})
+		res.Message = "目标机缺少 root 权限或 sudo 不可用"
 		d.auditf(operator, operatorIP, "一键部署 Agent 失败（权限不足）: %s@%s:%d", req.User, host, port)
 		return res, nil
 	}
@@ -469,23 +489,23 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 	}
 	remoteBin := "/tmp/mocenter-agent." + fmt.Sprint(time.Now().Unix())
 	if err := step("上传 Agent 二进制（"+filepath.Base(binary)+"）", func() (string, error) {
-		src, oerr := os.Open(binary)
+		f, oerr := os.Open(binary)
 		if oerr != nil {
 			return "", oerr
 		}
-		defer src.Close()
-		fi, serr := src.Stat()
+		defer f.Close()
+		fi, serr := f.Stat()
 		if serr != nil {
 			return "", serr
 		}
 		if fi.Size() > maxUploadSize {
 			return "", fmt.Errorf("安装包过大（%d 字节，上限 %d）", fi.Size(), int64(maxUploadSize))
 		}
-		if uerr := uploadFile(client, src, fi.Size(), remoteBin, info.IsRoot); uerr != nil {
+		// 每次尝试都重新打开：断点重传要喂的是完整字节流，不能拿一个已读尽的 reader。
+		if uerr := uploadFile(client, func() (io.ReadCloser, error) { return os.Open(binary) }, fi.Size(), remoteBin); uerr != nil {
 			return "", uerr
 		}
-		// 校验上传完整性：SFTP 中断会留下半个二进制，装上去就是"服务反复重启"。
-		return fmt.Sprintf("已上传 %s（%s）", filepath.Base(binary), humanSize(fi.Size())), nil
+		return fmt.Sprintf("已上传 %s（%s，远端字节数已核对）", filepath.Base(binary), humanSize(fi.Size())), nil
 	}); err != nil {
 		res.Message = "上传 Agent 二进制失败"
 		d.auditf(operator, operatorIP, "一键部署 Agent 失败（上传）: %s@%s:%d", req.User, host, port)
@@ -503,7 +523,7 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 	conf := d.buildAgentConfig(req, serverAddr)
 	remoteConf := "/tmp/mocenter-agent-config-" + fmt.Sprint(time.Now().Unix()) + ".json"
 	if err := step("写入 Agent 配置", func() (string, error) {
-		if err := uploadBytes(client, []byte(conf), remoteConf, info.IsRoot); err != nil {
+		if err := uploadBytes(client, []byte(conf), remoteConf); err != nil {
 			return "", err
 		}
 		return "配置已准备（含服务端地址、Agent 名称、注册密钥、延迟目标）", nil
@@ -533,6 +553,13 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 		return res, nil
 	}
 
+	priv := privRoot
+	switch info.SudoMode {
+	case "nopass":
+		priv = privSudoNoPass
+	case "password":
+		priv = privSudoPassword
+	}
 	script := buildInstallScript(installScriptArgs{
 		RemoteBin:  remoteBin,
 		RemoteConf: remoteConf,
@@ -540,10 +567,11 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 		Service:    svcName,
 		HasSystemd: info.HasSystemd,
 		AgentID:    req.AgentID,
-		IsRoot:     info.IsRoot,
+		// 安装脚本整体以 root 运行（root 或 sudo 包装），内部不再叠加 sudo。
+		IsRoot: true,
 	})
 	if err := step("安装为系统服务并启动", func() (string, error) {
-		out, err := runScript(client, script, info.IsRoot)
+		out, err := runScript(client, script, priv, sudoPw)
 		if err != nil {
 			return out, err
 		}
@@ -556,7 +584,7 @@ func (d *Deployer) Deploy(req *Request, operator, operatorIP string) (*Result, e
 
 	// --- 6. 回读状态确认 ---
 	if err := step("确认服务状态", func() (string, error) {
-		out, err := runCmd(client, info.IsRoot, statusProbeCmd(svcName, info.HasSystemd))
+		out, err := runStatusCheck(client, svcName, info.HasSystemd)
 		if err != nil {
 			return out, err
 		}
@@ -628,37 +656,168 @@ func (d *Deployer) dial(req *Request, host string, port int) (*ssh.Client, *host
 	return client, trust, nil
 }
 
-// probeTarget 探测目标机的架构与权限。
-func probeTarget(client *ssh.Client) (*TargetInfo, string, error) {
-	// 一次性把所有需要的值打出来，减少往返（每往返都有网络延迟）。
-	const probe = `echo "ARCH=$(uname -m)"; ` +
-		`echo "UID=$(id -u)"; ` +
-		`echo "HOST=$(hostname 2>/dev/null)"; ` +
-		`echo "OS=$( . /etc/os-release 2>/dev/null && echo $PRETTY_NAME )"; ` +
-		// 只判断 systemctl 是否存在还不够：容器里往往有 systemctl 但 PID 1 不是
-		// systemd，此时 systemctl 会直接报 "System has not been booted with systemd"。
-		// 因此额外检查 /run/systemd/system（systemd 运行时目录）。
-		`echo "SYSTEMD=$( [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && echo yes || echo no )"; ` +
-		`echo "SUDO=$(sudo -n true >/dev/null 2>&1 && echo yes || echo no)"`
-	out, err := runCmd(client, true, probe)
+// probeSentinel 探测脚本的结束标记。
+//
+// 只判断"有没有 ARCH="是不够的：目标机 exec 通道偶发只回吐半截输出，
+// 半截里可能正好含 ARCH=，却把 UID/SUDO 丢了，于是报出"需要 root 权限"这种错。
+// 有结束标记才认为这一份输出是完整的。
+const probeSentinel = "__MC_PROBE_END__"
+
+// probeAttempts 需要完整回显的命令的重试次数（含首次）。
+const probeAttempts = 3
+
+// runUntil 反复执行脚本直到回显里出现 marker。
+//
+// 目标机的 exec 通道偶发"命令退出码 0 却一行输出都没有"（慢链路上尤其常见，
+// 实测 Debian 12 云机首探就复现过）。这种失败没法从错误码看出来，只能靠
+// "回显里必须有约定标记"来判定，然后重跑。
+func runUntil(client *ssh.Client, script, marker string) (string, bool, error) {
+	var last string
+	var lastErr error
+	for attempt := 1; attempt <= probeAttempts; attempt++ {
+		out, err := runCmd(client, true, script)
+		last, lastErr = out, err
+		if strings.Contains(out, marker) {
+			return out, true, nil
+		}
+		if err != nil && attempt == probeAttempts {
+			break
+		}
+		time.Sleep(time.Duration(attempt) * 400 * time.Millisecond)
+	}
+	return last, false, lastErr
+}
+
+// runProbe 执行探测脚本，要求回显完整（含结束标记），否则重试。
+func runProbe(client *ssh.Client) (string, error) {
+	out, ok, err := runUntil(client, probeScriptSrc+"\necho "+probeSentinel+"\n", probeSentinel)
+	if ok {
+		return out, nil
+	}
 	if err != nil {
-		return nil, out, fmt.Errorf("执行探测命令失败: %w（输出: %s）", err, strings.TrimSpace(out))
+		return out, fmt.Errorf("执行探测命令失败: %w（输出: %s）", err, trimOutput(out))
+	}
+	return out, fmt.Errorf("探测脚本没有完整回显（末尾未收到 %s）。目标机通常能 SSH 连上，但 exec 通道输出丢失："+
+		"常见原因是 sshd 配置了强制命令/Shell 钩子、PAM 模块吞掉会话，或机器负载过高。最后输出: %s",
+		probeSentinel, trimOutput(out))
+}
+
+// runStatusCheck 回读服务状态，要求至少拿到 active= 这一行。
+func runStatusCheck(client *ssh.Client, svc string, hasSystemd bool) (string, error) {
+	out, ok, err := runUntil(client, statusProbeCmd(svc, hasSystemd), "active=")
+	if ok {
+		return out, nil
+	}
+	if err != nil {
+		return out, fmt.Errorf("读取服务状态失败: %w（输出: %s）", err, trimOutput(out))
+	}
+	return out, fmt.Errorf("读取服务状态没有回显（目标机 exec 通道输出丢失），请登录目标机执行 systemctl status %s 确认",
+		shellQuote(svc))
+}
+
+func trimOutput(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 400 {
+		return s[:400] + "…"
+	}
+	return s
+}
+
+// probeScriptSrc 一次性把所有需要的值打出来，减少往返（每往返都有网络延迟）。
+const probeScriptSrc = `ARCH=$(uname -m 2>/dev/null || true)
+if [ -z "$ARCH" ] && command -v dpkg >/dev/null 2>&1; then
+  ARCH=$(dpkg --print-architecture 2>/dev/null || true)
+fi
+echo "ARCH=$ARCH"
+echo "UID=$(id -u)"
+echo "HOST=$(hostname 2>/dev/null)"
+OS=""; DISTRO_ID=""; DISTRO_VER=""
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  OS="$PRETTY_NAME"; DISTRO_ID="$ID"; DISTRO_VER="$VERSION_ID"
+fi
+echo "OS=$OS"
+echo "DISTRO_ID=$DISTRO_ID"
+echo "DISTRO_VER=$DISTRO_VER"
+echo "SYSTEMD=$( [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && echo yes || echo no )"
+HAS_SUDO=no
+command -v sudo >/dev/null 2>&1 && HAS_SUDO=yes
+echo "HAS_SUDO=$HAS_SUDO"
+echo "SUDO_NOPASS=$( [ "$HAS_SUDO" = yes ] && sudo -n true >/dev/null 2>&1 && echo yes || echo no )"`
+
+// probeTarget 探测目标机的架构、发行版与提权能力。
+//
+// Debian/Ubuntu 云镜像常以非 root 用户（debian/ubuntu）登录，sudo 可能要求密码；
+// 这里在 sudo -n 失败时用本次 SSH 密码（或单独提供的 sudo 密码）做一次无回显验证，
+// 验证通过后安装脚本整体通过 sudo 提权执行。
+func probeTarget(client *ssh.Client, sudoPassword string) (*TargetInfo, string, error) {
+	out, err := runProbe(client)
+	if err != nil {
+		return nil, out, err
 	}
 	vals := parseKeyVals(out)
 	ti := &TargetInfo{
 		Arch:       strings.TrimSpace(vals["ARCH"]),
 		OSName:     trimQuotes(strings.TrimSpace(vals["OS"])),
+		DistroID:   strings.TrimSpace(vals["DISTRO_ID"]),
+		DistroVer:  strings.TrimSpace(vals["DISTRO_VER"]),
 		Hostname:   strings.TrimSpace(vals["HOST"]),
 		IsRoot:     strings.TrimSpace(vals["UID"]) == "0",
 		HasSystemd: strings.TrimSpace(vals["SYSTEMD"]) == "yes",
-		SudoOK:     strings.TrimSpace(vals["SUDO"]) == "yes",
 	}
 	ti.GOARCH, err = mapArch(ti.Arch)
 	if err != nil {
 		return ti, strings.TrimSpace(out), err
 	}
-	return ti, fmt.Sprintf("架构 %s（%s） / 系统 %s / root=%v / systemd=%v",
-		ti.Arch, ti.GOARCH, firstNonEmpty(ti.OSName, "未知"), ti.IsRoot, ti.HasSystemd), nil
+
+	sudoNote := ""
+	switch {
+	case ti.IsRoot:
+		ti.SudoOK, ti.SudoMode = true, "root"
+	case strings.TrimSpace(vals["SUDO_NOPASS"]) == "yes":
+		ti.SudoOK, ti.SudoMode = true, "nopass"
+	case strings.TrimSpace(vals["HAS_SUDO"]) == "yes" && strings.TrimSpace(sudoPassword) != "":
+		if err := verifySudoPassword(client, sudoPassword); err == nil {
+			ti.SudoOK, ti.SudoMode = true, "password"
+		} else {
+			sudoNote = "；" + err.Error()
+		}
+	case strings.TrimSpace(vals["HAS_SUDO"]) != "yes":
+		sudoNote = "；目标机未安装 sudo"
+	case strings.TrimSpace(sudoPassword) == "":
+		sudoNote = "；sudo 需要密码，请在表单填写 sudo 密码"
+	}
+	if ti.SudoMode == "" {
+		ti.SudoMode = "none"
+	}
+	sudoText := map[string]string{
+		"root": "无需 sudo（root）", "nopass": "免密 sudo", "password": "sudo 密码验证通过", "none": "不可用",
+	}[ti.SudoMode]
+	return ti, fmt.Sprintf("架构 %s（%s） / 系统 %s%s / root=%v / sudo=%s / systemd=%v%s",
+		ti.Arch, ti.GOARCH, firstNonEmpty(ti.OSName, "未知"), distroSuffix(ti), ti.IsRoot, sudoText, ti.HasSystemd, sudoNote), nil
+}
+
+func distroSuffix(ti *TargetInfo) string {
+	if ti.DistroID == "" {
+		return ""
+	}
+	if ti.DistroVer != "" {
+		return "（" + ti.DistroID + " " + ti.DistroVer + "）"
+	}
+	return "（" + ti.DistroID + "）"
+}
+
+// verifySudoPassword 用 `sudo -S -v` 验证密码。密码只走 stdin，不出现在命令行/日志。
+func verifySudoPassword(client *ssh.Client, password string) error {
+	out, err := runStdin(client, "sudo -S -p '' -v", password+"\n")
+	if err != nil {
+		msg := strings.TrimSpace(out)
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("sudo 密码验证失败: %s", msg)
+	}
+	return nil
 }
 
 // mapArch 把 uname -m 映射到 GOARCH。
@@ -796,7 +955,9 @@ func (d *Deployer) buildAgentConfig(req *Request, serverAddr string) string {
 	// 这里刻意不给服务端下发扩大范围的能力 —— 那等于让被攻击的通道自己放开自己。
 	fmt.Fprintf(&b, "  %q: %s,\n", "file_roots", jsonStringArray(nil))
 	// 延迟目标：把服务端配置的目标直接写进 Agent 配置，装完立刻开始探测
-	fmt.Fprintf(&b, "  %q: %s\n", "latency_targets", jsonStringArray(req.LatencyTargets))
+	fmt.Fprintf(&b, "  %q: %s,\n", "latency_targets", jsonStringArray(req.LatencyTargets))
+	// 日志级别：默认 error（Agent 部署量大，日常不产生噪声）；装好后可在控制台远程调整。
+	fmt.Fprintf(&b, "  %q: %q\n", "log_level", "error")
 	b.WriteString("}\n")
 	return b.String()
 }
@@ -819,6 +980,15 @@ func jsonStringArray(items []string) string {
 	}
 	return "[" + strings.Join(parts, ", ") + "]"
 }
+
+// runPrivilege 安装脚本的提权方式。
+type runPrivilege int
+
+const (
+	privRoot         runPrivilege = iota // 已是 root，直接 sh
+	privSudoNoPass                       // 免密 sudo
+	privSudoPassword                     // sudo 需要密码，密码经 stdin 送入
+)
 
 // installScriptArgs 安装脚本参数。
 type installScriptArgs struct {
@@ -940,6 +1110,31 @@ func statusProbeCmd(svc string, hasSystemd bool) string {
 		`echo "enabled=manual"`
 }
 
+// safeBuffer 可被多个 goroutine 并发写入的输出缓冲。
+//
+// x/crypto/ssh 在 Session.Stdout / Session.Stderr 不是 *os.File 时，会为每一路
+// 各起一个 `io.Copy(w, pipe)` goroutine。把**同一个** *bytes.Buffer 同时挂给这两路，
+// 就是两个 goroutine 并发对同一个 slice header 做 append —— 竞争输掉的一方会把自己的
+// 数据整段丢掉。实测在 Debian 12 云机上「命令退出码 0、回显全空」8 次里出现 7 次，
+// 表现成"探测失败/不支持的目标架构"，看着完全像目标机的问题。
+// 加锁合并成一路输出，既消掉竞争，也让运维看到的仍是一份连续日志。
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // runCmd 执行一条命令并返回合并输出。
 //
 // 命令通过 **stdin** 送给 `sh -s`，而不是拼成 `sh -c "<命令>"`。
@@ -967,7 +1162,7 @@ func runStdin(client *ssh.Client, remoteCmd, script string) (string, error) {
 		return "", err
 	}
 	defer sess.Close()
-	var out bytes.Buffer
+	var out safeBuffer
 	sess.Stdout = &out
 	sess.Stderr = &out
 	sess.Stdin = strings.NewReader(script)
@@ -983,33 +1178,72 @@ func runStdin(client *ssh.Client, remoteCmd, script string) (string, error) {
 }
 
 // runScript 执行一段多行脚本（同样走 stdin，避免引号与长度问题）。
-func runScript(client *ssh.Client, script string, root bool) (string, error) {
-	cmd := "sh -s"
-	if !root {
-		cmd = "sudo -n sh -s"
+func runScript(client *ssh.Client, script string, priv runPrivilege, sudoPassword string) (string, error) {
+	switch priv {
+	case privSudoNoPass:
+		return runStdin(client, "sudo -n sh -s", script)
+	case privSudoPassword:
+		if strings.TrimSpace(sudoPassword) == "" {
+			return "", fmt.Errorf("缺少 sudo 密码，无法以 root 安装")
+		}
+		// sudo 先读走第一行密码，随后 sh 读取剩余脚本；密码不出现在命令行。
+		return runStdin(client, "sudo -S -p '' sh -s", sudoPassword+"\n"+script)
+	default:
+		return runStdin(client, "sh -s", script)
 	}
-	return runStdin(client, cmd, script)
 }
 
-// uploadFile 用 `cat > file` 的方式上传（不依赖 sftp-server 子系统）。
+// uploadAttempts 单个文件的写入尝试次数。
 //
-// 为什么不走 SFTP：很多精简发行版/容器里的 sshd 未启用 sftp 子系统，
-// 而 `cat` 是任何 shell 都有的。代价是要自己做 shell 层的提权与权限设置。
-//
-// 以流式方式喂给 SSH，而不是先 io.ReadAll 进内存：Agent 二进制约 7–15 MB，
-// 并发部署多台时「每台一份完整副本」会直接放大成几十上百 MB 的峰值。
-func uploadFile(client *ssh.Client, src io.Reader, size int64, remotePath string, root bool) error {
+// SSH 的 exec 通道偶发"命令启动了但 stdin 没送到"（目标机负载抖动、PAM 钩子、
+// 网络重连都会造成），此时 `cat > 文件` 会留下一个 0 字节的空文件并正常退出。
+// 不校验的话，运维看到的是后面某一步完全不相干的错。
+const uploadAttempts = 2
+
+func uploadFile(client *ssh.Client, open func() (io.ReadCloser, error), size int64, remotePath string) error {
 	if size > maxUploadSize {
 		return fmt.Errorf("文件过大（超过 %d MB）", maxUploadSize>>20)
 	}
-	return uploadReader(client, io.LimitReader(src, maxUploadSize+1), remotePath, root)
+	return uploadWithVerify(client, func() (io.Reader, error) {
+		f, err := open()
+		if err != nil {
+			return nil, err
+		}
+		return &autoCloser{f, io.LimitReader(f, maxUploadSize+1)}, nil
+	}, size, remotePath)
 }
 
-func uploadBytes(client *ssh.Client, data []byte, remotePath string, root bool) error {
-	return uploadReader(client, bytes.NewReader(data), remotePath, root)
+func uploadBytes(client *ssh.Client, data []byte, remotePath string) error {
+	return uploadWithVerify(client, func() (io.Reader, error) {
+		return bytes.NewReader(data), nil
+	}, int64(len(data)), remotePath)
 }
 
-func uploadReader(client *ssh.Client, data io.Reader, remotePath string, root bool) error {
+// uploadWithVerify 写入远端文件并回读字节数校验，不符则重写一次。
+func uploadWithVerify(client *ssh.Client, open func() (io.Reader, error), expected int64, remotePath string) error {
+	var lastErr error
+	for attempt := 1; attempt <= uploadAttempts; attempt++ {
+		if lastErr = uploadOnce(client, open, expected, remotePath); lastErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w（已尝试 %d 次）", lastErr, uploadAttempts)
+}
+
+type autoCloser struct {
+	c io.Closer
+	r io.Reader
+}
+
+func (a *autoCloser) Read(p []byte) (int, error) { return a.r.Read(p) }
+func (a *autoCloser) Close() error               { return a.c.Close() }
+
+// uploadOnce 以 `cat > file` 写入（不依赖 sftp-server 子系统），再回读大小确认。
+func uploadOnce(client *ssh.Client, open func() (io.Reader, error), expected int64, remotePath string) error {
+	src, err := open()
+	if err != nil {
+		return err
+	}
 	sess, err := client.NewSession()
 	if err != nil {
 		return err
@@ -1017,20 +1251,39 @@ func uploadReader(client *ssh.Client, data io.Reader, remotePath string, root bo
 	defer sess.Close()
 	var stderr bytes.Buffer
 	sess.Stderr = &stderr
-	sess.Stdin = data
+	sess.Stdin = src
 	// umask 0077：二进制与配置含密钥，落地时就要收紧权限，
 	// 而不是先放开再 chmod（中间窗口期可被同机其他用户读走）。
-	pre := "umask 0077; "
-	if root {
-		pre += "cat > " + shellQuote(remotePath)
-	} else {
-		pre += "sudo -n sh -c " + shellQuote("cat > "+remotePath)
-	}
+	// 落点固定是登录用户可写的 /tmp，不需要 sudo；真正需要 root 的是后续 install。
+	pre := "umask 0077; cat > " + shellQuote(remotePath)
 	if err := sess.Run(pre); err != nil {
 		return fmt.Errorf("写入远端文件失败: %w（%s）", err, strings.TrimSpace(stderr.String()))
 	}
-	_ = remotePath
+	got, err := remoteFileSize(client, remotePath)
+	if err != nil {
+		return err
+	}
+	if got != expected {
+		return fmt.Errorf("远端文件不完整：期望 %d 字节，实际 %d 字节", expected, got)
+	}
 	return nil
+}
+
+// remoteFileSize 回读远端文件的字节数。
+func remoteFileSize(client *ssh.Client, path string) (int64, error) {
+	out, err := runCmd(client, true, "wc -c < "+shellQuote(path))
+	if err != nil {
+		return 0, fmt.Errorf("回读远端文件大小失败: %w（输出: %s）", err, strings.TrimSpace(out))
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("回读远端文件大小无回显（目标机 exec 通道可能被安全策略拦截）")
+	}
+	n, cerr := strconv.ParseInt(fields[len(fields)-1], 10, 64)
+	if cerr != nil {
+		return 0, fmt.Errorf("解析远端文件大小失败: %q", strings.TrimSpace(out))
+	}
+	return n, nil
 }
 
 // parseKeyVals 解析 "KEY=value" 行。

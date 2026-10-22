@@ -4,10 +4,11 @@
 `server/internal/version/version.go` 与 `agent/internal/version/version.go` 维护；
 安装包版本由 `installer/setup.iss` 的 `AppVersion` 决定。发布纪律：只在明确发版时修改版本号。
 
-## 未发布（2026-10-21）
+## 1.0.3（2026-10-22）
 
 本轮重点：Agent 部署/接入合并与系统配置、监听地址热切换、探针历史 7 天归档、
-远程升级支持服务端本地 pkg 直发，以及登录/OTP/令牌相关的安全加固。
+远程升级支持服务端本地 pkg 直发、SSH 一键部署的 Debian 12 支持与回显丢失修复，
+以及全量日志分级（含远程调整级别）。登录/OTP/令牌相关的安全加固见上一轮。
 整体安全评估见 `docs/security-review-2026-10-21.md`。
 
 ### 邀请远程管理（分享链接）
@@ -52,6 +53,56 @@
 - 在线链接模式保持原安全模型不变：仅 https、SHA-256 必填、Ed25519 签名必填；
   Agent 未配置公钥时只拒绝在线链接升级，本地 pkg 模式不受影响。
 - 本地直发需要目标 Agent 支持 `PackageName` 升级指令；旧版 Agent 请先用在线链接升级一次。
+
+### SSH 一键部署
+
+- **修复"识别不出 Debian 12 x86_64"的真正根因（服务端侧数据竞争，不是目标机问题）**：
+  `runStdin` 把同一个 `bytes.Buffer` 同时挂给 `Session.Stdout` 和 `Session.Stderr`，
+  而 x/crypto/ssh 对每一路各起一个 `io.Copy` goroutine，两个 goroutine 并发 append
+  同一个 slice header。实测在 Debian 12 云机上「命令退出码 0、回显整段丢失」
+  20 次里出现 20 次（拆开两个 buffer 后 8/8 正常），于是探测被报成
+  `不支持的目标架构: ""`，看起来像目标机不认识。现在改用带互斥锁的 `safeBuffer`。
+- 探测脚本末尾加结束标记，并允许最多 3 次重跑；回显不完整时明确说
+  「exec 通道输出丢失」并附上最后一次原始输出，不再把零输出误报成架构不支持。
+- **上传后核对远端字节数**：`cat > 文件` 在 stdin 丢失时会留下 0 字节文件并正常退出，
+  过去会一路装到 systemd 里才报一个不相干的错。现在按字节数校验、失败重传一次，
+  错误里给出期望/实际大小；服务状态回读同样要求拿到 `active=` 才认为回显有效。
+- **Debian 12 / x86_64 云机实机验证**：探测（`x86_64 → amd64`，发行版
+  `debian 12`，systemd 可用）→ 上传 10 MB 并核对 → 写配置 → 注册 systemd 服务 →
+  状态回读 `active=active / enabled=enabled / version=1.0.3` 全链路通过；
+  重复部署保留既有 `/etc/mocenter/mocenter-agent.json`（升级模式，不覆盖）。
+- 架构仍以 `uname -m` 为准，缺失时回退 `dpkg --print-architecture`；探测结果展示发行版 ID / 版本。
+- **支持非 root 用户的 sudo 密码**：新增可选「sudo 密码」；密码登录时留空自动复用
+  SSH 密码。探测阶段用无回显 stdin 验证 `sudo -S -v`，安装脚本整体经 sudo 提权执行，
+  不再要求必须配置免密 sudo。
+- 上传阶段固定写到登录用户可写的 `/tmp`（0600），由 root 安装阶段落位；免去对 sudo
+  写临时目录的依赖。
+- SSH 认证失败时明确提示 Debian/Ubuntu 云镜像通常禁用 root 密码登录，改用
+  `debian/ubuntu` 用户或私钥。
+
+### 日志分级与日志级别开关
+
+- **统一四级日志**：新增 `internal/logx`（server 与 agent 各一份，沿用 `protocol.go`/`flags.go`
+  的双份惯例），把存量 **357 处**裸 `log.Printf/Fatalf`（Server 237、Agent 120）按
+  `INFO / WARN / ERROR / CRITICAL` 分类迁移。级别为 `off < error < warn < info`。
+- **默认级别**：Agent `error`（部署量大、日常不产生噪声），Server `info`（只有一台，
+  启动信息对排障价值高）。可在配置文件 `log_level`、命令行 `-log-level` 调整。
+- **`off` 的边界**：关闭运行期日志，但启动期致命错误仍输出一行 `[CRITICAL]` 并退出 ——
+  否则"服务起不来"将没有任何线索。
+- **Windows 安装向导新增「运行期日志级别」页**（OFF/ERROR/WARN/INFO，默认 ERROR）：
+  新装写入配置；升级时预选既有值且**只改 `log_level` 一个键**，其余配置仍保持"升级不动配置"。
+  级别只进配置文件，不塞服务命令行。
+- **控制台远程下发**：「仪表盘 → 操作 → 日志级别」支持单台或全部在线主机，Agent 收到后
+  写回配置并**立即生效**（无需重启），回执里返回实际级别；旧版 Agent 不识别该指令，
+  界面明确提示"未回执"。主机列表通过心跳上报当前级别，弹窗里可直接看到。
+- **分级规则（关键几条）**：首次连接失败记 `ERROR`、同一轮故障的后续重试降为 `WARN`；
+  重连恢复、回退兜底、尽力而为的步骤失败记 `WARN`；证书/签名/路径越界等安全不变量被拒记
+  `ERROR`；启动配置错误、数据可能丢失记 `CRITICAL`；生命周期与部署步骤记 `INFO`。
+- **日志轮转**：Windows 服务的日志从"只在启动时按 8MB 截断"改为**运行期按大小轮转**
+  （单份 8MB，超出切到 `.log.1`，只保留一份旧文件），避免开 `info` 常驻把磁盘写满。
+- **SSH 一键部署**生成的 Agent 配置也写入 `log_level: "error"`，与安装器口径一致。
+- 新增单测：级别解析/过滤矩阵、`off` 下致命错误仍输出、并发读写的安全性、
+  日志轮转（超限切分与启动时轮转）、探测脚本在 POSIX `sh` 下的可执行性。
 
 ### 远程桌面 / VNC
 

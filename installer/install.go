@@ -129,6 +129,9 @@ func doInstall(o options) error {
 		return errors.New("需要以管理员身份运行（注册服务、写入 Program Files 都需要）")
 	}
 	roles, err := parseRoles(o.role)
+	if _, err := normalizeLogLevel(o.logLevel); err != nil {
+		return err
+	}
 	if err != nil {
 		return err
 	}
@@ -140,6 +143,14 @@ func doInstall(o options) error {
 		// 不要求重新提供，也不覆盖配置 —— 这就是「升级不动配置」。
 		if !o.force && existingInstall(o, r) {
 			fmt.Printf("[%s] 检测到既有配置，按升级处理（保留配置与账号）\n", r)
+			// 日志级别是本次向导里明确选择的唯一"运行参数"，升级时只改这一个键，
+			// 其余配置原样保留 —— 否则运维在向导里改了级别却毫无效果。
+			if strings.TrimSpace(o.logLevel) != "" {
+				if err := patchLogLevel(o, r); err != nil {
+					return fmt.Errorf("应用日志级别失败: %w", err)
+				}
+				fmt.Printf("  [%s] 日志级别已设为 %s（其余配置保持不变）\n", r, strings.ToLower(strings.TrimSpace(o.logLevel)))
+			}
 			continue
 		}
 		if r == "agent" && strings.TrimSpace(o.server) == "" {
@@ -479,6 +490,9 @@ func writeConfig(role, path string, o options) error {
 			}
 		}
 	}
+	if lv, _ := normalizeLogLevel(o.logLevel); lv != "" {
+		obj["log_level"] = lv
+	}
 	b, err := json.MarshalIndent(obj, "", "  ")
 	if err != nil {
 		return err
@@ -777,4 +791,56 @@ func stateText(state uint32) string {
 		return "已暂停"
 	}
 	return fmt.Sprintf("未知(%d)", state)
+}
+
+// validLogLevels 与 Agent/Server 侧的 logx.ParseLevel 同集合（两个模块独立，无法共享）。
+var validLogLevels = map[string]bool{"off": true, "error": true, "warn": true, "info": true}
+
+// normalizeLogLevel 校验并规范化日志级别；空串表示"不指定"，交给程序内置默认值。
+func normalizeLogLevel(s string) (string, error) {
+	lv := strings.ToLower(strings.TrimSpace(s))
+	if lv == "" {
+		return "", nil
+	}
+	if !validLogLevels[lv] {
+		return "", fmt.Errorf("不支持的日志级别 %q（可用 off / error / warn / info）", s)
+	}
+	return lv, nil
+}
+
+// patchLogLevel 升级路径专用：只改既有配置里的 log_level，其它键原样保留。
+//
+// 升级默认"不动配置"，但日志级别是用户在向导里显式选的运行参数，
+// 忽略它会让"改了级别却没效果"变成一个查不出原因的坑。
+func patchLogLevel(o options, role string) error {
+	lv, err := normalizeLogLevel(o.logLevel)
+	if err != nil || lv == "" {
+		return err
+	}
+	path := filepath.Join(o.dataRoot, role, "mocenter-"+role+".json")
+	if _, statErr := os.Stat(path); statErr != nil {
+		alt := filepath.Join(o.installDir, "mocenter-"+role+".json")
+		if _, altErr := os.Stat(alt); altErr == nil {
+			path = alt
+		} else {
+			return nil
+		}
+	}
+	obj, ok, err := loadConfigObject(path)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	obj["log_level"] = lv
+	b, err := json.MarshalIndent(obj, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		return err
+	}
+	hardenQuiet(path)
+	return nil
 }

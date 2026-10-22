@@ -2,7 +2,7 @@ package main
 
 import (
 	"flag"
-	"log"
+	"mocenter/server/internal/logx"
 )
 
 // normalizeBlankFlags 把「取值为空串」的参数回落成它自己的默认值，返回被处理过的参数名，
@@ -32,13 +32,13 @@ func normalizeBlankFlags(fs *flag.FlagSet, exclude ...string) map[string]bool {
 		}
 		if f.DefValue != "" {
 			if err := f.Value.Set(f.DefValue); err != nil {
-				log.Printf("警告: 参数 -%s 回落默认值 %q 失败: %v（按空值继续）", f.Name, f.DefValue, err)
+				logx.Warnf("参数 -%s 回落默认值 %q 失败: %v（按空值继续）", f.Name, f.DefValue, err)
 				return
 			}
 		}
 		done[f.Name] = true
 		if given[f.Name] {
-			log.Printf("参数 -%s 传入空值，按未配置处理（默认 %q）", f.Name, f.DefValue)
+			logx.Warnf("参数 -%s 传入空值，按未配置处理（默认 %q）", f.Name, f.DefValue)
 		}
 	})
 	return done

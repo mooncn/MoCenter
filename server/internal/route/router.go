@@ -5,7 +5,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"log"
+	"mocenter/server/internal/logx"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -121,7 +121,7 @@ func NewRouter(sess *session.Manager, db *storage.DB, auditPaths ...string) *Rou
 				// 再显式 Chmod 一次：os.OpenFile 的权限位**只在创建时**生效，
 				// 而旧版本留下的 0644 文件会一路保持下去 —— 里面是审计明文。
 				if cerr := f.Chmod(0600); cerr != nil {
-					log.Printf("[audit] 收紧 %s 权限失败: %v（审计含命令与结果，请手工改为 0600）", auditPaths[0], cerr)
+					logx.Errorf("[audit] 收紧 %s 权限失败: %v（审计含命令与结果，请手工改为 0600）", auditPaths[0], cerr)
 				}
 				r.auditFile = f
 			}
@@ -163,7 +163,7 @@ func (r *Router) importLegacyAudits(path string) {
 		// 去重：同一时间 + 同一命令视为已存在
 		exists, err := r.db.AuditLogExists(row.Time, row.Command)
 		if err != nil {
-			log.Printf("[audit] 导入历史审计时查询失败: %v", err)
+			logx.Errorf("[audit] 导入历史审计时查询失败: %v", err)
 			failed++
 			continue
 		}
@@ -172,17 +172,17 @@ func (r *Router) importLegacyAudits(path string) {
 			continue
 		}
 		if _, err := r.db.InsertAuditLog(&row); err != nil {
-			log.Printf("[audit] 导入历史审计失败: %v", err)
+			logx.Errorf("[audit] 导入历史审计失败: %v", err)
 			failed++
 			continue
 		}
 		imported++
 	}
 	if err := scanner.Err(); err != nil {
-		log.Printf("[audit] 读取历史审计文件出错: %v", err)
+		logx.Infof("[audit] 读取历史审计文件出错: %v", err)
 	}
 	if imported > 0 || failed > 0 {
-		log.Printf("[audit] 历史审计导入完成：新增 %d 条，跳过重复 %d 条，失败 %d 条", imported, skipped, failed)
+		logx.Errorf("[audit] 历史审计导入完成：新增 %d 条，跳过重复 %d 条，失败 %d 条", imported, skipped, failed)
 	}
 }
 
@@ -202,7 +202,7 @@ func (r *Router) Close() error {
 func (r *Router) loadBlacklistFromDB() {
 	rows, err := r.db.LoadBlacklist()
 	if err != nil {
-		log.Printf("[route] 从数据库加载黑名单失败: %v", err)
+		logx.Errorf("[route] 从数据库加载黑名单失败: %v", err)
 		return
 	}
 	r.blackMu.Lock()
@@ -620,7 +620,7 @@ func (r *Router) Audit(l *AuditLog) int64 {
 		go func() {
 			id, err := r.db.InsertAuditLog(row)
 			if err != nil {
-				log.Printf("[audit] 写入 SQLite 失败: %v", err)
+				logx.Errorf("[audit] 写入 SQLite 失败: %v", err)
 				return
 			}
 			// 回填 ID，使后续结果回写能定位到同一条记录
@@ -629,9 +629,9 @@ func (r *Router) Audit(l *AuditLog) int64 {
 			r.auditMu.Unlock()
 		}()
 	}
-	log.Printf("[audit] operator=%s agent=%s cmd=%q blocked=%v", l.Operator, l.AgentID, l.Command, l.Blocked)
+	logx.Infof("[audit] operator=%s agent=%s cmd=%q blocked=%v", l.Operator, l.AgentID, l.Command, l.Blocked)
 	if writeErr != nil {
-		log.Printf("[audit] 持久化写入失败: %v", writeErr)
+		logx.Errorf("[audit] 持久化写入失败: %v", writeErr)
 	}
 	// ID 由上面那个协程回填，读它必须同样持锁 —— 否则会与其写入竞争同一字段
 	// （这里通常仍是 0：落库没回来，回填结果改走 command_id 定位）。
@@ -663,7 +663,7 @@ func (r *Router) Complete(id int64, agentID, result string, exitCode int, durati
 	if r.db != nil && id > 0 {
 		go func() {
 			if err := r.db.CompleteAuditLog(id, result, exitCode, duration); err != nil {
-				log.Printf("[audit] 回填结果失败: %v", err)
+				logx.Errorf("[audit] 回填结果失败: %v", err)
 			}
 		}()
 	}
@@ -702,7 +702,7 @@ func (r *Router) completeByCommandID(commandID, agentID, result string, exitCode
 	if r.db != nil && id > 0 {
 		go func() {
 			if err := r.db.CompleteAuditLog(id, result, exitCode, duration); err != nil {
-				log.Printf("[audit] 回填结果失败: %v", err)
+				logx.Errorf("[audit] 回填结果失败: %v", err)
 			}
 		}()
 	}
@@ -793,7 +793,7 @@ func normalizePage(offset, limit int) (int, int) {
 func (r *Router) SearchAudits(q AuditQuery) []*AuditLog {
 	page, err := r.SearchAuditsPage(q)
 	if err != nil {
-		log.Printf("[audit] 检索审计日志失败: %v", err)
+		logx.Errorf("[audit] 检索审计日志失败: %v", err)
 	}
 	return page.Items
 }
@@ -835,9 +835,9 @@ func (r *Router) SearchAuditsPage(q AuditQuery) (*AuditPage, error) {
 				}
 				return &AuditPage{Items: items, Total: total}, nil
 			}
-			log.Printf("[audit] SQLite 查询失败，回退内存: %v", qerr)
+			logx.Errorf("[audit] SQLite 查询失败，回退内存: %v", qerr)
 		} else {
-			log.Printf("[audit] SQLite 计数失败，回退内存: %v", err)
+			logx.Errorf("[audit] SQLite 计数失败，回退内存: %v", err)
 		}
 	}
 

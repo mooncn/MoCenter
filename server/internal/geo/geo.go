@@ -33,7 +33,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"mocenter/server/internal/logx"
 	"net"
 	"net/http"
 	"strconv"
@@ -301,11 +301,11 @@ func (r *Resolver) fetch(ip string) *protocol.GeoInfo {
 	for _, src := range sources {
 		body, status, err := r.get(client, fmt.Sprintf(src.tmpl, ip))
 		if err != nil {
-			log.Printf("[geo] %s 查询 %s 失败: %v", src.name, ip, err)
+			logx.Errorf("[geo] %s 查询 %s 失败: %v", src.name, ip, err)
 			continue
 		}
 		if status != http.StatusOK {
-			log.Printf("[geo] %s 查询 %s 失败: HTTP %d（免费接口通常按分钟限流）", src.name, ip, status)
+			logx.Errorf("[geo] %s 查询 %s 失败: HTTP %d（免费接口通常按分钟限流）", src.name, ip, status)
 			continue
 		}
 		if g := src.fn(body); g != nil {
@@ -370,7 +370,7 @@ func (r *Resolver) parseIping(body []byte) *protocol.GeoInfo {
 		// code=500 有两种截然不同的含义，日志必须区分，否则运维会误判：
 		//   - msg 含 "frequent" → 按分钟限流（等一会儿自愈）；
 		//   - msg 含 "IPv6"     → 该源不支持 IPv6（永远查不到，应换源）。
-		log.Printf("[geo] api.iping.cc 未命中: code=%d msg=%s", pr.Code, pr.Msg)
+		logx.Infof("[geo] api.iping.cc 未命中: code=%d msg=%s", pr.Code, pr.Msg)
 		return nil
 	}
 	d := pr.Data
@@ -404,7 +404,7 @@ func (r *Resolver) parseIPAPI(body []byte) *protocol.GeoInfo {
 		return nil
 	}
 	if pr.Status != "success" {
-		log.Printf("[geo] ip-api.com 未命中: status=%s message=%s", pr.Status, pr.Message)
+		logx.Infof("[geo] ip-api.com 未命中: status=%s message=%s", pr.Status, pr.Message)
 		return nil
 	}
 	return &protocol.GeoInfo{
@@ -424,7 +424,7 @@ func (r *Resolver) parseIPWho(body []byte) *protocol.GeoInfo {
 		return nil
 	}
 	if !pr.Success {
-		log.Printf("[geo] ipwho.is 未命中: %s", pr.Message)
+		logx.Infof("[geo] ipwho.is 未命中: %s", pr.Message)
 		return nil
 	}
 	return &protocol.GeoInfo{

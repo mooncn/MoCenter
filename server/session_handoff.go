@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"mocenter/server/internal/logx"
 	"net/http"
 	"strings"
 	"sync"
@@ -149,7 +149,7 @@ func sessionHandoffConsumeHandler(authz *auth.Auth) http.HandlerFunc {
 			return
 		}
 		authz.RegisterToken(newToken, username)
-		log.Printf("[auth] 会话交接成功（用户 %s，来自 %s）", username, ip)
+		logx.Infof("[auth] 会话交接成功（用户 %s，来自 %s）", username, ip)
 		writeJSON(w, map[string]interface{}{"ok": true, "token": newToken})
 	}
 }

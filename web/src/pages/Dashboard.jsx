@@ -149,6 +149,12 @@ export default function Dashboard({ agents }) {
   const [trendAgent, setTrendAgent] = useState('')
   const [actionAgent, setActionAgent] = useState('')
   const [shareAgent, setShareAgent] = useState('')
+  // 日志级别弹窗：level 是"待下发的值"，logResult 是上一次下发的回执
+  const [logAgent, setLogAgent] = useState('')
+  const [logLevel, setLogLevel] = useState('error')
+  const [logAll, setLogAll] = useState(false)
+  const [logBusy, setLogBusy] = useState(false)
+  const [logResult, setLogResult] = useState(null)
   const [history, setHistory] = useState(null)
   // 服务端存活状态：null=检测中 true=在线 false=离线
   const [serverAlive, setServerAlive] = useState(null)
@@ -245,6 +251,22 @@ export default function Dashboard({ agents }) {
     ? ((agents || []).find((a) => a.agent_id === trendAgent) || { agent_id: trendAgent, hostname: trendAgent })
     : null
   const shareTarget = shareAgent ? (agents || []).find((a) => a.agent_id === shareAgent) : null
+  const logTarget = logAgent ? (agents || []).find((a) => a.agent_id === logAgent) : null
+
+  const applyLogLevel = async () => {
+    if (!logTarget && !logAll) return
+    setLogBusy(true)
+    setLogResult(null)
+    try {
+      const payload = logAll ? { all: true, level: logLevel } : { agent_id: logTarget.agent_id, level: logLevel }
+      const d = await Api.setAgentLogLevel(payload)
+      setLogResult({ ok: !!d.ok, msg: d.msg || (d.ok ? '已下发' : '下发失败') })
+    } catch (e) {
+      setLogResult({ ok: false, msg: e.response?.data?.msg || e.message })
+    } finally {
+      setLogBusy(false)
+    }
+  }
 
   const openHostPage = (path) => {
     if (!actionTarget) return
@@ -445,12 +467,60 @@ export default function Dashboard({ agents }) {
               disabled={!actionTarget.online}
               onClick={() => { setShareAgent(actionTarget.agent_id); setActionAgent('') }}
             />
+            <ActionItem
+              icon="📝" title="日志级别" desc="远程调整该主机的日志详细程度"
+              disabled={!actionTarget.online}
+              onClick={() => {
+                setLogAgent(actionTarget.agent_id)
+                setLogLevel(actionTarget.log_level || 'error')
+                setLogAll(false)
+                setLogResult(null)
+                setActionAgent('')
+              }}
+            />
           </div>
           {!actionTarget.online && (
             <div className="notice" style={{ background: 'var(--panel-2)', color: 'var(--muted)', marginTop: 12 }}>
               该主机当前离线：远程终端、远程桌面与分享不可用；仍可查看历史趋势、预先配置端口映射，
               或删除这台主机的登记。
             </div>
+          )}
+        </Modal>
+      )}
+
+      {logTarget && (
+        <Modal
+          title={`日志级别 · ${nameOf(logTarget)}`}
+          subtitle={hostLabel(logTarget)}
+          onClose={() => setLogAgent('')}
+          footer={<>
+            <button className="secondary" onClick={() => setLogAgent('')}>关闭</button>
+            <button className="primary" onClick={applyLogLevel} disabled={logBusy}>
+              {logBusy ? '下发中…' : '下发'}
+            </button>
+          </>}
+        >
+          <div className="form-grid">
+            <div className="form-row">
+              <label>日志级别</label>
+              <select value={logLevel} onChange={(e) => setLogLevel(e.target.value)} style={{ width: 300 }}>
+                <option value="off">off —— 关闭日志（启动致命错误仍会输出）</option>
+                <option value="error">error —— 只记录失败（默认）</option>
+                <option value="warn">warn —— 失败 + 重试/降级</option>
+                <option value="info">info —— 完整生命周期（排障用，日志量最大）</option>
+              </select>
+            </div>
+          </div>
+          <label className="cfg-check" style={{ marginTop: 10 }}>
+            <input type="checkbox" checked={logAll} onChange={(e) => setLogAll(e.target.checked)} />
+            应用到所有在线主机（忽略上面选中的这一台）
+          </label>
+          <div className="muted" style={{ fontSize: 12, marginTop: 10, lineHeight: 1.6 }}>
+            当前级别：<b>{logTarget.log_level || '未知（旧版 Agent 或尚未上报）'}</b>。
+            下发后立即生效，并写入该主机的配置文件（重启后保持）；旧版 Agent 不认识该指令，会提示未回执。
+          </div>
+          {logResult && (
+            <div className={`notice ${logResult.ok ? '' : 'err'}`} style={{ marginTop: 10 }}>{logResult.msg}</div>
           )}
         </Modal>
       )}

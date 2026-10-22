@@ -67,6 +67,12 @@ type Config struct {
 	// 换取成功后证书与私钥落盘为 <配置目录>/client.crt|client.key（0600），
 	// 随后本字段会被**自动清空**（不再需要，减少泄露面）。
 	EnrollmentSecret string `json:"enrollment_secret"`
+	// LogLevel 运行期日志级别：off / error / warn / info，默认 error。
+	//
+	// 可由三处修改：安装向导、本机命令行 -log-level、服务端远程下发（写回本字段）。
+	// 显式命令行参数仍然最优先；本字段是"最近一次生效值"的持久化，
+	// 因此服务端下发的级别在重启后依然有效。
+	LogLevel string `json:"log_level"`
 }
 
 // DefaultPath 返回默认配置文件路径（便携态：与可执行文件同目录）。

@@ -21,7 +21,7 @@ package command
 import (
 	"context"
 	"fmt"
-	"log"
+	"mocenter/agent/internal/logx"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,7 +78,7 @@ func installAndStartUltraVNCService(port int, cfg VncConfig, res *VncInstallResu
 	// 若为无头（无物理显示器）且未装虚拟显示器，则尝试安装 VDD。
 	vddMsg := ""
 	if vddOK, msg := ensureVirtualDisplay(cfg); !vddOK {
-		log.Printf("[vnc-install] UltraVNC 服务模式警告: %s", msg)
+		logx.Warnf("[vnc-install] UltraVNC 服务模式警告: %s", msg)
 		vddMsg = msg
 	}
 
@@ -153,7 +153,7 @@ func installAndStartUltraVNCApp(port int, cfg VncConfig, res *VncInstallResult) 
 	// 3) 无头检测（与其它模式一致：无活动显示输出必然黑屏）
 	vddMsg := ""
 	if vddOK, msg := ensureVirtualDisplay(cfg); !vddOK {
-		log.Printf("[vnc-install] UltraVNC 应用模式警告: %s", msg)
+		logx.Warnf("[vnc-install] UltraVNC 应用模式警告: %s", msg)
 		vddMsg = msg
 	}
 
@@ -183,7 +183,7 @@ func installAndStartUltraVNCApp(port int, cfg VncConfig, res *VncInstallResult) 
 			startInUserSession(exe)
 		}
 	} else {
-		log.Printf("[vnc-install] Agent 运行在 Session 0（服务形态），跳过直启，改由交互会话任务拉起")
+		logx.Warnf("[vnc-install] Agent 运行在 Session 0（服务形态），跳过直启，改由交互会话任务拉起")
 		startInUserSession(exe)
 	}
 	if !waitPortOpen(port, 10*time.Second) {
@@ -318,7 +318,7 @@ func installUltraVNC(cfg VncConfig) (string, bool) {
 	if cfg.FetchPackage != nil {
 		path, err := cfg.FetchPackage(name)
 		if err != nil {
-			log.Printf("[vnc-install] 服务端未托管安装包 %s（%v）", name, err)
+			logx.Infof("[vnc-install] 服务端未托管安装包 %s（%v）", name, err)
 		} else {
 			msg, ok := installUltraVNCFromLocal(path, want)
 			if ok {
@@ -379,7 +379,7 @@ func installUltraVNCByDownload(cfg VncConfig, want string) (string, bool) {
 	for i, u := range urls {
 		// 落盘名用规范包名：出错时看目录就知道是哪个包，也避免多架构共用一个含糊的临时名。
 		tmp := filepath.Join(os.TempDir(), uvncSetupName())
-		log.Printf("[vnc-install] 尝试下载 UltraVNC %s", u)
+		logx.Infof("[vnc-install] 尝试下载 UltraVNC %s", u)
 		var err error
 		if i == len(urls)-1 {
 			err = downloadPlain(u, tmp)
@@ -426,7 +426,7 @@ func installUltraVNCFromLocal(setup, want string) (string, bool) {
 	defer cancel()
 	out, err := exec.CommandContext(ctx, setup, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-").CombinedOutput()
 	_ = os.Remove(setup)
-	log.Printf("[vnc-install] UltraVNC 安装结束 err=%v", err)
+	logx.Infof("[vnc-install] UltraVNC 安装结束 err=%v", err)
 	if err != nil {
 		return fmt.Sprintf("UltraVNC 静默安装失败：%v %s", err, strings.TrimSpace(string(out))), false
 	}
@@ -470,9 +470,9 @@ func writeUltraVNCIni(installDir string, port int, password string) error {
 			continue
 		}
 		if err := restrictPathToPrivileged(p); err != nil {
-			log.Printf("[vnc-install] 警告: %s 的 VNC 口令仍可被本机其他用户读取: %v", p, err)
+			logx.Warnf("[vnc-install] 警告: %s 的 VNC 口令仍可被本机其他用户读取: %v", p, err)
 		}
-		log.Printf("[vnc-install] 已写入 UltraVNC 配置: %s", p)
+		logx.Infof("[vnc-install] 已写入 UltraVNC 配置: %s", p)
 		wrote = true
 	}
 	if !wrote {
@@ -556,7 +556,7 @@ func registerUltraVNCService(exe string) error {
 	if err != nil {
 		return fmt.Errorf("%v %s", err, strings.TrimSpace(string(out)))
 	}
-	log.Printf("[vnc-install] 已注册服务 %s: %s", uvncServiceName, binPath)
+	logx.Infof("[vnc-install] 已注册服务 %s: %s", uvncServiceName, binPath)
 	return nil
 }
 

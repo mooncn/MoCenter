@@ -2,7 +2,7 @@ package main
 
 import (
 	"flag"
-	"log"
+	"mocenter/agent/internal/logx"
 )
 
 // normalizeBlankFlags 与 server/flags.go 同实现（两个独立 go.mod，没有共享内部模块）。
@@ -34,13 +34,13 @@ func normalizeBlankFlags(fs *flag.FlagSet, exclude ...string) map[string]bool {
 		}
 		if f.DefValue != "" {
 			if err := f.Value.Set(f.DefValue); err != nil {
-				log.Printf("警告: 参数 -%s 回落默认值 %q 失败: %v（按空值继续）", f.Name, f.DefValue, err)
+				logx.Warnf("参数 -%s 回落默认值 %q 失败: %v（按空值继续）", f.Name, f.DefValue, err)
 				return
 			}
 		}
 		done[f.Name] = true
 		if given[f.Name] {
-			log.Printf("参数 -%s 传入空值，按未配置处理（默认 %q）", f.Name, f.DefValue)
+			logx.Warnf("参数 -%s 传入空值，按未配置处理（默认 %q）", f.Name, f.DefValue)
 		}
 	})
 	return done

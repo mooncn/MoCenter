@@ -5,7 +5,7 @@ package winapp
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"mocenter/agent/internal/logx"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,7 +77,7 @@ func AcquireSingleton(key, configPath string) (func(), bool) {
 		// 打不开锁文件（只读文件系统、目录属主不对、SELinux 等）。
 		// 此时**不阻塞启动** —— 宁可多跑一个实例，也不要让 Agent 完全起不来。
 		// 但必须留下明确告警：这类"保护静默失效"正是重复实例最难排查的形态。
-		log.Printf("[单实例] 警告: 无法打开锁文件 %s: %v —— 本次启动**未启用**单实例保护。"+
+		logx.Warnf("[单实例] 无法打开锁文件 %s: %v —— 本次启动**未启用**单实例保护。"+
 			"请检查该路径是否可写（可用 -config 指向可写目录，如 /var/lib/mocenter）", path, err)
 		return func() {}, true
 	}
@@ -90,12 +90,12 @@ func AcquireSingleton(key, configPath string) (func(), bool) {
 		owner := readLockOwner(path)
 		_ = f.Close()
 		if owner != nil {
-			log.Printf("[单实例] 已有实例正在运行: PID %d%s（可执行文件 %s，配置 %s，启动于 %s）",
+			logx.Infof("[单实例] 已有实例正在运行: PID %d%s（可执行文件 %s，配置 %s，启动于 %s）",
 				owner.PID, lockOwnerNote(owner), owner.Exe, owner.Config, owner.StartedAt)
-			log.Printf("[单实例] 提示: 本进程不会去终止对方。若确认系统里确实没有实例在运行"+
+			logx.Infof("[单实例] 提示: 本进程不会去终止对方。若确认系统里确实没有实例在运行"+
 				"（例如上次断电留下的陈迹），可删除锁文件后重试: %s", path)
 		} else {
-			log.Printf("[单实例] 已有实例正在运行（未能读取锁文件 %s 的持有者信息）", path)
+			logx.Infof("[单实例] 已有实例正在运行（未能读取锁文件 %s 的持有者信息）", path)
 		}
 		return nil, false
 	}
@@ -183,7 +183,7 @@ func readLockOwner(path string) *lockOwner {
 	// 只在日志里说明，不影响持锁判断。
 	if fi, serr := os.Stat(path); serr == nil {
 		if age := time.Since(fi.ModTime()); age > staleLockAge {
-			log.Printf("[单实例] 提示: 锁文件 %s 已 %s 未被刷新，可能是**上次异常退出**（如断电）"+
+			logx.Infof("[单实例] 锁文件 %s 已 %s 未被刷新，可能是**上次异常退出**（如断电）"+
 				"遗留；若本机确实没有实例在运行，可删除该文件后重试", path, age.Truncate(time.Second))
 		}
 	}

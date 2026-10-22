@@ -13,7 +13,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
+	"mocenter/agent/internal/logx"
 	"net"
 	"os"
 	"path/filepath"
@@ -55,6 +55,7 @@ func main() {
 			"留空=只允许本机回环（默认）：隧道连的是这台机器所在的网络，放开任意目标等于把本机变成总控的内网代理跳板。"+
 			"该白名单只认本机配置，服务端指令无法打开")
 	latencyTargets := flag.String("latency-targets", "", "延迟探测目标，逗号分隔（如 icmp:1.1.1.1,tcp:1.1.1.1:443,http:https://example.com ）")
+	logLevel := flag.String("log-level", os.Getenv("MOCENTER_LOG_LEVEL"), "运行期日志级别：off / error / warn / info（默认 error）；也可由服务端远程下发")
 	showVersion := flag.Bool("version", false, "打印版本号并退出")
 	flag.Parse()
 
@@ -72,8 +73,10 @@ func main() {
 	// 加载配置：首次生成，后续读取并让命令行显式参数覆盖
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("加载配置失败: %v", err)
+		logx.Fatalf("加载配置失败: %v", err)
 	}
+	// 日志级别在拿到配置后立刻生效：命令行 > 配置文件 > 默认 error。
+	applyLogLevel(*logLevel, cfg)
 	if cfg == nil {
 		// 首次启动：用当前参数生成配置
 		cfg = &config.Config{
@@ -98,11 +101,12 @@ func main() {
 			FileRoots:                  splitList(*fileRoots),
 			TunnelHosts:                splitList(*tunnelHosts),
 			LatencyTargets:             splitList(*latencyTargets),
+			LogLevel:                   normalizeLogLevel(*logLevel),
 		}
 		if err := config.Save(*configPath, cfg); err != nil {
-			log.Printf("警告: 写入配置文件 %s 失败: %v", *configPath, err)
+			logx.Warnf("写入配置文件 %s 失败: %v", *configPath, err)
 		} else {
-			log.Printf("已生成配置文件: %s（后续可直接运行 %s 或 %s 读取）", *configPath, os.Args[0], *configPath)
+			logx.Infof("已生成配置文件: %s（后续可直接运行 %s 或 %s 读取）", *configPath, os.Args[0], *configPath)
 		}
 	} else {
 		// 已有配置：命令行显式参数（非默认值）覆盖配置文件
@@ -168,20 +172,23 @@ func main() {
 		if len(cfg.LatencyTargets) > 0 && strings.TrimSpace(*latencyTargets) == "" {
 			*latencyTargets = strings.Join(cfg.LatencyTargets, ",")
 		}
+		if cfg.LogLevel != "" && strings.TrimSpace(*logLevel) == "" {
+			*logLevel = cfg.LogLevel
+		}
 	}
 
 	// 服务端地址的两道校验必须放在参数回写**之前**：回写会把命令行值持久化，
 	// 若配置里原本存着有效地址，一次 `-server your.server.com:9000`（老安装脚本就会这么传）
 	// 会先把有效配置覆盖成占位符再退出，下次无参启动也读不回来了。
 	if *server == "" {
-		log.Fatal("请通过 -server、环境变量 MOCENTER_SERVER 或配置文件指定服务端地址")
+		logx.Fatalf("请通过 -server、环境变量 MOCENTER_SERVER 或配置文件指定服务端地址")
 	}
 	// 安装介质里预置过的占位地址不能当配置用（L-7）。
 	// 现在模板已改留空，这条是给**老部署**兜底的：从旧包/旧脚本装上的机器配置里
 	// 仍然是 your.server.com:9000，不拦的话它会一直解析一个不存在的域名无限重连，
 	// 界面表现为"服务在跑但主机永远不在线"，运维无从下手。
 	if isPlaceholderServer(*server) {
-		log.Fatalf("服务端地址仍是安装占位符 %q：请改成实际地址（-server host:port、环境变量 MOCENTER_SERVER，或配置文件里的 MOCENTER_SERVER）后重启", *server)
+		logx.Fatalf("服务端地址仍是安装占位符 %q：请改成实际地址（-server host:port、环境变量 MOCENTER_SERVER，或配置文件里的 MOCENTER_SERVER）后重启", *server)
 	}
 
 	// 命令行显式传入的参数（flag.Visit）优先级最高，并自动保存回配置文件，
@@ -213,9 +220,10 @@ func main() {
 			"file-roots":                    func() { cfg.FileRoots = splitList(*fileRoots) },
 			"tunnel-hosts":                  func() { cfg.TunnelHosts = splitList(*tunnelHosts) },
 			"latency-targets":               func() { cfg.LatencyTargets = splitList(*latencyTargets) },
+			"log-level":                     func() { cfg.LogLevel = logx.Current().String() },
 		}
 		dirty := false
-		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "allow-public-package-download", "agent-key", "enroll-secret", "server-fingerprint", "upgrade-pubkey", "file-roots", "tunnel-hosts", "latency-targets"} {
+		for _, name := range []string{"server", "agentid", "uuid", "hb", "probe", "tls", "insecure", "daemon", "client-cert", "client-key", "ca-cert", "proxy-ip", "allow-public-package-download", "agent-key", "enroll-secret", "server-fingerprint", "upgrade-pubkey", "file-roots", "tunnel-hosts", "latency-targets", "log-level"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -223,9 +231,9 @@ func main() {
 		}
 		if dirty {
 			if err := config.Save(*configPath, cfg); err != nil {
-				log.Printf("警告: 更新配置文件 %s 失败: %v", *configPath, err)
+				logx.Warnf("更新配置文件 %s 失败: %v", *configPath, err)
 			} else {
-				log.Printf("已把命令行参数保存到配置文件: %s", *configPath)
+				logx.Infof("已把命令行参数保存到配置文件: %s", *configPath)
 			}
 		}
 	}
@@ -235,24 +243,24 @@ func main() {
 	if *agentUUID == "" {
 		if u := probepkg.HardwareUUID(); u != "" {
 			*agentUUID = u
-			log.Printf("已探测到硬件 UUID %q，作为设备唯一标识", *agentUUID)
+			logx.Infof("已探测到硬件 UUID %q，作为设备唯一标识", *agentUUID)
 		}
 	}
 	if *agentUUID != "" && cfg.UUID != *agentUUID {
 		cfg.UUID = *agentUUID
 		if err := config.Save(*configPath, cfg); err != nil {
-			log.Printf("警告: 写入设备 UUID 到配置失败: %v", err)
+			logx.Warnf("写入设备 UUID 到配置失败: %v", err)
 		}
 	}
 	if *agentID == "" {
 		// 未指定名称时：优先复用已持久化的 UUID，否则用硬件 UUID，再退回主机名
 		if *agentUUID != "" {
 			*agentID = *agentUUID
-			log.Printf("未指定 AgentID，使用设备 UUID %q", *agentID)
+			logx.Infof("未指定 AgentID，使用设备 UUID %q", *agentID)
 		} else {
 			host, _ := os.Hostname()
 			*agentID = host
-			log.Printf("未指定 AgentID，硬件 UUID 获取失败，回退使用主机名 %q", *agentID)
+			logx.Warnf("未指定 AgentID，硬件 UUID 获取失败，回退使用主机名 %q", *agentID)
 		}
 	}
 
@@ -270,11 +278,11 @@ func main() {
 	singleKey := winapp.SingletonKey("Agent", *configPath)
 	release, ok := winapp.AcquireSingleton(singleKey, *configPath)
 	if !ok {
-		log.Fatalf("已有一个使用同一配置(%s)的 Agent 在运行，本次启动终止（%s）",
+		logx.Fatalf("已有一个使用同一配置(%s)的 Agent 在运行，本次启动终止（%s）",
 			*configPath, winapp.DescribeSingleton(singleKey, *configPath))
 	}
 	defer release()
-	log.Printf("[agent] 已取得单实例锁：%s", winapp.DescribeSingleton(singleKey, *configPath))
+	logx.Infof("[agent] 已取得单实例锁：%s", winapp.DescribeSingleton(singleKey, *configPath))
 
 	// 换取成功后清理：证书路径写回配置、注册密钥清空（一次性使用）。
 	// 这样运维在配置里再也看不到可直接冒充的长期凭据，只有本机 0600 的证书私钥。
@@ -300,7 +308,7 @@ func main() {
 		}
 		cfg.EnrollmentSecret = ""
 		if err := config.Save(*configPath, cfg); err != nil {
-			log.Printf("警告: 保存换取结果到配置失败: %v", err)
+			logx.Warnf("保存换取结果到配置失败: %v", err)
 		}
 	}
 
@@ -318,6 +326,7 @@ func main() {
 			latencyTargets:    splitList(*latencyTargets),
 			serverFingerprint: *serverFingerprint,
 			enrollSecret:      firstNonEmpty(*enrollSecret, *agentKey),
+			logLevel:          logx.Current().String(),
 			onEnrolled:        handleEnrolled,
 			configPath:        *configPath, credsDir: *credsDir,
 		}
@@ -333,12 +342,12 @@ func main() {
 	if winapp.IsWindowsService() {
 		logPath := filepath.Join(filepath.Dir(*configPath), "logs", agentServiceName+".log")
 		if err := winapp.RedirectLogToFile(logPath); err != nil {
-			log.Printf("警告: 重定向服务日志到 %s 失败: %v", logPath, err)
+			logx.Warnf("重定向服务日志到 %s 失败: %v", logPath, err)
 		} else {
-			log.Printf("[agent] 服务模式启动，日志输出到 %s", logPath)
+			logx.Infof("[agent] 服务模式启动，日志输出到 %s", logPath)
 		}
 		if err := winapp.RunAsService(agentServiceName, start, func() { os.Exit(0) }); err != nil {
-			log.Fatalf("以 Windows 服务方式运行失败: %v", err)
+			logx.Fatalf("以 Windows 服务方式运行失败: %v", err)
 		}
 		return
 	}
@@ -366,6 +375,7 @@ type runOpts struct {
 	tunnelHosts                     []string
 	latencyTargets                  []string
 	serverFingerprint, enrollSecret string
+	logLevel                        string
 	configPath, credsDir            string
 	onEnrolled                      func(client.CredentialFiles)
 }
@@ -374,7 +384,7 @@ func runClient(o runOpts) {
 	// 指纹是 Agent 校验服务端的唯一锚点：格式不对时宁可启动失败，
 	// 也不能"看起来配了 pin、实际按空/弱值处理"。
 	if err := client.ValidateServerFingerprint(o.serverFingerprint); err != nil {
-		log.Fatalf("[agent] 配置错误: %v", err)
+		logx.Fatalf("[agent] 配置错误: %v", err)
 	}
 	c := client.New(client.Config{
 		ServerAddr:          o.server,
@@ -396,25 +406,26 @@ func runClient(o runOpts) {
 		LatencyTargets:      o.latencyTargets,
 		ServerFingerprint:   o.serverFingerprint,
 		EnrollmentSecret:    o.enrollSecret,
+		LogLevel:            o.logLevel,
 		ConfigPath:          o.configPath,
 		CredDir:             o.credsDir,
 	})
 	if o.onEnrolled != nil {
 		c.SetOnEnrolled(o.onEnrolled)
 	}
-	log.Printf("[agent] 启动 %s，Agent %s，目标服务端 %s", version.Full(), o.agentID, o.server)
+	logx.Infof("[agent] 启动 %s，Agent %s，目标服务端 %s，日志级别 %s", version.Full(), o.agentID, o.server, logx.Current().String())
 	// 两个"默认收紧、需本机显式放开"的开关都在启动日志里给出生效值：
 	// 出问题时第一手证据就是"它到底以为自己的边界在哪"。
-	log.Printf("[agent] 文件读写根目录: %s（用 -file-roots 扩大）",
+	logx.Infof("[agent] 文件读写根目录: %s（用 -file-roots 扩大）",
 		strings.Join(c.FileRoots(), ", "))
 	if len(o.tunnelHosts) == 0 {
-		log.Printf("[agent] 隧道目标仅限本机回环（默认）；如需放行其它地址请用 -tunnel-hosts 在本机配置")
+		logx.Infof("[agent] 隧道目标仅限本机回环（默认）；如需放行其它地址请用 -tunnel-hosts 在本机配置")
 	} else {
-		log.Printf("[agent] 注意: 隧道目标已放开到 %s —— 本机因此可作为通往这些地址的代理，"+
+		logx.Infof("[agent] 注意: 隧道目标已放开到 %s —— 本机因此可作为通往这些地址的代理，"+
 			"这是本机显式配置的结果（-tunnel-hosts）", strings.Join(o.tunnelHosts, ", "))
 	}
 	if o.upgradePubKey == "" {
-		log.Printf("[agent] 未配置 -upgrade-pubkey：在线链接升级会被拒绝（这是默认安全态）；服务端本地 pkg 升级仍可用（认证长连接 + SHA-256）")
+		logx.Warnf("[agent] 未配置 -upgrade-pubkey：在线链接升级会被拒绝（这是默认安全态）；服务端本地 pkg 升级仍可用（认证长连接 + SHA-256）")
 	}
 	c.Run()
 }
@@ -469,4 +480,28 @@ func isPlaceholderServer(addr string) bool {
 		host = strings.TrimSuffix(host, "/")
 	}
 	return host == placeholderServerHost
+}
+
+// applyLogLevel 解析并应用日志级别：命令行 > 配置文件 > 默认 error。
+func applyLogLevel(flagVal string, cfg *config.Config) {
+	text := strings.TrimSpace(flagVal)
+	if text == "" && cfg != nil {
+		text = strings.TrimSpace(cfg.LogLevel)
+	}
+	lv, ok := logx.ParseLevel(text)
+	if !ok {
+		// 配错级别不该静默：用 error 级别说出来，默认级别下也看得见。
+		logx.SetLevel(logx.Error)
+		logx.Errorf("无法识别的日志级别 %q，按 error 处理（可用 off / error / warn / info）", text)
+		return
+	}
+	logx.SetLevel(lv)
+}
+
+// normalizeLogLevel 返回写进配置文件的规范级别字符串。
+func normalizeLogLevel(s string) string {
+	if lv, ok := logx.ParseLevel(s); ok {
+		return lv.String()
+	}
+	return logx.Error.String()
 }
