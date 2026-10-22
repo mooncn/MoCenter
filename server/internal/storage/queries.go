@@ -641,6 +641,14 @@ func (db *DB) UpdateAgentIdentity(oldID, newID, uuid string) error {
 	return nil
 }
 
+// 删除主机数据用的 SQL 前缀，表名为字面量。IN 列表的 ? 占位符由
+// DeleteAgentData 按别名数量生成，值一律参数绑定。
+const (
+	deleteAgentsByID            = "DELETE FROM agents WHERE agent_id IN ("
+	deleteProbeHistoryByAgent   = "DELETE FROM probe_history WHERE agent_id IN ("
+	deleteLatencyHistoryByAgent = "DELETE FROM latency_history WHERE agent_id IN ("
+)
+
 // DeleteAgentData 删除主机记录及其探针/延迟历史。
 //
 // agentIDs 传入同一设备当前与历史用过的所有 agent_id（别名）：设备按 UUID 归并后，
@@ -670,9 +678,18 @@ func (db *DB) DeleteAgentData(agentIDs []string) error {
 		return fmt.Errorf("开始删除主机事务失败: %w", err)
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"agents", "probe_history", "latency_history"} {
-		if _, err := tx.Exec("DELETE FROM "+table+" WHERE agent_id IN ("+placeholders+")", args...); err != nil {
-			return fmt.Errorf("删除主机数据失败（%s）: %w", table, err)
+	// 三条 DELETE 各自写死表名，只共享 IN 列表的占位符：别名全部走参数绑定，
+	// SQL 文本里不出现任何数据值。
+	for _, q := range []struct {
+		table string
+		stmt  string
+	}{
+		{"agents", deleteAgentsByID},
+		{"probe_history", deleteProbeHistoryByAgent},
+		{"latency_history", deleteLatencyHistoryByAgent},
+	} {
+		if _, err := tx.Exec(q.stmt+placeholders+")", args...); err != nil {
+			return fmt.Errorf("删除主机数据失败（%s）: %w", q.table, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
