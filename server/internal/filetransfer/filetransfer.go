@@ -62,6 +62,8 @@ type Manager struct {
 	lastRejectLog time.Time
 	// baseDir 服务端接收目录
 	baseDir string
+	// downloadWaiters 正在等待 Agent 回传的下载（key 与 uploads 相同）。
+	downloadWaiters map[string]*downloadWaiter
 }
 
 type uploadTask struct {
@@ -74,6 +76,11 @@ type uploadTask struct {
 	maxSeq     int
 	done       bool
 	lastActive time.Time // 最近一次收到分片的时刻，用于 TTL 回收
+	// expectSize 为 true 表示这是 ExpectDownload 预建的下载任务：
+	// 文件大小要等 Agent 回传第一片时才知道。
+	expectSize bool
+	// wait 非空表示有 HTTP 下载在等这个任务落盘（完成/失败/超时都必须通知一次）。
+	wait *downloadWaiter
 }
 
 // NewManager 创建文件传输管理器。
@@ -82,8 +89,9 @@ type uploadTask struct {
 func NewManager(baseDir string) *Manager {
 	_ = os.MkdirAll(baseDir, 0700)
 	return &Manager{
-		uploads: make(map[string]*uploadTask),
-		baseDir: baseDir,
+		uploads:         make(map[string]*uploadTask),
+		downloadWaiters: make(map[string]*downloadWaiter),
+		baseDir:         baseDir,
 	}
 }
 
@@ -157,8 +165,9 @@ func (m *Manager) HandleUploadChunk(req *protocol.FileUploadReq) *protocol.Chunk
 	ack := &protocol.ChunkAck{FilePath: req.FilePath, ChunkSeq: req.ChunkSeq, Ack: false}
 
 	if req.FileSize < 0 {
-		// 文件打开失败通知
-		logx.Errorf("[filetransfer] Agent %s 上传文件 %s 失败", req.AgentID, req.FilePath)
+		// 文件打开失败通知：先让等待中的下载立刻拿到失败原因，而不是干等超时。
+		logx.Errorf("[filetransfer] Agent %s 上传/下载文件 %s 失败", req.AgentID, req.FilePath)
+		m.failDownload(key, fmt.Errorf("Agent 无法读取该文件（路径不存在、无权限或不是普通文件）"))
 		return ack
 	}
 
@@ -197,6 +206,18 @@ func (m *Manager) HandleUploadChunk(req *protocol.FileUploadReq) *protocol.Chunk
 		}
 		m.uploads[key] = t
 	}
+	// 下载任务：第一片到达时才确定文件大小；同时在这里就挡住超大文件，
+	// 否则要等 64MiB 的额度被吃满才 NACK，等待方只能超时。
+	if t.expectSize {
+		if req.FileSize > maxUploadTaskBytes {
+			m.mu.Unlock()
+			m.failDownload(key, fmt.Errorf("文件超过单次下载上限（%d MiB）", maxUploadTaskBytes>>20))
+			return ack
+		}
+		t.fileSize = req.FileSize
+		t.expectSize = false
+	}
+
 	// MD5 校验
 	if len(req.ChunkData) > 0 {
 		sum := fmt.Sprintf("%x", md5.Sum(req.ChunkData))
@@ -256,15 +277,24 @@ func (m *Manager) shouldLogReject() bool {
 // 增长，且分片全在内存里。
 func (m *Manager) CleanupStale() int {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	cutoff := time.Now().Add(-uploadTaskTTL)
 	var n int
+	var orphan []*downloadWaiter
 	for key, t := range m.uploads {
 		if t.done || !t.lastActive.After(cutoff) {
 			delete(m.uploads, key)
 			m.stored -= t.received
+			if w := m.cleanupWaiterForLocked(key); w != nil {
+				orphan = append(orphan, w)
+			}
 			n++
 		}
+	}
+	m.mu.Unlock()
+
+	// 通知必须在释放锁之后：等待方可能立刻回调 CancelDownload。
+	for _, w := range orphan {
+		w.notify(errDownloadCancelled)
 	}
 	if n > 0 {
 		logx.Infof("[filetransfer] 回收 %d 个超过 %v 未完成的上传任务", n, uploadTaskTTL)
@@ -275,48 +305,66 @@ func (m *Manager) CleanupStale() int {
 // tryAssemble 当所有分片到齐后按序合并写盘。
 func (m *Manager) tryAssemble(t *uploadTask) {
 	m.mu.Lock()
-	if t.done || t.fileSize == 0 {
+	if t.done || t.expectSize {
+		// expectSize：下载任务还没收到第一片，文件大小未知，不能判"齐了"。
 		m.mu.Unlock()
 		return
 	}
-	// 判断是否齐了：按序累加长度 == fileSize
 	var total int64
-	for i := 0; i <= t.maxSeq; i++ {
-		if _, ok := t.chunks[i]; !ok {
-			m.mu.Unlock()
-			return // 尚有缺失分片
+	// fileSize==0 是合法输入（空文件）：没有分片要累加，直接落一个空文件。
+	if t.fileSize > 0 {
+		// 判断是否齐了：按序累加长度 == fileSize
+		for i := 0; i <= t.maxSeq; i++ {
+			if _, ok := t.chunks[i]; !ok {
+				m.mu.Unlock()
+				return // 尚有缺失分片
+			}
+			total += int64(len(t.chunks[i]))
 		}
-		total += int64(len(t.chunks[i]))
-	}
-	if total != t.fileSize {
-		m.mu.Unlock()
-		return
-	}
-	t.done = true
-	chunks := make([][]byte, 0, t.maxSeq+1)
-	for i := 0; i <= t.maxSeq; i++ {
-		chunks = append(chunks, t.chunks[i])
-	}
-	delete(m.uploads, taskKey(t.agentID, t.filePath))
-	// 分片即将交给磁盘，暂存额度同步释放 —— 不释放的话闸门会被
-	// 一次次成功的上传吃满，最后反而把正常请求挡在门外。
-	m.stored -= total
-	m.mu.Unlock()
-
-	// 合并写盘
-	f, err := os.OpenFile(t.localPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
-	if err != nil {
-		logx.Errorf("[filetransfer] 打开 %s 失败: %v", t.localPath, err)
-		return
-	}
-	defer f.Close()
-	for _, c := range chunks {
-		if _, err := f.Write(c); err != nil {
-			logx.Errorf("[filetransfer] 写入 %s 失败: %v", t.localPath, err)
+		if total != t.fileSize {
+			m.mu.Unlock()
 			return
 		}
 	}
-	logx.Infof("[filetransfer] 文件上传完成: %s -> %s (%d bytes)", t.filePath, t.localPath, t.fileSize)
+	t.done = true
+	chunks := make([][]byte, 0, t.maxSeq+1)
+	if t.fileSize > 0 {
+		for i := 0; i <= t.maxSeq; i++ {
+			chunks = append(chunks, t.chunks[i])
+		}
+	}
+	key := taskKey(t.agentID, t.filePath)
+	delete(m.uploads, key)
+	// 分片即将交给磁盘，暂存额度同步释放 —— 不释放的话闸门会被
+	// 一次次成功的上传吃满，最后反而把正常请求挡在门外。
+	m.stored -= total
+	wait := t.wait
+	m.cleanupWaiterForLocked(key)
+	m.mu.Unlock()
+
+	// 合并写盘
+	var werr error
+	if f, err := os.OpenFile(t.localPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644); err != nil {
+		werr = err
+	} else {
+		for _, c := range chunks {
+			if _, err := f.Write(c); err != nil {
+				werr = err
+				break
+			}
+		}
+		if cerr := f.Close(); werr == nil {
+			werr = cerr
+		}
+	}
+	if werr != nil {
+		logx.Errorf("[filetransfer] 写入 %s 失败: %v", t.localPath, werr)
+		_ = os.Remove(t.localPath)
+	} else {
+		logx.Infof("[filetransfer] 文件接收完成: %s -> %s (%d bytes)", t.filePath, t.localPath, t.fileSize)
+	}
+	// 有 HTTP 下载在等：无论成功失败都通知一次（once 保证只通知一次）。
+	wait.notify(werr)
 }
 
 // HandleFileDownload 处理 Agent 下载回传的分片（复用上传逻辑）。

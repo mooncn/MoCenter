@@ -106,6 +106,8 @@ func main() {
 	adminTLSDays := flag.Int("admin-tls-days", 30, "Web 控制台自动 HTTPS 证书有效期（天）；0 表示关闭自动 HTTPS")
 	serverName := flag.String("server-name", "", "部署身份名（写入服务端 CA，用于区分多套总控；留空自动生成）")
 	tokenTTL := flag.Duration("token-ttl", auth.DefaultTokenTTL, "会话 Token 有效期（默认 12h）")
+	fileEditMaxMB := flag.Int("file-edit-max-mb", config.FileEditDefaultMB,
+		"文件管理在线预览/编辑的单文件上限（MiB，1–64）；超过上限的文件只能下载，不能在浏览器里打开")
 	// VNC 端口闸门：默认只放行 RFB 约定端口段，显式传空串才放开（=不限制）。
 	// 默认值取内置常量，运维在生成的配置文件里能直接看到它，改起来不用查文档。
 	defaultVncPorts := vnc.DefaultPortSpec
@@ -164,6 +166,7 @@ func main() {
 			WebTLSCert:        *webTLSCert,
 			WebTLSKey:         *webTLSKey,
 			TokenTTL:          tokenTTL.String(),
+			FileEditMaxMB:     *fileEditMaxMB,
 			RequireAgentCert:  *requireAgentCert,
 			// 一次性注册令牌的迁移终点开关：打开后共享注册密钥不再能注册任何主机。
 			DisableSharedAgentKey: *disableSharedAgentKey,
@@ -269,6 +272,11 @@ func main() {
 		if cfg.AdminTLSDays != 0 && !givenFlags["admin-tls-days"] {
 			*adminTLSDays = cfg.AdminTLSDays
 		}
+		// 0 是"未配置"（老配置文件没有这一项），不能覆盖命令行默认值；
+		// 显式传入的 -file-edit-max-mb 优先级仍然最高。
+		if cfg.FileEditMaxMB != 0 && !givenFlags["file-edit-max-mb"] {
+			*fileEditMaxMB = cfg.FileEditMaxMB
+		}
 		if cfg.ServerName != "" && *serverName == "" {
 			*serverName = cfg.ServerName
 		}
@@ -314,6 +322,7 @@ func main() {
 			"proxy-ip":                 func() { cfg.ProxyIP = *proxyIP },
 			"mmdb":                     func() { cfg.MMDBPath = *mmdbPath },
 			"token-ttl":                func() { cfg.TokenTTL = tokenTTL.String() },
+			"file-edit-max-mb":         func() { cfg.FileEditMaxMB = *fileEditMaxMB },
 			"require-agent-cert":       func() { cfg.RequireAgentCert = *requireAgentCert },
 			"disable-shared-agent-key": func() { cfg.DisableSharedAgentKey = *disableSharedAgentKey },
 			"admin-tls-days":           func() { cfg.AdminTLSDays = *adminTLSDays },
@@ -323,7 +332,7 @@ func main() {
 			"log-level":                func() { cfg.LogLevel = logx.Current().String() },
 		}
 		dirty := false
-		for _, name := range []string{"listen", "http", "whitelist", "trusted-proxies", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "password-file", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl", "require-agent-cert", "disable-shared-agent-key", "admin-tls-days", "server-name", "vnc-ports", "upgrade-pubkey", "log-level"} {
+		for _, name := range []string{"listen", "http", "whitelist", "trusted-proxies", "web", "web-tls-cert", "web-tls-key", "tls-cert", "tls-key", "ca-cert", "insecure", "data", "user", "password-file", "pkg-dir", "agent-key", "proxy-ip", "mmdb", "token-ttl", "file-edit-max-mb", "require-agent-cert", "disable-shared-agent-key", "admin-tls-days", "server-name", "vnc-ports", "upgrade-pubkey", "log-level"} {
 			if explicit[name] {
 				field[name]()
 				dirty = true
@@ -613,6 +622,9 @@ func main() {
 	// 旧版硬编码 /tmp/mocenter_uploads（全局可写目录），且 Linux 下任何用户可读。
 	ft := filetransfer.NewManager(filepath.Join(*dataDir, "uploads"))
 	pushMgr := filetransfer.NewPushManager()
+	// 文件管理会话：无操作 20 分钟自动断开，没有累计时长上限（sweeper 每 30 秒扫一次）。
+	fileMgr := newFileSessionManager()
+	go fileSessionSweeper(fileMgr)
 	vncMgr := vnc.NewMgr(sess)
 	// 端口闸门在启动时生效：配置写错应当是"起不来"，而不是"以为已收紧、实际还在放行"。
 	if err := vncMgr.SetAllowedPorts(*vncPorts); err != nil {
@@ -855,6 +867,14 @@ func main() {
 		})
 	}
 	mux.HandleFunc("/api/agents/log-level", agentLogLevelHandler(sess, authz, siteAudit))
+	// 文件管理：会话制（空闲/超时自动断开），路径在服务端与 Agent 双侧校验。
+	mux.HandleFunc("/api/files/session", fileSessionHandler(fileMgr, sess, authz, siteAudit))
+	mux.HandleFunc("/api/files/session/close", fileSessionCloseHandler(fileMgr, authz, siteAudit))
+	mux.HandleFunc("/api/files/list", fileListHandler(fileMgr, sess, authz))
+	mux.HandleFunc("/api/files/op", fileOpHandler(fileMgr, sess, authz, siteAudit))
+	mux.HandleFunc("/api/files/upload", fileUploadHandler(fileMgr, sess, authz, siteAudit))
+	mux.HandleFunc("/api/files/download", fileDownloadHandler(fileMgr, sess, ft, authz, siteAudit))
+	mux.HandleFunc("/api/files/text", fileTextHandler(fileMgr, sess, authz, settings, siteAudit))
 	mux.HandleFunc("/api/site/config", siteConfigHandler(siteCfg, authz, siteAudit))
 	mux.HandleFunc("/api/site/config/reset", siteConfigResetHandler(siteCfg, authz, siteAudit))
 	mux.HandleFunc("/api/site/hosts", siteHostOptionsHandler(store, authz))
@@ -867,6 +887,7 @@ func main() {
 		return listeners.AgentAddr(), listeners.HTTPAddr()
 	}))
 	mux.HandleFunc("/api/system/session", systemSessionHandler(authz, settings, siteAudit))
+	mux.HandleFunc("/api/system/file-edit", systemFileEditHandler(authz, settings, siteAudit))
 	mux.HandleFunc("/api/system/agent-listen", systemAgentListenHandler(authz, userMgr, settings,
 		func() *listenerHub { return listeners }, sess, siteAudit))
 	mux.HandleFunc("/api/system/http-listen", systemHTTPListenHandler(authz, userMgr, settings,
@@ -1977,6 +1998,13 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 				//   · 缓冲里含运维在终端里敲的**半行命令**（可能含口令），
 				//     会一直驻留到下一次整表 wipe。
 				router.DropInteractive(route.InteractiveKey(sessConn.GetAgentID(), io.CommandID))
+			}
+		case protocol.TypeFsOpResp:
+			var resp protocol.FsOpResp
+			if json.Unmarshal(env.Data, &resp) == nil {
+				// 身份以连接为准（与其它回执同口径）
+				resp.AgentID = sessConn.GetAgentID()
+				fsOpReqs.deliver(resp)
 			}
 		case protocol.TypeFileUploadReq:
 			var fu protocol.FileUploadReq

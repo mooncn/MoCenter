@@ -100,6 +100,62 @@ export const Api = {
     const { data } = await api.post('/agents/log-level', payload)
     return data
   },
+  // 文件管理：会话制（服务端无操作 20 分钟自动断开，无累计时长上限）
+  async fileSession(agentId) {
+    const { data } = await api.post('/files/session', { agent_id: agentId })
+    return data
+  },
+  async fileSessionStatus(id) {
+    const { data } = await api.get('/files/session', { params: { session: id } })
+    return data
+  },
+  async fileSessionClose(id) {
+    const { data } = await api.post('/files/session/close', { session: id })
+    return data
+  },
+  async fileList(id, path) {
+    const { data } = await api.get('/files/list', { params: { session: id, path } })
+    return data
+  },
+  // 原始正文上传（非 multipart）：服务端边读边推给 Agent，不在内存里缓存整份文件
+  async fileUpload(id, dir, name, file, onProgress) {
+    const { data } = await api.post('/files/upload', file, {
+      params: { session: id, dir, name },
+      headers: { 'Content-Type': 'application/octet-stream' },
+      timeout: 0,
+      onUploadProgress: onProgress,
+    })
+    return data
+  },
+  // 文本预览/编辑：GET 读取（encoding 留空 = 自动检测），POST 保存（正文即 UTF-8 内容）
+  async fileText(id, path, encoding) {
+    const { data } = await api.get('/files/text', { params: { session: id, path, encoding: encoding || '' } })
+    return data
+  },
+  async fileTextSave(id, path, encoding, content) {
+    const { data } = await api.post('/files/text', content, {
+      params: { session: id, path, encoding },
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      timeout: 0,
+    })
+    return data
+  },
+  // 系统配置：文件在线编辑上限（MiB）
+  async setFileEditLimit(maxMB) {
+    const { data } = await api.post('/system/file-edit', { max_mb: maxMB })
+    return data
+  },
+  // 整机文件操作：op = create | copy | move | delete
+  async fileOp(session, op, payload) {
+    const { data } = await api.post('/files/op', { session, op, ...payload })
+    return data
+  },
+  async fileDownload(id, path) {
+    const res = await api.get('/files/download', {
+      params: { session: id, path }, responseType: 'blob', timeout: 0,
+    })
+    return res
+  },
   // 获取全部主机（含离线）
   async agents() {
     const { data } = await api.get('/agents')

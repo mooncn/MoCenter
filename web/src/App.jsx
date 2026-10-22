@@ -3,6 +3,7 @@ import { Routes, Route, NavLink, Navigate, useLocation, useSearchParams, Link } 
 import Dashboard from './pages/Dashboard.jsx'
 import Terminal from './pages/Terminal.jsx'
 import Vnc from './pages/Vnc.jsx'
+import Files from './pages/Files.jsx'
 import PortMap from './pages/PortMap.jsx'
 import Offline from './pages/Offline.jsx'
 import Audit from './pages/Audit.jsx'
@@ -31,6 +32,7 @@ export const NAV_ITEMS = [
   { to: `${ADMIN}/latency`, label: '延迟监测', icon: '📶' },
   { to: `${ADMIN}/vnc`, label: '远程桌面', icon: '🖥' },
   { to: `${ADMIN}/portmap`, label: '端口映射', icon: '🔀' },
+  { to: `${ADMIN}/files`, label: '文件管理', icon: '📁' },
   { to: `${ADMIN}/ops`, label: '运维操作', icon: '🛠' },
   { to: `${ADMIN}/offline`, label: '离线机器', icon: '📴' },
   { to: `${ADMIN}/audit`, label: '操作审计', icon: '📋' },
@@ -141,6 +143,7 @@ function Layout() {
               <Route path="/terminal" element={<Terminal agents={agents} />} />
               <Route path="/vnc" element={<Vnc agents={agents} />} />
               <Route path="/portmap" element={<PortMap agents={agents} />} />
+              <Route path="/files" element={<Files agents={agents} />} />
               <Route path="/ops" element={<Ops agents={agents} />} />
               <Route path="/offline" element={<Offline agents={agents} />} />
               <Route path="/audit" element={<Audit />} />

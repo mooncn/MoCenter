@@ -232,6 +232,19 @@ body { -webkit-text-size-adjust: 100%; }
 
 /* 按钮补充样式 */
 .btn-sm { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+
+/* 表格内"看起来像链接"的按钮（文件管理的目录跳转等）。
+   保持 button 的可访问性（键盘可聚焦），只去掉按钮外观。 */
+.linklike {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.linklike:hover { text-decoration: underline; }
 button.secondary.danger, button.danger { background: rgba(239, 68, 68, .12); color: var(--red); border: 1px solid rgba(239, 68, 68, .35); }
 button.secondary.danger:hover { background: rgba(239, 68, 68, .2); }
 button.primary { background: var(--accent); }
@@ -1397,4 +1410,203 @@ tr.row-offline > td:last-child .cell-dot { display: inline-block; }
 @media (min-width: 1200px) {
   .account-cards.embedded { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .account-cards.embedded > .card { max-width: none; }
+}
+
+/* ============ 文件管理：紧凑工具条 + 密集列表 ============
+   一次浏览动辄几百个条目，"一屏能看到几行"直接决定这个页面好不好用，
+   所以卡片内边距、控件高度、表格行高整体压一档，并把原来三张卡片合成一张。
+   窄屏（<=900px）沿用上面的 .table-stack 卡片化：行高由那套规则负责，
+   这里只负责把控件排成一列并放大点击目标。 */
+.fm-head { margin-bottom: 12px; }
+.fm-head .sub { font-size: 13px; line-height: 1.45; }
+.fm-card { padding: 12px 14px; margin-bottom: 12px; }
+
+.fm-bar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 12px; }
+.fm-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.fm-field > label { font-size: 11px; margin: 0; color: var(--muted); letter-spacing: .2px; }
+.fm-field select, .fm-field input { width: 100%; min-width: 0; padding: 6px 9px; font-size: 13px; }
+.fm-host { flex: 0 1 220px; }
+.fm-path { flex: 1 1 260px; }
+.fm-root { flex: 0 1 132px; }
+.fm-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.fm-actions button { padding: 6px 11px; font-size: 12.5px; white-space: nowrap; }
+
+.fm-meta { display: flex; align-items: center; gap: 10px; margin-top: 8px; color: var(--muted); font-size: 12px; }
+.fm-meta code {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px;
+  padding: 2px 8px; font-size: 11.5px; color: var(--text);
+}
+.fm-meta-hint { flex: 0 0 auto; }
+.fm-notice { margin: 8px 0 0; padding: 7px 10px; }
+.fm-empty { padding: 18px 0 4px; color: var(--muted); font-size: 13px; }
+.fm-truncated { margin-top: 8px; color: var(--yellow); font-size: 12px; }
+
+.fm-safety { margin: 0 2px 16px; font-size: 12.5px; color: var(--muted); }
+.fm-safety > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  padding: 8px 12px; font-size: 13px; color: var(--text);
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.fm-safety > summary::-webkit-details-marker { display: none; }
+.fm-safety[open] > summary { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.fm-safety .desc { margin: 8px 2px 0; line-height: 1.7; font-size: 12.5px; }
+.fm-safety code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+
+/* 多选与剪贴板：都用"一条压扁的工具条"，不额外占一张卡片的纵向空间 */
+.fm-selall { font-size: 12px; flex: 0 0 auto; }
+.fm-col-check { text-align: center; }
+.fm-col-check input[type="checkbox"] {
+  width: 15px; height: 15px; margin: 0; padding: 0; vertical-align: middle;
+  accent-color: var(--accent); cursor: pointer;
+}
+/* 选中行整行提亮：只给 checkbox 加颜色，扫一眼看不出选了哪几条 */
+.fm-table tbody tr.fm-row-sel td { background: var(--accent-soft); }
+
+.fm-selbar, .fm-clipbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin-top: 8px; padding: 6px 10px; font-size: 12px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.fm-selbar b { color: var(--accent); }
+.fm-clip-label { color: var(--text); font-weight: 600; }
+.fm-clip-from {
+  color: var(--muted); max-width: 42%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fm-clip-busy { color: var(--yellow); }
+
+.fm-cliplist {
+  margin-top: 8px; padding: 8px 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.fm-clipfoot {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 8px; margin-top: 6px; color: var(--muted); font-size: 12px;
+}
+.fm-mini { width: 100%; font-size: 12px; }
+.fm-mini th, .fm-mini td {
+  padding: 4px 8px; border-bottom: 1px solid var(--border);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.fm-mini th { font-size: 11.5px; }
+/* 剪贴板列表三列：名称 / 原路径 / 大小（固定列宽才能稳定省略长路径） */
+.fm-cliplist .fm-mini { table-layout: fixed; }
+.fm-cliplist .fm-mini th:nth-child(1), .fm-cliplist .fm-mini td:nth-child(1) { width: 34%; }
+.fm-cliplist .fm-mini th:nth-child(2), .fm-cliplist .fm-mini td:nth-child(2) { width: 52%; }
+.fm-cliplist .fm-mini th:nth-child(3), .fm-cliplist .fm-mini td:nth-child(3) { width: 14%; }
+
+/* 文本预览 / 编辑：等宽字体 + 不自动换行，日志的原始行结构才看得清 */
+.fm-editor-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px;
+  margin-bottom: 8px; font-size: 12px; color: var(--muted);
+}
+.fm-editor-enc { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; }
+.fm-editor-enc select { width: auto; padding: 3px 6px; font-size: 12px; }
+.fm-editor-ro { display: inline-flex; align-items: center; gap: 5px; margin: 0; font-size: 12px; color: var(--muted); }
+.fm-editor-ro input { width: auto; margin: 0; }
+.fm-editor {
+  width: 100%; height: min(62vh, 620px); min-height: 280px; resize: vertical;
+  font-family: Menlo, Consolas, 'Courier New', monospace; font-size: 12.5px; line-height: 1.55;
+  white-space: pre; overflow: auto; tab-size: 4;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); padding: 10px;
+}
+.fm-editor:focus { outline: none; border-color: var(--accent); }
+.fm-editor-loading { padding: 40px 0; text-align: center; color: var(--muted); font-size: 13px; }
+
+/* 顶部磁盘条：当前分区的文件系统 + 使用率 + 剩余空间，点击看全部分区 */
+.fm-disk {
+  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  padding: 3px 10px; font-size: 11.5px; color: var(--muted); cursor: pointer;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+}
+.fm-disk:hover { border-color: var(--accent); color: var(--text); }
+.fm-disk-vol { color: var(--text); font-weight: 600; }
+.fm-disk-fs { color: #7cb0ff; }
+.fm-disk-text { white-space: nowrap; }
+.fm-disk-bar {
+  display: inline-block; width: 56px; height: 6px; border-radius: 3px;
+  background: var(--border); overflow: hidden; vertical-align: middle;
+}
+.fm-disk-bar > i { display: block; height: 100%; background: var(--accent); }
+.fm-disk-bar > i.warn { background: var(--yellow); }
+.fm-disk-bar > i.danger { background: var(--red); }
+.fm-disk-col { width: 168px; }
+.fm-disk-col .fm-disk-bar { width: 96px; }
+.fm-disk-pct { margin-left: 6px; color: var(--muted); }
+
+/* 宽屏才压行高并固定列宽（table-layout: fixed 让长文件名省略而不是撑出横向滚动，
+   完整路径与完整时间戳都在 title 里）。 */
+@media (min-width: 901px) {
+  .fm-table { table-layout: fixed; }
+  .fm-table th, .fm-table td { padding: 4px 8px; font-size: 13px; }
+  .fm-table thead th { font-size: 11.5px; }
+  .fm-table td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fm-col-size { width: 84px; text-align: right; }
+  .fm-col-time { width: 104px; }
+  .fm-col-check { width: 32px; }
+  /* 操作列要容得下「下载 / 编辑 / 重命名 / 删除」四个按钮：
+     换行会把 30px 的行高翻倍，正是"空隙太大"的主因 */
+  .fm-col-ops { width: 212px; }
+  /* 操作列不换行；放不下时宁可省略文件名也不要把行高翻倍 */
+  .fm-table td[data-label="操作"] { white-space: normal; overflow: visible; text-overflow: clip; }
+  .fm-table .row-actions { gap: 4px; }
+  .fm-table .row-actions button { padding: 2px 7px; font-size: 11.5px; }
+}
+/* 中等宽度（带侧边栏约 700px 内容区）：再收一遍列宽，按钮条单独占一行 */
+@media (min-width: 901px) and (max-width: 1180px) {
+  .fm-col-size { width: 70px; }
+  .fm-col-time { width: 92px; }
+  .fm-col-ops { width: 184px; }
+  .fm-table .row-actions { gap: 3px; }
+  .fm-table .row-actions button { padding: 2px 5px; }
+  .fm-actions { margin-left: 0; }
+}
+
+@media (max-width: 900px) {
+  .fm-card { padding: 12px; }
+  .fm-bar { gap: 8px; }
+  .fm-host, .fm-path, .fm-root { flex: 1 1 100%; }
+  .fm-actions { margin-left: 0; width: 100%; }
+  /* 手机上按钮要按手指尺寸排，不跟着表格一起缩小 */
+  .fm-actions button { flex: 1 1 auto; min-height: 36px; font-size: 13px; }
+  .fm-meta { flex-wrap: wrap; }
+  .fm-meta code { flex: 1 1 100%; }
+  .fm-safety { margin: 0 0 14px; }
+  /* 勾选框与文件名同一行，否则每条又多出一行 */
+  .fm-table td.fm-col-check { display: inline-block; width: auto; padding: 0 6px 0 0; vertical-align: middle; }
+  .fm-table td[data-label="名称"] { display: inline-block; max-width: calc(100% - 34px); vertical-align: middle; }
+  .fm-table td.fm-col-check input[type="checkbox"] { width: 17px; height: 17px; }
+  .fm-selbar button, .fm-clipbar button { min-height: 32px; }
+  .fm-editor { height: min(56vh, 420px); font-size: 12px; }
+  .fm-selbar, .fm-clipbar { font-size: 12.5px; }
+  .fm-clip-from { flex: 1 1 100%; max-width: 100%; }
+  /* "上一级"不需要字段名占位，卡片模式下占一行 88px 反而把按钮挤歪 */
+  .fm-table tr.fm-up td { display: block; }
+  .fm-table tr.fm-up td::before { content: none; }
+  /* 文件列表在卡片模式下压成三行（名称 / 大小·时间 / 操作）：
+     通用 .table-stack 每行都带字段名，一个目录要占 4 行，翻 C:\ 这种大目录
+     一屏只剩四五个条目。这里去掉字段名、把次要信息压成一行灰字。 */
+  .fm-table tr { padding: 6px 10px; margin-bottom: 6px; }
+  .fm-table td {
+    display: block; padding: 0; border: none; font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .fm-table td::before { content: none; }
+  .fm-table td[data-label="名称"] .linklike,
+  .fm-table td[data-label="名称"] > span {
+    display: inline-block; max-width: 100%; vertical-align: bottom;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .fm-table td[data-label="大小"],
+  .fm-table td[data-label="修改时间"] {
+    display: inline; color: var(--muted); font-size: 11.5px;
+  }
+  .fm-table td[data-label="大小"]::after { content: ' · '; }
+  /* 目录没有大小：卡片模式下这一格连同分隔符一起藏掉，避免出现"— · 6-09 16:19" */
+  .fm-table td.fm-na { display: none; }
+  .fm-table td[data-label="操作"] { white-space: normal; margin-top: 5px; }
+  .fm-table .row-actions { gap: 6px; }
+  .fm-table .row-actions button { padding: 5px 10px; font-size: 12px; min-height: 30px; }
 }

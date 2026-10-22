@@ -63,6 +63,10 @@ type Config struct {
 	ProxyIP string `json:"proxy_ip"`
 	// TokenTTL 会话 Token 有效期（Go duration 字符串，如 12h / 30m）；留空用内置默认 12h。
 	TokenTTL string `json:"token_ttl"`
+	// FileEditMaxMB 文件管理里"在线预览/编辑"的单文件上限（MiB）。
+	// 0 或未配置按默认 10 处理（老配置文件没有这一项）；界面允许 1–64。
+	// 超过上限的文件仍然可以下载，只是不在浏览器里打开。
+	FileEditMaxMB int `json:"file_edit_max_mb"`
 	// LogLevel 运行期日志级别：off / error / warn / info，**服务端默认 info**。
 	//
 	// 服务端日志量小、启动信息（监听地址、数据目录、证书路径）排障价值高，
@@ -165,4 +169,28 @@ func Save(path string, c *Config) error {
 		return err
 	}
 	return os.WriteFile(path, data, 0600)
+}
+
+// 在线编辑上限的默认值与天花板（MiB）。老配置文件没有 file_edit_max_mb 字段，
+// 读出来是 0 —— 按默认值处理，保证升级后行为一致。
+const (
+	FileEditDefaultMB = 10
+	FileEditHardMaxMB = 64
+)
+
+// FileEditLimitBytes 返回在线编辑单文件上限（字节）。
+func (c *Config) FileEditLimitBytes() int64 {
+	mb := c.FileEditMaxMB
+	if mb <= 0 {
+		mb = FileEditDefaultMB
+	}
+	if mb > FileEditHardMaxMB {
+		mb = FileEditHardMaxMB
+	}
+	return int64(mb) << 20
+}
+
+// FileEditLimitMB 返回归一后的上限（MiB），供控制台展示。
+func (c *Config) FileEditLimitMB() int {
+	return int(c.FileEditLimitBytes() >> 20)
 }

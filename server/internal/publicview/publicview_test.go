@@ -495,3 +495,39 @@ func TestSummaryOnlineOfflineCounts(t *testing.T) {
 		t.Fatalf("在线+离线应等于总数: %d+%d != %d", s.Online, s.Offline, s.Total)
 	}
 }
+
+// 内存/磁盘的「利用率」与「容量」是两个独立开关：只开其中一个时，
+// 另一类字段必须从 JSON 里完全消失（而不是下发 0 让前端显示 0 B）。
+func TestMemDiskSizeFieldGate(t *testing.T) {
+	cfg := siteconfig.Default()
+	cfg.Enabled = true
+	cfg.Fields = map[string]bool{"mem_usage": true, "disk_usage": true}
+	node := BuildNode(sampleAgent(), cfg, testKeys)
+	raw, _ := json.Marshal(node)
+	var onlyUsage map[string]interface{}
+	if err := json.Unmarshal(raw, &onlyUsage); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"mem_used_bytes", "mem_total_bytes", "disk_used_bytes", "disk_total_bytes"} {
+		if _, ok := onlyUsage[key]; ok {
+			t.Errorf("容量字段 %s 未开启时不应下发", key)
+		}
+	}
+	if _, ok := onlyUsage["mem_usage"]; !ok {
+		t.Error("已开启的 mem_usage 应下发")
+	}
+
+	cfg.Fields = map[string]bool{"mem_size": true, "disk_size": true}
+	node = BuildNode(sampleAgent(), cfg, testKeys)
+	raw, _ = json.Marshal(node)
+	var onlySize map[string]interface{}
+	_ = json.Unmarshal(raw, &onlySize)
+	for _, key := range []string{"mem_used_bytes", "mem_total_bytes", "disk_used_bytes", "disk_total_bytes"} {
+		if _, ok := onlySize[key]; !ok {
+			t.Errorf("容量字段 %s 开启时应下发", key)
+		}
+	}
+	if _, ok := onlySize["mem_usage"]; ok {
+		t.Error("未开启的 mem_usage 不应下发")
+	}
+}

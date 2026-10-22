@@ -68,8 +68,10 @@ var FieldCatalog = []Field{
 
 	{Key: "cpu_usage", Label: "CPU 利用率", Group: "性能", Default: true, Description: "当前 CPU 使用率"},
 	{Key: "cpu_model", Label: "CPU 型号", Group: "性能", Default: true, Description: "CPU 型号与主频"},
-	{Key: "mem_usage", Label: "内存利用率", Group: "性能", Default: true, Description: "已用/总内存与百分比"},
-	{Key: "disk_usage", Label: "磁盘利用率", Group: "性能", Default: true, Description: "已用/总磁盘与百分比"},
+	{Key: "mem_usage", Label: "内存利用率", Group: "性能", Default: true, Description: "当前内存使用百分比"},
+	{Key: "mem_size", Label: "内存大小", Group: "性能", Default: true, Description: "已用/总内存容量（绝对值）"},
+	{Key: "disk_usage", Label: "磁盘利用率", Group: "性能", Default: true, Description: "当前磁盘使用百分比"},
+	{Key: "disk_size", Label: "磁盘大小", Group: "性能", Default: true, Description: "已用/总磁盘容量（绝对值）"},
 	{Key: "load", Label: "系统负载", Group: "性能", Default: true, Description: "1/5/15 分钟平均负载（Windows 显示处理器队列长度近似值）"},
 }
 

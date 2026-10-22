@@ -401,11 +401,17 @@ func BuildNode(a *protocol.AgentInfo, cfg *siteconfig.Config, keys *NodeKeys) *N
 	}
 	if on("mem_usage") {
 		n.MemUsage = round1(a.MemUsage)
+	}
+	// 容量与百分比分开授权：只想知道"用了多少"的站点可以关掉百分比，
+	// 反之亦然。两项都关时 JSON 里不会出现任何内存容量字段。
+	if on("mem_size") {
 		n.MemUsedBytes = a.MemUsedBytes
 		n.MemTotalBytes = a.MemTotalBytes
 	}
 	if on("disk_usage") {
 		n.DiskUsage = round1(a.DiskUsage)
+	}
+	if on("disk_size") {
 		n.DiskUsedBytes = a.DiskUsedBytes
 		n.DiskTotalBytes = a.DiskTotalBytes
 	}

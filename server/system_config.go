@@ -98,6 +98,7 @@ func systemConfigHandler(authz *auth.Auth, settings *settingsStore, addrs func()
 			"agent_listen":      makeListenInfo(agentAddr),
 			"http_listen":       makeListenInfo(httpAddr),
 			"public_ip":         cachedPublicIP(),
+			"file_edit_max_mb":  snap.FileEditLimitMB(),
 		})
 	}
 }
@@ -140,6 +141,48 @@ func systemSessionHandler(authz *auth.Auth, settings *settingsStore, audit func(
 			"ok":  true,
 			"ttl": ttl,
 			"msg": "会话保持时长已更新；现有会话会在下次请求时按新时长续期",
+		})
+	}
+}
+
+// systemFileEditHandler 修改「文件管理 → 在线预览/编辑」的单文件上限。
+//
+// 上限同时决定读与写：超过它的文件只能在列表里下载，不在浏览器里打开。
+// 范围 1–64 MiB —— 再大就不是"简单文本编辑"了，浏览器里的 textarea 也扛不住。
+func systemFileEditHandler(authz *auth.Auth, settings *settingsStore, audit func(*http.Request, string)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			MaxMB int `json:"max_mb"`
+		}
+		if !decodeJSON(w, r, maxJSONBody, &body) {
+			return
+		}
+		if body.MaxMB < 1 || body.MaxMB > config.FileEditHardMaxMB {
+			writeJSON(w, map[string]interface{}{
+				"ok":  false,
+				"msg": fmt.Sprintf("上限需在 1–%d MiB 之间", config.FileEditHardMaxMB),
+			})
+			return
+		}
+		if err := settings.Update(func(c *config.Config) { c.FileEditMaxMB = body.MaxMB }); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "写入配置失败: " + err.Error()})
+			return
+		}
+		if audit != nil {
+			audit(r, fmt.Sprintf("修改文件在线编辑上限为 %d MiB", body.MaxMB))
+		}
+		logx.Infof("[server] 文件在线编辑上限已更新为 %d MiB", body.MaxMB)
+		writeJSON(w, map[string]interface{}{
+			"ok":     true,
+			"max_mb": body.MaxMB,
+			"msg":    fmt.Sprintf("已更新为 %d MiB；之后打开的编辑请求按新上限执行", body.MaxMB),
 		})
 	}
 }

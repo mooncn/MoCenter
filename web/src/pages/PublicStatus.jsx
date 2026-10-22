@@ -272,8 +272,9 @@ function NodeCards({ nodes, visible }) {
   const nav = useNavigate()
   const osOn = visible('os_type')
   const cpuOn = visible('cpu_usage')
-  const memOn = visible('mem_usage')
-  const diskOn = visible('disk_usage')
+  // 利用率与容量是两个独立开关：任一开启就显示这一行（只开容量时退化成文字行）
+  const memOn = visible('mem_usage') || visible('mem_size')
+  const diskOn = visible('disk_usage') || visible('disk_size')
   const loadOn = visible('load')
   // 这里用的是**字段开关**（后台展示配置）而不是"本次响应里有没有这个值"：
   // 开关开着就固定渲染这几行，值缺了显示「—」。若按"有没有值"决定渲染，
@@ -320,8 +321,20 @@ function NodeCards({ nodes, visible }) {
             {hasBars && (
               <div className="public-card-bars">
                 {cpuOn && <MiniBar label="CPU" value={n.cpu_usage} />}
-                {memOn && <MiniBar label="RAM" value={n.mem_usage} />}
-                {diskOn && <MiniBar label="磁盘" value={n.disk_usage} />}
+                {memOn && (
+                  <MiniBar
+                    label="RAM"
+                    value={visible('mem_usage') ? n.mem_usage : undefined}
+                    sub={visible('mem_size') ? bytesPair(n.mem_used_bytes, n.mem_total_bytes) : undefined}
+                  />
+                )}
+                {diskOn && (
+                  <MiniBar
+                    label="磁盘"
+                    value={visible('disk_usage') ? n.disk_usage : undefined}
+                    sub={visible('disk_size') ? bytesPair(n.disk_used_bytes, n.disk_total_bytes) : undefined}
+                  />
+                )}
                 {loadOn && <LoadLine node={n} />}
               </div>
             )}
@@ -383,8 +396,8 @@ function NodeTable({ nodes, visible }) {
     visible('os_version') ? { key: 'osver', label: '系统版本' } : null,
     visible('geo') ? { key: 'geo', label: '地区' } : null,
     visible('cpu_usage') ? { key: 'cpu', label: 'CPU' } : null,
-    visible('mem_usage') ? { key: 'mem', label: '内存' } : null,
-    visible('disk_usage') ? { key: 'disk', label: '磁盘' } : null,
+    visible('mem_usage') || visible('mem_size') ? { key: 'mem', label: '内存' } : null,
+    visible('disk_usage') || visible('disk_size') ? { key: 'disk', label: '磁盘' } : null,
     visible('network') ? { key: 'rate', label: '网速' } : null,
     visible('network') ? { key: 'traffic', label: '流量' } : null,
     visible('load') ? { key: 'load', label: '负载' } : null,
@@ -494,20 +507,19 @@ function cell(key, n, visible) {
       return geoText(n) || '-'
     case 'cpu':
       return n.cpu_usage === undefined ? '-' : <Pct value={n.cpu_usage} />
-    case 'mem':
-      return n.mem_usage === undefined ? '-' : (
-        <>
-          <Pct value={n.mem_usage} />
-          <div className="cell-sub">{bytesPair(n.mem_used_bytes, n.mem_total_bytes)}</div>
-        </>
-      )
-    case 'disk':
-      return n.disk_usage === undefined ? '-' : (
-        <>
-          <Pct value={n.disk_usage} />
-          <div className="cell-sub">{bytesPair(n.disk_used_bytes, n.disk_total_bytes)}</div>
-        </>
-      )
+    case 'mem': {
+      const pct = visible('mem_usage') && n.mem_usage !== undefined ? <Pct value={n.mem_usage} /> : null
+      // 容量字段未开启时服务端不下发 → bytesPair 返回空串，整行自动省略
+      const sizes = visible('mem_size') ? bytesPair(n.mem_used_bytes, n.mem_total_bytes) : ''
+      if (!pct && !sizes) return '-'
+      return <>{pct}{sizes ? <div className="cell-sub">{sizes}</div> : null}</>
+    }
+    case 'disk': {
+      const pct = visible('disk_usage') && n.disk_usage !== undefined ? <Pct value={n.disk_usage} /> : null
+      const sizes = visible('disk_size') ? bytesPair(n.disk_used_bytes, n.disk_total_bytes) : ''
+      if (!pct && !sizes) return '-'
+      return <>{pct}{sizes ? <div className="cell-sub">{sizes}</div> : null}</>
+    }
     case 'rate':
       if (!hasNet(n)) return '-'
       return (
@@ -557,7 +569,18 @@ function osText(n) {
 // 唯一的例外是**服务端明确置空**（null）：那表示"这次确实没采到"，
 // 与"采到了 0"是两件事，显示成 0% 会凭空造出一个不存在的读数。
 function MiniBar({ label, value, sub }) {
-  if (value === undefined || value === null) return null
+  if (value === undefined || value === null) {
+    // 只开启了「容量」而没开「利用率」：没有百分比可画，直接给一行容量文字。
+    if (!sub) return null
+    return (
+      <div className="public-mini">
+        <div className="public-mini-row">
+          <span className="k">{label}</span>
+          <span className="v">{sub}</span>
+        </div>
+      </div>
+    )
+  }
   const known = typeof value === 'number' && Number.isFinite(value)
   const v = known ? Math.max(0, Math.min(100, value)) : 0
   const cls = v > 85 ? 'danger' : v > 60 ? 'warn' : ''
@@ -737,12 +760,16 @@ function NodeFacts({ node }) {
     push('CPU 型号', node.cpu_model)
     push('CPU 利用率', node.cpu_usage !== undefined ? `${node.cpu_usage}%` : '')
     push('系统负载', loadText(node) ? `${loadText(node)}（1 / 5 / 15 分钟）` : '')
-    push('内存', node.mem_usage !== undefined
-      ? `${node.mem_usage}%（${bytesPair(node.mem_used_bytes, node.mem_total_bytes) || '—'}）`
-      : '')
-    push('磁盘', node.disk_usage !== undefined
-      ? `${node.disk_usage}%（${bytesPair(node.disk_used_bytes, node.disk_total_bytes) || '—'}）`
-      : '')
+    // 利用率与容量是独立开关：只开一项时只显示那一项，不拼出"61%（—）"这种半截值
+    const pushMetric = (label, pct, used, total) => {
+      const p = pct !== undefined ? `${pct}%` : ''
+      const s = used !== undefined ? bytesPair(used, total) : ''
+      if (p && s) push(label, `${p}（${s || '—'}）`)
+      else if (p) push(label, p)
+      else if (s) push(label, s)
+    }
+    pushMetric('内存', node.mem_usage, node.mem_used_bytes, node.mem_total_bytes)
+    pushMetric('磁盘', node.disk_usage, node.disk_used_bytes, node.disk_total_bytes)
     push('下行速率', hasNet(node) ? fmtRate(node.net_rate_in) : '')
     push('上行速率', hasNet(node) ? fmtRate(node.net_rate_out) : '')
     push('累计下行', typeof node.net_total_in === 'number' ? fmtBytes(node.net_total_in) : '')

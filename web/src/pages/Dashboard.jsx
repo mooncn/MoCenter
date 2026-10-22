@@ -468,6 +468,11 @@ export default function Dashboard({ agents }) {
               onClick={() => { setShareAgent(actionTarget.agent_id); setActionAgent('') }}
             />
             <ActionItem
+              icon="📁" title="文件管理" desc="浏览 / 上传 / 下载该主机的文件"
+              disabled={!actionTarget.online}
+              onClick={() => openHostPage('/admin/files')}
+            />
+            <ActionItem
               icon="📝" title="日志级别" desc="远程调整该主机的日志详细程度"
               disabled={!actionTarget.online}
               onClick={() => {

@@ -39,6 +39,10 @@ const (
 	// Agent 校验后写回配置 log_level 并立即生效，再回 Ack；旧版 Agent 忽略该消息。
 	TypeLogLevelUpdate    = "LogLevelUpdate"
 	TypeLogLevelUpdateAck = "LogLevelUpdateAck"
+	// TypeFsOpReq / TypeFsOpResp 文件管理：整机文件操作（Server->Agent / Agent->Server）。
+	// Op = roots | list | create | rename | copy | move | delete | disk | readtext | writetext；不做 -file-roots 沙箱限制。
+	TypeFsOpReq  = "FsOpReq"
+	TypeFsOpResp = "FsOpResp"
 )
 
 // Envelope 通用消息信封。
@@ -155,6 +159,9 @@ type FilePushReq struct {
 	ChunkData []byte `json:"chunk_data"`
 	ChunkMD5  string `json:"chunk_md5"`
 	Done      bool   `json:"done"`
+	// Unrestricted 为真表示"文件管理"发起的整机上传：跳过本机 -file-roots 沙箱，
+	// 但仍要求绝对路径。运维操作页的文件分发不设置它，保持沙箱。
+	Unrestricted bool `json:"unrestricted,omitempty"`
 }
 
 // FilePushAck Agent -> Server 文件分发分片确认。
@@ -174,6 +181,9 @@ type FileDownloadReq struct {
 	FileSize  int64  `json:"file_size"`
 	ChunkSeq  int    `json:"chunk_seq"`
 	ChunkData []byte `json:"chunk_data"`
+	// Unrestricted 为真表示"文件管理"发起的整机下载：跳过本机 -file-roots 沙箱，
+	// 但仍要求绝对路径。运维操作页的下载不设置它，保持沙箱。
+	Unrestricted bool `json:"unrestricted,omitempty"`
 }
 
 // InteractiveInputReq Server -> Agent
@@ -393,6 +403,79 @@ type ServerAddrUpdateAck struct {
 	ServerAddr string `json:"server_addr"`
 	OK         bool   `json:"ok"`
 	Message    string `json:"message,omitempty"`
+}
+
+// FsOpReq 整机文件操作请求（Server -> Agent）。
+//
+// 与文件分发/下载通道不同，这里**不做 -file-roots 沙箱限制**：
+// 文件管理定位为管理员对整台主机的文件运维（等价于已有的远程命令能力）。
+// Path/Dest 必须是绝对路径；Windows 盘符根（C:\）与 Unix 的 / 都允许。
+type FsOpReq struct {
+	RequestID string `json:"request_id"`
+	// Op roots=列出可浏览的根（Windows 盘符 / Unix 的 /）；
+	// list/create/rename/copy/move/delete/disk/readtext/writetext。
+	Op string `json:"op"`
+	// Path 操作对象（list 的目录、create 的路径、rename/copy/move 的源、delete 的目标）。
+	Path string `json:"path,omitempty"`
+	// Dest rename/copy/move 的目标（copy/move 的目标若是已存在目录，会放到该目录下同名；
+	// rename 的目标必须在同一目录下且不能已存在）。
+	Dest string `json:"dest,omitempty"`
+	// IsDir create 时 true=新建目录，false=新建空文件。
+	IsDir bool `json:"is_dir,omitempty"`
+	// WithDisk list 时顺带返回卷/分区信息：列表页顶部要显示剩余空间，
+	// 合进同一次往返，省一个 RTT 也保证"刚删完文件"时数字是新的。
+	WithDisk bool `json:"with_disk,omitempty"`
+	// Encoding readtext/writetext 的字符编码标签；readtext 留空表示自动检测。
+	Encoding string `json:"encoding,omitempty"`
+	// Content writetext 的新内容（**已是 UTF-8**，Agent 负责按 Encoding 转码）。
+	Content string `json:"content,omitempty"`
+	// MaxBytes 在线编辑的单文件字节上限（0 = Agent 默认 10 MiB）。
+	// 服务端按系统配置下发，Agent 侧再夹一个硬上限兜底。
+	MaxBytes int64 `json:"max_bytes,omitempty"`
+}
+
+// FsVolume 一个可存放文件的卷（Windows 盘符或 Unix 挂载点）。
+type FsVolume struct {
+	Name   string `json:"name"`              // "C:" 或 "/home"
+	Path   string `json:"path"`              // "C:\" 或 "/home/"
+	FSType string `json:"fs_type,omitempty"` // NTFS / ext4 / xfs …
+	Total  int64  `json:"total"`             // 字节
+	Free   int64  `json:"free"`              // 可用字节（当前用户可写）
+}
+
+// FileEntry 目录项。Symlink 为真表示这是符号链接本身（不跟随）。
+type FileEntry struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Dir     bool   `json:"dir"`
+	Size    int64  `json:"size,omitempty"`
+	ModTime int64  `json:"mod_time,omitempty"` // Unix 秒
+	Symlink bool   `json:"symlink,omitempty"`
+}
+
+// FsOpResp 文件操作结果（Agent -> Server）。
+// Truncated 表示目录条目数超过单次上限，只返回了前 N 项（目录优先 + 名称排序）。
+type FsOpResp struct {
+	RequestID string      `json:"request_id"`
+	Op        string      `json:"op"`
+	AgentID   string      `json:"agent_id"`
+	Path      string      `json:"path,omitempty"`
+	Parent    string      `json:"parent,omitempty"`
+	Entries   []FileEntry `json:"entries,omitempty"`
+	// Volumes 仅在 list(WithDisk) / disk 时返回；当前卷由前端按挂载点长度匹配。
+	Volumes   []FsVolume `json:"volumes,omitempty"`
+	Truncated bool       `json:"truncated,omitempty"`
+	// Content readtext 返回的文件内容（**已转成 UTF-8**）。
+	Content string `json:"content,omitempty"`
+	// Encoding readtext 实际使用的编码；writetext 为写入时使用的编码。
+	Encoding string `json:"encoding,omitempty"`
+	// Detected readtext 自动检测到的编码（用户显式指定时也给出，便于界面提示）。
+	Detected string `json:"detected,omitempty"`
+	// Size readtext/writetext 的文件字节数（磁盘上的实际大小）。
+	Size    int64 `json:"size,omitempty"`
+	ModTime int64 `json:"mod_time,omitempty"`
+	OK      bool  `json:"ok"`
+	Message string `json:"message,omitempty"`
 }
 
 // LogLevelUpdate 服务端要求 Agent 修改运行期日志级别。

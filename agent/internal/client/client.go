@@ -976,6 +976,11 @@ func (c *Client) handleMessage(env protocol.Envelope) {
 			return
 		}
 		go c.handleVncPassword(req)
+	case protocol.TypeFsOpReq:
+		var req protocol.FsOpReq
+		if json.Unmarshal(env.Data, &req) == nil {
+			c.handleFsOp(req)
+		}
 	case protocol.TypeLogLevelUpdate:
 		var u protocol.LogLevelUpdate
 		if json.Unmarshal(env.Data, &u) != nil {
@@ -1232,15 +1237,17 @@ func (c *Client) handleFilePush(req protocol.FilePushReq) {
 	//（不静默丢弃 —— 静默丢弃的表现是"传输一直卡在进行中"，最难排查）。
 	// 归一后的绝对路径同时充当 pushFiles 的键，避免同一路径的两种写法
 	// 各开一个句柄互相截断。
-	path, gerr := c.guardPath(req.FilePath)
+	path, gerr := c.pushTargetPath(req.FilePath, req.Unrestricted)
 	if gerr != nil {
 		logx.Errorf("[agent] 拒绝文件分发 %q: %v", req.FilePath, gerr)
 		ack(false, "rejected", gerr.Error())
 		return
 	}
 	req.FilePath = path
-	// 分发失败通知
+	// 分发失败/取消：关闭句柄并删除已写入的半截文件。
+	// 只在"确实打开过文件"时删除，避免取消一个从未开始的请求时误删同名旧文件。
 	if req.FileSize < 0 {
+		c.pushAbort(req.FilePath)
 		ack(false, "failed", "服务端取消分发")
 		return
 	}
@@ -1303,10 +1310,36 @@ func (c *Client) pushClose(filePath string) {
 	}
 }
 
+// pushTargetPath 解析文件分发/下载的目标路径。
+//
+// Unrestricted=true 是"文件管理"专用：整机模式只要求绝对路径（能力与远程命令等价）；
+// 其它入口（运维操作的文件分发、VNC 安装包）仍走 -file-roots 沙箱。
+func (c *Client) pushTargetPath(raw string, unrestricted bool) (string, error) {
+	if unrestricted {
+		return fsAbsPath(raw)
+	}
+	return c.guardPath(raw)
+}
+
+// pushAbort 服务端取消分发：关闭句柄并删除已写入的半截文件。
+func (c *Client) pushAbort(filePath string) {
+	c.pushMu.Lock()
+	defer c.pushMu.Unlock()
+	f, ok := c.pushFiles[filePath]
+	if !ok {
+		return
+	}
+	_ = f.Close()
+	delete(c.pushFiles, filePath)
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		logx.Warnf("[agent] 清理未完成的上传文件 %s 失败: %v", filePath, err)
+	}
+}
+
 // sendFileChunks 将本地文件分片回传给服务端（文件下载）。
 func (c *Client) sendFileChunks(req protocol.FileDownloadReq) {
 	logx.Infof("[agent] 收到文件下载请求: %s", req.FilePath)
-	path, gerr := c.guardPath(req.FilePath)
+	path, gerr := c.pushTargetPath(req.FilePath, req.Unrestricted)
 	if gerr != nil {
 		// 与读失败走同一条上报：否则服务端会一直等到超时
 		logx.Errorf("[agent] 拒绝文件下载 %q: %v", req.FilePath, gerr)
@@ -1328,7 +1361,23 @@ func (c *Client) sendFileChunks(req protocol.FileDownloadReq) {
 	if err != nil {
 		return
 	}
+	// 只回传普通文件：目录/设备/管道既没有有意义的"大小"，读下去还会把
+	// 主消息循环卡住（目录在 Windows 上直接报错，在 Linux 上读出 0 字节）。
+	if !st.Mode().IsRegular() {
+		_ = c.write(protocol.TypeFileUploadReq, protocol.FileUploadReq{
+			AgentID: c.cfg.AgentID, FilePath: req.FilePath, FileSize: -1,
+		})
+		logx.Warnf("[agent] 拒绝下载非普通文件: %s", path)
+		return
+	}
 	size := st.Size()
+	// 空文件也要回一帧：否则服务端永远等不到分片，只能按超时处理。
+	if size == 0 {
+		_ = c.write(protocol.TypeFileUploadReq, protocol.FileUploadReq{
+			AgentID: c.cfg.AgentID, FilePath: req.FilePath, FileSize: 0, ChunkSeq: 0,
+		})
+		return
+	}
 	buf := make([]byte, protocol.DefaultChunkSize)
 	seq := 0
 	for {

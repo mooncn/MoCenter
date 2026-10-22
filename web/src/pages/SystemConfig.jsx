@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import { Api } from '../api/api.js'
 import Account from './Account.jsx'
 
-// 系统配置：账号与安全 + 登录会话 + 两个监听地址。
+// 系统配置：账号与安全 + 登录会话 + 文件编辑上限 + 两个监听地址。
 // 入口统一为一个页面，各分区用可折叠（toggle）卡片展示，避免把高风险配置
 // 和日常改密码混在一屏。
 const TTL_OPTIONS = [
@@ -44,6 +44,7 @@ export default function SystemConfig() {
   const [open, setOpen] = useState({
     account: initial === 'account',
     session: initial === 'session',
+    files: initial === 'files',
     agent: initial === 'agent',
     http: initial === 'http',
   })
@@ -56,6 +57,11 @@ export default function SystemConfig() {
   const [ttl, setTtl] = useState('12h')
   const [ttlMsg, setTtlMsg] = useState(null)
   const [ttlBusy, setTtlBusy] = useState(false)
+
+  // 文件在线预览/编辑上限
+  const [editMB, setEditMB] = useState('10')
+  const [editMsg, setEditMsg] = useState(null)
+  const [editBusy, setEditBusy] = useState(false)
 
   // Agent 监听
   const [agentHost, setAgentHost] = useState('')
@@ -76,6 +82,7 @@ export default function SystemConfig() {
   const hydrate = (d) => {
     setCfg(d)
     setTtl(d.token_ttl || '12h')
+    setEditMB(String(d.file_edit_max_mb || 10))
     // 默认主机按需求取"本机外网 IP"；通配监听时后端返回的 host 为空。
     setAgentHost(d.agent_listen?.host || d.public_ip || '')
     setAgentPort(String(d.agent_listen?.port || 9000))
@@ -106,6 +113,25 @@ export default function SystemConfig() {
       setTtlMsg({ ok: false, text: errText(e) })
     } finally {
       setTtlBusy(false)
+    }
+  }
+
+  const saveEditLimit = async () => {
+    setEditMsg(null)
+    const mb = Number(editMB)
+    if (!Number.isInteger(mb) || mb < 1 || mb > 64) {
+      setEditMsg({ ok: false, text: '上限需在 1–64 MiB 之间' })
+      return
+    }
+    setEditBusy(true)
+    try {
+      const d = await Api.setFileEditLimit(mb)
+      setEditMsg({ ok: !!d.ok, text: d.msg || (d.ok ? '已保存' : '保存失败') })
+      if (d.ok) load()
+    } catch (e) {
+      setEditMsg({ ok: false, text: errText(e) })
+    } finally {
+      setEditBusy(false)
     }
   }
 
@@ -231,6 +257,35 @@ export default function SystemConfig() {
           </button>
         </div>
         {ttlMsg && <div className={`notice ${ttlMsg.ok ? 'ok' : 'err'}`}>{ttlMsg.text}</div>}
+      </Section>
+
+      <Section
+        id="files" title="文件编辑" sub="文件管理里在线预览/编辑的单文件上限（默认 10 MiB）"
+        open={open.files} onToggle={toggle}
+      >
+        <div className="cfg-grid">
+          <label>
+            单文件上限（MiB）
+            <input
+              value={editMB}
+              onChange={(e) => setEditMB(e.target.value.replace(/\D/g, ''))}
+              inputMode="numeric"
+              placeholder="10"
+            />
+            <span className="cell-sub">范围 1–64 MiB；超过上限的文件只能下载后本地打开。</span>
+          </label>
+          <div className="cell-sub cfg-note">
+            支持 .log / .txt / .php / .ini / .xml / .json / .yaml 等文本格式。
+            打开时会自动检测编码（UTF-8 / GB18030 / Big5 / UTF-16 …），也可以手动指定编码；
+            保存按所选编码写回。二进制文件会被拒绝，不会在浏览器里打开。
+          </div>
+        </div>
+        <div className="cfg-actions">
+          <button type="button" className="primary" onClick={saveEditLimit} disabled={editBusy}>
+            {editBusy ? '保存中…' : '保存编辑上限'}
+          </button>
+        </div>
+        {editMsg && <div className={`notice ${editMsg.ok ? 'ok' : 'err'}`}>{editMsg.text}</div>}
       </Section>
 
       <Section
