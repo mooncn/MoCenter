@@ -420,6 +420,43 @@ func (m *Manager) EnableRule(publicPort int) error {
 	return nil
 }
 
+// logFieldMax 单个日志字段的上限；防止一条超长隧道 ID 撑爆日志文件。
+const logFieldMax = 128
+
+// logField 把可能来自对端的字段收敛成"一行安全文本"（防日志注入 / 防刷屏）。
+//
+// 隧道号与 agent 身份都可能由对端报文参与构成；原样打印时一个换行就能伪造
+// 出 "[portmap] 规则 443 ..." 这样的假日志行。这里保留内容、只压掉结构。
+func logField(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSpace := false
+	truncated := false
+	for _, r := range s {
+		if b.Len() >= logFieldMax {
+			truncated = true
+			break
+		}
+		switch {
+		case r == '\n' || r == '\r' || r == '\t' || r == ' ':
+			if !prevSpace {
+				b.WriteRune(' ')
+				prevSpace = true
+			}
+			continue
+		case r < 0x20 || r == 0x7f:
+			b.WriteRune('·')
+		default:
+			b.WriteRune(r)
+		}
+		prevSpace = false
+	}
+	if truncated {
+		b.WriteString("…")
+	}
+	return b.String()
+}
+
 // parseSourceIPList 解析逗号分隔的源 IP 白名单（IP 或 CIDR），忽略空项。
 func parseSourceIPList(s string) []string {
 	var out []string
@@ -443,7 +480,7 @@ func (m *Manager) ServeRule(r *Rule) error {
 	}
 	if len(parseSourceIPList(r.SourceIP)) == 0 {
 		logx.Warnf("[portmap] 规则 %d (%s:%d) 未设置源 IP 白名单，将对全网开放",
-			publicPort, r.AgentID, r.LocalPort)
+			publicPort, logField(r.AgentID), r.LocalPort)
 	}
 	m.mu.Lock()
 	m.listeners[publicPort] = ln
@@ -489,7 +526,7 @@ func (m *Manager) handleConnection(clientConn net.Conn, publicPort int, r *Rule)
 		agent = m.sessions.Get(r.AgentID)
 	}
 	if agent == nil {
-		logx.Errorf("[portmap] 目标 Agent %s 离线，拒绝公网端口 %d", r.AgentID, publicPort)
+		logx.Errorf("[portmap] 目标 Agent %s 离线，拒绝公网端口 %d", logField(r.AgentID), publicPort)
 		return
 	}
 
@@ -591,7 +628,8 @@ const mismatchLogInterval = time.Minute
 
 // logMismatch 记录一次"用别人的隧道 ID 回传"，按伪造方 agentID 限频。
 func (m *Manager) logMismatch(from, owner, tunnelID, kind string) {
-	logx.Infof("[portmap] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）", from, kind, tunnelID, owner)
+	logx.Infof("[portmap] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）",
+		logField(from), kind, logField(tunnelID), logField(owner))
 	mismatchMu.Lock()
 	defer mismatchMu.Unlock()
 	now := time.Now()
