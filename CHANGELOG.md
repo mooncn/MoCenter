@@ -4,7 +4,7 @@
 `server/internal/version/version.go` 与 `agent/internal/version/version.go` 维护；
 安装包版本由 `installer/setup.iss` 的 `AppVersion` 决定。发布纪律：只在明确发版时修改版本号。
 
-## 未发布
+## 1.0.4（2026-10-23）
 
 ### 展示配置：内存大小 / 磁盘大小
 
