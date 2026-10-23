@@ -285,9 +285,47 @@ func (m *Mgr) sendTunnelClose(tunnelID, agentID, reason string) {
 // 变成灌满日志的 DoS 面。
 const mismatchLogInterval = time.Minute
 
+// logFieldMax 单个日志字段的上限。
+const logFieldMax = 128
+
+// logField 把可能来自浏览器的字段收敛成"一行安全文本"（防日志注入 / 防刷屏）。
+//
+// agent 参数直接来自 query string；原样打印时一个 %0a 就能在日志里伪造出一行
+// "[vnc] 隧道建立成功 …"。这里保留内容、只压掉结构。
+func logField(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSpace := false
+	truncated := false
+	for _, r := range s {
+		if b.Len() >= logFieldMax {
+			truncated = true
+			break
+		}
+		switch {
+		case r == '\n' || r == '\r' || r == '\t' || r == ' ':
+			if !prevSpace {
+				b.WriteRune(' ')
+				prevSpace = true
+			}
+			continue
+		case r < 0x20 || r == 0x7f:
+			b.WriteRune('·')
+		default:
+			b.WriteRune(r)
+		}
+		prevSpace = false
+	}
+	if truncated {
+		b.WriteString("…")
+	}
+	return b.String()
+}
+
 // logMismatch 记录一次"用别人的隧道 ID 回传"，按 agentID 限频。
 func (m *Mgr) logMismatch(from, owner, tunnelID, kind string) {
-	logx.Infof("[vnc] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）", from, kind, tunnelID, owner)
+	logx.Infof("[vnc] 丢弃 %s 的%s：隧道 %s 属于 %s（身份与归属不符）",
+		logField(from), kind, logField(tunnelID), logField(owner))
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.mismatchAt == nil {
@@ -331,7 +369,8 @@ func (m *Mgr) closeViewer(tunnelID string, reason ...string) {
 	relayed := vw.relayed
 	_ = vw.ws.Close()
 	vw.wmu.Unlock()
-	logx.Infof("[vnc] 关闭隧道 %s agent=%s 原因=%s 已转发=%dB", tunnelID, vw.agentID, r, relayed)
+	logx.Infof("[vnc] 关闭隧道 %s agent=%s 原因=%s 已转发=%dB",
+		logField(tunnelID), logField(vw.agentID), logField(r), relayed)
 	m.sendTunnelClose(tunnelID, vw.agentID, r)
 }
 
@@ -650,7 +689,7 @@ func (m *Mgr) handleViewer(w http.ResponseWriter, r *http.Request, validate func
 	// 目标端口闸门：放在握手与名额之前。VNC 隧道连的是被管主机的回环，
 	// 放开任意端口就等于给每个登录会话一台内网端口代理（Redis/SSH/调试端口）。
 	if err := m.CheckPort(port); err != nil {
-		logx.Errorf("[vnc] 拒绝隧道请求 agent=%s port=%d: %s", agentID, port, err.Error())
+		logx.Errorf("[vnc] 拒绝隧道请求 agent=%s port=%d: %s", logField(agentID), port, logField(err.Error()))
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

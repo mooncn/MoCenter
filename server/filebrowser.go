@@ -414,7 +414,7 @@ func fileSessionHandler(m *fileSessionManager, sess *session.Manager, authz *aut
 			if audit != nil {
 				audit(r, fmt.Sprintf("打开文件管理：%s（整机访问，默认 %s）", agentID, view.Root))
 			}
-			logx.Infof("[files] 打开文件会话 %s：agent=%s root=%s", view.ID, agentID, view.Root)
+			logx.Infof("[files] 打开文件会话 %s：agent=%s root=%s", view.ID, logSafe(agentID), logSafe(view.Root))
 			writeJSON(w, map[string]interface{}{
 				"ok": true, "session_id": view.ID, "agent_id": view.AgentID,
 				"roots": view.Roots, "root": view.Root,
@@ -604,7 +604,7 @@ func fileOpHandler(m *fileSessionManager, sess *session.Manager, authz *auth.Aut
 		}
 		resp, err := requestFsOp(conn, req, fsOpTimeout)
 		if err != nil {
-			logx.Warnf("[files] %s 失败 agent=%s path=%s dest=%s: %v", op, view.AgentID, path, req.Dest, err)
+			logx.Warnf("[files] %s 失败 agent=%s path=%s dest=%s: %v", op, logSafe(view.AgentID), logSafe(path), logSafe(req.Dest), err)
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 			return
 		}
@@ -630,7 +630,7 @@ func fileOpHandler(m *fileSessionManager, sess *session.Manager, authz *auth.Aut
 				audit(r, fmt.Sprintf("删除：%s（%s）", path, view.AgentID))
 			}
 		}
-		logx.Infof("[files] %s 成功 agent=%s path=%s dest=%s", op, view.AgentID, path, req.Dest)
+		logx.Infof("[files] %s 成功 agent=%s path=%s dest=%s", op, logSafe(view.AgentID), logSafe(path), logSafe(req.Dest))
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": resp.Message, "path": resp.Path})
 	}
 }
@@ -692,7 +692,7 @@ func fileUploadHandler(m *fileSessionManager, sess *session.Manager, authz *auth
 				http.Error(w, "文件超过 64 MiB 上限", http.StatusRequestEntityTooLarge)
 				return
 			}
-			logx.Errorf("[files] 上传 %s 到 %s 失败: %v", name, view.AgentID, err)
+			logx.Errorf("[files] 上传 %s 到 %s 失败: %v", logSafe(name), logSafe(view.AgentID), err)
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "上传失败：" + err.Error()})
 			return
 		}
@@ -706,7 +706,7 @@ func fileUploadHandler(m *fileSessionManager, sess *session.Manager, authz *auth
 		if audit != nil {
 			audit(r, fmt.Sprintf("文件上传：%s → %s（%d 字节）", name, view.AgentID, written))
 		}
-		logx.Infof("[files] 文件已上传到 %s：%s（%d 字节）", view.AgentID, target, written)
+		logx.Infof("[files] 文件已上传到 %s：%s（%d 字节）", logSafe(view.AgentID), logSafe(target), written)
 		writeJSON(w, map[string]interface{}{"ok": true, "path": target, "size": written, "msg": "上传完成"})
 	}
 }
@@ -843,14 +843,14 @@ func fileTextHandler(m *fileSessionManager, sess *session.Manager, authz *auth.A
 				Encoding: encodingLabel, MaxBytes: limit,
 			}, fsOpTimeout)
 			if err != nil {
-				logx.Warnf("[files] 保存文本失败 agent=%s path=%s: %v", view.AgentID, path, err)
+				logx.Warnf("[files] 保存文本失败 agent=%s path=%s: %v", logSafe(view.AgentID), logSafe(path), err)
 				writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 				return
 			}
 			if audit != nil {
 				audit(r, fmt.Sprintf("编辑文件：%s（%d 字节，%s）", path, resp.Size, resp.Encoding))
 			}
-			logx.Infof("[files] 已保存文本 %s（%d 字节，%s）", path, resp.Size, resp.Encoding)
+			logx.Infof("[files] 已保存文本 %s（%d 字节，%s）", logSafe(path), resp.Size, resp.Encoding)
 			writeJSON(w, map[string]interface{}{
 				"ok": true, "size": resp.Size, "encoding": resp.Encoding, "msg": "已保存",
 			})
@@ -940,7 +940,7 @@ func fileDownloadHandler(m *fileSessionManager, sess *session.Manager, ft *filet
 		if audit != nil {
 			audit(r, fmt.Sprintf("文件下载：%s ← %s（%d 字节）", path, view.AgentID, st.Size()))
 		}
-		logx.Infof("[files] 文件已从 %s 下载：%s（%d 字节）", view.AgentID, path, st.Size())
+		logx.Infof("[files] 文件已从 %s 下载：%s（%d 字节）", logSafe(view.AgentID), logSafe(path), st.Size())
 		http.ServeContent(w, r, name, st.ModTime(), f)
 	}
 }
