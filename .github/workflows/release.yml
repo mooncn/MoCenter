@@ -1,0 +1,129 @@
+name: Release
+
+# 打 tag（v1.0.3）时自动构建 Windows + Linux 全套产物，并创建 GitHub Release。
+# 也可以在 Actions 页面手动触发（只构建、不发布）。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不含 v，如 1.0.3；留空则取 tag 或源码里的版本）"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: 解析版本号
+    runs-on: ubuntu-latest
+    outputs:
+      value: ${{ steps.v.outputs.value }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          v="${{ github.event.inputs.version }}"
+          if [ -z "$v" ]; then v="${GITHUB_REF_NAME}"; fi
+          echo "value=${v#v}" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows 产物
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache: true
+          cache-dependency-path: |
+            server/go.sum
+            agent/go.sum
+            installer/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 图形安装程序（Inno Setup）需要 ISCC；runner 上不一定预装
+      - name: 安装 Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: 构建（Server/Agent/Web/Zip/安装包）
+        shell: cmd
+        run: scripts\build-all.bat --clean --version=${{ needs.version.outputs.value }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-windows
+          path: build
+          if-no-files-found: error
+
+  linux:
+    name: Linux 产物
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache: true
+          cache-dependency-path: |
+            server/go.sum
+            agent/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # .deb 用 dpkg-deb（runner 自带）；.rpm 需要 rpmbuild
+      - name: 安装打包依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm fakeroot
+
+      - name: 构建（Linux 二进制 + deb/rpm）
+        run: |
+          bash scripts/build-linux-all.sh --clean \
+            --platform=linux --package=all \
+            --version=${{ needs.version.outputs.value }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-linux
+          path: build
+          if-no-files-found: error
+
+  publish:
+    name: 创建 GitHub Release
+    needs: [version, windows, linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: MoCenter v${{ needs.version.outputs.value }}
+          generate_release_notes: true
+          files: |
+            artifacts/build-windows/**/*.zip
+            artifacts/build-windows/**/*.exe
+            artifacts/build-linux/**/*.deb
+            artifacts/build-linux/**/*.rpm
