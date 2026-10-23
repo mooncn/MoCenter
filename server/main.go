@@ -608,9 +608,9 @@ func main() {
 				continue
 			}
 			if !winapp.IsWindowsService() {
-				logx.Infof("已修复历史空密码账号 %s，临时密码：%s（请登录后立即修改）", name, pw)
+				logx.Infof("已修复历史空密码账号 %s，临时密码：%s（请登录后立即修改）", logSafe(name), pw)
 			} else {
-				logx.Infof("已修复历史空密码账号 %s，临时密码见 %s", name,
+				logx.Infof("已修复历史空密码账号 %s，临时密码见 %s", logSafe(name),
 					filepath.Join(*dataDir, "initial-password.txt"))
 			}
 		}
@@ -1677,7 +1677,7 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 		// 显式匿名接入必须留痕：事后排查看得出"这台主机的身份是没有凭据支撑的"。
 		logx.Warnf("[server] 以**无凭据**方式为 Agent %q 签发证书（服务端开启了 "+
 			"-allow-unauthenticated-agents，来自 %s）；该身份不可作为信任依据，"+
-			"请为该主机签发一次性注册令牌后重新接入", er.AgentID, tlsInfo(conn))
+			"请为该主机签发一次性注册令牌后重新接入", logSafe(er.AgentID), tlsInfo(conn))
 	}
 	if sess != nil && sess.Busy(er.AgentID) {
 		resp.Message = "该 agent_id 当前有活动会话，拒绝换发证书；本次注册凭据已消耗，" +
@@ -1713,13 +1713,13 @@ func enrollAgentCert(conn net.Conn, er protocol.EnrollReq, identity *agentauth.I
 	resp.ServerFingerprint = identity.Fingerprint()
 	resp.Identity = identity.Name()
 	resp.CredSource = credSource
-	logx.Infof("[server] 已为 Agent %q 签发客户端证书（凭证类型 %s，来自 %s）", er.AgentID, credSource, tlsInfo(conn))
+	logx.Infof("[server] 已为 Agent %q 签发客户端证书（凭证类型 %s，来自 %s）", logSafe(er.AgentID), credSource, tlsInfo(conn))
 	if credSource == agentauth.CredSharedKey {
 		// 双轨过渡期的提醒：还靠"一把密钥认全网"上来的主机，是 C-1 未收口的部分。
 		logx.Infof("[server] 注意: Agent %q 用**部署级共享注册密钥**换取了证书。"+
 			"该密钥泄露一台即等于全网身份泄露；请为每台主机改用一次性注册令牌"+
 			"（Web 控制台「Agent 接入」页签发，或 POST /api/enroll/tokens），"+
-			"全部迁移完成后加 -disable-shared-agent-key 彻底关闭此路径", er.AgentID)
+			"全部迁移完成后加 -disable-shared-agent-key 彻底关闭此路径", logSafe(er.AgentID))
 	}
 	return resp
 }
@@ -1843,7 +1843,7 @@ func handleAgentConn(conn net.Conn, sess *session.Manager, store *probe.Store, h
 		// 否则要求报文里的 HMAC 证明（自报身份 + 持有注册密钥）。
 		if sessConn.CertCN != "" && sessConn.CertCN != info.AgentID {
 			logx.Errorf("[server] 拒绝 Agent %q 注册: 客户端证书身份为 %q，与自报身份不符（来自 %s）",
-				info.AgentID, sessConn.CertCN, tlsInfo(conn))
+				logSafe(info.AgentID), logSafe(sessConn.CertCN), tlsInfo(conn))
 			return
 		}
 		// 应用层注册鉴权：HMAC 证明 + 时间窗 + 防重放。
@@ -3435,7 +3435,7 @@ func loginHandler(um *auth.UserManager, authz *auth.Auth, loginGuard *auth.Login
 			Time: time.Now().Unix(), Operator: auditSafeText(body.Username), OperatorIP: opIP,
 			Command: "登录成功", Result: "ok", Category: "auth",
 		})
-		logx.Infof("[auth] 用户 %s 登录成功（来自 %s）", body.Username, opIP)
+		logx.Infof("[auth] 用户 %s 登录成功（来自 %s）", logSafe(body.Username), opIP)
 		writeJSON(w, map[string]interface{}{"ok": true, "token": tok})
 	}
 }
@@ -3514,9 +3514,9 @@ func changePasswordHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerF
 		}
 		// 吊销该用户的其它会话：被盗 Token 即使不知道新密码也会立即失效
 		if n := authz.RevokeUserTokens(username, token); n > 0 {
-			logx.Infof("[auth] 用户 %s 修改密码成功，已吊销 %d 个其它会话", username, n)
+			logx.Infof("[auth] 用户 %s 修改密码成功，已吊销 %d 个其它会话", logSafe(username), n)
 		} else {
-			logx.Infof("[auth] 用户 %s 修改密码成功", username)
+			logx.Infof("[auth] 用户 %s 修改密码成功", logSafe(username))
 		}
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "密码修改成功"})
 	}
@@ -3664,9 +3664,9 @@ func otpEnableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc {
 		}
 		// 绑定 OTP 属于安全状态变更：吊销其它会话
 		if n := authz.RevokeUserTokens(username, token); n > 0 {
-			logx.Infof("[auth] 用户 %s 启用 OTP，吊销 %d 个其它会话", username, n)
+			logx.Infof("[auth] 用户 %s 启用 OTP，吊销 %d 个其它会话", logSafe(username), n)
 		} else {
-			logx.Infof("[auth] 用户 %s 已启用 OTP 动态验证码", username)
+			logx.Infof("[auth] 用户 %s 已启用 OTP 动态验证码", logSafe(username))
 		}
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已启用"})
 	}
@@ -3711,7 +3711,7 @@ func otpDisableHandler(um *auth.UserManager, authz *auth.Auth) http.HandlerFunc 
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": msg})
 			return
 		}
-		logx.Infof("[auth] 用户 %s 已关闭 OTP 动态验证码", username)
+		logx.Infof("[auth] 用户 %s 已关闭 OTP 动态验证码", logSafe(username))
 		writeJSON(w, map[string]interface{}{"ok": true, "msg": "OTP 动态验证码已关闭"})
 	}
 }
@@ -4208,7 +4208,9 @@ func handleWebMessage(sessionKey, operator string, data []byte, sess *session.Ma
 		}
 		handlePortMapOp(pm, sess, &op)
 		hub.Broadcast(protocol.TypePortMapState, pm.Tracks())
-		logx.Infof("[server] 端口映射操作: %+v", op)
+		// 操作者的输入全部过 logSafe：SourceIP 是自由文本，原样打印就能用换行伪造日志行。
+		logx.Infof("[server] 端口映射操作: action=%s public=%d local=%d agent=%s source_ip=%s",
+			logSafe(op.Action), op.PublicPort, op.LocalPort, logSafe(op.AgentID), logSafe(op.SourceIP))
 	case protocol.TypeFileTransferOp:
 		var op protocol.FileTransferOp
 		if err := json.Unmarshal(env.Data, &op); err != nil {

@@ -629,7 +629,11 @@ func (r *Router) Audit(l *AuditLog) int64 {
 			r.auditMu.Unlock()
 		}()
 	}
-	logx.Infof("[audit] operator=%s agent=%s cmd=%q blocked=%v", l.Operator, l.AgentID, l.Command, l.Blocked)
+	// Operator 可能来自**未认证方**（登录失败时记的是请求体里的用户名），
+	// 换行/制表若原样进日志，就能伪造出 "[server] ..." 这样的假日志行（L-2 的同类面）。
+	// 四个字段全部过 logField：审计会写盘、也会被日志收集器当成结构化字段解析。
+	logx.Infof("[audit] operator=%s agent=%s cmd=%q blocked=%v",
+		logField(l.Operator), logField(l.AgentID), logField(l.Command), l.Blocked)
 	if writeErr != nil {
 		logx.Errorf("[audit] 持久化写入失败: %v", writeErr)
 	}
@@ -929,6 +933,49 @@ func MaskCommand(cmd string) string {
 	reGeneric := regexp.MustCompile(`(?i)(password|passwd|passphrase|secret|token|apikey|api_key|authorization)(\s*[=:]\s*|\s+)(\S+)`)
 	cmd = reGeneric.ReplaceAllString(cmd, "$1$2***")
 	return cmd
+}
+
+// logFieldMax 单个日志字段的长度上限。
+//
+// 审计里的命令串可达 8 KiB（auditCommandMax），整条打进日志是可行的，
+// 但换成一行十几万字符的"日志"只会让收集器截断在任意字节上，
+// 反而把真正要看的尾部丢掉。
+const logFieldMax = 512
+
+// logField 把可能来自不可信输入的字段收敛成"一行安全文本"。
+//
+// 目的是防**日志注入**：命令、agent_id、操作者名都可能含换行，
+// 原样打印后日志里会出现伪造的 "[server] 已禁用鉴权" 这类行。
+// 结论要能被 grep 到，所以这里保留内容、只压掉结构：
+// 换行/回车/制表/连续空白压成单个空格，其余控制字符换成 "·"。
+func logField(s string) string {
+	truncated := false
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSpace := false
+	for _, r := range s {
+		if b.Len() >= logFieldMax {
+			truncated = true
+			break
+		}
+		switch {
+		case r == '\n' || r == '\r' || r == '\t' || r == ' ':
+			if !prevSpace {
+				b.WriteRune(' ')
+				prevSpace = true
+			}
+			continue
+		case r < 0x20 || r == 0x7f:
+			b.WriteRune('·')
+		default:
+			b.WriteRune(r)
+		}
+		prevSpace = false
+	}
+	if truncated {
+		b.WriteString("…")
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // sanitizeAuditField 收敛审计字段：限长并去掉控制字符。
