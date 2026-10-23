@@ -117,6 +117,14 @@
   `npm run build` 产出纯静态站点，构建与 Nginx/子路径/对象存储发布方式见 `docs/wiki-publish.md`。
 - 根 README 增加手册入口；`wiki/node_modules`、缓存与构建产物已加入 `.gitignore`。
 
+### 构建与发布
+
+- 修复 `scripts/build-all.bat` 的参数解析：`--version=…` / `--type=…` 这类带等号的选项
+  会在解析阶段直接报错（cmd 对空搜索串的替换语法报 “was unexpected at this time”），
+  导致 Windows 产物无法通过脚本或 GitHub Actions 构建；本机与 CI 均已复跑通过。
+- 新增 `.github/workflows/release.yml`：推 `v*` 标签后自动构建 Windows（zip/Setup.exe）与
+  Linux（deb/rpm）产物并创建 GitHub Release；发布方式见 `docs/release-github.md`。
+
 ### 依赖安全更新（2026-10-22）
 
 - **Go 工具链下限对齐到 1.26.10**（server / agent / installer 三个模块的 `go` 指令同步）：

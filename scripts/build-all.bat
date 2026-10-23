@@ -81,31 +81,17 @@ if /i "%ARG%"=="-h"         goto show_help
 if /i "%ARG%"=="--list"     goto show_list
 if /i "%ARG%"=="--clean"    ( set "OPT_CLEAN=1" & shift & goto parse )
 
-REM Split "--name=value" into its two halves (first "=" only, since an outdir
-REM may legitimately contain "=").
+REM "--name=value" and "--name value" are equivalent to cmd: the command line
+REM is split at "=" before it reaches us, so the first argument here is the key
+REM and the second one is the value.
 REM
-REM The "for /f ... delims==" idiom is avoided on purpose: it is the single
-REM most implementation-dependent construct in cmd (token handling differs
-REM between Windows versions, and every cmd emulator gets it wrong in a
-REM different way).  Instead the "=" is turned into a space and the two halves
-REM are read back as positional arguments of a called label -- plain, fully
-REM specified behaviour.
-set "OPT_KEY="
-set "OPT_VALUE="
-for %%A in ("%ARG%") do set "ARGPAIR=%%~A"
-set "ARGPAIR_SPACED=%ARGPAIR:= %"
-if "%ARGPAIR_SPACED%"=="%ARGPAIR%" (
-  REM no "=" present: bare "--name value" form
-  set "OPT_KEY=%ARGPAIR%"
-  for %%A in (%ARGPAIR_SPACED%) do set "OPT_KEY=%%A"
-  shift
-  if "%~1"=="" goto parse_unknown
-  set "OPT_VALUE=%~1"
-) else (
-  REM The two halves arrive as %1/%2 of :split_pair -- the "=" -> space
-  REM rewrite above means the value keeps any further "=" it contains.
-  call :split_pair %ARGPAIR_SPACED%
-)
+REM Never use the "replace = with space" variable substitution on this line:
+REM cmd treats the empty search string as a syntax error ("was unexpected at
+REM this time") and aborts while parsing, before any option can be read.
+set "OPT_KEY=%~1"
+shift
+if "%~1"=="" goto parse_unknown
+set "OPT_VALUE=%~1"
 
 set "OPT_FOUND="
 if /i "%OPT_KEY%"=="--type"          set "OPT_FOUND=1" & if defined OPT_FOUND set "OPT_TYPE=%OPT_VALUE%"
@@ -335,15 +321,6 @@ REM =============================================================
 REM EVERYTHING BELOW IS A SUBROUTINE.  Do not place subroutines above the
 REM "exit /b 0" line: cmd executes them as part of the main flow.
 REM =============================================================
-
-REM :split_pair <key> <value>
-REM Called with the "--name<space>value" form produced by rewriting "=" to a
-REM space.  Anything after a further "=" stays in %2 because cmd only splits on
-REM the separators that are actually present in the command line.
-:split_pair
-set "OPT_KEY=%~1"
-if "%~2"=="" ( set "OPT_VALUE=" ) else ( set "OPT_VALUE=%~2" )
-exit /b 0
 
 REM :read_version <go source file> <fallback version>
 REM Reads `var Version = "x.y.z"` (or `const Version = ...`) into RSV.
