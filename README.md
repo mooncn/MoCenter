@@ -2,6 +2,9 @@
 
 基于 [项目规划书](docs/项目规划书.md) 实现的一套集中式主机远控管理系统。统一管理跨网络环境的 **Linux** 与 **Windows** 主机，通过 **Web 界面**实现远程命令执行与运行状态监控。
 
+> **使用手册**：见 [`wiki/`](wiki/index.md)（VitePress 站点）。本地预览 `cd wiki && npm install && npm run dev`；
+> 构建与发布（Nginx / 子路径 / 对象存储）见 [`docs/wiki-publish.md`](docs/wiki-publish.md)。
+
 ## 系统架构
 
 采用 **C/S 架构**，由三个独立部分构成（对应仓库 `web` / `server` / `agent` 三个目录）：
