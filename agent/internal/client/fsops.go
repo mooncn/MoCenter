@@ -21,11 +21,12 @@ import (
 // 安全性由"仅管理员可调用的认证通道 + 操作审计 + 破坏性操作二次确认"保证，
 // 不再依赖路径白名单。
 const (
-	// maxFsListEntries 单次列目录返回的条目上限。
-	// 整机目录（如 /usr/bin、C:\Windows\System32）可能上千项，整份回传会把
-	// TCP 帧撑大并堵住心跳/命令；截断并标记，运维可进入子目录继续看。
+	// maxFsListEntries 单次列目录的**扫描**上限：排序需要全量，先留一道安全阀。
+	// 真正回传给服务端的是其中一页（见 defaultFsPageSize/maxFsPageSize）。
 	maxFsListEntries = 5000
-	maxFsPathLen     = 4096
+	// 分页：单页最多 1000（页大小由服务端的系统配置决定，默认 100）。
+	maxFsPageSize = 1000
+	maxFsPathLen  = 4096
 	// maxCopyDepth 递归复制的最大深度：防止符号链接成环时无限递归。
 	maxCopyDepth = 32
 )
@@ -63,7 +64,9 @@ func runFsOp(req protocol.FsOpReq, agentID string) protocol.FsOpResp {
 		// Unix 上 "/" 就是根目录本身，正常列其内容。
 		if strings.TrimSpace(req.Path) == "" || (runtime.GOOS == "windows" && strings.TrimSpace(req.Path) == "/") {
 			resp.Entries = fsRoots()
+			resp.Total = len(resp.Entries)
 			resp.Path = "/"
+			resp.Platform = runtime.GOOS
 			if req.WithDisk {
 				resp.Volumes = fsVolumes()
 			}
@@ -101,7 +104,7 @@ func runFsOp(req protocol.FsOpReq, agentID string) protocol.FsOpResp {
 			if ierr != nil {
 				continue
 			}
-			out = append(out, protocol.FileEntry{
+			fe := protocol.FileEntry{
 				Name:    e.Name(),
 				Path:    filepath.Join(p, e.Name()),
 				Dir:     e.IsDir(),
@@ -109,10 +112,49 @@ func runFsOp(req protocol.FsOpReq, agentID string) protocol.FsOpResp {
 				ModTime: info.ModTime().Unix(),
 				// DirEntry.Info 对符号链接返回链接本身的信息（不跟随目标）。
 				Symlink: info.Mode()&os.ModeSymlink != 0,
-			})
+			}
+			// 符号链接到目录（/bin、/lib …）要能被"进入"：DirEntry.IsDir 对链接恒为 false，
+			// 这里跟随一次目标判断，并清掉链接自身的字节数（否则界面显示 "7 B"）。
+			if fe.Symlink {
+				if st, serr := os.Stat(fe.Path); serr == nil && st.IsDir() {
+					fe.TargetDir = true
+					fe.Size = 0
+				}
+			}
+			// Unix 上顺带带上权限与属主，右击菜单的「权限/所有者」要用；
+			// 列目录时一次解析好，避免再发一轮请求。
+			if mode, uid, gid, ok := fsEntryMeta(info); ok {
+				fe.Mode, fe.UID, fe.GID = mode, uid, gid
+				fe.Owner, fe.Group = fsUserName(uid), fsGroupName(gid)
+			}
+			out = append(out, fe)
 		}
-		resp.Entries = out
+		// 分页：排序后切一页；total 用于前端算总页数（扫描上限内）。
+		total := len(out)
+		offset := req.Offset
+		if offset < 0 {
+			offset = 0
+		}
+		if offset > total {
+			offset = total
+		}
+		// Limit<=0 表示"不分页"：旧版服务端不会带这个字段，保持整份返回，
+		// 不能悄悄只给 100 条。新版服务端总会带页大小（≤1000）。
+		limit := req.Limit
+		if limit <= 0 {
+			limit = total
+		}
+		if limit > maxFsPageSize {
+			limit = maxFsPageSize
+		}
+		end := offset + limit
+		if end > total {
+			end = total
+		}
+		resp.Entries = out[offset:end]
+		resp.Total = total
 		resp.Path = p
+		resp.Platform = runtime.GOOS
 		if req.WithDisk {
 			resp.Volumes = fsVolumes()
 		}
@@ -200,6 +242,32 @@ func runFsOp(req protocol.FsOpReq, agentID string) protocol.FsOpResp {
 			return fail("移动失败: " + err.Error())
 		}
 		return ok("已移动到 " + dst)
+
+	case "chmod":
+		p, err := fsAbsPath(req.Path)
+		if err != nil {
+			return fail(err.Error())
+		}
+		if isFsRoot(p) {
+			return fail("拒绝修改文件系统根的权限")
+		}
+		if err := applyFsChmod(p, req.Mode); err != nil {
+			return fail(err.Error())
+		}
+		return ok("权限已修改为 " + req.Mode)
+
+	case "chown":
+		p, err := fsAbsPath(req.Path)
+		if err != nil {
+			return fail(err.Error())
+		}
+		if isFsRoot(p) {
+			return fail("拒绝修改文件系统根的所有者")
+		}
+		if err := applyFsChown(p, req.Owner, req.Group); err != nil {
+			return fail(err.Error())
+		}
+		return ok("所有者/分组已修改")
 
 	case "delete":
 		p, err := fsAbsPath(req.Path)

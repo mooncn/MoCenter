@@ -113,8 +113,9 @@ export const Api = {
     const { data } = await api.post('/files/session/close', { session: id })
     return data
   },
-  async fileList(id, path) {
-    const { data } = await api.get('/files/list', { params: { session: id, path } })
+  // 分页：每页条数由服务端「系统配置 → 文件管理」决定，前端只传页码
+  async fileList(id, path, page = 1) {
+    const { data } = await api.get('/files/list', { params: { session: id, path, page } })
     return data
   },
   // 原始正文上传（非 multipart）：服务端边读边推给 Agent，不在内存里缓存整份文件
@@ -143,6 +144,11 @@ export const Api = {
   // 系统配置：文件在线编辑上限（MiB）
   async setFileEditLimit(maxMB) {
     const { data } = await api.post('/system/file-edit', { max_mb: maxMB })
+    return data
+  },
+  // 系统配置：文件列表每页条数
+  async setFileListPageSize(pageSize) {
+    const { data } = await api.post('/system/file-list', { page_size: pageSize })
     return data
   },
   // 整机文件操作：op = create | copy | move | delete

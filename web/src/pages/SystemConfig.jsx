@@ -60,6 +60,7 @@ export default function SystemConfig() {
 
   // 文件在线预览/编辑上限
   const [editMB, setEditMB] = useState('10')
+  const [listPageSize, setListPageSize] = useState('100')
   const [editMsg, setEditMsg] = useState(null)
   const [editBusy, setEditBusy] = useState(false)
 
@@ -83,6 +84,7 @@ export default function SystemConfig() {
     setCfg(d)
     setTtl(d.token_ttl || '12h')
     setEditMB(String(d.file_edit_max_mb || 10))
+    setListPageSize(String(d.file_list_page_size || 100))
     // 默认主机按需求取"本机外网 IP"；通配监听时后端返回的 host 为空。
     setAgentHost(d.agent_listen?.host || d.public_ip || '')
     setAgentPort(String(d.agent_listen?.port || 9000))
@@ -116,18 +118,25 @@ export default function SystemConfig() {
     }
   }
 
-  const saveEditLimit = async () => {
+  const saveFileCfg = async () => {
     setEditMsg(null)
     const mb = Number(editMB)
+    const ps = Number(listPageSize)
     if (!Number.isInteger(mb) || mb < 1 || mb > 64) {
-      setEditMsg({ ok: false, text: '上限需在 1–64 MiB 之间' })
+      setEditMsg({ ok: false, text: '编辑上限需在 1–64 MiB 之间' })
+      return
+    }
+    if (!Number.isInteger(ps) || ps < 20 || ps > 1000) {
+      setEditMsg({ ok: false, text: '每页条数需在 20–1000 之间' })
       return
     }
     setEditBusy(true)
     try {
-      const d = await Api.setFileEditLimit(mb)
-      setEditMsg({ ok: !!d.ok, text: d.msg || (d.ok ? '已保存' : '保存失败') })
-      if (d.ok) load()
+      const a = await Api.setFileEditLimit(mb)
+      if (!a.ok) { setEditMsg({ ok: false, text: a.msg || '保存失败' }); return }
+      const b = await Api.setFileListPageSize(ps)
+      setEditMsg({ ok: !!b.ok, text: b.ok ? '已保存' : (b.msg || '保存失败') })
+      if (b.ok) load()
     } catch (e) {
       setEditMsg({ ok: false, text: errText(e) })
     } finally {
@@ -260,7 +269,7 @@ export default function SystemConfig() {
       </Section>
 
       <Section
-        id="files" title="文件编辑" sub="文件管理里在线预览/编辑的单文件上限（默认 10 MiB）"
+        id="files" title="文件管理" sub="在线预览/编辑上限与列表分页（默认每页 100 条）"
         open={open.files} onToggle={toggle}
       >
         <div className="cfg-grid">
@@ -274,6 +283,16 @@ export default function SystemConfig() {
             />
             <span className="cell-sub">范围 1–64 MiB；超过上限的文件只能下载后本地打开。</span>
           </label>
+          <label>
+            列表每页条数
+            <input
+              value={listPageSize}
+              onChange={(e) => setListPageSize(e.target.value.replace(/[^0-9]/g, ''))}
+              inputMode="numeric"
+              placeholder="100"
+            />
+            <span className="cell-sub">范围 20–1000 条；大目录分页加载，避免一次把整份列表压给服务端和浏览器。</span>
+          </label>
           <div className="cell-sub cfg-note">
             支持 .log / .txt / .php / .ini / .xml / .json / .yaml 等文本格式。
             打开时会自动检测编码（UTF-8 / GB18030 / Big5 / UTF-16 …），也可以手动指定编码；
@@ -281,8 +300,8 @@ export default function SystemConfig() {
           </div>
         </div>
         <div className="cfg-actions">
-          <button type="button" className="primary" onClick={saveEditLimit} disabled={editBusy}>
-            {editBusy ? '保存中…' : '保存编辑上限'}
+          <button type="button" className="primary" onClick={saveFileCfg} disabled={editBusy}>
+            {editBusy ? '保存中…' : '保存文件管理配置'}
           </button>
         </div>
         {editMsg && <div className={`notice ${editMsg.ok ? 'ok' : 'err'}`}>{editMsg.text}</div>}

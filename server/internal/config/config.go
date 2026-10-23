@@ -63,6 +63,9 @@ type Config struct {
 	ProxyIP string `json:"proxy_ip"`
 	// TokenTTL 会话 Token 有效期（Go duration 字符串，如 12h / 30m）；留空用内置默认 12h。
 	TokenTTL string `json:"token_ttl"`
+	// FileListPageSize 文件列表每页条数（默认 100，范围 20–1000）。
+	// 大目录一次只回一页，避免把整份列表压给服务端与浏览器。
+	FileListPageSize int `json:"file_list_page_size"`
 	// FileEditMaxMB 文件管理里"在线预览/编辑"的单文件上限（MiB）。
 	// 0 或未配置按默认 10 处理（老配置文件没有这一项）；界面允许 1–64。
 	// 超过上限的文件仍然可以下载，只是不在浏览器里打开。
@@ -193,4 +196,26 @@ func (c *Config) FileEditLimitBytes() int64 {
 // FileEditLimitMB 返回归一后的上限（MiB），供控制台展示。
 func (c *Config) FileEditLimitMB() int {
 	return int(c.FileEditLimitBytes() >> 20)
+}
+
+// 文件列表分页参数的默认值与边界（条）。
+const (
+	FileListPageDefault = 100
+	FileListPageMin     = 20
+	FileListPageMax     = 1000
+)
+
+// FileListPage 返回归一后的每页条数（0/未配置按默认 100）。
+func (c *Config) FileListPage() int {
+	n := c.FileListPageSize
+	if n <= 0 {
+		n = FileListPageDefault
+	}
+	if n < FileListPageMin {
+		n = FileListPageMin
+	}
+	if n > FileListPageMax {
+		n = FileListPageMax
+	}
+	return n
 }

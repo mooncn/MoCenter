@@ -51,6 +51,21 @@ function isTextFile(name) {
   return TEXT_EXTS.has(lower.slice(i + 1))
 }
 
+function hasExtension(name) {
+  const lower = String(name || '').toLowerCase()
+  return lower.lastIndexOf('.') > 0
+}
+
+// 是否可以按文本打开：已知文本扩展名；或"没有扩展名且不是可执行文件"
+// —— Linux 的 /etc/hosts、/etc/passwd、sshd_config、/var/log/messages 都属于后者。
+// 真正的二进制判断交给 Agent（读内容看 NUL/控制字符），这里只决定要不要显示入口。
+function canEditText(entry) {
+  if (!entry || entry.dir || entry.target_dir) return false
+  if (isTextFile(entry.name)) return true
+  if (hasExtension(entry.name)) return false
+  return ((entry.mode || 0) & 0o111) === 0
+}
+
 function fmtSize(n) {
   if (typeof n !== 'number' || n < 0) return '—'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -75,6 +90,16 @@ function fmtTime(ts) {
 function fullTime(ts) {
   if (!ts) return ''
   try { return new Date(ts * 1000).toLocaleString() } catch { return '' }
+}
+
+// 权限位 → rwx 文本（如 rwxr-xr-x），右击菜单与「权限」列共用
+function modeText(mode) {
+  return [6, 3, 0]
+    .map((shift) => {
+      const b = (mode >> shift) & 7
+      return `${b & 4 ? 'r' : '-'}${b & 2 ? 'w' : '-'}${b & 1 ? 'x' : '-'}`
+    })
+    .join('')
 }
 
 function fmtCountdown(sec) {
@@ -129,7 +154,13 @@ export default function Files({ agents }) {
   const [busy, setBusy] = useState('') // 批量操作的进行中文案
   const [diskOpen, setDiskOpen] = useState(false)
   const [editor, setEditor] = useState(null) // 文本编辑器：{path,name,content,encoding,detected,...}
+  const [ctx, setCtx] = useState(null) // 右击菜单：{x,y,entry}
+  const [perm, setPerm] = useState(null) // 权限/所有者对话框
+  const [props, setProps] = useState(null) // 属性对话框
   const [editLimitMB, setEditLimitMB] = useState(10)
+  const [page, setPage] = useState(1)
+  const [totalPages, setTotalPages] = useState(1)
+  const [pageSize, setPageSize] = useState(100)
   // 应用内弹窗：不用 window.prompt/confirm —— Electron/内嵌 WebView 会禁用它们
   const [dialog, setDialog] = useState(null)
   const fileInput = useRef(null)
@@ -140,7 +171,10 @@ export default function Files({ agents }) {
   // 在线编辑上限来自「系统配置」，页面加载时取一次；取不到就按默认 10 MiB 提示。
   useEffect(() => {
     Api.systemConfig()
-      .then((d) => { if (d?.file_edit_max_mb) setEditLimitMB(d.file_edit_max_mb) })
+      .then((d) => {
+        if (d?.file_edit_max_mb) setEditLimitMB(d.file_edit_max_mb)
+        if (d?.file_list_page_size) setPageSize(d.file_list_page_size)
+      })
       .catch(() => {})
   }, [])
 
@@ -162,11 +196,12 @@ export default function Files({ agents }) {
     if (msg) setNotice({ ok: false, msg })
   }, [])
 
-  const load = useCallback(async (s, p) => {
+  // pageNo 从 1 开始；每页条数由服务端「系统配置 → 文件管理」决定，前端只传页码。
+  const load = useCallback(async (s, p, pageNo = 1) => {
     if (!s) return
     setLoading(true)
     try {
-      const d = await Api.fileList(s.session_id, p)
+      const d = await Api.fileList(s.session_id, p, pageNo)
       if (!d.ok) {
         if (String(d.msg || '').includes('会话')) endSession(d.msg)
         else setNotice({ ok: false, msg: d.msg || '读取目录失败' })
@@ -176,6 +211,9 @@ export default function Files({ agents }) {
       setPath(d.path || p)
       setPathInput(d.path || p)
       setIdleLeft(s.idle_seconds || 0)
+      setPage(d.page || pageNo)
+      setTotalPages(d.total_pages || 1)
+      if (d.page_size) setPageSize(d.page_size)
       setSelected(new Set())
     } catch (e) {
       setNotice({ ok: false, msg: '读取目录失败：' + (e.response?.data?.msg || e.message) })
@@ -260,7 +298,7 @@ export default function Files({ agents }) {
         return false
       }
       setNotice({ ok: true, msg: okMsg || d.msg || '操作完成' })
-      await load(session, path)
+      await load(session, path, page)
       return true
     } catch (e) {
       const msg = e.response?.data?.msg || e.message
@@ -291,7 +329,7 @@ export default function Files({ agents }) {
     }
     setBusy('')
     setLoading(true)
-    try { await load(session, path) } finally { setLoading(false) }
+    try { await load(session, path, page) } finally { setLoading(false) }
     return { ok, fail, firstErr }
   }
 
@@ -369,25 +407,37 @@ export default function Files({ agents }) {
     setNotice({ ok: true, msg: `已${verb} ${items.length} 项${extra}，进入目标目录后点「粘贴」` })
   }
 
-  const pasteClip = async () => {
+  // targetDir 默认是当前目录；右击某个子目录时"粘贴到该目录"。
+  const pasteClip = async (targetDir = path) => {
     if (!clip || !session) return
-    const todo = clip.items.filter((it) => !sameDir(it.path, path))
+    const todo = clip.items.filter((it) => !sameDir(it.path, targetDir))
     const skipped = clip.items.length - todo.length
     if (!todo.length) {
-      setNotice({ ok: false, msg: '这些条目已经在当前目录里，无需粘贴' })
+      setNotice({ ok: false, msg: '这些条目已经在目标目录里，无需粘贴' })
       return
     }
-    const existing = new Set(entries.map((e) => e.name.toLowerCase()))
+    let existing = new Set(entries.map((e) => e.name.toLowerCase()))
+    if (targetDir !== path) {
+      // 目标不是当前目录：先取它的列表才能判断同名冲突（否则会静默覆盖）。
+      try {
+        const d = await Api.fileList(session.session_id, targetDir)
+        if (!d.ok) { setNotice({ ok: false, msg: d.msg || '读取目标目录失败' }); return }
+        existing = new Set((d.entries || []).map((e) => e.name.toLowerCase()))
+      } catch (e) {
+        setNotice({ ok: false, msg: '读取目标目录失败：' + (e.response?.data?.msg || e.message) })
+        return
+      }
+    }
     const conflicts = todo.filter((it) => existing.has(it.name.toLowerCase()))
     const run = async () => {
       const moving = clip.mode === 'cut'
       const r = await runBatch(moving ? '正在移动' : '正在复制', todo, (it) =>
-        Api.fileOp(session.session_id, moving ? 'move' : 'copy', { path: it.path, dest: joinPath(path, it.name) }))
+        Api.fileOp(session.session_id, moving ? 'move' : 'copy', { path: it.path, dest: joinPath(targetDir, it.name) }))
       if (moving) setClip(null)
       const parts = []
       if (r.ok) parts.push(`已粘贴 ${r.ok} 项`)
       if (r.fail) parts.push(`${r.fail} 项失败${r.firstErr ? '：' + r.firstErr : ''}`)
-      if (skipped) parts.push(`${skipped} 项已在当前目录被跳过`)
+      if (skipped) parts.push(`${skipped} 项已在目标目录被跳过`)
       setNotice({ ok: r.fail === 0, msg: parts.join('；') })
     }
     if (conflicts.length) {
@@ -424,6 +474,100 @@ export default function Files({ agents }) {
     })
   }
 
+  // ---- 右击菜单 / 权限 / 属性 ----
+  // 右键点在未选中的行上时，先把它变成唯一选中项（与资源管理器一致）。
+  const openCtx = (e, entry) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (!selected.has(entry.path)) setSelected(new Set([entry.path]))
+    const menuW = 208
+    const menuH = 340
+    setCtx({
+      entry,
+      x: Math.max(6, Math.min(e.clientX, window.innerWidth - menuW - 6)),
+      y: Math.max(6, Math.min(e.clientY, window.innerHeight - menuH - 6)),
+    })
+  }
+
+  // 菜单项作用于"当前选中项"；若选中集不含右击的那一行，则退回该行。
+  const ctxTargets = () => {
+    if (!ctx) return []
+    if (selected.has(ctx.entry.path) && selectedEntries.length) return selectedEntries
+    return [ctx.entry]
+  }
+
+  // 点空白处 / 滚动 / Esc 都要收起菜单（scroll 用捕获阶段，列表滚动也能收到）。
+  useEffect(() => {
+    if (!ctx) return undefined
+    const close = () => setCtx(null)
+    const onKey = (e) => { if (e.key === 'Escape') close() }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('contextmenu', close)
+    document.addEventListener('scroll', close, true)
+    window.addEventListener('resize', close)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('contextmenu', close)
+      document.removeEventListener('scroll', close, true)
+      window.removeEventListener('resize', close)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [ctx])
+
+  const openPerm = (entry) => {
+    const octal = (entry.mode || 0).toString(8).padStart(3, '0')
+    setPerm({
+      path: entry.path, name: entry.name,
+      origMode: octal, mode: octal,
+      owner: entry.owner || '', group: entry.group || '',
+      ownerInput: '', groupInput: '', busy: false,
+    })
+  }
+
+  const togglePermBit = (shift, bit) => {
+    setPerm((cur) => {
+      if (!cur) return cur
+      const parsed = parseInt(cur.mode, 8)
+      const base = Number.isNaN(parsed) ? 0 : parsed
+      const next = base ^ (bit << shift)
+      return { ...cur, mode: (next & 0o7777).toString(8).padStart(3, '0') }
+    })
+  }
+
+  const applyPerm = async () => {
+    const cur = perm
+    if (!cur || !session) return
+    setPerm({ ...cur, busy: true })
+    const parts = []
+    let failed = false
+    try {
+      if (cur.mode !== cur.origMode) {
+        const d = await Api.fileOp(session.session_id, 'chmod', { path: cur.path, mode: cur.mode })
+        if (d.ok) parts.push(`权限 ${cur.mode}`)
+        else { failed = true; parts.push(d.msg || '修改权限失败') }
+      }
+      if (cur.ownerInput.trim() || cur.groupInput.trim()) {
+        const d = await Api.fileOp(session.session_id, 'chown', {
+          path: cur.path, owner: cur.ownerInput.trim(), group: cur.groupInput.trim(),
+        })
+        if (d.ok) parts.push(`所有者 ${cur.ownerInput.trim() || '不变'}:${cur.groupInput.trim() || '不变'}`)
+        else { failed = true; parts.push(d.msg || '修改所有者失败') }
+      }
+      if (!parts.length) {
+        setPerm({ ...cur, busy: false })
+        setNotice({ ok: false, msg: '没有需要修改的内容' })
+        return
+      }
+      await load(session, path, page)
+      setNotice({ ok: !failed, msg: (failed ? '部分失败：' : '已更新：') + parts.join('；') })
+      setPerm(failed ? { ...cur, busy: false } : null)
+    } catch (e) {
+      setPerm({ ...cur, busy: false })
+      setNotice({ ok: false, msg: '修改失败：' + (e.response?.data?.msg || e.message) })
+    }
+  }
+
   const submitDialog = async () => {
     const d = dialog
     if (!d) return
@@ -450,6 +594,9 @@ export default function Files({ agents }) {
   const sep = (path || '').includes('\\') ? '\\' : '/'
   const activeRoot = roots.find((r) => path === r || path.startsWith(r.endsWith(sep) ? r : r + sep)) || roots[0] || ''
 
+  // 平台来自列表响应：非 Windows 才显示权限列与「权限/所有者」菜单
+  const platform = listing?.platform || ''
+  const unixLike = !!platform && platform !== 'windows'
   const volumes = listing?.volumes || []
   const curVol = useMemo(() => pickVolume(volumes, path), [volumes, path])
   const usedPct = curVol && curVol.total > 0
@@ -469,7 +616,7 @@ export default function Files({ agents }) {
       })
       if (d.ok) {
         setNotice({ ok: true, msg: `已上传 ${file.name}（${fmtSize(d.size)}）` })
-        await load(session, path)
+        await load(session, path, page)
       } else {
         setNotice({ ok: false, msg: d.msg || '上传失败' })
       }
@@ -551,16 +698,17 @@ export default function Files({ agents }) {
     }
   }
 
-  const openEditor = (entry) => {
+  // readOnly=true 时以"查看"模式打开（右击菜单的「查看」），仍可切编码重载。
+  const openEditor = (entry, readOnly = false) => {
     if ((entry.size || 0) > editLimitBytes) {
       setNotice({ ok: false, msg: `文件 ${fmtSize(entry.size)} 超过在线编辑上限 ${editLimitMB} MiB，请下载后本地打开` })
       return
     }
     setEditor({
       path: entry.path, name: entry.name, content: '', encoding: 'UTF-8', detected: '',
-      size: entry.size || 0, dirty: false, readOnly: false, saving: false, loading: true,
+      size: entry.size || 0, dirty: false, readOnly, saving: false, loading: true,
     })
-    loadText(entry.path, '')
+    loadText(entry.path, '', readOnly)
   }
 
   // 换了编码要按新编码重读一遍：同一份字节用错编码解出来就是乱码。
@@ -593,7 +741,7 @@ export default function Files({ agents }) {
       }
       setEditor({ ...cur, saving: false, dirty: false, size: d.size || 0 })
       setNotice({ ok: true, msg: `已保存 ${cur.name}（${fmtSize(d.size || 0)}，${d.encoding || cur.encoding}）` })
-      await load(session, path)
+      await load(session, path, page)
     } catch (e) {
       setEditor({ ...cur, saving: false })
       setNotice({ ok: false, msg: '保存失败：' + (e.response?.data?.msg || e.message) })
@@ -661,7 +809,7 @@ export default function Files({ agents }) {
               />
             </div>
           )}
-          {session && roots.length > 0 && (
+          {session && roots.length > 1 && (
             <div className="fm-field fm-root">
               <label>根目录</label>
               <select
@@ -686,7 +834,7 @@ export default function Files({ agents }) {
                 </button>
                 <button className="secondary" onClick={() => createEntry(false)} disabled={loading || !!busy}>新建文件</button>
                 <button className="secondary" onClick={() => createEntry(true)} disabled={loading || !!busy}>新建文件夹</button>
-                <button className="secondary" onClick={() => load(session, path)} disabled={loading || !!busy}>刷新</button>
+                <button className="secondary" onClick={() => load(session, path, page)} disabled={loading || !!busy}>刷新</button>
                 <button className="secondary danger" onClick={disconnect}>断开</button>
               </>
             )}
@@ -703,10 +851,19 @@ export default function Files({ agents }) {
           <div className="fm-meta">
             <span title="会话所属主机">{hostLabel((agents || []).find((a) => a.agent_id === session.agent_id) || { agent_id: session.agent_id })}</span>
             <code title={path}>{path || '—'}</code>
-            <span className="fm-meta-hint">{(listing?.entries || []).length} 项</span>
+            <span className="fm-meta-hint">共 {listing?.total ?? (listing?.entries || []).length} 项</span>
             <button className="linklike fm-selall" onClick={toggleAll} disabled={!entries.length}>
-              {allSelected ? '取消全选' : '全选'}
+              {allSelected ? '取消全选' : ((listing?.total || 0) > entries.length ? '全选本页' : '全选')}
             </button>
+            {/* 页大小 100 时列表会有 100 行，翻页条放在底部要滚到底才点得到：
+                这里再放一份紧凑翻页，顶部即可操作。 */}
+            {totalPages > 1 && (
+              <span className="fm-pagebtns fm-pagebtns-top">
+                <button className="linklike" onClick={() => load(session, path, page - 1)} disabled={loading || page <= 1}>上一页</button>
+                <span>第 {page}/{totalPages} 页</span>
+                <button className="linklike" onClick={() => load(session, path, page + 1)} disabled={loading || page >= totalPages}>下一页</button>
+              </span>
+            )}
             {curVol && (
               <button className="fm-disk" onClick={() => setDiskOpen(true)} title="查看全部分区">
                 <span className="fm-disk-vol">{curVol.name}</span>
@@ -778,6 +935,7 @@ export default function Files({ agents }) {
                 <tr>
                   <th className="fm-col-check" aria-label="选择"></th>
                   <th>名称</th>
+                  {unixLike && <th className="fm-col-mode">权限</th>}
                   <th className="fm-col-size">大小</th>
                   <th className="fm-col-time">修改时间</th>
                   <th className="fm-col-ops">操作</th>
@@ -786,13 +944,17 @@ export default function Files({ agents }) {
               <tbody>
                 {listing?.parent && (
                   <tr className="fm-up">
-                    <td colSpan="5" data-label="名称">
+                    <td colSpan={unixLike ? 6 : 5} data-label="名称">
                       <button className="linklike" onClick={() => enterDir(listing.parent)}>⬆ 上一级</button>
                     </td>
                   </tr>
                 )}
                 {entries.map((e) => (
-                  <tr key={e.path} className={selected.has(e.path) ? 'fm-row-sel' : ''}>
+                  <tr
+                    key={e.path}
+                    className={selected.has(e.path) ? 'fm-row-sel' : ''}
+                    onContextMenu={(event) => openCtx(event, e)}
+                  >
                     <td className="fm-col-check" data-label="选择">
                       <input
                         type="checkbox"
@@ -802,20 +964,29 @@ export default function Files({ agents }) {
                       />
                     </td>
                     <td data-label="名称" title={e.path}>
-                      {e.dir ? (
-                        <button className="linklike" onClick={() => enterDir(e.path)}>📁 {e.name}</button>
+                      {e.dir || e.target_dir ? (
+                        <button className="linklike" onClick={() => enterDir(e.path)}>
+                          {e.dir ? '📁' : '🔗📁'} {e.name}
+                        </button>
                       ) : (
                         <span className="fm-name">{e.symlink ? '🔗' : '📄'} {e.name}</span>
                       )}
                     </td>
-                    <td data-label="大小" className={e.dir ? 'fm-col-size fm-na' : 'fm-col-size'}>{e.dir ? '—' : fmtSize(e.size || 0)}</td>
+                    {unixLike && (
+                      <td data-label="权限" className="fm-col-mode" title={`${e.owner || '?'}:${e.group || '?'}（${e.uid}:${e.gid}）`}>
+                        {modeText(e.mode || 0)}
+                      </td>
+                    )}
+                    <td data-label="大小" className={e.dir || e.target_dir ? 'fm-col-size fm-na' : 'fm-col-size'}>
+                      {e.dir || e.target_dir ? '—' : fmtSize(e.size || 0)}
+                    </td>
                     <td data-label="修改时间" className="fm-col-time" title={fullTime(e.mod_time)}>{fmtTime(e.mod_time)}</td>
                     <td data-label="操作">
                       <div className="row-actions">
-                        {!e.dir && (
+                        {!e.dir && !e.target_dir && (
                           <button className="secondary btn-sm" onClick={() => download(e)}>下载</button>
                         )}
-                        {!e.dir && isTextFile(e.name) && (
+                        {canEditText(e) && (
                           <button
                             className="secondary btn-sm"
                             onClick={() => openEditor(e)}
@@ -833,9 +1004,9 @@ export default function Files({ agents }) {
                     </td>
                   </tr>
                 ))}
-                {loading && <tr><td colSpan="5" className="table-empty">加载中…</td></tr>}
+                {loading && <tr><td colSpan={unixLike ? 6 : 5} className="table-empty">加载中…</td></tr>}
                 {!loading && listing && entries.length === 0 && (
-                  <tr><td colSpan="5" className="table-empty">目录为空</td></tr>
+                  <tr><td colSpan={unixLike ? 6 : 5} className="table-empty">目录为空</td></tr>
                 )}
               </tbody>
             </table>
@@ -843,8 +1014,29 @@ export default function Files({ agents }) {
         ) : (
           <div className="fm-empty">选择一台在线主机后点击「连接文件管理」，即可浏览该主机的整机文件。</div>
         )}
+        {session && listing && (listing.total || 0) > 0 && (
+          <div className="fm-pagefoot">
+            <span>共 {listing.total} 项 · 每页 {pageSize} 条 · 第 {page} / {totalPages} 页</span>
+            <div className="fm-pagebtns">
+              <button
+                className="secondary btn-sm"
+                onClick={() => load(session, path, page - 1)}
+                disabled={loading || page <= 1}
+              >
+                上一页
+              </button>
+              <button
+                className="secondary btn-sm"
+                onClick={() => load(session, path, page + 1)}
+                disabled={loading || page >= totalPages}
+              >
+                下一页
+              </button>
+            </div>
+          </div>
+        )}
         {listing?.truncated && (
-          <div className="fm-truncated">目录条目过多，仅显示前 1000 项（目录优先、按名称排序）。</div>
+          <div className="fm-truncated">目录条目过多，仅扫描前 5000 项（目录优先、按名称排序）。</div>
         )}
       </div>
 
@@ -859,6 +1051,158 @@ export default function Files({ agents }) {
           单文件上传/下载上限 64 MiB（更大的文件请用「运维操作 → 文件分发」或命令行）。
         </div>
       </details>
+
+      {ctx && (
+        <div
+          className="ctx-menu"
+          style={{ left: ctx.x, top: ctx.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          {(ctx.entry.dir || ctx.entry.target_dir) && (
+            <button onClick={() => { setCtx(null); enterDir(ctx.entry.path) }}>打开</button>
+          )}
+          {/* 菜单里对所有非目录项都给出「查看 / 编辑」：行内按钮按扩展名/可执行位保守显示，
+              但可执行脚本、特殊扩展名仍需要入口——真二进制由 Agent 按内容拒绝。
+              「查看」默认以只读模式打开（防误改日志/配置），需要改再勾掉「只读」。 */}
+          {!ctx.entry.dir && !ctx.entry.target_dir && (
+            <button onClick={() => { setCtx(null); openEditor(ctx.entry, true) }}>查看</button>
+          )}
+          {!ctx.entry.dir && !ctx.entry.target_dir && (
+            <button onClick={() => { setCtx(null); openEditor(ctx.entry) }}>编辑</button>
+          )}
+          {!ctx.entry.dir && !ctx.entry.target_dir && (
+            <button onClick={() => { setCtx(null); download(ctx.entry) }}>下载</button>
+          )}
+          <div className="ctx-sep" />
+          <button onClick={() => { const list = ctxTargets(); setCtx(null); putClipboard('copy', list) }}>复制</button>
+          <button onClick={() => { const list = ctxTargets(); setCtx(null); putClipboard('cut', list) }}>剪切</button>
+          <button
+            disabled={!clip}
+            onClick={() => {
+              const target = (ctx.entry.dir || ctx.entry.target_dir) ? ctx.entry.path : path
+              setCtx(null)
+              pasteClip(target)
+            }}
+          >
+            粘贴{(ctx.entry.dir || ctx.entry.target_dir) ? '到该目录' : ''}
+          </button>
+          <div className="ctx-sep" />
+          <button
+            disabled={ctxTargets().length > 1}
+            title={ctxTargets().length > 1 ? '重命名只能针对单个条目' : ''}
+            onClick={() => { setCtx(null); renameEntry(ctx.entry) }}
+          >
+            重命名
+          </button>
+          <button className="danger" onClick={() => { setCtx(null); removeSelected() }}>删除</button>
+          <div className="ctx-sep" />
+          {unixLike && (
+            <button onClick={() => { setCtx(null); openPerm(ctx.entry) }}>权限 / 所有者…</button>
+          )}
+          <button onClick={() => { setCtx(null); setProps(ctx.entry) }}>属性</button>
+        </div>
+      )}
+
+      {props && (
+        <Modal
+          title="属性"
+          subtitle={props.path}
+          onClose={() => setProps(null)}
+          footer={<button className="secondary" onClick={() => setProps(null)}>关闭</button>}
+        >
+          <table className="fm-mini">
+            <tbody>
+              <tr><th>名称</th><td>{props.name}</td></tr>
+              <tr>
+                <th>类型</th>
+                <td>{props.dir ? '目录' : props.symlink ? (props.target_dir ? '符号链接 → 目录' : '符号链接') : '文件'}</td>
+              </tr>
+              <tr><th>大小</th><td>{props.dir ? '—' : fmtSize(props.size || 0)}</td></tr>
+              <tr><th>修改时间</th><td>{fullTime(props.mod_time) || '—'}</td></tr>
+              {unixLike && (
+                <tr>
+                  <th>权限</th>
+                  <td>{modeText(props.mode || 0)}（{(props.mode || 0).toString(8).padStart(3, '0')}）</td>
+                </tr>
+              )}
+              {unixLike && (
+                <tr><th>所有者</th><td>{props.owner || '—'}:{props.group || '—'}（{props.uid}:{props.gid}）</td></tr>
+              )}
+              <tr><th>完整路径</th><td>{props.path}</td></tr>
+            </tbody>
+          </table>
+        </Modal>
+      )}
+
+      {perm && (
+        <Modal
+          title="权限 / 所有者"
+          subtitle={perm.path}
+          onClose={() => setPerm(null)}
+          footer={<>
+            <button className="secondary" onClick={() => setPerm(null)}>取消</button>
+            <button className="primary" onClick={applyPerm} disabled={perm.busy}>
+              {perm.busy ? '应用中…' : '应用'}
+            </button>
+          </>}
+        >
+          <table className="fm-perm-table">
+            <thead>
+              <tr><th></th><th>读</th><th>写</th><th>执行</th></tr>
+            </thead>
+            <tbody>
+              {[['所有者', 6], ['同组', 3], ['其他', 0]].map(([label, shift]) => {
+                const parsed = parseInt(perm.mode, 8)
+                const bits = Number.isNaN(parsed) ? 0 : parsed
+                return (
+                  <tr key={label}>
+                    <th>{label}</th>
+                    {[4, 2, 1].map((bit) => (
+                      <td key={bit}>
+                        <input
+                          type="checkbox"
+                          checked={(bits & (bit << shift)) !== 0}
+                          onChange={() => togglePermBit(shift, bit)}
+                        />
+                      </td>
+                    ))}
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+          <label className="fm-perm-octal">
+            八进制
+            <input
+              value={perm.mode}
+              onChange={(e) => setPerm({ ...perm, mode: e.target.value.replace(/[^0-7]/g, '').slice(0, 4) })}
+            />
+            <span className="cell-sub">{modeText(parseInt(perm.mode, 8) || 0)}</span>
+          </label>
+          <div className="form-grid" style={{ marginTop: 12 }}>
+            <div className="form-row">
+              <label>所有者（用户名或 UID）</label>
+              <input
+                value={perm.ownerInput}
+                placeholder={perm.owner ? `${perm.owner}（留空不改）` : '留空不改'}
+                onChange={(e) => setPerm({ ...perm, ownerInput: e.target.value })}
+              />
+            </div>
+            <div className="form-row">
+              <label>分组（组名或 GID）</label>
+              <input
+                value={perm.groupInput}
+                placeholder={perm.group ? `${perm.group}（留空不改）` : '留空不改'}
+                onChange={(e) => setPerm({ ...perm, groupInput: e.target.value })}
+              />
+            </div>
+          </div>
+          <div className="cell-sub">
+            当前：{perm.owner || '—'}:{perm.group || '—'} · {perm.origMode}（{modeText(parseInt(perm.origMode, 8) || 0)}）
+          </div>
+        </Modal>
+      )}
 
       {diskOpen && (
         <Modal title="磁盘与分区" onClose={() => setDiskOpen(false)}
@@ -894,7 +1238,7 @@ export default function Files({ agents }) {
       {editor && (
         <Modal
           wide
-          title={`编辑 ${editor.name}`}
+          title={`${editor.readOnly ? '查看' : '编辑'} ${editor.name}`}
           subtitle={editor.path}
           onClose={closeEditor}
           footer={<>

@@ -92,13 +92,14 @@ func systemConfigHandler(authz *auth.Auth, settings *settingsStore, addrs func()
 			}
 		}
 		writeJSON(w, map[string]interface{}{
-			"ok":                true,
-			"token_ttl":         ttl,
-			"token_ttl_seconds": int(authz.TokenTTL().Seconds()),
-			"agent_listen":      makeListenInfo(agentAddr),
-			"http_listen":       makeListenInfo(httpAddr),
-			"public_ip":         cachedPublicIP(),
-			"file_edit_max_mb":  snap.FileEditLimitMB(),
+			"ok":                  true,
+			"token_ttl":           ttl,
+			"token_ttl_seconds":   int(authz.TokenTTL().Seconds()),
+			"agent_listen":        makeListenInfo(agentAddr),
+			"http_listen":         makeListenInfo(httpAddr),
+			"public_ip":           cachedPublicIP(),
+			"file_edit_max_mb":    snap.FileEditLimitMB(),
+			"file_list_page_size": snap.FileListPage(),
 		})
 	}
 }
@@ -184,6 +185,41 @@ func systemFileEditHandler(authz *auth.Auth, settings *settingsStore, audit func
 			"max_mb": body.MaxMB,
 			"msg":    fmt.Sprintf("已更新为 %d MiB；之后打开的编辑请求按新上限执行", body.MaxMB),
 		})
+	}
+}
+
+// systemFileListHandler 修改文件列表每页条数。
+func systemFileListHandler(authz *auth.Auth, settings *settingsStore, audit func(*http.Request, string)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guard(w, r, authz) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			PageSize int `json:"page_size"`
+		}
+		if !decodeJSON(w, r, maxJSONBody, &body) {
+			return
+		}
+		if body.PageSize < config.FileListPageMin || body.PageSize > config.FileListPageMax {
+			writeJSON(w, map[string]interface{}{
+				"ok":  false,
+				"msg": fmt.Sprintf("每页条数需在 %d–%d 之间", config.FileListPageMin, config.FileListPageMax),
+			})
+			return
+		}
+		if err := settings.Update(func(c *config.Config) { c.FileListPageSize = body.PageSize }); err != nil {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "写入配置失败: " + err.Error()})
+			return
+		}
+		if audit != nil {
+			audit(r, fmt.Sprintf("修改文件列表每页条数为 %d", body.PageSize))
+		}
+		logx.Infof("[server] 文件列表每页条数已更新为 %d", body.PageSize)
+		writeJSON(w, map[string]interface{}{"ok": true, "page_size": body.PageSize, "msg": "已保存"})
 	}
 }
 

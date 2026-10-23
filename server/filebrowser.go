@@ -22,7 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -269,18 +269,79 @@ func requestFsOp(conn *session.Conn, req protocol.FsOpReq, timeout time.Duration
 	}
 }
 
+// 服务端可能跑在与 Agent 不同的操作系统上（Windows 总控管理 Linux 主机，或反之），
+// 因此路径判断、拼接、取父目录**一律按路径自身的风格**来，不能用 filepath 的本机语义：
+// 在 Windows 上 filepath.IsAbs("/etc") 是 false、filepath.Join("/etc","a") 会变成 "\etc\a"
+// —— 这正是"读得到根目录、点进子目录却报'必须是绝对路径'"的根因。
+
+// isAbsEitherOS 同时接受 POSIX 绝对路径、Windows 盘符路径与 UNC 路径。
+func isAbsEitherOS(p string) bool {
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, `\`) {
+		return true
+	}
+	return len(p) >= 3 && isASCIILetter(p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/')
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// pathSepOf 按路径自身判断分隔符：含反斜杠或是盘符路径就是 Windows 风格。
+func pathSepOf(p string) string {
+	if strings.Contains(p, `\`) || (len(p) >= 2 && p[1] == ':') {
+		return `\`
+	}
+	return "/"
+}
+
+func baseNameAnyOS(p string) string {
+	if i := strings.LastIndexAny(p, `\/`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+func dirNameAnyOS(p string) string {
+	i := strings.LastIndexAny(p, `\/`)
+	if i < 0 {
+		return ""
+	}
+	if i == 0 {
+		return p[:1] // "/x" -> "/"
+	}
+	if i == 2 && len(p) >= 3 && p[1] == ':' {
+		return p[:3] // "C:\x" -> "C:\"
+	}
+	return p[:i]
+}
+
+func joinPathAnyOS(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	sep := pathSepOf(dir)
+	if strings.HasSuffix(dir, sep) {
+		return dir + name
+	}
+	return dir + sep + name
+}
+
 // fsAbsolutePath 服务端侧路径校验：整机模式只要求绝对路径。
+//
+// 不在服务端做 filepath.Clean：本机 OS 的语义可能与目标主机不同
+// （Windows 会把 "/etc" 清成 "\etc"）。归一化交给 Agent 用目标主机的 filepath 做。
 func fsAbsolutePath(p string) (string, error) {
-	if strings.TrimSpace(p) == "" {
+	p = strings.TrimSpace(p)
+	if p == "" {
 		return "", errors.New("路径为空")
 	}
 	if len(p) > maxFilePathLen || strings.ContainsRune(p, 0) {
 		return "", errors.New("路径不合法")
 	}
-	if !filepath.IsAbs(p) {
+	if !isAbsEitherOS(p) {
 		return "", errors.New("必须是绝对路径")
 	}
-	return filepath.Clean(p), nil
+	return p, nil
 }
 
 // fsListPath 列目录允许 "/"（Windows 表示盘符列表，Unix 表示根目录）。
@@ -391,8 +452,11 @@ func fileSessionCloseHandler(m *fileSessionManager, authz *auth.Auth, audit func
 	}
 }
 
-// fileListHandler GET /api/files/list?session=&path=
-func fileListHandler(m *fileSessionManager, sess *session.Manager, authz *auth.Auth) http.HandlerFunc {
+// fileListHandler GET /api/files/list?session=&path=&page=
+//
+// 分页在服务端做：每页条数由「系统配置 → 文件管理」决定（默认 100），
+// 只把当前页发给浏览器；大目录不会整份塞进 HTTP 响应。
+func fileListHandler(m *fileSessionManager, sess *session.Manager, authz *auth.Auth, settings *settingsStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !guard(w, r, authz) {
 			return
@@ -419,15 +483,49 @@ func fileListHandler(m *fileSessionManager, sess *session.Manager, authz *auth.A
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "主机已离线，文件会话结束"})
 			return
 		}
-		resp, err := requestFsOp(conn, protocol.FsOpReq{Op: "list", Path: path, WithDisk: true}, fileListTimeout)
+		page := 1
+		if v, perr := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page"))); perr == nil && v > 0 {
+			page = v
+		}
+		snap := settings.Snapshot()
+		size := snap.FileListPage()
+		offset := (page - 1) * size
+
+		resp, err := requestFsOp(conn, protocol.FsOpReq{
+			Op: "list", Path: path, WithDisk: true, Offset: offset, Limit: size,
+		}, fileListTimeout)
 		if err != nil {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 			return
 		}
+		total := resp.Total
+		pages := (total + size - 1) / size
+		if pages < 1 {
+			pages = 1
+		}
+		// 页码越界（比如刚把最后一页删空）时回落到最后一页，
+		// 否则用户会停在一张空列表上，还得自己点上一页。
+		if page > pages {
+			page = pages
+			offset = (page - 1) * size
+			resp, err = requestFsOp(conn, protocol.FsOpReq{
+				Op: "list", Path: path, WithDisk: true, Offset: offset, Limit: size,
+			}, fileListTimeout)
+			if err != nil {
+				writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
+				return
+			}
+			total = resp.Total
+			pages = (total + size - 1) / size
+			if pages < 1 {
+				pages = 1
+			}
+		}
 		writeJSON(w, map[string]interface{}{
 			"ok": true, "path": resp.Path, "parent": resp.Parent,
 			"entries": resp.Entries, "truncated": resp.Truncated,
-			"roots": view.Roots, "volumes": resp.Volumes,
+			"roots": view.Roots, "volumes": resp.Volumes, "platform": resp.Platform,
+			"page": page, "page_size": size, "total": total, "total_pages": pages,
 		})
 	}
 }
@@ -451,13 +549,16 @@ func fileOpHandler(m *fileSessionManager, sess *session.Manager, authz *auth.Aut
 			Path    string `json:"path"`
 			Dest    string `json:"dest"`
 			IsDir   bool   `json:"is_dir"`
+			Mode    string `json:"mode"`  // chmod：八进制权限
+			Owner   string `json:"owner"` // chown：用户名或 UID
+			Group   string `json:"group"` // chown：组名或 GID
 		}
 		if !decodeJSON(w, r, maxJSONBody, &body) {
 			return
 		}
 		op := strings.ToLower(strings.TrimSpace(body.Op))
 		switch op {
-		case "create", "rename", "copy", "move", "delete":
+		case "create", "rename", "copy", "move", "delete", "chmod", "chown":
 		default:
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "不支持的操作"})
 			return
@@ -475,7 +576,19 @@ func fileOpHandler(m *fileSessionManager, sess *session.Manager, authz *auth.Aut
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "路径不合法：" + err.Error()})
 			return
 		}
-		req := protocol.FsOpReq{Op: op, Path: path, IsDir: body.IsDir}
+		req := protocol.FsOpReq{
+			Op: op, Path: path, IsDir: body.IsDir,
+			Mode: strings.TrimSpace(body.Mode), Owner: strings.TrimSpace(body.Owner),
+			Group: strings.TrimSpace(body.Group),
+		}
+		if op == "chmod" && req.Mode == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "请填写权限（八进制，如 755）"})
+			return
+		}
+		if op == "chown" && req.Owner == "" && req.Group == "" {
+			writeJSON(w, map[string]interface{}{"ok": false, "msg": "请填写所有者或分组"})
+			return
+		}
 		if op == "copy" || op == "move" || op == "rename" {
 			dest, derr := fsAbsolutePath(body.Dest)
 			if derr != nil {
@@ -509,6 +622,10 @@ func fileOpHandler(m *fileSessionManager, sess *session.Manager, authz *auth.Aut
 				audit(r, fmt.Sprintf("移动：%s → %s（%s）", path, req.Dest, view.AgentID))
 			case "rename":
 				audit(r, fmt.Sprintf("重命名：%s → %s（%s）", path, req.Dest, view.AgentID))
+			case "chmod":
+				audit(r, fmt.Sprintf("修改权限：%s → %s（%s）", path, req.Mode, view.AgentID))
+			case "chown":
+				audit(r, fmt.Sprintf("修改所有者：%s → %s:%s（%s）", path, req.Owner, req.Group, view.AgentID))
 			case "delete":
 				audit(r, fmt.Sprintf("删除：%s（%s）", path, view.AgentID))
 			}
@@ -546,12 +663,16 @@ func fileUploadHandler(m *fileSessionManager, sess *session.Manager, authz *auth
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "目标目录不合法：" + err.Error()})
 			return
 		}
-		name := filepath.Base(strings.TrimSpace(q.Get("name")))
-		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+		rawName := strings.TrimSpace(q.Get("name"))
+		name := baseNameAnyOS(rawName)
+		// 文件名里不允许带路径分隔符：否则 filepath.Base 会把 "a/b" 悄悄变成 "b"，
+		// 看起来成功、实际写到了另一个名字上。
+		if rawName == "" || name == "" || name == "." || name == ".." ||
+			strings.ContainsAny(rawName, `/\`) || strings.ContainsRune(name, 0) {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": "文件名不合法"})
 			return
 		}
-		target, err := fsAbsolutePath(filepath.Join(dir, name))
+		target, err := fsAbsolutePath(joinPathAnyOS(dir, name))
 		if err != nil {
 			writeJSON(w, map[string]interface{}{"ok": false, "msg": err.Error()})
 			return
@@ -812,7 +933,7 @@ func fileDownloadHandler(m *fileSessionManager, sess *session.Manager, ft *filet
 			fileError(w, http.StatusRequestEntityTooLarge, "文件超过单次下载上限（64 MiB）")
 			return
 		}
-		name := filepath.Base(path)
+		name := baseNameAnyOS(path)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(name))
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -826,11 +947,11 @@ func fileDownloadHandler(m *fileSessionManager, sess *session.Manager, ft *filet
 
 // confirmRemoteFile 通过列目录回读，确认 Agent 侧确实落盘且大小一致。
 func confirmRemoteFile(conn *session.Conn, target string, want int64) error {
-	resp, err := requestFsOp(conn, protocol.FsOpReq{Op: "list", Path: filepath.Dir(target)}, fileListTimeout)
+	resp, err := requestFsOp(conn, protocol.FsOpReq{Op: "list", Path: dirNameAnyOS(target)}, fileListTimeout)
 	if err != nil {
 		return err
 	}
-	base := filepath.Base(target)
+	base := baseNameAnyOS(target)
 	for _, e := range resp.Entries {
 		if e.Name != base {
 			continue

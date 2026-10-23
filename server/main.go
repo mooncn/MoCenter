@@ -870,7 +870,7 @@ func main() {
 	// 文件管理：会话制（空闲/超时自动断开），路径在服务端与 Agent 双侧校验。
 	mux.HandleFunc("/api/files/session", fileSessionHandler(fileMgr, sess, authz, siteAudit))
 	mux.HandleFunc("/api/files/session/close", fileSessionCloseHandler(fileMgr, authz, siteAudit))
-	mux.HandleFunc("/api/files/list", fileListHandler(fileMgr, sess, authz))
+	mux.HandleFunc("/api/files/list", fileListHandler(fileMgr, sess, authz, settings))
 	mux.HandleFunc("/api/files/op", fileOpHandler(fileMgr, sess, authz, siteAudit))
 	mux.HandleFunc("/api/files/upload", fileUploadHandler(fileMgr, sess, authz, siteAudit))
 	mux.HandleFunc("/api/files/download", fileDownloadHandler(fileMgr, sess, ft, authz, siteAudit))
@@ -888,6 +888,7 @@ func main() {
 	}))
 	mux.HandleFunc("/api/system/session", systemSessionHandler(authz, settings, siteAudit))
 	mux.HandleFunc("/api/system/file-edit", systemFileEditHandler(authz, settings, siteAudit))
+	mux.HandleFunc("/api/system/file-list", systemFileListHandler(authz, settings, siteAudit))
 	mux.HandleFunc("/api/system/agent-listen", systemAgentListenHandler(authz, userMgr, settings,
 		func() *listenerHub { return listeners }, sess, siteAudit))
 	mux.HandleFunc("/api/system/http-listen", systemHTTPListenHandler(authz, userMgr, settings,

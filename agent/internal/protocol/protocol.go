@@ -429,9 +429,18 @@ type FsOpReq struct {
 	Encoding string `json:"encoding,omitempty"`
 	// Content writetext 的新内容（**已是 UTF-8**，Agent 负责按 Encoding 转码）。
 	Content string `json:"content,omitempty"`
+	// Offset / Limit list 的分页参数（Limit=0 表示用默认页大小）。
+	// 目录可能有上万项，服务端只取一页，避免整份列表压到服务端/浏览器。
+	Offset int `json:"offset,omitempty"`
+	Limit  int `json:"limit,omitempty"`
 	// MaxBytes 在线编辑的单文件字节上限（0 = Agent 默认 10 MiB）。
 	// 服务端按系统配置下发，Agent 侧再夹一个硬上限兜底。
 	MaxBytes int64 `json:"max_bytes,omitempty"`
+	// Mode chmod 的新权限（八进制字符串，如 "755" / "0644"，范围 0–07777）。
+	Mode string `json:"mode,omitempty"`
+	// Owner / Group chown 的目标所有者与分组：用户名/组名或数字 ID，留空表示不改。
+	Owner string `json:"owner,omitempty"`
+	Group string `json:"group,omitempty"`
 }
 
 // FsVolume 一个可存放文件的卷（Windows 盘符或 Unix 挂载点）。
@@ -451,6 +460,14 @@ type FileEntry struct {
 	Size    int64  `json:"size,omitempty"`
 	ModTime int64  `json:"mod_time,omitempty"` // Unix 秒
 	Symlink bool   `json:"symlink,omitempty"`
+	// TargetDir 仅对符号链接有意义：链接指向目录时为 true（界面可"进入"）。
+	TargetDir bool `json:"target_dir,omitempty"`
+	// 以下四项仅 Unix 有意义（Windows 返回零值，界面按平台隐藏）。
+	Mode  uint32 `json:"mode,omitempty"`  // 权限位（如 0644）
+	UID   int    `json:"uid,omitempty"`   // 所有者 ID
+	GID   int    `json:"gid,omitempty"`   // 所属组 ID
+	Owner string `json:"owner,omitempty"` // 所有者名（解析失败时为空）
+	Group string `json:"group,omitempty"` // 组名
 }
 
 // FsOpResp 文件操作结果（Agent -> Server）。
@@ -465,6 +482,8 @@ type FsOpResp struct {
 	// Volumes 仅在 list(WithDisk) / disk 时返回；当前卷由前端按挂载点长度匹配。
 	Volumes   []FsVolume `json:"volumes,omitempty"`
 	Truncated bool       `json:"truncated,omitempty"`
+	// Total list 时该目录（扫描上限内）的条目总数，用于前端翻页。
+	Total int `json:"total,omitempty"`
 	// Content readtext 返回的文件内容（**已转成 UTF-8**）。
 	Content string `json:"content,omitempty"`
 	// Encoding readtext 实际使用的编码；writetext 为写入时使用的编码。
@@ -474,8 +493,11 @@ type FsOpResp struct {
 	// Size readtext/writetext 的文件字节数（磁盘上的实际大小）。
 	Size    int64 `json:"size,omitempty"`
 	ModTime int64 `json:"mod_time,omitempty"`
-	OK      bool  `json:"ok"`
-	Message string `json:"message,omitempty"`
+	// Platform Agent 所在操作系统（windows / linux / darwin），
+	// 界面据此决定是否显示权限、所有者等 Unix 专有项。
+	Platform string `json:"platform,omitempty"`
+	OK       bool   `json:"ok"`
+	Message  string `json:"message,omitempty"`
 }
 
 // LogLevelUpdate 服务端要求 Agent 修改运行期日志级别。

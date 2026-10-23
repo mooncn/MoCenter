@@ -27,6 +27,49 @@ func TestFsPathValidation(t *testing.T) {
 	}
 }
 
+// 服务端可能跑在与 Agent 不同的 OS 上（Windows 总控管理 Linux 主机）：
+// 路径判断/拼接必须按路径自身风格，不能套用本机 filepath 语义。
+func TestFsPathCrossOS(t *testing.T) {
+	for _, p := range []string{"/", "/etc", "/var/log", `C:\Windows`, `C:/Windows`, `\\server\share\x`} {
+		if _, err := fsAbsolutePath(p); err != nil {
+			t.Errorf("%q 应被视为绝对路径: %v", p, err)
+		}
+	}
+	for _, p := range []string{"", "etc", "a/b", "C:relative"} {
+		if _, err := fsAbsolutePath(p); err == nil {
+			t.Errorf("%q 应被拒绝", p)
+		}
+	}
+	// 不做本机 filepath.Clean：Linux 路径在 Windows 服务端上必须原样下发
+	if got, _ := fsAbsolutePath("/etc/../etc/"); got != "/etc/../etc/" {
+		t.Errorf("路径被本机 Clean 改写: %q", got)
+	}
+	if got := joinPathAnyOS("/etc", "a.conf"); got != "/etc/a.conf" {
+		t.Errorf("POSIX 拼接错误: %q", got)
+	}
+	if got := joinPathAnyOS("/", "x"); got != "/x" {
+		t.Errorf("根目录拼接错误: %q", got)
+	}
+	if got := joinPathAnyOS(`C:\Windows`, "a.txt"); got != `C:\Windows\a.txt` {
+		t.Errorf("Windows 拼接错误: %q", got)
+	}
+	if got := baseNameAnyOS("/var/log/messages"); got != "messages" {
+		t.Errorf("POSIX base 错误: %q", got)
+	}
+	if got := baseNameAnyOS(`C:\a\b.txt`); got != "b.txt" {
+		t.Errorf("Windows base 错误: %q", got)
+	}
+	if got := dirNameAnyOS("/var/log/messages"); got != "/var/log" {
+		t.Errorf("POSIX dir 错误: %q", got)
+	}
+	if got := dirNameAnyOS("/etc"); got != "/" {
+		t.Errorf("根下子目录的父目录应为 /: %q", got)
+	}
+	if got := dirNameAnyOS(`C:\a\b.txt`); got != `C:\a` {
+		t.Errorf("Windows dir 错误: %q", got)
+	}
+}
+
 // 会话：操作者绑定、空闲回收、每主机上限、主动关闭。
 func TestFileSessionLifecycle(t *testing.T) {
 	m := newFileSessionManager()

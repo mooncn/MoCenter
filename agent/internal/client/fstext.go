@@ -143,13 +143,17 @@ func looksBinary(b []byte) bool {
 	return nul > 0 || ctrl*100/len(b) > 5
 }
 
-// utf8PrefixValid 允许样本恰好在多字节字符中间被截断（最多补 3 个字节）。
+// utf8PrefixValid 允许样本恰好在多字节字符中间被截断（最多回退 3 个字节）。
+// 空文件也算 UTF-8：否则会一路掉到"什么都能解"的 GB18030 兜底上。
 func utf8PrefixValid(b []byte) bool {
-	for i := 0; i < 4 && len(b) > 0; i++ {
+	if utf8.Valid(b) {
+		return true
+	}
+	for i := 0; i < 3 && len(b) > 0; i++ {
+		b = b[:len(b)-1]
 		if utf8.Valid(b) {
 			return true
 		}
-		b = b[:len(b)-1]
 	}
 	return false
 }

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -39,6 +40,45 @@ func TestFsOpList(t *testing.T) {
 	}
 	if resp.Parent != filepath.Dir(dir) {
 		t.Fatalf("父目录不正确: %q", resp.Parent)
+	}
+}
+
+// TestFsOpListPaging 列目录分页：total 正确、页之间不重不漏、越界返回空页。
+func TestFsOpListPaging(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 25; i++ {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%02d.txt", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page := func(offset, limit int) protocol.FsOpResp {
+		return runFsOp(protocol.FsOpReq{Op: "list", Path: dir, Offset: offset, Limit: limit}, "a1")
+	}
+	p1 := page(0, 10)
+	if !p1.OK || p1.Total != 25 || len(p1.Entries) != 10 {
+		t.Fatalf("第 1 页不正确: ok=%v total=%d n=%d", p1.OK, p1.Total, len(p1.Entries))
+	}
+	p2 := page(10, 10)
+	p3 := page(20, 10)
+	if len(p2.Entries) != 10 || len(p3.Entries) != 5 {
+		t.Fatalf("第 2/3 页条目数不对: %d %d", len(p2.Entries), len(p3.Entries))
+	}
+	seen := map[string]bool{}
+	for _, e := range append(append(p1.Entries, p2.Entries...), p3.Entries...) {
+		if seen[e.Name] {
+			t.Errorf("分页重复: %s", e.Name)
+		}
+		seen[e.Name] = true
+	}
+	if len(seen) != 25 {
+		t.Errorf("三页合计应 25 项，实际 %d", len(seen))
+	}
+	if over := page(100, 10); !over.OK || len(over.Entries) != 0 || over.Total != 25 {
+		t.Errorf("越界页应为空且仍报 total: %+v", over)
+	}
+	// Limit=0 表示不分页（兼容不带分页参数的旧服务端）
+	if def := runFsOp(fsReq("list", dir, "", false), "a1"); len(def.Entries) != 25 {
+		t.Errorf("Limit=0 应返回整份列表，实际 %d", len(def.Entries))
 	}
 }
 

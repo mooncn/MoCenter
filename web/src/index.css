@@ -1484,6 +1484,16 @@ tr.row-offline > td:last-child .cell-dot { display: inline-block; }
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
   gap: 8px; margin-top: 6px; color: var(--muted); font-size: 12px;
 }
+/* 分页条：与剪贴板列表的翻页保持同一视觉语言 */
+.fm-pagefoot {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 8px; margin-top: 8px; padding-top: 8px;
+  border-top: 1px solid var(--border); color: var(--muted); font-size: 12px;
+}
+.fm-pagebtns { display: flex; gap: 6px; align-items: center; }
+.fm-pagebtns-top { gap: 8px; font-size: 12px; }
+.fm-pagebtns-top button:disabled { opacity: .35; cursor: not-allowed; }
+
 .fm-mini { width: 100%; font-size: 12px; }
 .fm-mini th, .fm-mini td {
   padding: 4px 8px; border-bottom: 1px solid var(--border);
@@ -1514,6 +1524,38 @@ tr.row-offline > td:last-child .cell-dot { display: inline-block; }
 }
 .fm-editor:focus { outline: none; border-color: var(--accent); }
 .fm-editor-loading { padding: 40px 0; text-align: center; color: var(--muted); font-size: 13px; }
+
+/* 权限列：等宽字体，竖向扫读时 rwx 才对得齐 */
+.fm-col-mode { font-family: Menlo, Consolas, 'Courier New', monospace; font-size: 12px; letter-spacing: .2px; }
+
+/* 右击菜单：position: fixed 跟随光标，靠近边缘时由 JS 夹回视口内 */
+.ctx-menu {
+  position: fixed; z-index: 200; min-width: 190px; padding: 4px;
+  display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .5);
+}
+.ctx-menu button {
+  background: transparent; color: var(--text); text-align: left;
+  padding: 7px 10px; font-size: 13px; border-radius: 5px; white-space: nowrap;
+}
+.ctx-menu button:hover:not(:disabled) { background: var(--accent-soft); opacity: 1; }
+.ctx-menu button:disabled { opacity: .38; cursor: not-allowed; }
+.ctx-menu button.danger { color: var(--red); }
+.ctx-menu button.danger:hover:not(:disabled) { background: rgba(239, 68, 68, .14); }
+.ctx-sep { height: 1px; margin: 4px 6px; background: var(--border); }
+
+/* 权限矩阵 */
+.fm-perm-table { width: auto; margin-bottom: 6px; }
+.fm-perm-table th, .fm-perm-table td {
+  padding: 4px 12px; border: none; text-align: center; font-size: 12.5px;
+}
+.fm-perm-table th:first-child { text-align: left; color: var(--muted); font-weight: 600; }
+.fm-perm-table input[type="checkbox"] { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
+.fm-perm-octal { display: inline-flex; align-items: center; gap: 8px; margin: 2px 0 0; font-size: 12.5px; }
+.fm-perm-octal input {
+  width: 88px; padding: 4px 8px; font-family: Menlo, Consolas, monospace; font-size: 13px;
+}
 
 /* 顶部磁盘条：当前分区的文件系统 + 使用率 + 剩余空间，点击看全部分区 */
 .fm-disk {
@@ -1546,6 +1588,7 @@ tr.row-offline > td:last-child .cell-dot { display: inline-block; }
   .fm-col-size { width: 84px; text-align: right; }
   .fm-col-time { width: 104px; }
   .fm-col-check { width: 32px; }
+  .fm-col-mode { width: 92px; }
   /* 操作列要容得下「下载 / 编辑 / 重命名 / 删除」四个按钮：
      换行会把 30px 的行高翻倍，正是"空隙太大"的主因 */
   .fm-col-ops { width: 212px; }
@@ -1558,6 +1601,7 @@ tr.row-offline > td:last-child .cell-dot { display: inline-block; }
 @media (min-width: 901px) and (max-width: 1180px) {
   .fm-col-size { width: 70px; }
   .fm-col-time { width: 92px; }
+  .fm-col-mode { width: 78px; }
   .fm-col-ops { width: 184px; }
   .fm-table .row-actions { gap: 3px; }
   .fm-table .row-actions button { padding: 2px 5px; }
@@ -1580,6 +1624,8 @@ tr.row-offline > td:last-child .cell-dot { display: inline-block; }
   .fm-table td.fm-col-check input[type="checkbox"] { width: 17px; height: 17px; }
   .fm-selbar button, .fm-clipbar button { min-height: 32px; }
   .fm-editor { height: min(56vh, 420px); font-size: 12px; }
+  .fm-table th.fm-col-mode, .fm-table td[data-label="权限"] { display: none; }
+  .ctx-menu button { padding: 9px 12px; font-size: 14px; }
   .fm-selbar, .fm-clipbar { font-size: 12.5px; }
   .fm-clip-from { flex: 1 1 100%; max-width: 100%; }
   /* "上一级"不需要字段名占位，卡片模式下占一行 88px 反而把按钮挤歪 */
